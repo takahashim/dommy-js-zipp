@@ -61,28 +61,41 @@ module ZippRb
   # A persistent Zipp JavaScript VM.
   #
   # The engine state lives in a thread-local registry inside the native
-  # extension (the VM is not `Send`); this object just holds its id and
-  # delegates. Using a VM from a thread other than the one that created it
-  # raises, which matches the engine's single-thread contract.
+  # extension (the VM is not `Send`); this object holds its id and the thread
+  # that created it, and delegates. A VM may only be used from its owning
+  # thread; another thread raises a ThreadError rather than reaching an
+  # unrelated VM.
   class VM
+    # Finalizer body: drop the native VM and the bindings retained for it.
+    # Captures only the id, never the VM (a finalizer that captured `self`
+    # would keep it alive forever).
+    def self.finalizer(id)
+      proc { ZippRb._drop(id) }
+    end
+
     def initialize
       @id = ZippRb._create
+      @thread = Thread.current
       @disposed = false
+      ObjectSpace.define_finalizer(self, self.class.finalizer(@id))
     end
 
     # Evaluate +src+ in the VM's global context and return the completion value.
     def eval(src)
+      check_owner!
       ZippRb._eval(@id, src)
     end
 
     # Call the JS global function +name+ with +args+, converting both ways.
     def call(name, *args)
+      check_owner!
       ZippRb._call(@id, name.to_s, args)
     end
 
     # Take a durable handle to the global +name+ (a function or any value), so
     # Ruby can hold it and use it later. Returns nil if the name is unbound.
     def handle(name)
+      check_owner!
       hid = ZippRb._handle(@id, name.to_s)
       hid && Handle.new(@id, hid)
     end
@@ -91,6 +104,7 @@ module ZippRb
     # return value cross between Ruby and JS (numbers, strings, booleans, nil,
     # Array and Hash).
     def define_function(name, &block)
+      check_owner!
       raise ArgumentError, "block required" unless block
 
       ZippRb._define_function(@id, name.to_s, block)
@@ -104,6 +118,7 @@ module ZippRb
     #   vm.set_module_provider("/app", { "/app/mod.mjs" => "export const x = 1;" })
     #   vm.eval("import('/app/mod.mjs').then(ns => ...)")
     def set_module_provider(root, sources, max_module_bytes: 64 * 1024 * 1024)
+      check_owner!
       ZippRb._set_module_provider(@id, root.to_s, sources, max_module_bytes)
       nil
     end
@@ -112,12 +127,14 @@ module ZippRb
     # namespace exports as a Hash. Requires a module loader, usually
     # #set_module_provider.
     def import(specifier)
+      check_owner!
       ZippRb._import(@id, specifier.to_s)
     end
 
     # Register +block+ to receive every console line as `(severity, message)`,
     # where severity is :log or :error. Replaces any previous listener.
     def on_log(&block)
+      check_owner!
       ZippRb._on_log(@id, block)
       nil
     end
@@ -125,19 +142,24 @@ module ZippRb
     # Register +block+ to receive the message of every unhandled Promise
     # rejection. Replaces any previous listener.
     def on_unhandled_rejection(&block)
+      check_owner!
       ZippRb._on_unhandled_rejection(@id, block)
       nil
     end
 
     # Run queued microtasks (promise reactions, queueMicrotask). Returns nil.
     def drain_jobs!
+      check_owner!
       ZippRb._drain_jobs(@id)
       nil
     end
 
-    # Tear the VM down. Idempotent.
+    # Tear the VM down. Idempotent. Raises ThreadError if called from inside a
+    # callback while the VM is executing (the native layer refuses it), so the
+    # VM is never torn down under a running evaluation.
     def dispose
-      return if @disposed
+      check_owner!
+      return nil if @disposed
 
       ZippRb._dispose(@id)
       @disposed = true
@@ -146,6 +168,14 @@ module ZippRb
 
     def disposed?
       @disposed || ZippRb._disposed?(@id)
+    end
+
+    private
+
+    def check_owner!
+      return if Thread.current.equal?(@thread)
+
+      raise ThreadError, "ZippRb::VM can only be used from the thread that created it"
     end
   end
 end

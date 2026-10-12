@@ -13,8 +13,9 @@
 //! them up by kind on each call.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use magnus::{
     block::Proc, function, prelude::*, r_hash::ForEach, Class, Error, ExceptionClass, RArray,
@@ -26,11 +27,20 @@ use zipp_vm::embed::{
     ScriptState,
 };
 
+/// VM ids are process-global and monotonic, so an id minted on one thread can
+/// never denote a different VM on another thread. Combined with the
+/// thread-local registry (a VM lives only on its owner's thread), a cross-thread
+/// use misses the registry and is refused instead of silently hitting an
+/// unrelated VM that happens to share the id.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 thread_local! {
     /// Live VMs for this thread, keyed by id.
     static VMS: RefCell<HashMap<u64, ScriptState>> = RefCell::new(HashMap::new());
-    /// Next VM id to hand out.
-    static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    /// VMs currently executing on this thread (taken out of `VMS` for the
+    /// duration of a host entry). A `dispose` while a VM is in flight is
+    /// refused, so the VM cannot be torn down under a running evaluation.
+    static IN_FLIGHT: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
     /// Next callback id.
     static NEXT_FN: Cell<u64> = const { Cell::new(1) };
     /// Next module-provider id.
@@ -45,8 +55,9 @@ thread_local! {
     /// within the callback's dynamic scope; the handler saves and restores it.
     static ACTIVE_CTX: Cell<Option<(u64, *mut (dyn HostCtx + 'static))>> = const { Cell::new(None) };
     /// Durable JS value handles the binding has handed to Ruby, keyed by a
-    /// binding id. Each roots a JS value in its VM's heap.
-    static HANDLES: RefCell<HashMap<u64, HostHandle>> = RefCell::new(HashMap::new());
+    /// binding id. Value is `(owning VM id, engine handle)`, so a VM's handles
+    /// can be dropped when it is disposed.
+    static HANDLES: RefCell<HashMap<u64, (u64, HostHandle)>> = RefCell::new(HashMap::new());
     /// Next handle id to hand out.
     static NEXT_HANDLE: Cell<u64> = const { Cell::new(1) };
     /// Next import scratch-key id.
@@ -57,12 +68,10 @@ thread_local! {
 fn create(ruby: &Ruby) -> Result<u64, Error> {
     let mut state = compile_script("").map_err(|e| runtime_error(ruby, e))?;
     state.run_init().map_err(|e| runtime_error(ruby, e))?;
-    let id = NEXT_ID.with(|c| {
-        let v = c.get();
-        c.set(v.wrapping_add(1));
-        v
-    });
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    // Process-global id: unique across threads, so a VM can never be confused
+    // with a same-numbered VM on another thread.
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    put_vm(id, state);
     Ok(id)
 }
 
@@ -83,7 +92,7 @@ fn eval(ruby: &Ruby, id: u64, src: String) -> Result<Value, Error> {
     // registry (the reentry path above is what makes a nested call work).
     let mut state = take_vm(ruby, id)?;
     let result = state.eval_in_context_structured(&src);
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     match result {
         Ok(hv) => Ok(host_to_ruby(ruby, &hv)),
         Err(e) => Err(js_error(ruby, &e)),
@@ -102,7 +111,7 @@ fn call(ruby: &Ruby, id: u64, name: String, args: RArray) -> Result<Value, Error
     }
     let mut state = take_vm(ruby, id)?;
     let result = state.call_global_structured(&name, &host_args);
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     match result {
         Ok(hv) => Ok(host_to_ruby(ruby, &hv)),
         Err(e) => Err(js_error(ruby, &e)),
@@ -116,8 +125,9 @@ fn define_function(
     name: String,
     block: Value,
 ) -> Result<Symbol, Error> {
+    // The kind embeds the VM id so its callbacks can be reclaimed on dispose.
     let kind = format!(
-        "rb:{}",
+        "rb:{id}:{}",
         NEXT_FN.with(|c| {
             let v = c.get();
             c.set(v.wrapping_add(1));
@@ -137,7 +147,7 @@ fn define_function(
         kind = js_string(&kind),
     );
     let result = state.eval_in_context(&js).map_err(|e| runtime_error(ruby, e));
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     result.map(|_| ruby.to_symbol(name.as_str()))
 }
 
@@ -179,7 +189,7 @@ fn import_module(ruby: &Ruby, id: u64, specifier: String) -> Result<Value, Error
             Err(e) => Err(js_error(ruby, &e)),
         }
     })();
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     run
 }
 
@@ -205,7 +215,7 @@ fn on_log(ruby: &Ruby, id: u64, block: Value) -> Result<(), Error> {
         ];
         let _ = call_listener(&k, &args);
     }));
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     Ok(())
 }
 
@@ -224,7 +234,7 @@ fn on_unhandled_rejection(ruby: &Ruby, id: u64, block: Value) -> Result<(), Erro
         let args = [ruby.into_value(message.to_string())];
         let _ = call_listener(&k, &args);
     }));
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     Ok(())
 }
 
@@ -232,7 +242,7 @@ fn on_unhandled_rejection(ruby: &Ruby, id: u64, block: Value) -> Result<(), Erro
 fn drain_jobs(ruby: &Ruby, id: u64) -> Result<(), Error> {
     let mut state = take_vm(ruby, id)?;
     state.run_microtasks();
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     Ok(())
 }
 
@@ -261,7 +271,7 @@ fn call_listener(key: &str, args: &[Value]) -> Option<Value> {
 fn handle(ruby: &Ruby, id: u64, name: String) -> Result<Option<u64>, Error> {
     let mut state = take_vm(ruby, id)?;
     let made = state.handle_of_global(&name);
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     let Some(engine_handle) = made else {
         return Ok(None);
     };
@@ -270,19 +280,22 @@ fn handle(ruby: &Ruby, id: u64, name: String) -> Result<Option<u64>, Error> {
         c.set(v.wrapping_add(1));
         v
     });
-    HANDLES.with(|h| h.borrow_mut().insert(hid, engine_handle));
+    HANDLES.with(|h| h.borrow_mut().insert(hid, (id, engine_handle)));
     Ok(Some(hid))
 }
 
 /// Call the function a binding handle roots.
 fn call_handle(ruby: &Ruby, id: u64, handle_id: u64, args: RArray) -> Result<Value, Error> {
-    let Some(engine_handle) = HANDLES.with(|h| h.borrow().get(&handle_id).copied()) else {
+    let Some((vm_id, engine_handle)) = HANDLES.with(|h| h.borrow().get(&handle_id).copied()) else {
         return Err(runtime_error(ruby, format!("unknown handle {handle_id}")));
     };
+    if vm_id != id {
+        return Err(runtime_error(ruby, "handle belongs to another VM".to_string()));
+    }
     let host_args: Vec<HostValue> = args.into_iter().map(|a| ruby_to_host(ruby, a)).collect();
     let mut state = take_vm(ruby, id)?;
     let result = state.call_handle(engine_handle, &host_args);
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     result
         .map(|hv| host_to_ruby(ruby, &hv))
         .map_err(|e| js_error_from_message(ruby, &e))
@@ -290,12 +303,15 @@ fn call_handle(ruby: &Ruby, id: u64, handle_id: u64, args: RArray) -> Result<Val
 
 /// Read the value a binding handle roots.
 fn get_handle(ruby: &Ruby, id: u64, handle_id: u64) -> Result<Value, Error> {
-    let Some(engine_handle) = HANDLES.with(|h| h.borrow().get(&handle_id).copied()) else {
+    let Some((vm_id, engine_handle)) = HANDLES.with(|h| h.borrow().get(&handle_id).copied()) else {
         return Err(runtime_error(ruby, format!("unknown handle {handle_id}")));
     };
+    if vm_id != id {
+        return Err(runtime_error(ruby, "handle belongs to another VM".to_string()));
+    }
     let mut state = take_vm(ruby, id)?;
     let result = state.get_handle(engine_handle);
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     result
         .map(|hv| host_to_ruby(ruby, &hv))
         .map_err(|e| js_error_from_message(ruby, &e))
@@ -303,12 +319,16 @@ fn get_handle(ruby: &Ruby, id: u64, handle_id: u64) -> Result<Value, Error> {
 
 /// Release a binding handle. Returns whether it was live.
 fn release_handle(ruby: &Ruby, id: u64, handle_id: u64) -> Result<bool, Error> {
-    let Some(engine_handle) = HANDLES.with(|h| h.borrow_mut().remove(&handle_id)) else {
+    let Some((vm_id, engine_handle)) = HANDLES.with(|h| h.borrow_mut().remove(&handle_id)) else {
         return Ok(false);
     };
+    if vm_id != id {
+        HANDLES.with(|h| h.borrow_mut().insert(handle_id, (vm_id, engine_handle)));
+        return Err(runtime_error(ruby, "handle belongs to another VM".to_string()));
+    }
     let mut state = take_vm(ruby, id)?;
     let released = state.release_handle(engine_handle);
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     Ok(released)
 }
 
@@ -322,7 +342,8 @@ fn set_module_provider(
     sources: Value,
     max_module_bytes: u64,
 ) -> Result<(), Error> {
-    let pid = NEXT_PROVIDER.with(|c| {
+    // One provider per VM, keyed by the VM id, so it is reclaimed on dispose.
+    let _ = NEXT_PROVIDER.with(|c| {
         let v = c.get();
         c.set(v.wrapping_add(1));
         v
@@ -330,14 +351,14 @@ fn set_module_provider(
     // Keep the sources Hash in a Ruby constant so the GC roots any Procs in it.
     let module: RModule = ruby.define_module("ZippRb")?;
     let modules: RHash = module.const_get("MODULES")?;
-    modules.aset(pid, sources)?;
+    modules.aset(id, sources)?;
 
     let mut state = take_vm(ruby, id)?;
     let provider = move |path: &str| -> Option<Vec<u8>> {
         let ruby = Ruby::get().ok()?;
         let module = ruby.define_module("ZippRb").ok()?;
         let modules: RHash = module.const_get("MODULES").ok()?;
-        let sources: Value = modules.aref(pid).ok()?;
+        let sources: Value = modules.aref(id).ok()?;
         let sources = RHash::from_value(sources)?;
         let value: Value = sources.aref(path).ok()?;
         if value.is_nil() {
@@ -353,17 +374,26 @@ fn set_module_provider(
     let result = state
         .set_module_provider(std::path::Path::new(&root), max_module_bytes, Rc::new(provider))
         .map_err(|e| runtime_error(ruby, e));
-    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+    put_vm(id, state);
     result
 }
 
-/// Dispose the VM `id`. Idempotent; an unknown id is a no-op.
-fn dispose(id: u64) {
-    VMS.with(|vms| {
-        if let Some(state) = vms.borrow_mut().get_mut(&id) {
-            state.dispose();
-        }
-    });
+/// Dispose the VM `id`. Idempotent; an unknown id is a no-op. Refused with a
+/// `ThreadError` while the VM is executing on this thread (its state has been
+/// taken out of the registry for the call), so a callback cannot tear down the
+/// VM under a running evaluation.
+fn dispose(ruby: &Ruby, id: u64) -> Result<(), Error> {
+    if IN_FLIGHT.with(|s| s.borrow().contains(&id)) {
+        return Err(Error::new(
+            ruby.exception_thread_error(),
+            "cannot dispose a VM while it is executing",
+        ));
+    }
+    if let Some(mut state) = VMS.with(|vms| vms.borrow_mut().remove(&id)) {
+        state.dispose();
+        forget_vm(ruby, id);
+    }
+    Ok(())
 }
 
 /// Whether the VM `id` has been disposed (unknown ids report `true`).
@@ -376,13 +406,72 @@ fn disposed(id: u64) -> bool {
     })
 }
 
+/// Finalizer entry: drop the VM `id` and everything the binding retained for
+/// it. Tolerant — it may run on a different thread (the registry is
+/// thread-local) and must never raise.
+fn drop_vm(ruby: &Ruby, id: u64) {
+    if let Some(mut state) = VMS.with(|vms| vms.borrow_mut().remove(&id)) {
+        state.dispose();
+    }
+    forget_vm(ruby, id);
+}
+
 fn take_vm(ruby: &Ruby, id: u64) -> Result<ScriptState, Error> {
-    VMS.with(|vms| vms.borrow_mut().remove(&id)).ok_or_else(|| {
-        runtime_error(
+    match VMS.with(|vms| vms.borrow_mut().remove(&id)) {
+        Some(state) => {
+            IN_FLIGHT.with(|s| {
+                s.borrow_mut().insert(id);
+            });
+            Ok(state)
+        }
+        None => Err(runtime_error(
             ruby,
             format!("unknown VM id {id} (used from another thread, or re-entered from a callback)"),
-        )
-    })
+        )),
+    }
+}
+
+/// Put a VM back after a host entry, clearing its in-flight marker.
+fn put_vm(id: u64, state: ScriptState) {
+    IN_FLIGHT.with(|s| {
+        s.borrow_mut().remove(&id);
+    });
+    VMS.with(|vms| vms.borrow_mut().insert(id, state));
+}
+
+/// Drop every Ruby-side retention the binding holds for VM `id`: its callbacks,
+/// listeners, in-memory module sources, and durable handles. Without this, the
+/// procs (and whatever application objects they close over) would live for the
+/// process lifetime even after the VM is disposed or GC'd.
+fn forget_vm(ruby: &Ruby, id: u64) {
+    if let Some(listeners) = hash_const(ruby, "LISTENERS") {
+        for key in [format!("log:{id}"), format!("rejection:{id}")] {
+            let _ = listeners.funcall::<_, _, Value>("delete", (key,));
+        }
+    }
+    if let Some(modules) = hash_const(ruby, "MODULES") {
+        let _ = modules.funcall::<_, _, Value>("delete", (id,));
+    }
+    if let Some(callbacks) = hash_const(ruby, "CALLBACKS") {
+        let prefix = format!("rb:{id}:");
+        let mut keys: Vec<String> = Vec::new();
+        let _ = callbacks.foreach(|k: String, _v: Value| -> Result<ForEach, Error> {
+            if k.starts_with(&prefix) {
+                keys.push(k);
+            }
+            Ok(ForEach::Continue)
+        });
+        for key in keys {
+            let _ = callbacks.funcall::<_, _, Value>("delete", (key,));
+        }
+    }
+    HANDLES.with(|h| h.borrow_mut().retain(|_, (vm, _)| *vm != id));
+}
+
+/// Look up a `ZippRb` constant that is a Hash, or `None`.
+fn hash_const(ruby: &Ruby, name: &str) -> Option<RHash> {
+    let module: RModule = ruby.define_module("ZippRb").ok()?;
+    module.const_get(name).ok()
 }
 
 /// The structured host handler backing Ruby callbacks: on
@@ -411,10 +500,18 @@ fn call_ruby_back(kind: &str, args: &[HostValue]) -> Result<HostValue, String> {
     if proc.is_nil() {
         return Err(format!("Error: no Ruby function registered as {kind}"));
     }
-    let ruby_args: Vec<Value> = args.iter().map(|a| host_to_ruby(&ruby, a)).collect();
-    let result: Value = proc
-        .funcall("call", ruby_args.as_slice())
-        .map_err(|e| e.to_string())?;
+    // Build the argument list as an RArray (a stack `VALUE`, so the Ruby GC
+    // sees the whole list) rather than a heap `Vec<Value>`: values held only in
+    // a Rust heap buffer are not rooted and could be collected while a later
+    // argument is allocated.
+    let ruby_args = ruby.ary_new_capa(args.len());
+    for a in args {
+        ruby_args
+            .push(host_to_ruby(&ruby, a))
+            .map_err(|e| e.to_string())?;
+    }
+    let callable = Proc::from_value(proc).ok_or_else(|| format!("{kind} is not a Proc"))?;
+    let result: Value = callable.call(ruby_args).map_err(|e| e.to_string())?;
     Ok(ruby_to_host(&ruby, result))
 }
 
@@ -613,6 +710,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_on_unhandled_rejection", function!(on_unhandled_rejection, 2))?;
     module.define_singleton_method("_drain_jobs", function!(drain_jobs, 1))?;
     module.define_singleton_method("_dispose", function!(dispose, 1))?;
+    module.define_singleton_method("_drop", function!(drop_vm, 1))?;
     module.define_singleton_method("_disposed?", function!(disposed, 1))?;
     Ok(())
 }
