@@ -292,6 +292,39 @@ fn eval(ruby: &Ruby, id: u64, src: String) -> Result<Value, Error> {
     }
 }
 
+/// The VM's resource usage as a Ruby Hash (heap bytes, instruction steps,
+/// retained dynamic code). The closest analogue of quickjs.rb's `memory_usage`.
+fn memory_usage(ruby: &Ruby, id: u64) -> Result<RHash, Error> {
+    let mut state = take_vm(ruby, id)?;
+    let u = state.resource_usage();
+    put_vm(id, state);
+    let hash = ruby.hash_new();
+    let mut set = |name: &str, v: u64| {
+        let _ = hash.aset(ruby.to_symbol(name), v);
+    };
+    set("heap_bytes", u.heap_bytes as u64);
+    set("steps_used", u.steps_used);
+    set("dynamic_code_calls", u.dynamic_code_calls as u64);
+    set("dynamic_code_source_bytes", u.dynamic_code_source_bytes as u64);
+    set("retained_functions", u.retained_functions as u64);
+    set("retained_classes", u.retained_classes as u64);
+    set("retained_function_bytes", u.retained_function_bytes as u64);
+    set("retained_class_bytes", u.retained_class_bytes as u64);
+    Ok(hash)
+}
+
+/// Split a `define_function` name (a String/Symbol, or an Array path) into its
+/// segments, each as a String.
+fn name_segments(name: Value) -> Vec<String> {
+    if let Some(arr) = RArray::from_value(name) {
+        arr.into_iter()
+            .map(|v| v.funcall::<_, _, String>("to_s", ()).unwrap_or_default())
+            .collect()
+    } else {
+        vec![name.funcall::<_, _, String>("to_s", ()).unwrap_or_default()]
+    }
+}
+
 /// Evaluate `src` for its side effects, discarding the completion value. Much
 /// cheaper than `eval` when a script's last expression is a large object (a
 /// UMD factory's return value, say): `eval` marshals that value into Ruby,
@@ -335,9 +368,13 @@ fn call(ruby: &Ruby, id: u64, name: String, args: RArray) -> Result<Value, Error
 fn define_function(
     ruby: &Ruby,
     id: u64,
-    name: String,
+    name: Value,
     block: Value,
 ) -> Result<Symbol, Error> {
+    let segments = name_segments(name);
+    let Some(last) = segments.last().cloned() else {
+        return Err(runtime_error(ruby, "a function name is required".into()));
+    };
     // The kind embeds the VM id so its callbacks can be reclaimed on dispose.
     let kind = format!(
         "rb:{id}:{}",
@@ -355,14 +392,24 @@ fn define_function(
 
     let mut state = take_vm(ruby, id)?;
     state.set_host_call_values(rb_handler(id));
-    let js = format!(
-        "globalThis[{name}] = function(...args) {{ return __zippHostCallValue({kind}, ...args); }};",
-        name = js_string(&name),
-        kind = js_string(&kind),
-    );
+    // A single name installs a global; an Array path installs on a nested
+    // object (`["a","b"]` → `a.b`), creating intermediates as needed — the
+    // quickjs.rb `define_function ["a","b"]` shape.
+    let mut js = String::new();
+    let mut base = String::from("globalThis");
+    for seg in &segments[..segments.len() - 1] {
+        let path = format!("{base}[{}]", js_string(seg));
+        js.push_str(&format!("{path} = {path} || {{}};\n"));
+        base = path;
+    }
+    js.push_str(&format!(
+        "{base}[{}] = function(...args) {{ return __zippHostCallValue({}, ...args); }};",
+        js_string(&last),
+        js_string(&kind),
+    ));
     let result = state.eval_in_context(&js).map_err(|e| runtime_error(ruby, e));
     put_vm(id, state);
-    result.map(|_| ruby.to_symbol(name.as_str()))
+    result.map(|_| ruby.to_symbol(last.as_str()))
 }
 
 /// Enable `setTimeout`/`setInterval` on VM `id` (opt-in, like quickjs.rb's
@@ -1121,6 +1168,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_drain_jobs", function!(drain_jobs, 1))?;
     module.define_singleton_method("_dispose", function!(dispose, 1))?;
     module.define_singleton_method("_drop", function!(drop_vm, 1))?;
+    module.define_singleton_method("_memory_usage", function!(memory_usage, 1))?;
     module.define_singleton_method("_disposed?", function!(disposed, 1))?;
     Ok(())
 }

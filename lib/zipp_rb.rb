@@ -34,6 +34,17 @@ module ZippRb
   # Feature flag: provide setTimeout/setInterval (mirrors Quickjs::FEATURE_TIMEOUT).
   FEATURE_TIMEOUT = :feature_timeout
 
+  # Evaluate +code+ on a fresh VM and return the completion value, disposing the
+  # VM afterwards (quickjs.rb's `Quickjs.eval_code`). +opts+ are the VM options.
+  def self.eval_code(code, **opts)
+    vm = VM.new(**opts)
+    begin
+      vm.eval(code)
+    ensure
+      vm.dispose
+    end
+  end
+
   # A durable handle to a JS value (usually a function) the VM keeps alive, so
   # Ruby can hold it and call it later (e.g. an event listener). Returned by
   # VM#handle.
@@ -130,14 +141,24 @@ module ZippRb
       hid && Handle.new(@id, hid)
     end
 
-    # Register +block+ as a JS global function named +name+. Arguments and the
-    # return value cross between Ruby and JS (numbers, strings, booleans, nil,
-    # Array and Hash).
+    # Register +block+ as a JS function. +name+ is a String/Symbol (a global
+    # name) or an Array of segments (a nested path, `["a", "b"]` → `a.b`).
+    # Arguments and the return value cross between Ruby and JS (numbers,
+    # strings, booleans, nil, Array and Hash). Returns a Symbol, or an Array of
+    # Symbols for a path (quickjs.rb's shape).
     def define_function(name, &block)
       check_usable!
       raise ArgumentError, "block required" unless block
 
-      ZippRb._define_function(@id, name.to_s, block)
+      result = ZippRb._define_function(@id, name, block)
+      name.is_a?(Array) ? name.map(&:to_sym) : result
+    end
+
+    # Resource-usage counters (heap bytes, instruction steps, retained dynamic
+    # code) as a Hash — the closest analogue of quickjs.rb's memory_usage.
+    def memory_usage
+      check_usable!
+      ZippRb._memory_usage(@id)
     end
 
     # Register in-memory ES module sources. +sources+ maps a resolved module

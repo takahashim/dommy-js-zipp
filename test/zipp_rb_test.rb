@@ -192,6 +192,28 @@ class ZippRbTest < Minitest::Test
     vm.dispose
   end
 
+  def test_eval_code_module_function
+    assert_equal 3, ZippRb.eval_code("1 + 2")
+  end
+
+  def test_define_function_array_path
+    vm = ZippRb::VM.new
+    assert_equal %i[helpers double], vm.define_function(%w[helpers double]) { |x| x * 2 }
+    assert_equal 42, vm.eval("helpers.double(21)")
+  ensure
+    vm.dispose
+  end
+
+  def test_memory_usage
+    vm = ZippRb::VM.new
+    vm.load("var big = []; for (let i = 0; i < 1000; i++) big.push({ i: i });")
+    usage = vm.memory_usage
+    assert_operator usage[:heap_bytes], :>, 0
+    assert_includes usage.keys, :retained_functions
+  ensure
+    vm.dispose
+  end
+
   def test_dispose_is_idempotent
     vm = ZippRb::VM.new
     refute vm.disposed?
