@@ -73,11 +73,18 @@ module ZippRb
       proc { ZippRb._drop(id) }
     end
 
-    def initialize
+    # Create a VM. Optional resource limits:
+    #   timeout_msec:  wall-clock deadline for each evaluation (ms)
+    #   memory_limit:  heap ceiling in bytes
+    #   step_limit:    instruction budget per evaluation
+    def initialize(timeout_msec: nil, memory_limit: nil, step_limit: nil)
       @id = ZippRb._create
       @thread = Thread.current
       @disposed = false
       ObjectSpace.define_finalizer(self, self.class.finalizer(@id))
+      if timeout_msec || memory_limit || step_limit
+        ZippRb._configure_limits(@id, step_limit, memory_limit, timeout_msec)
+      end
     end
 
     # Evaluate +src+ in the VM's global context and return the completion value.

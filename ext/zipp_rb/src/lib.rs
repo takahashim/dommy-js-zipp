@@ -15,7 +15,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use magnus::{
     block::Proc, function, prelude::*, r_hash::ForEach, Class, Error, ExceptionClass, RArray,
@@ -33,6 +35,26 @@ use zipp_vm::embed::{
 /// use misses the registry and is refused instead of silently hitting an
 /// unrelated VM that happens to share the id.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Wall-clock milliseconds, for timeout deadlines shared with a watchdog thread.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Per-VM resource limits, applied around every host entry. `abort` and
+/// `deadline` are shared with a watchdog thread that sets `abort` when the
+/// deadline passes.
+struct LimitState {
+    abort: Arc<AtomicBool>,
+    deadline: Arc<AtomicU64>,
+    running: Arc<AtomicBool>,
+    max_steps: u64,
+    timeout_ms: Option<u64>,
+    memory_limit: Option<usize>,
+}
 
 thread_local! {
     /// Live VMs for this thread, keyed by id.
@@ -62,6 +84,8 @@ thread_local! {
     static NEXT_HANDLE: Cell<u64> = const { Cell::new(1) };
     /// Next import scratch-key id.
     static NEXT_IMPORT: Cell<u64> = const { Cell::new(1) };
+    /// Resource limits per VM (instruction budget, heap ceiling, wall timeout).
+    static LIMITS: RefCell<HashMap<u64, LimitState>> = RefCell::new(HashMap::new());
 }
 
 /// Create a VM with an empty global context; return its id.
@@ -73,6 +97,81 @@ fn create(ruby: &Ruby) -> Result<u64, Error> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     put_vm(id, state);
     Ok(id)
+}
+
+/// Configure resource limits for VM `id`: an instruction budget (`step_limit`),
+/// a heap ceiling in bytes (`memory_limit`), and a wall-clock deadline in
+/// milliseconds (`timeout_ms`). Any `None` leaves that dimension at its default
+/// (instruction budget `u64::MAX` = effectively unbounded).
+fn configure_limits(
+    ruby: &Ruby,
+    id: u64,
+    step_limit: Option<u64>,
+    memory_limit: Option<u64>,
+    timeout_ms: Option<u64>,
+) -> Result<(), Error> {
+    let mut state = take_vm(ruby, id)?;
+    let abort = Arc::new(AtomicBool::new(false));
+    let deadline = Arc::new(AtomicU64::new(0));
+    let running = Arc::new(AtomicBool::new(true));
+    let max_steps = step_limit.unwrap_or(u64::MAX);
+    // The step/abort hook lives in the interpreter loop; native code does not
+    // iterate it. Turn the JIT off for a bounded VM so a hot loop stays
+    // cooperatively interruptible.
+    state.disable_vm_jit();
+    if timeout_ms.is_some() {
+        let (d, a, r) = (deadline.clone(), abort.clone(), running.clone());
+        std::thread::spawn(move || {
+            while r.load(Ordering::Relaxed) {
+                let dl = d.load(Ordering::Relaxed);
+                if dl != 0 && now_ms() >= dl {
+                    a.store(true, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+    }
+    LIMITS.with(|m| {
+        m.borrow_mut().insert(
+            id,
+            LimitState {
+                abort,
+                deadline,
+                running,
+                max_steps,
+                timeout_ms,
+                memory_limit: memory_limit.map(|b| b as usize),
+            },
+        );
+    });
+    put_vm(id, state);
+    Ok(())
+}
+
+/// Arm the limits for an entry: reset the abort flag and set the deadline.
+fn arm_limits(state: &mut ScriptState, id: u64) {
+    LIMITS.with(|m| {
+        if let Some(l) = m.borrow().get(&id) {
+            l.abort.store(false, Ordering::Relaxed);
+            l.deadline
+                .store(now_ms().saturating_add(l.timeout_ms.unwrap_or(0)), Ordering::Relaxed);
+            // A fresh recorder per entry (set_limits replaces it), so the heap
+            // ceiling must be re-applied here too, after set_limits.
+            state.set_limits(l.max_steps, l.timeout_ms.map(|_| l.abort.clone()));
+            if let Some(bytes) = l.memory_limit {
+                state.set_heap_limit(bytes);
+            }
+        }
+    });
+}
+
+/// Disarm the wall-clock deadline after an entry (leaves the abort flag alone).
+fn disarm_limits(id: u64) {
+    LIMITS.with(|m| {
+        if let Some(l) = m.borrow().get(&id) {
+            l.deadline.store(0, Ordering::Relaxed);
+        }
+    });
 }
 
 /// Evaluate `src` in the VM `id`. The completion value crosses as a structured
@@ -418,10 +517,11 @@ fn drop_vm(ruby: &Ruby, id: u64) {
 
 fn take_vm(ruby: &Ruby, id: u64) -> Result<ScriptState, Error> {
     match VMS.with(|vms| vms.borrow_mut().remove(&id)) {
-        Some(state) => {
+        Some(mut state) => {
             IN_FLIGHT.with(|s| {
                 s.borrow_mut().insert(id);
             });
+            arm_limits(&mut state, id);
             Ok(state)
         }
         None => Err(runtime_error(
@@ -431,8 +531,9 @@ fn take_vm(ruby: &Ruby, id: u64) -> Result<ScriptState, Error> {
     }
 }
 
-/// Put a VM back after a host entry, clearing its in-flight marker.
+/// Put a VM back after a host entry, clearing its in-flight marker and deadline.
 fn put_vm(id: u64, state: ScriptState) {
+    disarm_limits(id);
     IN_FLIGHT.with(|s| {
         s.borrow_mut().remove(&id);
     });
@@ -464,6 +565,9 @@ fn forget_vm(ruby: &Ruby, id: u64) {
         for key in keys {
             let _ = callbacks.funcall::<_, _, Value>("delete", (key,));
         }
+    }
+    if let Some(l) = LIMITS.with(|m| m.borrow_mut().remove(&id)) {
+        l.running.store(false, Ordering::Relaxed);
     }
     HANDLES.with(|h| h.borrow_mut().retain(|_, (vm, _)| *vm != id));
 }
@@ -544,10 +648,17 @@ fn to_exception_class(class: RClass) -> ExceptionClass {
 fn js_error(ruby: &Ruby, e: &JsError) -> Error {
     // A JS error name with no dedicated class falls back to ZippRb::Error (the
     // base), not to a bare RuntimeError, so `#js_name` stays available.
+    // A host abort is a timeout (the watchdog set the flag), reported as
+    // InterruptedError rather than the engine's RangeError.
+    let key = if e.message.contains("aborted by the host") {
+        "InterruptedError"
+    } else {
+        e.name.as_str()
+    };
     let class = ERROR_CLASSES
         .with(|m| {
             let m = m.borrow();
-            m.get(e.name.as_str()).or_else(|| m.get("Error")).copied()
+            m.get(key).or_else(|| m.get("Error")).copied()
         })
         .unwrap_or_else(|| ruby.exception_runtime_error());
     let Ok(instance) = class.new_instance((e.message.clone(),)) else {
@@ -689,6 +800,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
             "EvalError",
             "URIError",
             "AggregateError",
+            "InterruptedError",
         ] {
             if let Ok(class) = module.define_class(name, base_rclass) {
                 m.insert(name, to_exception_class(class));
@@ -697,6 +809,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     });
 
     module.define_singleton_method("_create", function!(create, 0))?;
+    module.define_singleton_method("_configure_limits", function!(configure_limits, 4))?;
     module.define_singleton_method("_eval", function!(eval, 2))?;
     module.define_singleton_method("_call", function!(call, 3))?;
     module.define_singleton_method("_handle", function!(handle, 2))?;
