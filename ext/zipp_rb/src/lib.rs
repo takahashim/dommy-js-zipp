@@ -75,6 +75,38 @@ function clearInterval(id) {
 globalThis.__zipp_fire_timer = (id) => { const cb = globalThis.__zipp_timer_cbs[id]; if (cb) cb(); };
 "#;
 
+/// Run `f` with the GVL released, so other Ruby threads can run while a pure
+/// engine evaluation proceeds. The caller MUST guarantee `f` touches no Ruby
+/// API (it only drives the engine); a VM with any Ruby bridge installed is not
+/// run through this path.
+///
+/// `rb_thread_call_without_gvl` runs `f` on the same OS thread with the GVL
+/// dropped; the `ubf` is `None`, so the region is not interruptible by
+/// `Thread#raise`/`Timeout` (the engine's own timeout watchdog still applies).
+unsafe fn without_gvl<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    unsafe extern "C" fn trampoline<F, R>(data: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void
+    where
+        F: FnOnce() -> R,
+    {
+        let f = unsafe { Box::from_raw(data as *mut F) };
+        let result = f();
+        Box::into_raw(Box::new(result)) as *mut std::os::raw::c_void
+    }
+    let data = Box::into_raw(Box::new(f)) as *mut std::os::raw::c_void;
+    let out = unsafe {
+        rb_sys::rb_thread_call_without_gvl(
+            Some(trampoline::<F, R>),
+            data,
+            None,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { *Box::from_raw(out as *mut R) }
+}
+
 /// Wall-clock milliseconds, for timeout deadlines shared with a watchdog thread.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -127,6 +159,21 @@ thread_local! {
     static LIMITS: RefCell<HashMap<u64, LimitState>> = RefCell::new(HashMap::new());
     /// Scheduled timers per VM (opt-in `feature_timeout`).
     static TIMERS: RefCell<HashMap<u64, Vec<TimerEntry>>> = RefCell::new(HashMap::new());
+    /// VMs with a Ruby bridge (callback, listener, module provider, timers):
+    /// their entries must keep the GVL, unlike a pure eval.
+    static BRIDGED: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
+
+/// Mark a VM as bridged (needs the GVL for every entry).
+fn mark_bridged(id: u64) {
+    BRIDGED.with(|s| {
+        s.borrow_mut().insert(id);
+    });
+}
+
+/// Whether a VM can run a pure evaluation without the GVL.
+fn gvl_free_ok(id: u64) -> bool {
+    !BRIDGED.with(|s| s.borrow().contains(&id))
 }
 
 /// Create a VM with an empty global context; return its id.
@@ -231,7 +278,13 @@ fn eval(ruby: &Ruby, id: u64, src: String) -> Result<Value, Error> {
     // Take the state out for the call so a nested call cannot double-borrow the
     // registry (the reentry path above is what makes a nested call work).
     let mut state = take_vm(ruby, id)?;
-    let result = state.eval_in_context_structured(&src);
+    // A VM with no Ruby bridge runs without the GVL, so other Ruby threads
+    // proceed during a long evaluation.
+    let result = if gvl_free_ok(id) {
+        unsafe { without_gvl(|| state.eval_in_context_structured(&src)) }
+    } else {
+        state.eval_in_context_structured(&src)
+    };
     put_vm(id, state);
     match result {
         Ok(hv) => Ok(host_to_ruby(ruby, &hv)),
@@ -250,7 +303,11 @@ fn call(ruby: &Ruby, id: u64, name: String, args: RArray) -> Result<Value, Error
         };
     }
     let mut state = take_vm(ruby, id)?;
-    let result = state.call_global_structured(&name, &host_args);
+    let result = if gvl_free_ok(id) {
+        unsafe { without_gvl(|| state.call_global_structured(&name, &host_args)) }
+    } else {
+        state.call_global_structured(&name, &host_args)
+    };
     put_vm(id, state);
     match result {
         Ok(hv) => Ok(host_to_ruby(ruby, &hv)),
@@ -274,6 +331,7 @@ fn define_function(
             v
         })
     );
+    mark_bridged(id);
     // Keep the proc in the Ruby-side registry so the GC roots it.
     let module: RModule = ruby.define_module("ZippRb")?;
     let callbacks: RHash = module.const_get("CALLBACKS")?;
@@ -295,6 +353,7 @@ fn define_function(
 /// `feature_timeout`): install the host handler and the JS shims that register
 /// timers with Rust.
 fn enable_timers(ruby: &Ruby, id: u64) -> Result<(), Error> {
+    mark_bridged(id);
     let mut state = take_vm(ruby, id)?;
     state.set_host_call_values(rb_handler(id));
     let result = state
@@ -501,6 +560,7 @@ fn import_module(ruby: &Ruby, id: u64, specifier: String) -> Result<Value, Error
 /// Register a Ruby block as the console listener for VM `id`; it is called
 /// with `(severity_symbol, line)` for every `console.*` line.
 fn on_log(ruby: &Ruby, id: u64, block: Value) -> Result<(), Error> {
+    mark_bridged(id);
     let key = format!("log:{id}");
     store_listener(ruby, &key, block)?;
     let mut state = take_vm(ruby, id)?;
@@ -527,6 +587,7 @@ fn on_log(ruby: &Ruby, id: u64, block: Value) -> Result<(), Error> {
 /// Register a Ruby block as the unhandled-rejection listener for VM `id`; it
 /// is called with the rejection's message.
 fn on_unhandled_rejection(ruby: &Ruby, id: u64, block: Value) -> Result<(), Error> {
+    mark_bridged(id);
     let key = format!("rejection:{id}");
     store_listener(ruby, &key, block)?;
     let mut state = take_vm(ruby, id)?;
@@ -647,6 +708,7 @@ fn set_module_provider(
     sources: Value,
     max_module_bytes: u64,
 ) -> Result<(), Error> {
+    mark_bridged(id);
     // One provider per VM, keyed by the VM id, so it is reclaimed on dispose.
     let _ = NEXT_PROVIDER.with(|c| {
         let v = c.get();
@@ -777,6 +839,9 @@ fn forget_vm(ruby: &Ruby, id: u64) {
     }
     TIMERS.with(|m| {
         m.borrow_mut().remove(&id);
+    });
+    BRIDGED.with(|s| {
+        s.borrow_mut().remove(&id);
     });
     HANDLES.with(|h| h.borrow_mut().retain(|_, (vm, _)| *vm != id));
 }
