@@ -74,10 +74,54 @@ module DomBridge
       return cb(ev);
     };
 
+    // Timers delegate to the Ruby-driven event loop (`__timer`).
+    globalThis.__timerCallbacks = {};
+    globalThis.__timerSeq = 1;
+    // NOTE: function declarations, not `globalThis.setTimeout = ...`: the
+    // engine installs a native `setTimeout` as a PROGRAM global, which a bare
+    // identifier read prefers over a global-object property. A function
+    // declaration rebinds that global.
+    function setTimeout(fn, delay, ...args) {
+      const id = globalThis.__timerSeq++;
+      globalThis.__timerCallbacks[id] = () => fn(...args);
+      __timer("set", id, Math.max(0, Number(delay) || 0));
+      return id;
+    }
+    function clearTimeout(id) {
+      delete globalThis.__timerCallbacks[id];
+      __timer("clear", id, 0);
+    }
+    function setInterval(fn, delay, ...args) {
+      const id = globalThis.__timerSeq++;
+      globalThis.__timerCallbacks[id] = () => fn(...args);
+      __timer("setInterval", id, Math.max(1, Number(delay) || 1));
+      return id;
+    }
+    function clearInterval(id) {
+      delete globalThis.__timerCallbacks[id];
+      __timer("clear", id, 0);
+    }
+    // Fires WITHOUT deleting: Ruby decides one-shot (setTimeout) vs repeating
+    // (setInterval); a cancelled timer's callback is removed by clear*.
+    globalThis.__fireTimer = function (id) {
+      const cb = globalThis.__timerCallbacks[id];
+      if (cb) cb();
+    };
+
     globalThis.document = __wrapHost(0);
     globalThis.HTMLElement = function () {};
     globalThis.MutationObserver = function () { return { observe() {}, disconnect() {} }; };
   JS
+
+  # Wire the JS bridge to a Ruby host: `__host` (DOM ops), `__timer` (timer
+  # registration), and the preamble. Returns the host.
+  def self.install(vm, dom)
+    dom.vm = vm
+    vm.define_function("__host") { |op, id, key, value| dom.handle(op, id, key, value) }
+    vm.define_function("__timer") { |op, id, delay| dom.timer(op, id, delay) }
+    vm.eval(PREAMBLE)
+    dom
+  end
 
   class Node
     attr_reader :id, :tag
@@ -101,11 +145,61 @@ module DomBridge
       @seq = 0
       @nodes = {}
       @events = Hash.new { |h, k| h[k] = [] }
+      @timers = {}
       @document_id = 0
       @nodes[0] = Node.new(0, "#document")
     end
 
     def node(id) = @nodes[id]
+
+    # Register / clear a timer (called by the JS timer shims). A repeating timer
+    # records its interval; `run_timers` reschedules it.
+    def timer(op, id, delay)
+      seconds = delay.to_f / 1000.0
+      case op
+      when "set" then @timers[id] = { at: monotonic + seconds, interval: nil }
+      when "setInterval"
+        interval = [seconds, 0.001].max
+        @timers[id] = { at: monotonic + interval, interval: interval }
+      when "clear" then @timers.delete(id)
+      end
+      nil
+    end
+
+    # Fire due timers in due-time order, re-entering JS for each, until none
+    # remain. `max` bounds total firings (so an interval cannot loop forever).
+    # Returns how many fired.
+    def run_timers(max: 10_000)
+      fired = 0
+      while fired < max
+        now = monotonic
+        due = @timers.select { |_, t| t[:at] <= now }.keys
+        if due.empty?
+          next_at = @timers.values.map { |t| t[:at] }.min
+          break if next_at.nil?
+
+          wait = next_at - now
+          sleep(wait) if wait.positive?
+          next
+        end
+        due.sort.each do |id|
+          break if fired >= max
+
+          entry = @timers[id]
+          next unless entry
+
+          if entry[:interval]
+            entry[:at] += entry[:interval]
+          else
+            @timers.delete(id)
+          end
+          @vm.call("__fireTimer", id)
+          @vm.drain_jobs!
+          fired += 1
+        end
+      end
+      fired
+    end
 
     def handle(op, id, key, value)
       case op
@@ -124,6 +218,8 @@ module DomBridge
     end
 
     private
+
+    def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
     def new_node(tag)
       @seq += 1

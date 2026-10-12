@@ -38,11 +38,8 @@ JS
 puts "== host environment + DOM bridge PoC"
 
 vm = ZippRb::VM.new
-dom = DomBridge::MiniDom.new
-dom.vm = vm
-vm.define_function("__host") { |op, id, key, value| dom.handle(op, id, key, value) }
+dom = DomBridge.install(vm, DomBridge::MiniDom.new)
 
-vm.eval(DomBridge::PREAMBLE)
 vm.eval(APP)
 
 assert("browser globals present", vm.eval("typeof window") == "object" && vm.eval("typeof document") == "object")
@@ -61,6 +58,36 @@ assert("JS reads children length", vm.eval("document.children[0].children.length
 dom.dispatch(btn.id, "click")
 assert("event dispatched from Ruby ran the JS listener", btn.text == "clicked")
 assert("JS sees the updated state afterwards", vm.eval("document.children[0].children[0].textContent") == "clicked")
+
+puts "\n== timers driven by the Ruby event loop"
+vm.eval(<<~JS)
+  globalThis.__seq = [];
+  Promise.resolve().then(() => globalThis.__seq.push("micro"));
+  setTimeout(() => globalThis.__seq.push("t0"), 0);
+  setTimeout(() => globalThis.__seq.push("t20"), 20);
+JS
+vm.drain_jobs!
+dom.run_timers
+assert("microtask before timers", vm.eval("globalThis.__seq[0]") == "micro")
+assert("timers fire in due order", vm.eval("JSON.stringify(globalThis.__seq)") == '["micro","t0","t20"]')
+vm.eval('globalThis.__c = 0; const __id = setTimeout(() => { globalThis.__c = 1; }, 0); clearTimeout(__id);')
+dom.run_timers
+assert("clearTimeout cancels", vm.eval("globalThis.__c") == 0)
+
+puts "\n== interval + click (a tiny interactive app)"
+vm.eval(<<~JS)
+  globalThis.__count = 0;
+  const stop = document.createElement("button");
+  document.appendChild(stop);
+  globalThis.__iv = setInterval(() => { globalThis.__count++; }, 5);
+  stop.addEventListener("click", () => clearInterval(globalThis.__iv));
+JS
+dom.run_timers(max: 2)
+assert("interval fired twice", vm.eval("globalThis.__count") == 2)
+stop = dom.node(dom.document_id).children.last
+dom.dispatch(stop.id, "click")
+dom.run_timers(max: 5)
+assert("clearInterval stopped the interval", vm.eval("globalThis.__count") == 2)
 
 puts "\n== real bundle on top of the environment"
 vm.eval(File.read("/Users/maki/git/dommy-js-quickjs/test/fixtures/react.umd.js"))

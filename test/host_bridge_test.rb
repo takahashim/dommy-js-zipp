@@ -9,10 +9,7 @@ require_relative "../experiments/dom_bridge"
 class HostBridgeTest < Minitest::Test
   def setup
     @vm = ZippRb::VM.new
-    @dom = DomBridge::MiniDom.new
-    @dom.vm = @vm
-    @vm.define_function("__host") { |op, id, key, value| @dom.handle(op, id, key, value) }
-    @vm.eval(DomBridge::PREAMBLE)
+    @dom = DomBridge.install(@vm, DomBridge::MiniDom.new)
   end
 
   def teardown
@@ -51,5 +48,37 @@ class HostBridgeTest < Minitest::Test
     assert_equal "span", r.children.first.tag
     # JS reads the same structure back through the bridge.
     assert_equal "SPAN", @vm.eval("document.children[0].children[0].tagName")
+  end
+
+  def test_timers_fire_in_order_and_clear
+    @vm.eval(<<~JS)
+      globalThis.__seq = [];
+      Promise.resolve().then(() => globalThis.__seq.push("micro"));
+      setTimeout(() => globalThis.__seq.push("t0"), 0);
+      setTimeout(() => globalThis.__seq.push("t20"), 20);
+      globalThis.__c = 0;
+      const id = setTimeout(() => { globalThis.__c = 1; }, 0);
+      clearTimeout(id);
+    JS
+    @vm.drain_jobs!
+    @dom.run_timers
+    assert_equal %w[micro t0 t20], @vm.eval("globalThis.__seq")
+    assert_equal 0, @vm.eval("globalThis.__c")
+  end
+
+  def test_interval_stops_on_click
+    @vm.eval(<<~JS)
+      globalThis.__count = 0;
+      const stop = document.createElement("button");
+      document.appendChild(stop);
+      globalThis.__iv = setInterval(() => { globalThis.__count++; }, 2);
+      stop.addEventListener("click", () => clearInterval(globalThis.__iv));
+    JS
+    @dom.run_timers(max: 2)
+    assert_equal 2, @vm.eval("globalThis.__count")
+    stop = @dom.node(@dom.document_id).children.last
+    @dom.dispatch(stop.id, "click")
+    @dom.run_timers(max: 5)
+    assert_equal 2, @vm.eval("globalThis.__count")
   end
 end
