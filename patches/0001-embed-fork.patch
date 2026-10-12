@@ -1,0 +1,1425 @@
+diff --git a/crates/zipp-vm/src/embed.rs b/crates/zipp-vm/src/embed.rs
+index 3ec6aa1..a63c413 100644
+--- a/crates/zipp-vm/src/embed.rs
++++ b/crates/zipp-vm/src/embed.rs
+@@ -33,7 +33,7 @@
+ use crate::vm::Vm;
+ 
+ pub use crate::vm::host_api::{
+-    FingerprintBudget, HostCallError, HostValue, HostValueBudget, ResourceUsage, Symbol,
++    FingerprintBudget, HostCallError, HostValue, HostValueBudget, JsError, ResourceUsage, Symbol,
+     SymbolScope, DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+     DEFAULT_HOST_VALUE_WORK_PER_NODE,
+ };
+@@ -62,6 +62,36 @@ pub fn parse_f64(text: &str) -> Option<f64> {
+ /// script to see.
+ pub type HostCall = Box<dyn FnMut(&str, &[String]) -> Result<String, String>>;
+ 
++/// The re-entrant host channel, installed with
++/// [`ScriptState::set_host_call_reentrant`]. Like [`HostCallCtx`], it receives
++/// the VM as [`HostCtx`] (so it may resolve typed arrays, evaluate JS and call
++/// globals), but it is shared behind an `Rc` and invoked through a cloned
++/// handle, so a guest that calls `__zippHostCall` again while a call is being
++/// served re-enters the same closure instead of failing with "no host
++/// installed". The closure is `Fn`: mutable host state lives behind the host's
++/// own interior mutability (which also makes re-entry the host's decision to
++/// allow or refuse). This is the channel a Ruby binding needs for the common
++/// JS→Ruby→JS round trip.
++pub type HostCallReentrant =
++    std::rc::Rc<dyn Fn(&mut dyn HostCtx, &str, &[String]) -> Result<String, String>>;
++
++/// The structured host channel, installed with
++/// [`ScriptState::set_host_call_values`]. Backs the `__zippHostCallValue` native:
++/// like [`HostCallReentrant`] it is shared behind an `Rc` and re-entrant, but
++/// every argument and the reply cross as an owned [`HostValue`] tree rather
++/// than a ToString'd string, so numbers, arrays, plain objects, `Float32Array`s
++/// and lone-surrogate strings round-trip exactly — no JSON in the path. This is
++/// the channel a Ruby binding uses for anything that is not a bare string.
++pub type HostCallValues = std::rc::Rc<
++    dyn Fn(&mut dyn HostCtx, &str, &[HostValue]) -> Result<HostValue, String>,
++>;
++
++/// An in-memory module source provider, installed with
++/// [`ScriptState::set_module_provider`]. It receives the resolved module path
++/// (as a string) and returns the module's source bytes, or `None` when it does
++/// not know that module. No file is ever read for such a module.
++pub type HostModuleProvider = std::rc::Rc<dyn Fn(&str) -> Option<Vec<u8>>>;
++
+ /// A JS value marshalled out of the VM. Deliberately shallow: the engine's
+ /// `Value` is a NaN-boxed heap index whose meaning depends on the live VM, so
+ /// handing one to an embedder would be handing out a dangling reference the
+@@ -104,6 +134,34 @@ pub fn truthy(&self) -> bool {
+     }
+ }
+ 
++/// A durable, VM-scoped handle to a JS value the host keeps across re-entries
++/// (see [`ScriptState::handle_of_slot`]). Opaque on purpose: the value it roots
++/// lives in the VM's heap and is only meaningful to that VM. Using it on
++/// another VM, or after the VM is dropped, is refused rather than reinterpreted.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct HostHandle {
++    /// High 32 bits: a per-VM id. Low 32 bits: the registry index.
++    raw: u64,
++}
++
++impl HostHandle {
++    fn new(vm_id: u64, index: u32) -> Self {
++        HostHandle {
++            raw: (vm_id << 32) | index as u64,
++        }
++    }
++    fn vm_id(self) -> u64 {
++        self.raw >> 32
++    }
++    fn index(self) -> u32 {
++        self.raw as u32
++    }
++}
++
++/// Handed out in `ScriptState::from_program`; starts above zero so a default
++/// `HostHandle` cannot alias a live VM.
++static NEXT_VM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++
+ /// A compiled program plus the live VM executing it.
+ ///
+ /// `Vm<'p>` borrows its `Program`, which makes the pair self-referential. It
+@@ -124,6 +182,9 @@ pub struct ScriptState {
+     vm: Option<OwnedVm>,
+     /// Key for [`Self::fingerprint_slot`]. See [`Self::set_fingerprint_seed`].
+     fp_seed: u64,
++    /// Identity stamped into every [`HostHandle`] this state hands out, so a
++    /// handle from one VM cannot be used on another.
++    vm_id: u64,
+ }
+ 
+ self_cell::self_cell!(
+@@ -261,6 +322,7 @@ pub(crate) fn from_program(program: Program) -> ScriptState {
+             // Unkeyed until a host supplies randomness. Documented on
+             // set_fingerprint_seed: a fixed start is solvable.
+             fp_seed: 0,
++            vm_id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+         }
+     }
+ 
+@@ -302,6 +364,25 @@ pub fn set_host_call_ctx(&mut self, host: HostCallCtx) {
+         self.with_vm(|vm| vm.host_ctx = Some(host));
+     }
+ 
++    /// Install the re-entrant host channel (see [`HostCallReentrant`]). Served
++    /// in preference to both [`Self::set_host_call_ctx`] and
++    /// [`Self::set_host_call`]. Unlike them it is not taken out of the VM for
++    /// the duration of a call, so the guest may call `__zippHostCall` again
++    /// while a call is being served, and the host may evaluate JS or call
++    /// globals through the [`HostCtx`] it receives.
++    pub fn set_host_call_reentrant(&mut self, host: HostCallReentrant) {
++        self.with_vm(|vm| vm.host_reentrant = Some(host));
++    }
++
++    /// Install the structured host channel backing `__zippHostCallValue` (see
++    /// [`HostCallValues`]). Leaves the string channels
++    /// ([`Self::set_host_call`], [`Self::set_host_call_ctx`],
++    /// [`Self::set_host_call_reentrant`]) in place for `__zippHostCall`; the two
++    /// natives are independent, so a host may serve either or both.
++    pub fn set_host_call_values(&mut self, host: HostCallValues) {
++        self.with_vm(|vm| vm.host_values = Some(host));
++    }
++
+     /// Enable filesystem module loading, confined to one canonical directory.
+     ///
+     /// Embedded scripts normally have no module loader at all. A host that
+@@ -346,6 +427,34 @@ pub fn set_confined_module_loader(
+         Err("filesystem module loader is disabled in this build".into())
+     }
+ 
++    /// Install an in-memory module loader over a VIRTUAL root: `import` of a
++    /// specifier under `root` resolves lexically and each module's bytes come
++    /// from `provider` — the filesystem is never consulted, so sources can be
++    /// registered from Ruby with no files on disk. `root` must be absolute and
++    /// need not exist. The count/size/aggregate budgets of the confined loader
++    /// apply, so `max_module_bytes` must be in `1..u64::MAX`.
++    ///
++    /// `provider` receives the resolved module path as a string (for example
++    /// `/app/mod.mjs`) and returns its source bytes, or `None` for a module it
++    /// does not know (reported to the guest as "module not found"). Because the
++    /// loader resolves relative specifiers against the importing module's
++    /// directory, a provider that keys its sources by path gets correct
++    /// relative imports for free.
++    pub fn set_module_provider(
++        &mut self,
++        root: &std::path::Path,
++        max_module_bytes: u64,
++        provider: HostModuleProvider,
++    ) -> Result<(), String> {
++        let root = root.to_path_buf();
++        self.with_vm(|vm| {
++            let p: std::rc::Rc<dyn Fn(&std::path::Path) -> Option<Vec<u8>>> =
++                std::rc::Rc::new(move |path: &std::path::Path| provider(&path.to_string_lossy()));
++            vm.set_module_provider(root, max_module_bytes, p)
++        })
++        .unwrap_or_else(torn_down)
++    }
++
+     /// Disable the VM's native code generators for this script state.
+     ///
+     /// Sandboxed callers should also disable regress' process-global regex JIT
+@@ -381,11 +490,14 @@ pub fn enable_vm_jit(&mut self) {
+     /// throw is preserved and still readable via [`Self::take_output`] — the
+     /// engine flushes what it managed to print, like a real one.
+     pub fn run_init(&mut self) -> Result<JsValue, String> {
+-        self.with_vm(|vm| match vm.run() {
+-            Ok(v) => Ok(marshal(vm, v)),
+-            Err(thrown) => Err(vm.take_host_throw(thrown)),
+-        })
+-        .unwrap_or_else(torn_down)
++        let result = self
++            .with_vm(|vm| match vm.run() {
++                Ok(v) => Ok(marshal(vm, v)),
++                Err(thrown) => Err(vm.take_host_throw(thrown)),
++            })
++            .unwrap_or_else(torn_down);
++        self.report_rejections();
++        result
+     }
+ 
+     /// Evaluate `src` in the running script's global context and return its
+@@ -500,6 +612,7 @@ pub fn has_global_function(&mut self, name: &str) -> bool {
+     /// does nothing.
+     pub fn run_microtasks(&mut self) {
+         self.with_vm(|vm| vm.drain_microtasks());
++        self.report_rejections();
+     }
+ 
+     /// Deliver console lines to `sink` as they are produced, each tagged with
+@@ -512,6 +625,26 @@ pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &str)>) {
+         self.with_vm(|vm| vm.console_sink = Some(sink));
+     }
+ 
++    /// Deliver every still-unhandled Promise rejection to `sink`, with the
++    /// rejection's rendered message, as it reaches a microtask checkpoint.
++    ///
++    /// The host counterpart of the browser's `unhandledrejection` event: a
++    /// framework that swallows the promises it rejects otherwise leaves the
++    /// host no way to observe it. Once installed, EVERY unhandled rejection is
++    /// collected (not only the Test262 narrowing of `report_unhandled_errors`),
++    /// and the reports are delivered at the host entry points that drain
++    /// microtasks — [`Self::run_microtasks`], [`Self::pump`], [`Self::call_slot`],
++    /// [`Self::eval_in_context_rich`] and [`Self::run_init`].
++    pub fn set_unhandled_rejection_sink(&mut self, sink: Box<dyn FnMut(&str)>) {
++        self.with_vm(|vm| vm.unhandled_rejection_sink = Some(sink));
++    }
++
++    /// Flush any pending unhandled-rejection reports to the installed sink
++    /// (no-op without one). Called after every host entry that drains jobs.
++    fn report_rejections(&mut self) {
++        self.with_vm(|vm| vm.report_unhandled_errors());
++    }
++
+     /// Take the `console.log`/`info`/`debug` lines produced so far, clearing the
+     /// buffer. Un-drained output accumulates for the VM's lifetime, so a
+     /// long-lived embedder should drain (or discard) periodically.
+@@ -725,14 +858,153 @@ pub fn set_slot(&mut self, index: u32, value: &HostValue) -> bool {
+             .unwrap_or(false)
+     }
+ 
++    // ---- Durable host handles -------------------------------------------
++    //
++    // A handle roots a JS value (function, object, …) in this VM's heap for as
++    // long as the host holds it, so the host can call it later without
++    // re-resolving a name or re-importing it. This is what lets a Ruby binding
++    // keep a JS callback and invoke it on a later event. Handles are scoped to
++    // one VM: using one on another is refused.
++
++    /// Take a durable handle to the value in global slot `index`. `None` when
++    /// the slot has no such value (out of range).
++    pub fn handle_of_slot(&mut self, index: u32) -> Option<HostHandle> {
++        let vm_id = self.vm_id;
++        self.with_vm(|vm| vm.host_handle_of_slot(index))
++            .flatten()
++            .map(|idx| HostHandle::new(vm_id, idx))
++    }
++
++    /// Take a durable handle to the global binding `name` resolves to. `None`
++    /// when the name does not resolve.
++    pub fn handle_of_global(&mut self, name: &str) -> Option<HostHandle> {
++        let vm_id = self.vm_id;
++        self.with_vm(|vm| vm.host_handle_of_global(name))
++            .flatten()
++            .map(|idx| HostHandle::new(vm_id, idx))
++    }
++
++    /// Call the function a handle roots, with arguments and result crossing as
++    /// structured [`HostValue`]s. Drains microtasks, as [`Self::call_slot`]
++    /// does. A handle from another VM, or one already released, is refused.
++    pub fn call_handle(
++        &mut self,
++        handle: HostHandle,
++        args: &[HostValue],
++    ) -> Result<HostValue, String> {
++        if handle.vm_id() != self.vm_id {
++            return Err("zipp: handle belongs to another VM".into());
++        }
++        let index = handle.index();
++        let mut budget = HostValueBudget::default();
++        let result = self
++            .with_vm(|vm| vm.host_handle_call(index, args, &mut budget, true))
++            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
++            .map_err(HostCallError::into_message);
++        self.report_rejections();
++        result
++    }
++
++    /// Read the value a handle roots, as a structured [`HostValue`].
++    pub fn get_handle(&mut self, handle: HostHandle) -> Result<HostValue, String> {
++        if handle.vm_id() != self.vm_id {
++            return Err("zipp: handle belongs to another VM".into());
++        }
++        let index = handle.index();
++        let mut budget = HostValueBudget::default();
++        self.with_vm(|vm| vm.host_handle_read(index, &mut budget))
++            .unwrap_or_else(|| Err(TORN_DOWN.into()))
++    }
++
++    /// Release a handle, dropping its root. `false` for a handle from another
++    /// VM or one already released.
++    pub fn release_handle(&mut self, handle: HostHandle) -> bool {
++        if handle.vm_id() != self.vm_id {
++            return false;
++        }
++        let index = handle.index();
++        self.with_vm(|vm| vm.host_handle_release(index))
++            .unwrap_or(false)
++    }
++
++    /// Tear the VM down now, releasing its heap and compiled program. After
++    /// this every entry point reports the "VM has been torn down" error and
++    /// [`Self::disposed`] is `true`. Idempotent: a second call is a no-op.
++    ///
++    /// Reclamation is bounded by the engine's own retention rules: a
++    /// `ScriptState`'s heap and program are freed here, but dynamically defined
++    /// functions and classes are not broadly reclaimed, so a process that
++    /// cycles many states still grows until it is recycled (see
++    /// [`Self::resource_usage`]). A multi-tenant host should recycle the
++    /// process, not just dispose states.
++    pub fn dispose(&mut self) {
++        self.vm = None;
++    }
++
++    /// Whether [`Self::dispose`] ran (every entry point is inert afterwards).
++    pub fn disposed(&self) -> bool {
++        self.vm.is_none()
++    }
++
++    // ---- Structured errors ----------------------------------------------
++    //
++    // The string entry points above report an uncaught throw as its rendered
++    // message. These report a [`JsError`] with the thrown Error's `name`,
++    // `message` and `stack`, so a binding can map JS error classes and attach
++    // a backtrace. Same rooting, drain and value-marshalling rules otherwise.
++
++    /// [`Self::call_slot`] returning a structured [`JsError`] on a throw.
++    pub fn call_slot_structured(
++        &mut self,
++        index: u32,
++        args: &[HostValue],
++    ) -> Result<HostValue, JsError> {
++        let result = self
++            .with_vm(|vm| vm.host_call_slot_structured(index, args))
++            .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)));
++        self.report_rejections();
++        result
++    }
++
++    /// Call the global function `name` with structured arguments, returning a
++    /// structured [`HostValue`] and a throw as a structured [`JsError`]. The
++    /// by-name counterpart of [`Self::call_slot_structured`]: it resolves the
++    /// name a bare identifier read would (program and eval-created bindings,
++    /// the global object and its chain, then the builtins), so an
++    /// eval-declared function or a `globalThis` property is found.
++    pub fn call_global_structured(
++        &mut self,
++        name: &str,
++        args: &[HostValue],
++    ) -> Result<HostValue, JsError> {
++        let result = self
++            .with_vm(|vm| vm.host_call_global_structured(name, args))
++            .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)));
++        self.report_rejections();
++        result
++    }
++
++    /// [`Self::eval_in_context_rich`]-style evaluation returning the result as
++    /// a structured [`HostValue`] and a throw as a structured [`JsError`].
++    pub fn eval_in_context_structured(&mut self, src: &str) -> Result<HostValue, JsError> {
++        let result = self
++            .with_vm(|vm| vm.host_eval_structured(src))
++            .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)));
++        self.report_rejections();
++        result
++    }
++
+     /// Call the function in global slot `index` and drain the microtask queue.
+     ///
+     /// Prefer this to [`Self::call_global`] on a hot path: a slot is a direct
+     /// index, while a name is looked up through the global environment on
+     /// every call (no compilation either way).
+     pub fn call_slot(&mut self, index: u32, args: &[HostValue]) -> Result<HostValue, String> {
+-        self.with_vm(|vm| vm.host_call_slot(index, args))
+-            .unwrap_or_else(torn_down)
++        let result = self
++            .with_vm(|vm| vm.host_call_slot(index, args))
++            .unwrap_or_else(torn_down);
++        self.report_rejections();
++        result
+     }
+ 
+     /// [`Self::call_slot`] with the caller's own conversion budget for the
+@@ -817,6 +1089,7 @@ pub fn heap_bytes(&self) -> usize {
+     /// Run pending microtasks without calling anything.
+     pub fn pump(&mut self) {
+         self.with_vm(|vm| vm.host_pump());
++        self.report_rejections();
+     }
+ 
+     /// Evaluate `src` in the script's global context and marshal its
+@@ -832,8 +1105,11 @@ pub fn eval_in_context_rich(
+         src: &str,
+         budget: &mut HostValueBudget,
+     ) -> Result<HostValue, HostCallError> {
+-        self.with_vm(|vm| vm.host_eval_rich(src, budget))
+-            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
++        let result = self
++            .with_vm(|vm| vm.host_eval_rich(src, budget))
++            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())));
++        self.report_rejections();
++        result
+     }
+ 
+     /// What this VM currently retains and has spent — see [`ResourceUsage`].
+@@ -2096,4 +2372,211 @@ fn resource_limit_status_is_typed_and_survives_microtask_rejection() {
+             .expect("recorder status survives promise rejection");
+         assert!(error.contains("instruction budget"), "{error}");
+     }
++
++    #[test]
++    fn reentrant_host_channel_serves_nested_calls() {
++        let mut st = compile_script("").expect("compiles");
++        st.run_init().expect("runs");
++        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
++        let seen = calls.clone();
++        st.set_host_call_reentrant(std::rc::Rc::new(
++            move |ctx: &mut dyn HostCtx, kind: &str, _args: &[String]| -> Result<String, String> {
++                seen.borrow_mut().push(kind.to_string());
++                if kind == "outer" {
++                    // The guest calls the host again from inside the host call;
++                    // the reentrant channel must serve it instead of throwing.
++                    let v = ctx.eval_script("__zippHostCall('inner')")?;
++                    Ok(format!("{v:?}"))
++                } else {
++                    Ok("inner".into())
++                }
++            },
++        ));
++        assert_eq!(
++            st.eval_in_context("__zippHostCall('outer')"),
++            Ok(JsValue::String("String(\"inner\")".into()))
++        );
++        assert_eq!(*calls.borrow(), vec!["outer".to_string(), "inner".to_string()]);
++    }
++
++    #[test]
++    fn host_ctx_can_eval_and_call_globals() {
++        let mut st = compile_script("function greet(n){ return 'hi ' + n; }").expect("compiles");
++        st.run_init().expect("runs");
++        st.set_host_call_ctx(Box::new(|ctx, kind, args| match kind {
++            "eval" => Ok(format!("{:?}", ctx.eval_script("21 * 2")?)),
++            "call" => Ok(format!(
++                "{:?}",
++                ctx.call_global_value("greet", &[HostValue::String(args[0].clone())])?
++            )),
++            other => Err(format!("Error: unknown {other}")),
++        }));
++        assert_eq!(
++            st.eval_in_context("__zippHostCall('eval')"),
++            Ok(JsValue::String("Number(42.0)".into()))
++        );
++        assert_eq!(
++            st.eval_in_context("__zippHostCall('call','bob')"),
++            Ok(JsValue::String("String(\"hi bob\")".into()))
++        );
++    }
++
++    #[test]
++    fn handles_root_values_across_calls_and_reject_cross_vm() {
++        let mut st =
++            compile_script("function adder(a,b){ return a+b; } var obj = { v: 7 };").expect("compiles");
++        st.run_init().expect("runs");
++        let adder = st.handle_of_global("adder").expect("adder handle");
++        // A handle roots its value: allocate heavily between taking and using it.
++        for _ in 0..200 {
++            let _ = st.eval_in_context("[1,2,3,4,5,6,7,8].map(x => ({ x }))");
++        }
++        assert_eq!(
++            st.call_handle(adder, &[HostValue::Number(2.0), HostValue::Number(3.0)]),
++            Ok(HostValue::Number(5.0))
++        );
++        let obj = st.handle_of_global("obj").expect("obj handle");
++        assert!(matches!(st.get_handle(obj), Ok(HostValue::Object(_))));
++        assert!(st.release_handle(adder), "first release drops the root");
++        assert!(!st.release_handle(adder), "second release is a no-op");
++
++        let mut other = compile_script("function f(){}").expect("compiles");
++        other.run_init().expect("runs");
++        let h = other.handle_of_global("f").expect("handle");
++        assert!(st.call_handle(h, &[]).is_err(), "cross-VM call refused");
++        assert!(st.get_handle(h).is_err(), "cross-VM read refused");
++        assert!(!st.release_handle(h), "cross-VM release refused");
++    }
++
++    #[test]
++    fn unhandled_rejection_sink_observes_a_rejected_promise() {
++        let mut st = compile_script("").expect("compiles");
++        st.run_init().expect("runs");
++        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
++        let sink = seen.clone();
++        st.set_unhandled_rejection_sink(Box::new(move |msg| sink.borrow_mut().push(msg.to_string())));
++        let _ = st.eval_in_context("Promise.reject(new Error('boom'));");
++        st.run_microtasks();
++        assert!(
++            seen.borrow().iter().any(|m| m.contains("boom")),
++            "sink saw {:?}",
++            seen.borrow()
++        );
++    }
++
++    #[test]
++    fn structured_host_channel_round_trips_without_json() {
++        let mut st = compile_script("").expect("compiles");
++        st.run_init().expect("runs");
++        st.set_host_call_values(std::rc::Rc::new(
++            |_ctx: &mut dyn HostCtx, kind: &str, args: &[HostValue]| match kind {
++                "sum" => {
++                    let total: f64 = match &args[0] {
++                        HostValue::Array(items) => items
++                            .iter()
++                            .map(|v| if let HostValue::Number(n) = v { *n } else { 0.0 })
++                            .sum(),
++                        _ => 0.0,
++                    };
++                    Ok(HostValue::Object(vec![(
++                        "total".into(),
++                        HostValue::Number(total),
++                    )]))
++                }
++                "echo" => Ok(args[0].clone()),
++                other => Err(format!("Error: unknown {other}")),
++            },
++        ));
++        let mut budget = HostValueBudget::default();
++        assert_eq!(
++            st.eval_in_context_rich("__zippHostCallValue('sum', [1,2,3,4])", &mut budget),
++            Ok(HostValue::Object(vec![(
++                "total".into(),
++                HostValue::Number(10.0)
++            )]))
++        );
++        // A typed array crosses both ways without a JSON projection.
++        let mut budget = HostValueBudget::default();
++        assert_eq!(
++            st.eval_in_context_rich(
++                "(()=>{ const a = __zippHostCallValue('echo', new Float32Array([1.5,2.5])); \
++                 return [a instanceof Float32Array, a[1]] })()",
++                &mut budget,
++            ),
++            Ok(HostValue::Array(vec![
++                HostValue::Bool(true),
++                HostValue::Number(2.5)
++            ]))
++        );
++    }
++
++    #[test]
++    fn dispose_tears_down_and_is_idempotent() {
++        let mut st = compile_script("1 + 1").expect("compiles");
++        st.run_init().expect("runs");
++        assert!(!st.disposed());
++        st.dispose();
++        st.dispose();
++        assert!(st.disposed());
++        assert!(st.eval_in_context("1").is_err(), "entry is inert after dispose");
++    }
++
++    #[test]
++    fn structured_errors_preserve_name_message_and_stack() {
++        let mut st = compile_script("").expect("compiles");
++        st.run_init().expect("runs");
++        let err = st
++            .eval_in_context_structured("throw new TypeError('bad')")
++            .expect_err("throws");
++        assert_eq!(err.name, "TypeError");
++        assert_eq!(err.message, "bad");
++        assert!(err.stack.is_some(), "an Error carries a stack");
++
++        let mut st = compile_script("function boom(){ throw new RangeError('rng'); }").expect("compiles");
++        st.run_init().expect("runs");
++        let slot = slot_of(&st, "boom");
++        let err = st.call_slot_structured(slot, &[]).expect_err("throws");
++        assert_eq!(err.name, "RangeError");
++        assert_eq!(err.message, "rng");
++
++        // A non-object throw has no Error structure: the value's text is the
++        // message and the name falls back to "Error".
++        let err = st.eval_in_context_structured("throw 'plain'").expect_err("throws");
++        assert_eq!(err.name, "Error");
++        assert!(err.message.contains("plain"), "{:?}", err.message);
++    }
++
++    #[test]
++    fn in_memory_module_provider_loads_without_files() {
++        let mut st = compile_script("").expect("compiles");
++        st.run_init().expect("runs");
++        let mut map: std::collections::HashMap<String, Vec<u8>> =
++            std::collections::HashMap::new();
++        map.insert("/zippvfs/dep.mjs".to_string(), b"export const two = 2;".to_vec());
++        map.insert(
++            "/zippvfs/mod.mjs".to_string(),
++            b"import { two } from './dep.mjs'; export const value = two * 21;".to_vec(),
++        );
++        let map = std::rc::Rc::new(map);
++        let lookup = map.clone();
++        // The root does not exist on disk; the provider serves every module.
++        st.set_module_provider(
++            std::path::Path::new("/zippvfs"),
++            1 << 20,
++            std::rc::Rc::new(move |p: &str| lookup.get(p).cloned()),
++        )
++        .expect("installs the provider");
++        let _ = st.eval_in_context(
++            "globalThis.__v = null; import('./mod.mjs').then(ns => { globalThis.__v = ns.value; });",
++        );
++        st.run_microtasks();
++        assert_eq!(st.eval_in_context("globalThis.__v"), Ok(JsValue::Number(42.0)));
++
++        // A path the provider declines is "module not found", never a disk read.
++        let _ = st.eval_in_context(
++            "globalThis.__m = null; import('./nope.mjs').then(() => {}, e => { globalThis.__m = e.name; });",
++        );
++        st.run_microtasks();
++        assert_eq!(st.eval_in_context("globalThis.__m"), Ok(JsValue::String("TypeError".into())));
++    }
+ }
+diff --git a/crates/zipp-vm/src/vm/async_runtime.rs b/crates/zipp-vm/src/vm/async_runtime.rs
+index 4432ada..2bbf2da 100644
+--- a/crates/zipp-vm/src/vm/async_runtime.rs
++++ b/crates/zipp-vm/src/vm/async_runtime.rs
+@@ -978,7 +978,16 @@ pub(crate) fn settle(&mut self, p: u32, state: PromiseState, val: Value) {
+         // HostPromiseRejectionTracker(promise, "reject"), narrowed to the
+         // rejections a running job THREW and kept only for the Test262 host
+         // report (see `reject_thrown_job` and `report_unhandled_errors`).
+-        if unhandled && self.report_unhandled && self.rejecting_thrown_job {
++        // When a host sink is installed, every still-unhandled rejection is
++        // collected (the browser `unhandledrejection` contract); otherwise the
++        // historical Test262 narrowing applies (only a thrown job's rejection,
++        // only when the report switch is on).
++        let track = if self.unhandled_rejection_sink.is_some() {
++            unhandled
++        } else {
++            unhandled && self.report_unhandled && self.rejecting_thrown_job
++        };
++        if track {
+             self.unhandled_rejections.push(p);
+         }
+         let kind = if state == PromiseState::Fulfilled {
+@@ -3870,7 +3879,7 @@ fn drain_mailbox(&mut self) {
+     /// positive test whose assertion fails inside a promise job or a timer
+     /// scores PASS. A no-op when reporting is off.
+     pub(crate) fn report_unhandled_errors(&mut self) {
+-        if !self.report_unhandled {
++        if !self.report_unhandled && self.unhandled_rejection_sink.is_none() {
+             return;
+         }
+         for p in std::mem::take(&mut self.unhandled_rejections) {
+@@ -3890,11 +3899,18 @@ pub(crate) fn report_unhandled_errors(&mut self) {
+             } else {
+                 self.display(reason)
+             };
+-            self.errput
+-                .push(format!("zipp: unhandled exception in promise job: {msg}"));
++            if let Some(sink) = self.unhandled_rejection_sink.as_mut() {
++                sink(&msg);
++            }
++            if self.report_unhandled {
++                self.errput
++                    .push(format!("zipp: unhandled exception in promise job: {msg}"));
++            }
++        }
++        if self.report_unhandled {
++            let timers = std::mem::take(&mut self.uncaught_timer_errors);
++            self.errput.extend(timers);
+         }
+-        let timers = std::mem::take(&mut self.uncaught_timer_errors);
+-        self.errput.extend(timers);
+     }
+ 
+     /// The full event loop: deliver cross-thread waitAsync wakes, drain
+diff --git a/crates/zipp-vm/src/vm/engine/boot.rs b/crates/zipp-vm/src/vm/engine/boot.rs
+index a2546f6..969367a 100644
+--- a/crates/zipp-vm/src/vm/engine/boot.rs
++++ b/crates/zipp-vm/src/vm/engine/boot.rs
+@@ -219,6 +219,11 @@ pub fn new(program: &'p Program) -> Vm<'p> {
+             console_sink: None,
+             host: None,
+             host_ctx: None,
++            host_reentrant: None,
++            host_values: None,
++            unhandled_rejection_sink: None,
++            host_handles: Vec::new(),
++            host_handle_free: Vec::new(),
+             start_mono_ms: crate::vm::clock::now_mono_ms(),
+             pending_throw: None,
+             pending_new_target: Value::UNDEFINED,
+@@ -423,6 +428,7 @@ pub fn new(program: &'p Program) -> Vm<'p> {
+             module_base_dir: None,
+             module_root: None,
+             module_max_bytes: None,
++            module_provider: None,
+             module_read_bytes: std::collections::HashMap::new(),
+             module_total_bytes: 0,
+             module_load_depth: 0,
+diff --git a/crates/zipp-vm/src/vm/engine/modules.rs b/crates/zipp-vm/src/vm/engine/modules.rs
+index 7e1cfed..5afbf05 100644
+--- a/crates/zipp-vm/src/vm/engine/modules.rs
++++ b/crates/zipp-vm/src/vm/engine/modules.rs
+@@ -108,9 +108,87 @@ pub(crate) fn resolve_module_path(
+         &self,
+         raw_path: &std::path::Path,
+     ) -> Result<std::path::PathBuf, Thrown> {
++        // With a host module provider the root is VIRTUAL: resolve lexically
++        // (never touching the filesystem, which would reject a path that has
++        // no file), confining to the root by the same lexical rule.
++        if self.module_provider.is_some() {
++            if let Some(root) = self.module_root.as_deref() {
++                if !lexically_confined(root, raw_path) {
++                    return Err(Thrown(MODULE_NOT_FOUND.into()));
++                }
++            }
++            return lexical_module_path(raw_path).ok_or_else(|| Thrown(MODULE_NOT_FOUND.into()));
++        }
+         canonical_module_path(self.module_root.as_deref(), raw_path)
+     }
+ 
++    /// Install a host module provider over a virtual `root`: specifiers under
++    /// `root` resolve lexically and each module's bytes come from `provider`
++    /// (never from the filesystem). `root` must be absolute; it need not exist.
++    /// The aggregate/count/size budgets of the confined loader apply.
++    pub(crate) fn set_module_provider(
++        &mut self,
++        root: std::path::PathBuf,
++        max_bytes: u64,
++        provider: std::rc::Rc<dyn Fn(&std::path::Path) -> Option<Vec<u8>>>,
++    ) -> Result<(), String> {
++        if max_bytes == 0 || max_bytes == u64::MAX {
++            return Err("module size limit must be in 1..u64::MAX".into());
++        }
++        if !root.is_absolute() {
++            return Err(format!(
++                "module provider root '{}' must be an absolute path",
++                root.display()
++            ));
++        }
++        self.module_root = Some(root.clone());
++        self.module_max_bytes = Some(max_bytes);
++        self.module_base_dir = Some(root);
++        self.module_provider = Some(provider);
++        self.module_read_bytes.clear();
++        self.module_total_bytes = 0;
++        self.module_load_depth = 0;
++        Ok(())
++    }
++
++    /// Apply the confined loader's count/size/aggregate budgets to one read of
++    /// `bytes.len()` bytes at `path`.
++    fn account_confined_module(
++        &mut self,
++        path: &std::path::Path,
++        observed: u64,
++        limit: u64,
++    ) -> Result<(), Thrown> {
++        let already_seen = self.module_read_bytes.contains_key(path);
++        if !already_seen && self.module_read_bytes.len() >= CONFINED_MODULE_COUNT_LIMIT {
++            return Err(Thrown(format!(
++                "RangeError: sandbox module count limit of {CONFINED_MODULE_COUNT_LIMIT} exceeded"
++            )));
++        }
++        if observed > limit {
++            return Err(Thrown(format!(
++                "RangeError: module exceeds the sandbox size limit of {limit} bytes"
++            )));
++        }
++        let previous = self.module_read_bytes.get(path).copied().unwrap_or(0);
++        let growth = observed.saturating_sub(previous);
++        let new_total = self
++            .module_total_bytes
++            .checked_add(growth)
++            .filter(|&n| n <= CONFINED_MODULE_TOTAL_BYTES_LIMIT)
++            .ok_or_else(|| {
++                Thrown(format!(
++                    "RangeError: sandbox aggregate module size limit of {CONFINED_MODULE_TOTAL_BYTES_LIMIT} bytes exceeded"
++                ))
++            })?;
++        if !already_seen || observed > previous {
++            self.module_read_bytes
++                .insert(path.to_path_buf(), observed.max(previous));
++            self.module_total_bytes = new_total;
++        }
++        Ok(())
++    }
++
+     /// Run one recursive loader operation under the confined graph-depth cap.
+     /// The closure shape makes decrementing unconditional on every ordinary
+     /// error return; unrestricted loading does not touch the counter.
+@@ -133,6 +211,16 @@ fn with_confined_module_depth<T>(
+     }
+ 
+     fn read_module_bytes(&mut self, path: &std::path::Path) -> Result<Vec<u8>, Thrown> {
++        // A host module provider serves VIRTUAL modules from memory. A path it
++        // declines is "module not found"; the filesystem is never consulted, so
++        // nothing can leak through it.
++        if let Some(provider) = self.module_provider.clone() {
++            let bytes = provider(path).ok_or_else(|| Thrown(MODULE_NOT_FOUND.into()))?;
++            if let Some(limit) = self.module_max_bytes {
++                self.account_confined_module(path, bytes.len() as u64, limit)?;
++            }
++            return Ok(bytes);
++        }
+         let Some(limit) = self.module_max_bytes else {
+             return std::fs::read(path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()));
+         };
+@@ -162,23 +250,7 @@ fn read_module_bytes(&mut self, path: &std::path::Path) -> Result<Vec<u8>, Throw
+         // Charge a canonical path once at its observed high-water mark. This
+         // closes both the many-small-files attack and a mutate-between-reads
+         // variant without double-charging ordinary repeated/typed reads.
+-        let observed = bytes.len() as u64;
+-        let previous = self.module_read_bytes.get(path).copied().unwrap_or(0);
+-        let growth = observed.saturating_sub(previous);
+-        let new_total = self
+-            .module_total_bytes
+-            .checked_add(growth)
+-            .filter(|&n| n <= CONFINED_MODULE_TOTAL_BYTES_LIMIT)
+-            .ok_or_else(|| {
+-                Thrown(format!(
+-                    "RangeError: sandbox aggregate module size limit of {CONFINED_MODULE_TOTAL_BYTES_LIMIT} bytes exceeded"
+-                ))
+-            })?;
+-        if !already_seen || observed > previous {
+-            self.module_read_bytes
+-                .insert(path.to_path_buf(), observed.max(previous));
+-            self.module_total_bytes = new_total;
+-        }
++        self.account_confined_module(path, bytes.len() as u64, limit)?;
+         Ok(bytes)
+     }
+ 
+diff --git a/crates/zipp-vm/src/vm/gc.rs b/crates/zipp-vm/src/vm/gc.rs
+index 94492ed..73718c1 100644
+--- a/crates/zipp-vm/src/vm/gc.rs
++++ b/crates/zipp-vm/src/vm/gc.rs
+@@ -484,6 +484,13 @@ macro_rules! root_idx {
+         for &v in &self.host_result_roots {
+             root_val!(v);
+         }
++        // Durable host handles: values a host holds across re-entries, so the
++        // collector never reclaims a function/object the embedder still owns.
++        for slot in &self.host_handles {
++            if let Some(v) = *slot {
++                root_val!(v);
++            }
++        }
+         // Short interpreter string constants memoized by immutable
+         // (function, constant-slot). The cache is bounded and its Values are
+         // roots just like the region-embedded constant strings below.
+diff --git a/crates/zipp-vm/src/vm/host_api.rs b/crates/zipp-vm/src/vm/host_api.rs
+index f3342f6..30704c8 100644
+--- a/crates/zipp-vm/src/vm/host_api.rs
++++ b/crates/zipp-vm/src/vm/host_api.rs
+@@ -692,6 +692,50 @@ pub fn into_message(self) -> String {
+     }
+ }
+ 
++/// A JS exception at the host boundary with its structure preserved: the
++/// `name` and `message` properties (so a Ruby binding maps `TypeError` to a
++/// Ruby class rather than parsing a string) and the `stack` when the thrown
++/// value was an Error. Produced by the structured entry points
++/// (`ScriptState::call_slot_structured` / `eval_in_context_structured`); the
++/// string entry points continue to report a rendered message.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct JsError {
++    pub name: String,
++    pub message: String,
++    pub stack: Option<String>,
++}
++
++impl JsError {
++    /// Best-effort structure from a rendered `"Name: message"` string, for a
++    /// throw whose value was not an object (a thrown string/number) or a
++    /// resource-limit error raised inside the engine.
++    pub fn from_message(msg: &str) -> JsError {
++        if let Some((name, rest)) = msg.split_once(": ") {
++            if is_error_name(name) {
++                return JsError {
++                    name: name.to_string(),
++                    message: rest.to_string(),
++                    stack: None,
++                };
++            }
++        }
++        JsError {
++            name: "Error".to_string(),
++            message: msg.to_string(),
++            stack: None,
++        }
++    }
++}
++
++/// A plausible JS error `name`: identifier characters ending in `Error`
++/// (`TypeError`, `Test262Error`, a user `CustomError`). Guards the message
++/// split so `"zipp: …"`/`"RangeError: …"` are told apart correctly.
++fn is_error_name(name: &str) -> bool {
++    !name.is_empty()
++        && name.ends_with("Error")
++        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
++}
++
+ #[derive(Debug, Clone)]
+ pub struct HostValueBudget {
+     max_nodes: usize,
+@@ -1222,6 +1266,113 @@ pub(crate) fn host_set_slot(&mut self, index: u32, hv: &HostValue) -> bool {
+         true
+     }
+ 
++    /// Allocate a durable handle rooting `v` for as long as the host holds it
++    /// (see `crate::embed::HostHandle`). Reuses a released index when one is
++    /// free, so a host that releases its handles does not grow the table
++    /// without bound.
++    pub(crate) fn host_handle_new(&mut self, v: Value) -> u32 {
++        if let Some(idx) = self.host_handle_free.pop() {
++            self.host_handles[idx as usize] = Some(v);
++            idx
++        } else {
++            let idx = self.host_handles.len() as u32;
++            self.host_handles.push(Some(v));
++            idx
++        }
++    }
++
++    /// A durable handle for the value currently in global slot `index`.
++    pub(crate) fn host_handle_of_slot(&mut self, index: u32) -> Option<u32> {
++        let v = *self.globals.get(index as usize)?;
++        Some(self.host_handle_new(v))
++    }
++
++    /// A durable handle for the global binding `name` resolves to, by the same
++    /// lookup a bare identifier read uses (program/eval bindings, the global
++    /// object and its chain, then the builtins).
++    pub(crate) fn host_handle_of_global(&mut self, name: &str) -> Option<u32> {
++        let v = self.host_resolve_global_by_name(name).ok()?;
++        Some(self.host_handle_new(v))
++    }
++
++    /// Read the value a handle roots, as a structured [`HostValue`].
++    pub(crate) fn host_handle_read(
++        &mut self,
++        idx: u32,
++        budget: &mut HostValueBudget,
++    ) -> Result<HostValue, String> {
++        let v = match self.host_handles.get(idx as usize).and_then(|h| *h) {
++            Some(v) => v,
++            None => return Err(format!("zipp: no value in handle {idx}")),
++        };
++        let mut seen = Vec::new();
++        self.host_out(v, 0, &mut seen, budget)
++    }
++
++    /// Call the function a handle roots, marshalling arguments in and the
++    /// result out. The handle is a durable root, so the callee survives any
++    /// collection the call triggers; microtasks are drained after the call as
++    /// [`Self::host_call_slot_bounded_opts`] drains them.
++    pub(crate) fn host_handle_call(
++        &mut self,
++        idx: u32,
++        args: &[HostValue],
++        budget: &mut HostValueBudget,
++        drain_microtasks: bool,
++    ) -> Result<HostValue, HostCallError> {
++        let callee = match self.host_handles.get(idx as usize).and_then(|h| *h) {
++            Some(v) => v,
++            None => {
++                return Err(HostCallError::Thrown(format!(
++                    "zipp: no function in handle {idx}"
++                )))
++            }
++        };
++        if !self.is_callable(callee) {
++            return Err(HostCallError::Thrown(format!(
++                "TypeError: handle {idx} is not a function"
++            )));
++        }
++        let argv: Vec<Value> = {
++            let _g = self.gc_lock_guard();
++            args.iter().map(|a| self.host_in(a, 0)).collect()
++        };
++        let res = self.host_invoke(callee, &argv);
++        self.marshal_after_drain(res, budget, drain_microtasks)
++    }
++
++    /// Release a handle, dropping its root. Returns `false` for an index that
++    /// is not currently live (already released, or never allocated).
++    pub(crate) fn host_handle_release(&mut self, idx: u32) -> bool {
++        match self.host_handles.get_mut(idx as usize) {
++            Some(slot @ Some(_)) => {
++                *slot = None;
++                self.host_handle_free.push(idx);
++                true
++            }
++            _ => false,
++        }
++    }
++
++    /// Marshal one guest `Value` to an owned [`HostValue`] under `budget` — the
++    /// entry the structured host channel (`HOST_CALL_VALUE`) uses for each
++    /// argument. Same cycle/depth/opaque rules as a slot read.
++    pub(crate) fn host_marshal_out(
++        &mut self,
++        v: Value,
++        budget: &mut HostValueBudget,
++    ) -> Result<HostValue, String> {
++        let mut seen = Vec::new();
++        self.host_out(v, 0, &mut seen, budget)
++    }
++
++    /// Marshal an owned [`HostValue`] back into a guest `Value`, under the GC
++    /// lock so a collection cannot run between the allocations that build it.
++    pub(crate) fn host_marshal_in(&mut self, hv: &HostValue) -> Value {
++        let _g = self.gc_lock_guard();
++        self.host_in(hv, 0)
++    }
++
+     /// Call the function in global slot `index`, then drain the microtask queue
+     /// so promise callbacks the call scheduled have run before the host looks
+     /// at the resulting state.
+@@ -1386,6 +1537,132 @@ fn marshal_after_drain(
+         }
+     }
+ 
++    /// [`Self::marshal_after_drain`] returning a structured [`JsError`]
++    /// instead of a message string. Same rooting, drain and ordering rules.
++    fn marshal_after_drain_structured(
++        &mut self,
++        res: Result<Value, crate::vm::Thrown>,
++        budget: &mut HostValueBudget,
++        drain_microtasks: bool,
++    ) -> Result<HostValue, JsError> {
++        let res = match res {
++            Ok(v) => {
++                if v.is_heap() {
++                    self.host_result_roots.push(v);
++                }
++                Ok(v)
++            }
++            Err(t) => Err(self.take_host_throw_structured(t)),
++        };
++        if drain_microtasks {
++            self.drain_microtasks();
++        } else {
++            self.finish_weak_job();
++        }
++        match res {
++            Ok(v) => {
++                let out = {
++                    let _g = self.gc_lock_guard();
++                    let mut seen: Vec<u32> = Vec::new();
++                    self.host_out(v, 0, &mut seen, budget)
++                        .map_err(|m| JsError::from_message(&m))
++                };
++                if v.is_heap() {
++                    self.host_result_roots.pop();
++                }
++                out
++            }
++            Err(e) => Err(e),
++        }
++    }
++
++    /// Call the function in global slot `index` and return its result as a
++    /// structured [`HostValue`], with a throw reported as a structured
++    /// [`JsError`] (name/message/stack). Drains microtasks like
++    /// [`Self::host_call_slot`].
++    pub(crate) fn host_call_slot_structured(
++        &mut self,
++        index: u32,
++        args: &[HostValue],
++    ) -> Result<HostValue, JsError> {
++        let callee = match self.globals.get(index as usize) {
++            Some(v) => *v,
++            None => {
++                return Err(JsError::from_message(&format!(
++                    "zipp: no global in slot {index}"
++                )))
++            }
++        };
++        if !self.is_callable(callee) {
++            return Err(JsError {
++                name: "TypeError".to_string(),
++                message: format!("global slot {index} is not a function"),
++                stack: None,
++            });
++        }
++        let argv: Vec<Value> = {
++            let _g = self.gc_lock_guard();
++            args.iter().map(|a| self.host_in(a, 0)).collect()
++        };
++        let res = self.host_invoke(callee, &argv);
++        let mut budget = HostValueBudget::default();
++        self.marshal_after_drain_structured(res, &mut budget, true)
++    }
++
++    /// Call the global function `name` with structured arguments and return
++    /// its result as a structured [`HostValue`], reporting a throw as a
++    /// structured [`JsError`]. Resolves `name` the way a bare identifier read
++    /// is (so an eval-declared function or a `globalThis` property is found).
++    pub(crate) fn host_call_global_structured(
++        &mut self,
++        name: &str,
++        args: &[HostValue],
++    ) -> Result<HostValue, JsError> {
++        let callee = match self.host_resolve_global_by_name(name) {
++            Ok(v) => v,
++            Err(msg) => return Err(JsError::from_message(&msg)),
++        };
++        if !self.is_callable(callee) {
++            return Err(JsError {
++                name: "TypeError".to_string(),
++                message: format!("{name} is not a function"),
++                stack: None,
++            });
++        }
++        let argv: Vec<Value> = {
++            let _g = self.gc_lock_guard();
++            args.iter().map(|a| self.host_in(a, 0)).collect()
++        };
++        let res = self.host_invoke(callee, &argv);
++        let mut budget = HostValueBudget::default();
++        self.marshal_after_drain_structured(res, &mut budget, true)
++    }
++
++    /// Evaluate `src` as indirect eval and return its completion value as a
++    /// structured [`HostValue`], with a throw reported as a structured
++    /// [`JsError`]. Mirrors [`Self::host_eval_rich`] otherwise.
++    pub(crate) fn host_eval_structured(&mut self, src: &str) -> Result<HostValue, JsError> {
++        let res = self.do_eval(
++            src,
++            false,
++            false,
++            None,
++            None,
++            false,
++            false,
++            Value::UNDEFINED,
++            None,
++            true,
++            None,
++            Vec::new(),
++            None,
++            None,
++            None,
++        );
++        let mut budget = HostValueBudget::default();
++        self.marshal_after_drain_structured(res, &mut budget, true)
++    }
++
+     /// A throw that has propagated to the host boundary, as its message.
+     ///
+     /// `run_loop` leaves `pending_throw` set when a throw escapes it, so an
+@@ -1402,6 +1679,47 @@ pub(crate) fn take_host_throw(&mut self, t: crate::vm::Thrown) -> String {
+         t.0
+     }
+ 
++    /// The structured twin of [`Self::take_host_throw`]: read the thrown
++    /// value's `name`/`message`/`stack` before clearing it, falling back to
++    /// the rendered message when the value was not an Error object (a thrown
++    /// string/number) or the throw carried no value (an engine resource-limit
++    /// error).
++    pub(crate) fn take_host_throw_structured(&mut self, t: crate::vm::Thrown) -> JsError {
++        let thrown = self.pending_throw.take();
++        if let Some(v) = thrown {
++            if v.is_heap() {
++                if matches!(self.heap.get(v.heap_index()), crate::heap::HeapObj::Object(_)) {
++                    let idx = v.heap_index();
++                    let name = self.read_data_prop(idx, "name").map(|n| self.display(n));
++                    let message = self.read_data_prop(idx, "message").map(|m| self.display(m));
++                    // The engine does not populate Error.stack in embedded
++                    // states; an empty/absent stack is reported as `None` so a
++                    // host leaves Ruby's own backtrace in place.
++                    let stack = self
++                        .read_data_prop(idx, "stack")
++                        .map(|s| self.display(s))
++                        .filter(|s| !s.is_empty());
++                    if name.is_some() || message.is_some() || stack.is_some() {
++                        return JsError {
++                            name: name.unwrap_or_else(|| "Error".to_string()),
++                            message: message.unwrap_or_default(),
++                            stack,
++                        };
++                    }
++                }
++            } else {
++                // A primitive throw (string/number/undefined): the value's text
++                // is the message.
++                return JsError {
++                    name: "Error".to_string(),
++                    message: self.display(v),
++                    stack: None,
++                };
++            }
++        }
++        JsError::from_message(&t.0)
++    }
++
+     /// How many host completion values are currently rooted — zero between
+     /// host entries. Test-only: pins that every exit releases its root.
+     pub(crate) fn host_result_roots_len(&self) -> usize {
+@@ -1968,6 +2286,28 @@ fn typed_array_regions(&mut self, names: &[&str]) -> Result<Vec<(usize, usize, u
+     /// Runs the guest re-entrantly inside the host call; the guest cannot make
+     /// a nested host call while it does.
+     fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, String>;
++    /// Evaluate `src` as indirect eval in the running global context, from
++    /// inside the host call, and return the completion value as a structured
++    /// [`HostValue`]. Top-level `var`/`function` declarations persist, and
++    /// microtasks are drained afterwards. This is the general re-entry a host
++    /// needs to run guest JS while serving a `__zippHostCall` (a Ruby callback
++    /// dispatching a DOM event can evaluate the handler it just found).
++    ///
++    /// Requires no nested host call to run unaided; a guest that calls
++    /// `__zippHostCall` again during it fails honestly unless the re-entrant
++    /// host channel is also installed. The default implementation refuses,
++    /// for a context that cannot reach the evaluator.
++    fn eval_script(&mut self, _src: &str) -> Result<HostValue, String> {
++        Err("TypeError: this host context cannot evaluate scripts".into())
++    }
++    /// Call the guest function a global names, with structured arguments, and
++    /// return its result as a structured [`HostValue`]. The rich counterpart
++    /// of [`Self::call_global_numbers`]: any JSON-shaped argument and result
++    /// crosses without a string round-trip. The default implementation
++    /// refuses.
++    fn call_global_value(&mut self, _name: &str, _args: &[HostValue]) -> Result<HostValue, String> {
++        Err("TypeError: this host context cannot call globals".into())
++    }
+ }
+ 
+ /// The context-taking twin of [`crate::embed::HostCall`]: the same string
+@@ -2160,4 +2500,36 @@ fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, Strin
+         self.to_number_strict(v)
+             .map_err(|t| self.take_host_throw(t))
+     }
++
++    /// General re-entry: indirect eval in the running global context, with the
++    /// completion value marshalled as a structured [`HostValue`]. Microtasks
++    /// are drained (see [`Vm::host_eval_rich`]).
++    fn eval_script(&mut self, src: &str) -> Result<HostValue, String> {
++        let mut budget = HostValueBudget::default();
++        self.host_eval_rich(src, &mut budget)
++            .map_err(HostCallError::into_message)
++    }
++
++    /// Rich by-name call: resolve `name` the way a bare identifier read is,
++    /// marshal the arguments in, invoke re-entrantly, and marshal the result
++    /// back. Mirrors [`Vm::host_call_slot_bounded_opts`] for a name rather
++    /// than a slot, and drains microtasks after the call as that entry does.
++    fn call_global_value(&mut self, name: &str, args: &[HostValue]) -> Result<HostValue, String> {
++        // Resolve the way a bare identifier read is — program/eval bindings,
++        // then the global object and its prototype chain, then the builtins —
++        // so a function installed as `globalThis[name]` is found, matching
++        // `ScriptState::call_global`.
++        let callee = self.host_resolve_global_by_name(name)?;
++        if !self.is_callable(callee) {
++            return Err(format!("TypeError: {name} is not a function"));
++        }
++        let mut budget = HostValueBudget::default();
++        let argv: Vec<Value> = {
++            let _g = self.gc_lock_guard();
++            args.iter().map(|a| self.host_in(a, 0)).collect()
++        };
++        let res = self.host_invoke(callee, &argv);
++        self.marshal_after_drain(res, &mut budget, true)
++            .map_err(HostCallError::into_message)
++    }
+ }
+diff --git a/crates/zipp-vm/src/vm/mod.rs b/crates/zipp-vm/src/vm/mod.rs
+index cdf1e5f..1ab1171 100644
+--- a/crates/zipp-vm/src/vm/mod.rs
++++ b/crates/zipp-vm/src/vm/mod.rs
+@@ -1659,6 +1659,46 @@ pub struct Vm<'p> {
+     /// call runs. Preferred over `host` when both are installed; taken out
+     /// of the `Vm` for the duration of the call like `host`.
+     pub(crate) host_ctx: Option<crate::vm::host_api::HostCallCtx>,
++    /// Embedder hook for unhandled Promise rejections. When installed, every
++    /// rejection that reaches the microtask checkpoint with no handler is
++    /// reported here with its rendered message, in addition to (never
++    /// instead of) the Test262 `errput` line `report_unhandled_errors`
++    /// already produces. The host counterpart of the browser's
++    /// `unhandledrejection` event.
++    pub(crate) unhandled_rejection_sink: Option<Box<dyn FnMut(&str)>>,
++    /// Re-entrant host channel: like `host_ctx`, but stored behind an `Rc`
++    /// and called through a cloned handle rather than taken out of the `Vm`,
++    /// so a guest that calls `__zippHostCall` again while a call is being
++    /// served re-enters the SAME closure instead of throwing "no host
++    /// installed". The closure is `Fn` (not `FnMut`); host-side mutable state
++    /// belongs behind the host's own interior mutability. Preferred over
++    /// `host_ctx` and `host` when installed. A Ruby binding needs this: a
++    /// host call that dispatches a DOM event can run a handler that calls
++    /// back into the host.
++    pub(crate) host_reentrant:
++        Option<std::rc::Rc<dyn Fn(&mut dyn crate::vm::host_api::HostCtx, &str, &[String]) -> Result<String, String>>>,
++    /// Structured host channel backing the `HOST_CALL_VALUE` native. Like
++    /// `host_reentrant`, it is shared behind an `Rc` and called through a
++    /// cloned handle (so it is re-entrant), but arguments and the reply cross
++    /// as owned `HostValue` trees rather than strings. The channel a Ruby
++    /// binding uses for everything that is not a bare string.
++    pub(crate) host_values: Option<
++        std::rc::Rc<
++            dyn Fn(
++                &mut dyn crate::vm::host_api::HostCtx,
++                &str,
++                &[crate::vm::host_api::HostValue],
++            ) -> Result<crate::vm::host_api::HostValue, String>,
++        >,
++    >,
++    /// Durable roots a host holds across re-entries via
++    /// [`crate::embed::HostHandle`]. A `Some` entry is a live JS value the
++    /// collector must trace (see `mark_roots`); a `None` entry is a released
++    /// or never-used handle. `host_handle_free` lists the `None` indices, so a
++    /// release is reused rather than growing the table. Empty in every
++    /// engine-internal path.
++    pub(crate) host_handles: Vec<Option<Value>>,
++    pub(crate) host_handle_free: Vec<u32>,
+     /// Monotonic-clock reading at VM start — the zero point for
+     /// `performance.now()` (which reports fractional milliseconds elapsed
+     /// since the program began). A host-installed clock's reading when one
+@@ -2445,6 +2485,14 @@ pub struct Vm<'p> {
+     /// Maximum bytes read from any one module while `module_root` is active.
+     /// `None` preserves the unrestricted compatibility loader.
+     module_max_bytes: Option<u64>,
++    /// Host-provided module sources for a VIRTUAL module root, keyed by the
++    /// module's path under `module_root`. When installed, the loader resolves
++    /// specifiers lexically (never touching the filesystem) and asks this
++    /// closure for each module's bytes; a path it does not know is
++    /// "module not found". This is what lets an embedder (a Ruby binding)
++    /// register module sources in memory and import them with no files on disk.
++    pub(crate) module_provider:
++        Option<std::rc::Rc<dyn Fn(&std::path::Path) -> Option<Vec<u8>>>>,
+     /// Canonical confined module paths and the largest byte length successfully
+     /// observed for each. All loader variants share this ledger, so rereading a
+     /// file (including as a typed/deferred/source-phase module) does not charge
+diff --git a/crates/zipp-vm/src/vm/native.rs b/crates/zipp-vm/src/vm/native.rs
+index 9540caa..3e58066 100644
+--- a/crates/zipp-vm/src/vm/native.rs
++++ b/crates/zipp-vm/src/vm/native.rs
+@@ -308,6 +308,15 @@
+ /// natives added by ongoing engine work.
+ pub const HOST_CALL: u16 = 950;
+ pub const HOST_CALL_NAME: &str = "__zippHostCall";
++/// The structured twin of [`HOST_CALL`]: `__zippHostCallValue(kind, ...values)`
++/// hands the host the same `kind` but marshals every argument, and the reply,
++/// as an owned `HostValue` tree instead of ToString'd strings, so numbers,
++/// arrays, plain objects, `Float32Array`s and lone-surrogate strings cross
++/// exactly (no JSON round-trip). Installed by
++/// [`crate::embed::ScriptState::set_host_call_values`]; absent and inert in a
++/// stock run, like `HOST_CALL`.
++pub const HOST_CALL_VALUE: u16 = 952;
++pub const HOST_CALL_VALUE_NAME: &str = "__zippHostCallValue";
+ /// The Python runtime's native tensor loops (`vm::py_tensor`), bound to the
+ /// reserved global below only in a program the Python frontend built
+ /// (`Program::python_natives`): an ordinary JavaScript program never sees it.
+@@ -1737,6 +1746,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
+         GLOBAL_ESCAPE => ("escape", 1),
+         GLOBAL_UNESCAPE => ("unescape", 1),
+         HOST_CALL => (HOST_CALL_NAME, 1),
++        HOST_CALL_VALUE => (HOST_CALL_VALUE_NAME, 1),
+         #[cfg(feature = "python")]
+         PY_TENSOR => ("", 0),
+         #[cfg(feature = "python")]
+diff --git a/crates/zipp-vm/src/vm/natives.rs b/crates/zipp-vm/src/vm/natives.rs
+index 799c7de..231afd0 100644
+--- a/crates/zipp-vm/src/vm/natives.rs
++++ b/crates/zipp-vm/src/vm/natives.rs
+@@ -5330,10 +5330,13 @@ pub(crate) fn call_native(
+                     self.preflight_guest_string_size(aggregate)?;
+                     rest.push(value);
+                 }
+-                // The context-taking hook first: it receives the VM, so the
+-                // host may resolve typed arrays and call guest functions while
+-                // it runs (`crate::vm::host_api::HostCtx`).
+-                let reply = if let Some(mut host) = self.host_ctx.take() {
++                // The re-entrant hook first: a cloned `Rc` is called while the
++                // `Vm` is passed as `HostCtx`, so the host may resolve typed
++                // arrays, evaluate JS, and be re-entered by the guest without
++                // the "no host installed" failure the taken-out hooks produce.
++                let reply = if let Some(host) = self.host_reentrant.clone() {
++                    host(self, &kind, &rest)
++                } else if let Some(mut host) = self.host_ctx.take() {
+                     let reply = host(self, &kind, &rest);
+                     self.host_ctx = Some(host);
+                     reply
+@@ -5359,6 +5362,33 @@ pub(crate) fn call_native(
+                     }
+                 }
+             }
++            HOST_CALL_VALUE => {
++                // The structured twin of HOST_CALL: each argument crosses as an
++                // owned HostValue (no ToString), and the reply is marshalled
++                // back. The host closure is re-entrant (cloned Rc, not taken).
++                let kind = self.to_js_string(a0)?;
++                let mut budget = crate::vm::host_api::HostValueBudget::default();
++                let rest_len = args.len().saturating_sub(1);
++                let mut rest: Vec<crate::vm::host_api::HostValue> = Vec::new();
++                rest.try_reserve_exact(rest_len)
++                    .map_err(|_| Thrown::from_static("RangeError: host argument allocation failed"))?;
++                for &a in args.iter().skip(1) {
++                    let hv = self.host_marshal_out(a, &mut budget).map_err(Thrown)?;
++                    rest.push(hv);
++                }
++                let reply = match self.host_values.clone() {
++                    Some(host) => host(self, &kind, &rest),
++                    None => {
++                        return Err(Thrown(format!(
++                            "TypeError: {HOST_CALL_VALUE_NAME}(\"{kind}\") with no value host installed"
++                        )))
++                    }
++                };
++                match reply {
++                    Ok(hv) => self.host_marshal_in(&hv),
++                    Err(e) => return Err(Thrown(e)),
++                }
++            }
+             // Global functions as values.
+             GLOBAL_PARSE_INT => {
+                 // ToString(string) — observable (calls toString, not valueOf) and
+diff --git a/crates/zipp-vm/src/vm/setup.rs b/crates/zipp-vm/src/vm/setup.rs
+index 56d2768..f6044fe 100644
+--- a/crates/zipp-vm/src/vm/setup.rs
++++ b/crates/zipp-vm/src/vm/setup.rs
+@@ -2688,6 +2688,7 @@ pub(crate) fn setup_globals(&mut self) {
+         // installed the native itself throws, so a stock `zipp js` run cannot
+         // reach anything through it.
+         let host_call_fn = self.heap.alloc(HeapObj::Native(native::HOST_CALL));
++        let host_call_value_fn = self.heap.alloc(HeapObj::Native(native::HOST_CALL_VALUE));
+         // `globalThis`: an empty Object whose property access is routed to the
+         // global slots by name (see get_prop/set_prop/has_own_property).
+         let global_this = self.setup_object(ObjMap::new());
+@@ -2819,6 +2820,7 @@ pub(crate) fn setup_globals(&mut self) {
+             ("globalThis", global_this),
+             (native::ANNEXB_REF_ERROR_NAME, annexb_ref_error_fn),
+             (native::HOST_CALL_NAME, host_call_fn),
++            (native::HOST_CALL_VALUE_NAME, host_call_value_fn),
+         ];
+         #[cfg(feature = "safe-sandbox")]
+         all.retain(|(name, _)| !matches!(*name, "SharedArrayBuffer" | "Atomics"));

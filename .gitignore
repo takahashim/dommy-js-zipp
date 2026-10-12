@@ -1,0 +1,17 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Ruby
+*.gem
+.bundle/
+vendor/bundle/
+pkg/
+tmp/
+*.so
+*.bundle
+
+# Editor / OS
+.DS_Store
+
+notes/

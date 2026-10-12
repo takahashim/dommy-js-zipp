@@ -1,0 +1,17 @@
+[package]
+name = "zipp_rb"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Ruby native extension: a Rust cdylib that embeds the Zipp engine and exposes
+# it as ZippRb::VM. `zipp-vm` is the patched fork under vendor/ (see
+# scripts/apply-patches.sh); `instrument` is enabled so the resource-limit
+# surface is compiled in.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = "0.8"
+rb-sys = "0.9"
+zipp-vm = { path = "../../vendor/zipp/crates/zipp-vm", features = ["instrument"] }
