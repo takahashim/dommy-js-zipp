@@ -182,6 +182,16 @@ class ZippRbTest < Minitest::Test
     assert_match(/not found/, err.message)
   end
 
+  def test_load_runs_for_side_effects_and_discards_the_value
+    vm = ZippRb::VM.new
+    assert_nil vm.load("globalThis.x = 41")
+    assert_equal 42, vm.eval("x + 1")
+    # A large completion value (a bundle's factory result) is not walked.
+    assert_nil vm.load("var big = {}; for (let i = 0; i < 5000; i++) big['k' + i] = i; big")
+  ensure
+    vm.dispose
+  end
+
   def test_dispose_is_idempotent
     vm = ZippRb::VM.new
     refute vm.disposed?

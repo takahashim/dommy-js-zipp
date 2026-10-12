@@ -32,9 +32,11 @@ def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 start = now
 if engine == "zipp"
   vm = ZippRb::VM.new
-  vm.eval(BOOT)
-  vm.eval(REACT)
-  vm.eval(REACT_DOM_SERVER)
+  # `load` discards the completion value (a UMD factory returns a large object;
+  # marshalling it into Ruby is pure overhead when loading a bundle).
+  vm.load(BOOT)
+  vm.load(REACT)
+  vm.load(REACT_DOM_SERVER)
 else
   vm = Quickjs::VM.new
   vm.eval_code(BOOT, async: false)

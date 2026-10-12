@@ -98,6 +98,15 @@ module ZippRb
       ZippRb._eval(@id, src)
     end
 
+    # Evaluate +src+ for its side effects, discarding the completion value.
+    # Prefer this to #eval when a script's last expression is a large object
+    # (loading a bundle): the completion value is not marshalled into Ruby.
+    def load(src)
+      check_usable!
+      ZippRb._load(@id, src)
+      nil
+    end
+
     # Await-capable eval (quickjs.rb's default shape): +src+ runs as an async
     # function body, so it may use top-level +await+; the event loop drains
     # microtasks and fires timers until the top-level promise settles. Requires

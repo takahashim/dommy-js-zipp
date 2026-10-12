@@ -292,6 +292,22 @@ fn eval(ruby: &Ruby, id: u64, src: String) -> Result<Value, Error> {
     }
 }
 
+/// Evaluate `src` for its side effects, discarding the completion value. Much
+/// cheaper than `eval` when a script's last expression is a large object (a
+/// UMD factory's return value, say): `eval` marshals that value into Ruby,
+/// whereas this only asks the engine for the shallow `ToString`-class result
+/// and drops it.
+fn load(ruby: &Ruby, id: u64, src: String) -> Result<(), Error> {
+    let mut state = take_vm(ruby, id)?;
+    let result = if gvl_free_ok(id) {
+        unsafe { without_gvl(|| state.eval_in_context(&src)) }
+    } else {
+        state.eval_in_context(&src)
+    };
+    put_vm(id, state);
+    result.map(|_| ()).map_err(|e| runtime_error(ruby, e))
+}
+
 /// Call the global function `name` with Ruby `args`, converting both ways.
 fn call(ruby: &Ruby, id: u64, name: String, args: RArray) -> Result<Value, Error> {
     let host_args: Vec<HostValue> = args.into_iter().map(|a| ruby_to_host(ruby, a)).collect();
@@ -1089,6 +1105,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_create", function!(create, 0))?;
     module.define_singleton_method("_configure_limits", function!(configure_limits, 4))?;
     module.define_singleton_method("_eval", function!(eval, 2))?;
+    module.define_singleton_method("_load", function!(load, 2))?;
     module.define_singleton_method("_call", function!(call, 3))?;
     module.define_singleton_method("_handle", function!(handle, 2))?;
     module.define_singleton_method("_call_handle", function!(call_handle, 3))?;

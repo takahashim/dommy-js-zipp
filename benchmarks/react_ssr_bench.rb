@@ -45,9 +45,10 @@ zipp_load = nil
 zipp_render = nil
 zipp_vm = ZippRb::VM.new
 zipp_load = time do
-  zipp_vm.eval(BOOT)
-  zipp_vm.eval(REACT)
-  zipp_vm.eval(REACT_DOM_SERVER)
+  # load (not eval): discard the UMD completion value instead of marshalling it.
+  zipp_vm.load(BOOT)
+  zipp_vm.load(REACT)
+  zipp_vm.load(REACT_DOM_SERVER)
 end
 zipp_out = zipp_vm.eval(RENDER)
 zipp_render = time { N.times { zipp_vm.eval(RENDER) } }
