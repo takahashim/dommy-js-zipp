@@ -14,4 +14,7 @@ crate-type = ["cdylib"]
 [dependencies]
 magnus = "0.8"
 rb-sys = "0.9"
-zipp-vm = { path = "../../vendor/zipp/crates/zipp-vm", features = ["instrument"] }
+# The vendored engine (scripts/vendor-engine.sh), not the vendor/zipp submodule:
+# vendor/engine is a self-contained copy so a built .gem carries its engine and
+# builds outside this checkout. `rake compile` regenerates it first.
+zipp-vm = { path = "../../vendor/engine/crates/zipp-vm", features = ["instrument"] }

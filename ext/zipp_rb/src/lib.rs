@@ -80,9 +80,15 @@ globalThis.__zipp_fire_timer = (id) => { const cb = globalThis.__zipp_timer_cbs[
 /// API (it only drives the engine); a VM with any Ruby bridge installed is not
 /// run through this path.
 ///
-/// `rb_thread_call_without_gvl` runs `f` on the same OS thread with the GVL
-/// dropped; the `ubf` is `None`, so the region is not interruptible by
-/// `Thread#raise`/`Timeout` (the engine's own timeout watchdog still applies).
+/// `rb_thread_call_without_gvl2` is used deliberately: `..._without_gvl` checks
+/// interrupts while re-acquiring the GVL and can raise there, which would unwind
+/// (via a Ruby longjmp that skips Rust destructors) past the caller's
+/// `put_vm` — losing the VM out of the registry and leaving it marked in-flight
+/// (a later `eval` then reports "unknown VM id" and `dispose` reports "while
+/// executing"). The `2` variant defers a pending interrupt (`Thread#raise`,
+/// `Timeout`) until the next interrupt check AFTER this call returns, so the VM
+/// is restored first and the exception is delivered at a safe point. `ubf` is
+/// `None`: the engine's own timeout watchdog still bounds a runaway program.
 unsafe fn without_gvl<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
@@ -97,7 +103,7 @@ where
     }
     let data = Box::into_raw(Box::new(f)) as *mut std::os::raw::c_void;
     let out = unsafe {
-        rb_sys::rb_thread_call_without_gvl(
+        rb_sys::rb_thread_call_without_gvl2(
             Some(trampoline::<F, R>),
             data,
             None,
@@ -550,12 +556,16 @@ fn eval_async(ruby: &Ruby, id: u64, src: String, max_ms: u64) -> Result<Value, E
             .eval_in_context_structured(&js)
             .map_err(|e| js_error(ruby, &e))?;
         let deadline = now_ms().saturating_add(max_ms);
+        let mut settled = false;
         loop {
             state.run_microtasks();
             match state.eval_in_context_structured(&format!(
                 "!!(globalThis[{k}] && globalThis[{k}].done)"
             )) {
-                Ok(HostValue::Bool(true)) => break,
+                Ok(HostValue::Bool(true)) => {
+                    settled = true;
+                    break;
+                }
                 Ok(_) => {}
                 Err(e) => return Err(js_error(ruby, &e)),
             }
@@ -575,6 +585,17 @@ fn eval_async(ruby: &Ruby, id: u64, src: String, max_ms: u64) -> Result<Value, E
             if now_ms() >= deadline {
                 break;
             }
+        }
+        // An unsettled top-level promise must not read as a normal `undefined`
+        // result: report it (a pending promise, or `max_ms` elapsed).
+        if !settled {
+            let class = ERROR_CLASSES
+                .with(|m| m.borrow().get("NoAwaitError").copied())
+                .unwrap_or_else(|| ruby.exception_runtime_error());
+            return Err(Error::new(
+                class,
+                format!("eval_async: the awaited expression did not settle within {max_ms} ms"),
+            ));
         }
         let err = state
             .eval_in_context_structured(&format!(
@@ -1161,6 +1182,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
             "URIError",
             "AggregateError",
             "InterruptedError",
+            "NoAwaitError",
         ] {
             if let Ok(class) = module.define_class(name, base_rclass) {
                 m.insert(name, to_exception_class(class));

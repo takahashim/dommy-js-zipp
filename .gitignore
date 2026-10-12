@@ -2,6 +2,10 @@
 target/
 **/*.rs.bk
 
+# Generated vendored engine (scripts/vendor-engine.sh); shipped in the gem, not
+# committed (the vendor/zipp submodule + patches/ are the source of truth).
+vendor/engine/
+
 # Ruby
 *.gem
 .bundle/

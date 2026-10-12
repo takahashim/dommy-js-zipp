@@ -38,6 +38,25 @@ class GvlTest < Minitest::Test
     vm.dispose
   end
 
+  def test_async_exception_during_gvl_free_eval_leaves_vm_usable
+    vm = ZippRb::VM.new
+    main = Thread.current
+    # A cross-thread Thread#raise lands during the GVL-free eval. It must not
+    # strand the VM out of the registry: a later eval and dispose must work.
+    raiser = Thread.new do
+      sleep 0.05
+      main.raise("killed")
+    end
+    assert_raises(RuntimeError) do
+      vm.eval("let s = 0; for (let i = 0; i < 200000000; i++) s = (s + i) | 0; s")
+    end
+    raiser.join
+    assert_equal 42, vm.eval("42"), "the VM must be restored after the async exception"
+    assert_nil vm.dispose, "dispose must not report a VM still executing"
+  ensure
+    vm.dispose rescue nil
+  end
+
   def test_pure_eval_still_correct
     vm = ZippRb::VM.new
     assert_equal 42, vm.eval("40 + 2")
