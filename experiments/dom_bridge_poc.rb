@@ -89,6 +89,29 @@ dom.dispatch(stop.id, "click")
 dom.run_timers(max: 5)
 assert("clearInterval stopped the interval", vm.eval("globalThis.__count") == 2)
 
+puts "\n== a small app (list, click toggles a class, querySelector)"
+vm.eval(<<~JS)
+  const list = document.createElement("ul");
+  list.setAttribute("id", "list");
+  document.appendChild(list);
+  for (let i = 1; i <= 3; i++) {
+    const li = document.createElement("li");
+    li.textContent = "item " + i;
+    li.setAttribute("id", "item-" + i);
+    li.addEventListener("click", (e) => e.target.classList.toggle("done"));
+    list.appendChild(li);
+  }
+JS
+list = dom.node(dom.document_id).children.last
+items = list.children
+items.each { |li| dom.dispatch(li.id, "click") }
+assert("clicks toggled 'done' on all items", items.all? { |li| li.classes.include?("done") })
+dom.dispatch(items.first.id, "click")
+assert("clicking again un-toggles", !items.first.classes.include?("done") && items[1].classes.include?("done"))
+assert("querySelector by id", vm.eval('document.querySelector("#item-2").textContent') == "item 2")
+assert("querySelectorAll count", vm.eval('document.querySelectorAll("li").length') == 3)
+assert("querySelector by class", vm.eval('document.querySelector(".done") ? "yes" : "no"') == "yes")
+
 puts "\n== async host IO (Ruby-backed fetch)"
 vm.eval(<<~JS)
   globalThis.__data = null;

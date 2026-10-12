@@ -82,6 +82,27 @@ class HostBridgeTest < Minitest::Test
     assert_equal 2, @vm.eval("globalThis.__count")
   end
 
+  def test_query_selector_and_class_list
+    @vm.eval(<<~JS)
+      const list = document.createElement("ul");
+      list.setAttribute("id", "list");
+      document.appendChild(list);
+      for (let i = 1; i <= 3; i++) {
+        const li = document.createElement("li");
+        li.textContent = "item " + i;
+        li.setAttribute("id", "item-" + i);
+        li.addEventListener("click", (e) => e.target.classList.toggle("done"));
+        list.appendChild(li);
+      }
+    JS
+    list = @dom.node(@dom.document_id).children.last
+    list.children.each { |li| @dom.dispatch(li.id, "click") }
+    assert(list.children.all? { |li| li.classes.include?("done") })
+    assert_equal "item 2", @vm.eval('document.querySelector("#item-2").textContent')
+    assert_equal 3, @vm.eval('document.querySelectorAll("li").length')
+    assert_equal "yes", @vm.eval('document.querySelector(".done") ? "yes" : "no"')
+  end
+
   def test_async_fetch_resolved_by_ruby
     @vm.eval('globalThis.__data = null; (async () => { globalThis.__data = await fetch("/api"); })();')
     @dom.serve(->(url) { [true, "r:#{url}"] })

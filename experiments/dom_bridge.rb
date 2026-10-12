@@ -45,9 +45,17 @@ module DomBridge
     function __wrapHost(id) {
       const handler = {
         get(t, prop) {
-          if (typeof prop !== "string") return undefined;
-          if (!METHODS.has(prop)) return __wrapResult(__host("get", id, prop));
-          if (prop === "addEventListener") {
+        if (typeof prop !== "string") return undefined;
+        if (prop === "classList") {
+          return {
+            add: (c) => __host("call", id, "classList.add", [c]),
+            remove: (c) => __host("call", id, "classList.remove", [c]),
+            toggle: (c) => __host("call", id, "classList.toggle", [c]),
+            contains: (c) => __host("call", id, "classList.contains", [c]),
+          };
+        }
+        if (!METHODS.has(prop)) return __wrapResult(__host("get", id, prop));
+        if (prop === "addEventListener") {
             return (type, cb) => {
               const cbId = globalThis.__cbSeq++;
               globalThis.__callbacks[cbId] = cb;
@@ -144,13 +152,14 @@ module DomBridge
 
   class Node
     attr_reader :id, :tag
-    attr_accessor :text, :attrs, :children, :parent
+    attr_accessor :text, :attrs, :children, :parent, :classes
     def initialize(id, tag)
       @id = id
       @tag = tag
       @text = ""
       @attrs = {}
       @children = []
+      @classes = []
       @parent = nil
     end
   end
@@ -272,7 +281,7 @@ module DomBridge
       case key
       when "tagName" then n.tag == "#document" ? "#document" : n.tag.upcase
       when "textContent" then n.text
-      when "className" then n.attrs["class"].to_s
+      when "className" then n.classes.join(" ")
       when "id" then n.attrs.key?("id") ? n.attrs["id"] : n.id
       when "children" then n.children.map { |c| { "__host" => c.id } }
       when "parentNode" then n.parent ? { "__host" => n.parent.id } : nil
@@ -284,7 +293,9 @@ module DomBridge
       n = node(id)
       case key
       when "textContent" then n.text = value.to_s
-      when "className" then n.attrs["class"] = value.to_s
+      when "className"
+        n.classes = value.to_s.split(/\s+/).reject(&:empty?)
+        n.attrs["class"] = n.classes.join(" ")
       else n.attrs[key] = value
       end
     end
@@ -308,10 +319,42 @@ module DomBridge
         nil
       when "setAttribute" then n.attrs[args[0].to_s] = args[1].to_s
       when "getAttribute" then n.attrs[args[0].to_s]
+      when "removeAttribute" then n.attrs.delete(args[0].to_s)
       when "addEventListener" then @events[[n.id, args[0].to_s]] << args[1]
-      when "querySelector" then nil
-      when "querySelectorAll" then []
+      when "querySelector" then query_selector(id, args[0].to_s)
+      when "querySelectorAll" then query_selector_all(id, args[0].to_s)
+      when "classList.add"
+        n.classes << args[0].to_s unless n.classes.include?(args[0].to_s)
+        n.attrs["class"] = n.classes.join(" ")
+      when "classList.remove"
+        n.classes.delete(args[0].to_s)
+        n.attrs["class"] = n.classes.join(" ")
+      when "classList.toggle"
+        c = args[0].to_s
+        n.classes.include?(c) ? n.classes.delete(c) : n.classes << c
+        n.attrs["class"] = n.classes.join(" ")
+      when "classList.contains" then n.classes.include?(args[0].to_s)
       end
+    end
+
+    def descendants(node)
+      node.children.flat_map { |c| [c, *descendants(c)] }
+    end
+
+    def matches?(node, selector)
+      if selector.start_with?("#") then node.attrs["id"].to_s == selector[1..]
+      elsif selector.start_with?(".") then node.classes.include?(selector[1..])
+      else node.tag == selector
+      end
+    end
+
+    def query_selector(id, selector)
+      found = descendants(node(id)).find { |n| matches?(n, selector) }
+      found ? { "__host" => found.id } : nil
+    end
+
+    def query_selector_all(id, selector)
+      descendants(node(id)).select { |n| matches?(n, selector) }.map { |n| { "__host" => n.id } }
     end
   end
 end
