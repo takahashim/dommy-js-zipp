@@ -1,3 +1,445 @@
+diff --git a/crates/zipp-vm/src/compile/calls.rs b/crates/zipp-vm/src/compile/calls.rs
+index d738e4e..bb5f179 100644
+--- a/crates/zipp-vm/src/compile/calls.rs
++++ b/crates/zipp-vm/src/compile/calls.rs
+@@ -771,7 +771,7 @@ fn bare_math_global(&mut self) -> Option<Reg> {
+         if !self.with_objs_for("Math").is_empty() {
+             return None;
+         }
+-        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == "Math")
++        let bound_here = self.bound_anywhere("Math")
+             || self.self_name.as_ref().is_some_and(|(n, _)| n == "Math");
+         if !bound_here && self.inherited_with_shadows.contains_key("Math") {
+             return None;
+@@ -797,7 +797,7 @@ fn stable_register_receiver(&mut self, name: &str, args: &[Arg]) -> bool {
+         if name == "arguments" || !self.with_objs_for(name).is_empty() {
+             return false;
+         }
+-        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == name)
++        let bound_here = self.bound_anywhere(name)
+             || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
+         if !bound_here && self.inherited_with_shadows.contains_key(name) {
+             return false;
+@@ -2181,7 +2181,7 @@ fn ident_order_transparent(&mut self, name: &str, relaxed: bool) -> bool {
+         if !self.with_objs_for(name).is_empty() {
+             return false;
+         }
+-        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == name)
++        let bound_here = self.bound_anywhere(name)
+             || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
+         if !bound_here && self.inherited_with_shadows.contains_key(name) {
+             return false;
+diff --git a/crates/zipp-vm/src/compile/compiler.rs b/crates/zipp-vm/src/compile/compiler.rs
+index e1123fa..1e5dfe2 100644
+--- a/crates/zipp-vm/src/compile/compiler.rs
++++ b/crates/zipp-vm/src/compile/compiler.rs
+@@ -947,9 +947,9 @@ pub(crate) fn compile_function_body(
+             }
+             // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
+             for name in &crate::compile::helpers::sorted_name_vec(&lex) {
+-                if !fc.scopes[0].iter().any(|(n, _)| n == name) {
++                if fc.lookup_in_scope(0, name).is_none() {
+                     let r = fc.alloc_reg();
+-                    fc.scopes[0].push((name.clone(), r));
++                    fc.bind_in_scope(0, name, r);
+                     fc.emit(Instr::MakeCellTdz { reg: r });
+                     fc.cell_regs.insert(r);
+                     fc.entry_lexicals.insert(name.clone());
+@@ -978,7 +978,7 @@ pub(crate) fn compile_function_body(
+             // textually after the `with` (unscopables-with); (3) `for (var k
+             // in …)` heads resolve the hoisted binding instead of minting one.
+             for name in &sorted_name_vec(&hv) {
+-                if !fc.scopes[0].iter().any(|(n, _)| n == name) {
++                if fc.lookup_in_scope(0, name).is_none() {
+                     fc.declare_local(name); // boxes a cell if captured (undefined)
+                 }
+             }
+@@ -1396,7 +1396,7 @@ pub(crate) fn compile_class_fn(
+         // Hoisted declarations must capture the method/constructor's own
+         // bindings even when their textual declarations appear later.
+         for local in hoisted_var_names(body) {
+-            if !fc.scopes[0].iter().any(|(n, _)| n == &local) {
++            if fc.lookup_in_scope(0, &local).is_none() {
+                 fc.declare_local(&local);
+             }
+         }
+@@ -1618,7 +1618,7 @@ pub(crate) fn compile_arrow_body(
+                         collect_hoisted_vars(s, &mut hv);
+                     }
+                     for name in &sorted_name_vec(&hv) {
+-                        if !fc.scopes[0].iter().any(|(n, _)| n == name) {
++                        if fc.lookup_in_scope(0, name).is_none() {
+                             fc.declare_local(name);
+                         }
+                     }
+@@ -1684,9 +1684,9 @@ pub(crate) fn compile_arrow_body(
+                             || fc.captured.contains(name)
+                             || fc.box_all_locals
+                             || early_cell.contains(name);
+-                        if needs_cell && !fc.scopes[0].iter().any(|(n, _)| n == name) {
++                        if needs_cell && fc.lookup_in_scope(0, name).is_none() {
+                             let r = fc.alloc_reg();
+-                            fc.scopes[0].push((name.clone(), r));
++                            fc.bind_in_scope(0, name, r);
+                             fc.emit(Instr::MakeCellTdz { reg: r });
+                             fc.cell_regs.insert(r);
+                             fc.entry_lexicals.insert(name.clone());
+@@ -1900,11 +1900,7 @@ fn split_param_scope_vars(&mut self, params_ast: Option<&ast::Params>, body: &[a
+             if name == "arguments" || !seen.contains(name) {
+                 continue;
+             }
+-            let Some(preg) = self.scopes[0]
+-                .iter()
+-                .rev()
+-                .find(|(n, _)| n == name)
+-                .map(|(_, r)| *r)
++            let Some(preg) = self.lookup_in_scope(0, name)
+             else {
+                 continue;
+             };
+@@ -1980,13 +1976,13 @@ fn predeclare_body_lexicals(&mut self, body: &[ast::Stmt]) {
+                 || self.box_all_locals
+                 || forward.contains(name)
+                 || matches!(name.as_str(), "undefined" | "NaN" | "Infinity"))
+-                && !self.scopes[0].iter().any(|(n, _)| n == name)
++                && self.lookup_in_scope(0, name).is_none()
+             {
+                 // Box a TDZ cell: a read before the textual declaration runs
+                 // (e.g. via a forward-materialised function) throws a
+                 // ReferenceError rather than reading undefined.
+                 let r = self.alloc_reg();
+-                self.scopes[0].push((name.clone(), r));
++                self.bind_in_scope(0, name, r);
+                 self.emit(Instr::MakeCellTdz { reg: r });
+                 self.cell_regs.insert(r);
+                 self.entry_lexicals.insert(name.clone());
+diff --git a/crates/zipp-vm/src/compile/control_flow.rs b/crates/zipp-vm/src/compile/control_flow.rs
+index 3becb1e..755a875 100644
+--- a/crates/zipp-vm/src/compile/control_flow.rs
++++ b/crates/zipp-vm/src/compile/control_flow.rs
+@@ -503,10 +503,10 @@ pub(crate) fn predeclare_lexical_tdz_with(
+                 if (fc.captured.contains(name)
+                     || early.contains(name)
+                     || matches!(name, "undefined" | "NaN" | "Infinity"))
+-                    && !fc.scopes.last().unwrap().iter().any(|(n, _)| n == name)
++                    && fc.lookup_in_scope(fc.scopes.len() - 1, name).is_none()
+                 {
+                     let r = fc.alloc_reg();
+-                    fc.scopes.last_mut().unwrap().push((name.to_string(), r));
++                    fc.bind_last(name, r);
+                     fc.emit(Instr::MakeCellTdz { reg: r });
+                     fc.cell_regs.insert(r);
+                     fc.block_tdz_cells.insert(r);
+@@ -1124,7 +1124,7 @@ pub(crate) fn for_of_statement(
+             self.push_scope();
+             for n in &tdz_added {
+                 let r = self.alloc_reg();
+-                self.scopes.last_mut().unwrap().push((n.clone(), r));
++                self.bind_last(n, r);
+                 self.emit(Instr::MakeCellTdz { reg: r });
+                 self.cell_regs.insert(r);
+             }
+@@ -1620,7 +1620,7 @@ pub(crate) fn for_in_statement(
+             self.push_scope();
+             for n in &tdz_added {
+                 let r = self.alloc_reg();
+-                self.scopes.last_mut().unwrap().push((n.clone(), r));
++                self.bind_last(n, r);
+                 self.emit(Instr::MakeCellTdz { reg: r });
+                 self.cell_regs.insert(r);
+             }
+diff --git a/crates/zipp-vm/src/compile/decls.rs b/crates/zipp-vm/src/compile/decls.rs
+index 5b38ec2..00889de 100644
+--- a/crates/zipp-vm/src/compile/decls.rs
++++ b/crates/zipp-vm/src/compile/decls.rs
+@@ -986,16 +986,12 @@ pub(crate) fn var_decl(&mut self, d: &ast::VarDecl) -> R<()> {
+             // rather than duplicating. A nested closure over it boxes the slot (the
+             // var name is in the capture set). A bare `var x;` never resets `x`.
+             if !d.kind.is_lexical() {
+-                let existing = self.scopes[0]
+-                    .iter()
+-                    .rev()
+-                    .find(|(n, _)| n == name)
+-                    .map(|(_, r)| *r);
++                let existing = self.lookup_in_scope(0, name);
+                 let reg = match existing {
+                     Some(r) => r,
+                     None => {
+                         let r = self.alloc_reg();
+-                        self.scopes[0].push((name.to_string(), r));
++                        self.bind_in_scope(0, name, r);
+                         if self.captured.contains(name) {
+                             self.emit(Instr::MakeCell { reg: r });
+                             self.cell_regs.insert(r);
+@@ -1058,20 +1054,13 @@ pub(crate) fn var_decl(&mut self, d: &ast::VarDecl) -> R<()> {
+             // rather than shadowed, so the closure and this declaration share one
+             // cell; otherwise a fresh binding is allocated.
+             let reg = if self.scopes.len() == 1 && self.entry_lexicals.contains(name) {
+-                let r = self.scopes[0]
+-                    .iter()
+-                    .find(|(n, _)| n == name)
+-                    .map(|(_, r)| *r)
++                let r = self
++                    .lookup_in_scope(0, name)
+                     .unwrap_or_else(|| self.declare_local(name));
+                 self.entry_tdz_cells.remove(&r); // TDZ ends here
+                 r
+             } else if let Some(r) = self
+-                .scopes
+-                .last()
+-                .unwrap()
+-                .iter()
+-                .find(|(n, _)| n == name)
+-                .map(|(_, r)| *r)
++                .lookup_in_scope(self.scopes.len() - 1, name)
+                 .filter(|r| self.block_tdz_cells.contains(r))
+             {
+                 // A block-entry pre-created TDZ cell (captured forward-referenced
+@@ -1204,7 +1193,7 @@ pub(crate) fn head_var_binding(&mut self, name: &str) -> Binding {
+         }
+         // First mention: create the function-scoped var binding (scopes[0]).
+         let r = self.alloc_reg();
+-        self.scopes[0].push((name.to_string(), r));
++        self.bind_in_scope(0, name, r);
+         if self.box_all_locals || self.captured.contains(name) {
+             self.emit(Instr::MakeCell { reg: r });
+             self.cell_regs.insert(r);
+@@ -1246,20 +1235,12 @@ pub(crate) fn declare_pattern(&mut self, pat: &ast::Pattern, is_var: bool) -> R<
+                     // Its TDZ ends here: the extraction that follows writes
+                     // through `store_binding`, and a checked store would throw on
+                     // the very cell it is initializing (`const {z} = {z:9}`).
+-                    if let Some(r) = self.scopes[0]
+-                        .iter()
+-                        .find(|(n, _)| n == &**id)
+-                        .map(|(_, r)| *r)
++                    if let Some(r) = self.lookup_in_scope(0, &**id)
+                     {
+                         self.entry_tdz_cells.remove(&r);
+                     }
+                 } else if let Some(r) = self
+-                    .scopes
+-                    .last()
+-                    .unwrap()
+-                    .iter()
+-                    .find(|(n, _)| n == &**id)
+-                    .map(|(_, r)| *r)
++                    .lookup_in_scope(self.scopes.len() - 1, &**id)
+                     .filter(|r| self.block_tdz_cells.contains(r))
+                 {
+                     // The block-entry TDZ cell of this leaf (captured, or
+diff --git a/crates/zipp-vm/src/compile/funcs.rs b/crates/zipp-vm/src/compile/funcs.rs
+index fc4ead5..82c3c0d 100644
+--- a/crates/zipp-vm/src/compile/funcs.rs
++++ b/crates/zipp-vm/src/compile/funcs.rs
+@@ -1958,7 +1958,7 @@ fn stash_child_free_names(&mut self, free_names: HashSet<String>) {
+         let mut map = std::collections::HashMap::new();
+         for name in free_names {
+             let mut chain = self.with_names_for(&name);
+-            if !self.scopes.iter().flatten().any(|(n, _)| *n == name)
++            if !self.bound_anywhere(&name)
+                 && self.self_name.as_ref().map_or(true, |(n, _)| *n != name)
+             {
+                 if let Some(inh) = self.inherited_with_shadows.get(&name) {
+diff --git a/crates/zipp-vm/src/compile/mod.rs b/crates/zipp-vm/src/compile/mod.rs
+index a3e789d..0261db2 100644
+--- a/crates/zipp-vm/src/compile/mod.rs
++++ b/crates/zipp-vm/src/compile/mod.rs
+@@ -17,7 +17,7 @@
+ //! time, the same way the old engine did.
+ 
+ use std::cell::RefCell;
+-use std::collections::HashSet;
++use std::collections::{HashMap, HashSet};
+ use std::rc::Rc;
+ 
+ // The AST, under both spellings: `ast::Expr` for code that wants the prefix and
+@@ -456,6 +456,14 @@ struct FnCompiler<'a> {
+     wtf8_consts: Vec<u32>,
+     /// Lexical scope chain: each entry is (name, register).
+     scopes: Vec<Vec<(String, Reg)>>,
++    /// Parallel to `scopes` (same length, same indices): a name→register index
++    /// for each scope, kept in sync with `scopes`. Binding a local pushes the
++    /// entry onto `scopes` and inserts here; resolving a name looks up the
++    /// innermost scope that has it in O(1). Without it, `resolve`/
++    /// `resolve_existing` and the declaration paths scanned the scope `Vec`s,
++    /// which is quadratic in the number of locals in one function body (a
++    /// bundle's single huge IIFE).
++    scope_index: Vec<HashMap<String, Reg>>,
+     /// Parallel to `scopes` (same length, same indices): the lexically-declared
+     /// names of each BLOCK-like scope, recorded at block ENTRY.
+     ///
+diff --git a/crates/zipp-vm/src/compile/scopes.rs b/crates/zipp-vm/src/compile/scopes.rs
+index 165b041..63169e3 100644
+--- a/crates/zipp-vm/src/compile/scopes.rs
++++ b/crates/zipp-vm/src/compile/scopes.rs
+@@ -30,6 +30,7 @@ pub(crate) fn new(
+             bigint_consts: Vec::new(),
+             wtf8_consts: Vec::new(),
+             scopes: vec![Vec::new()],
++            scope_index: vec![HashMap::new()],
+             scope_lex_names: vec![HashSet::new()],
+             next_reg: 0,
+             max_reg: 0,
+@@ -96,7 +97,7 @@ pub(crate) fn new(
+         let _this_reg = fc.alloc_reg(); // reg 0 = this
+         for p in params {
+             let r = fc.alloc_reg();
+-            fc.scopes[0].push((p.clone(), r));
++            fc.bind_in_scope(0, p, r);
+             // A captured parameter is boxed into a cell immediately so a nested
+             // closure shares the live slot (mutations visible both ways).
+             if fc.captured.contains(p) {
+@@ -110,7 +111,7 @@ pub(crate) fn new(
+         if let Some(name) = rest {
+             let r = fc.alloc_reg();
+             fc.rest_reg = Some(r);
+-            fc.scopes[0].push((name.to_string(), r));
++            fc.bind_in_scope(0, name, r);
+             if fc.captured.contains(name) {
+                 fc.emit(Instr::MakeCell { reg: r });
+                 fc.cell_regs.insert(r);
+@@ -131,7 +132,7 @@ pub(crate) fn reserve_arguments(&mut self) {
+             return;
+         }
+         let r = self.alloc_reg();
+-        self.scopes[0].push(("arguments".to_string(), r));
++        self.bind_in_scope(0, "arguments", r);
+         self.arguments_reg = Some(r);
+     }
+ 
+@@ -454,9 +455,36 @@ pub(crate) fn here(&self) -> u32 {
+ 
+     pub(crate) fn push_scope(&mut self) {
+         self.scopes.push(Vec::new());
++        self.scope_index.push(HashMap::new());
+         self.scope_lex_names.push(HashSet::new());
+     }
+ 
++    /// Push a binding `(name, reg)` onto scope `scope`, keeping `scope_index`
++    /// in sync. THE way to add a scope entry (a raw `scopes[..].push` would
++    /// leave the index stale).
++    pub(crate) fn bind_in_scope(&mut self, scope: usize, name: &str, reg: Reg) {
++        self.scopes[scope].push((name.to_string(), reg));
++        self.scope_index[scope].insert(name.to_string(), reg);
++    }
++
++    /// [`Self::bind_in_scope`] for the innermost (current) scope.
++    pub(crate) fn bind_last(&mut self, name: &str, reg: Reg) {
++        let last = self.scopes.len() - 1;
++        self.bind_in_scope(last, name, reg);
++    }
++
++    /// The register bound to `name` in scope `scope`, if any (last binding wins,
++    /// matching the previous reverse scan).
++    pub(crate) fn lookup_in_scope(&self, scope: usize, name: &str) -> Option<Reg> {
++        self.scope_index[scope].get(name).copied()
++    }
++
++    /// Whether `name` is bound in ANY scope of this function (the O(1) form of
++    /// the previous `self.scopes.iter().flatten().any(|(n,_)| n == name)`).
++    pub(crate) fn bound_anywhere(&self, name: &str) -> bool {
++        self.scope_index.iter().any(|m| m.contains_key(name))
++    }
++
+     /// Record the lexically-declared names of the block scope just opened, for
+     /// the position-sensitive Annex B B.3.3 blocker test (`block_fn_conflicts`).
+     /// Call right after `push_scope`, before compiling the block's contents.
+@@ -472,6 +500,7 @@ pub(crate) fn note_block_lexicals(&mut self, stmts: &[ast::Stmt]) {
+ 
+     pub(crate) fn pop_scope(&mut self) {
+         self.scope_lex_names.pop();
++        self.scope_index.pop();
+         let scope = self.scopes.pop().unwrap();
+         // Free the registers the scope's locals used (block-local reuse) —
+         // and drop their per-register markings, or a later local reallocated
+@@ -513,7 +542,7 @@ pub(crate) fn builtin_unshadowed(&mut self, name: &str) -> bool {
+ 
+     pub(crate) fn declare_local(&mut self, name: &str) -> Reg {
+         let r = self.alloc_reg();
+-        self.scopes.last_mut().unwrap().push((name.to_string(), r));
++        self.bind_last(name, r);
+         // Box the local into a cell if a nested function captures it, so the
+         // closure and this scope share one mutable slot — or unconditionally in
+         // a function whose body may direct-eval (the eval closes over cells).
+@@ -537,7 +566,7 @@ pub(crate) fn declare_local(&mut self, name: &str) -> Reg {
+     /// where boxing must happen AFTER the value is present.
+     pub(crate) fn declare_local_no_box(&mut self, name: &str) -> Reg {
+         let r = self.alloc_reg();
+-        self.scopes.last_mut().unwrap().push((name.to_string(), r));
++        self.bind_last(name, r);
+         r
+     }
+ 
+@@ -554,15 +583,13 @@ pub(crate) fn resolve(&mut self, name: &str) -> Binding {
+         if name == "arguments" {
+             self.uses_arguments = true; // request the call-time `arguments` array
+         }
+-        for scope in self.scopes.iter().rev() {
+-            for (n, r) in scope.iter().rev() {
+-                if n == name {
+-                    return if self.cell_regs.contains(r) {
+-                        Binding::LocalCell(*r)
+-                    } else {
+-                        Binding::Local(*r)
+-                    };
+-                }
++        for scope in (0..self.scopes.len()).rev() {
++            if let Some(r) = self.lookup_in_scope(scope, name) {
++                return if self.cell_regs.contains(&r) {
++                    Binding::LocalCell(r)
++                } else {
++                    Binding::Local(r)
++                };
+             }
+         }
+         // A named function expression's own name: outside the param/var scope, so
+@@ -674,7 +701,7 @@ pub(crate) fn class_inner_name_visible(&self) -> bool {
+         if self.heritage_class.as_ref().is_some_and(|(n, _)| n == name) {
+             return true;
+         }
+-        !self.scopes.iter().any(|s| s.iter().any(|(n, _)| n == name))
++        !self.bound_anywhere(name)
+             && !self.self_name.as_ref().is_some_and(|(n, _)| n == name)
+     }
+ 
+@@ -697,15 +724,13 @@ pub(crate) fn bound_in_enclosing(&self, name: &str) -> bool {
+     /// Does not thread upvalues (no side effects); an enclosing-function local is
+     /// reported as unresolved, which only affects the rare `delete <outer local>`.
+     pub(crate) fn resolve_existing(&self, name: &str) -> Option<Binding> {
+-        for scope in self.scopes.iter().rev() {
+-            for (n, r) in scope.iter().rev() {
+-                if n == name {
+-                    return Some(if self.cell_regs.contains(r) {
+-                        Binding::LocalCell(*r)
+-                    } else {
+-                        Binding::Local(*r)
+-                    });
+-                }
++        for scope in (0..self.scopes.len()).rev() {
++            if let Some(r) = self.lookup_in_scope(scope, name) {
++                return Some(if self.cell_regs.contains(&r) {
++                    Binding::LocalCell(r)
++                } else {
++                    Binding::Local(r)
++                });
+             }
+         }
+         if let Some((n, r)) = &self.self_name {
+diff --git a/crates/zipp-vm/src/compile/with_stmt.rs b/crates/zipp-vm/src/compile/with_stmt.rs
+index 600c4ff..a8fce56 100644
+--- a/crates/zipp-vm/src/compile/with_stmt.rs
++++ b/crates/zipp-vm/src/compile/with_stmt.rs
+@@ -85,8 +85,8 @@ pub(crate) fn with_obj_regs(&mut self, name: &str) -> Vec<Reg> {
+         }
+         // Enclosing-function withs apply only to names this function does not
+         // bind itself (a local/param/self-name is never shadowed from outside).
+-        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == name)
+-            || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
++        let bound_here =
++            self.bound_anywhere(name) || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
+         if !bound_here {
+             if let Some(chain) = self.inherited_with_shadows.get(name).cloned() {
+                 for wname in chain {
 diff --git a/crates/zipp-vm/src/embed.rs b/crates/zipp-vm/src/embed.rs
 index 3ec6aa1..a63c413 100644
 --- a/crates/zipp-vm/src/embed.rs
@@ -607,6 +1049,107 @@ index 3ec6aa1..a63c413 100644
 +        assert_eq!(st.eval_in_context("globalThis.__m"), Ok(JsValue::String("TypeError".into())));
 +    }
  }
+diff --git a/crates/zipp-vm/src/parse/parser.rs b/crates/zipp-vm/src/parse/parser.rs
+index 781d632..fc61ec9 100644
+--- a/crates/zipp-vm/src/parse/parser.rs
++++ b/crates/zipp-vm/src/parse/parser.rs
+@@ -351,6 +351,14 @@ pub(crate) struct Scope {
+     pub kind: ScopeKind,
+     pub lex: Vec<(Box<str>, BindKind, u32)>,
+     pub var: Vec<(Box<str>, u32)>,
++    /// Membership indexes over `lex`/`var`. The declaration early-error checks
++    /// used to scan these `Vec`s, which is quadratic in the number of bindings
++    /// in one function body (a bundle's single huge IIFE). `lex_all` is every
++    /// lexical name; `lex_nonfn` those with a non-`Function` kind (the Annex B
++    /// function-duplicate carve-out); `var_all` every var/param name.
++    pub lex_all: rustc_hash::FxHashSet<Box<str>>,
++    pub lex_nonfn: rustc_hash::FxHashSet<Box<str>>,
++    pub var_all: rustc_hash::FxHashSet<Box<str>>,
+     /// `var` stops here: Script, Module, Function, ClassStaticBlock.
+     pub var_boundary: bool,
+     /// Annex B B.3.5: `catch (e) { var e; }` is legal for a SIMPLE catch
+@@ -381,6 +389,9 @@ pub(crate) fn push(&mut self, kind: ScopeKind) {
+             kind,
+             lex: Vec::new(),
+             var: Vec::new(),
++            lex_all: rustc_hash::FxHashSet::default(),
++            lex_nonfn: rustc_hash::FxHashSet::default(),
++            var_all: rustc_hash::FxHashSet::default(),
+             var_boundary,
+             simple_catch_param: None,
+         });
+@@ -423,17 +434,22 @@ pub(crate) fn declare_lexical(
+         let Some(scope) = self.scopes.last_mut() else {
+             return Ok(());
+         };
+-        let dup_lex = scope
+-            .lex
+-            .iter()
+-            .any(|(n, k, _)| &**n == name && !(annexb_dup_ok && *k == BindKind::Function));
+-        if dup_lex || scope.var.iter().any(|(n, _)| &**n == name) {
++        let dup_lex = if annexb_dup_ok {
++            scope.lex_nonfn.contains(name)
++        } else {
++            scope.lex_all.contains(name)
++        };
++        if dup_lex || scope.var_all.contains(name) {
+             return Err(SyntaxError::new(
+                 format!("SyntaxError: Identifier '{name}' has already been declared"),
+                 pos,
+             ));
+         }
+         scope.lex.push((name.into(), kind, pos));
++        scope.lex_all.insert(name.into());
++        if kind != BindKind::Function {
++            scope.lex_nonfn.insert(name.into());
++        }
+         Ok(())
+     }
+ 
+@@ -454,9 +470,9 @@ pub(crate) fn at_module_top_level(&self) -> bool {
+     /// Is `name` bound anywhere at the module's top level (lexically or by a
+     /// `var`)? An `export { x }` must resolve to such a binding.
+     pub(crate) fn module_binds(&self, name: &str) -> bool {
+-        self.scopes.iter().any(|s| {
+-            s.lex.iter().any(|(n, _, _)| &**n == name) || s.var.iter().any(|(n, _)| &**n == name)
+-        })
++        self.scopes
++            .iter()
++            .any(|s| s.lex_all.contains(name) || s.var_all.contains(name))
+     }
+ 
+     /// May a `using` / `await using` declaration appear in the current scope?
+@@ -486,8 +502,9 @@ pub(crate) fn fn_decl_is_var_scoped(&self) -> bool {
+     /// binding that does not exist yet.
+     pub(crate) fn declare_param(&mut self, name: &str) {
+         if let Some(scope) = self.scopes.last_mut() {
+-            if !scope.var.iter().any(|(n, _)| &**n == name) {
++            if !scope.var_all.contains(name) {
+                 scope.var.push((name.into(), 0));
++                scope.var_all.insert(name.into());
+             }
+         }
+     }
+@@ -502,7 +519,7 @@ pub(crate) fn declare_var(&mut self, name: &str, pos: u32) -> PResult<()> {
+                     break;
+                 }
+             }
+-            if scope.lex.iter().any(|(n, _, _)| &**n == name) {
++            if scope.lex_all.contains(name) {
+                 return Err(SyntaxError::new(
+                     format!("SyntaxError: Identifier '{name}' has already been declared"),
+                     pos,
+@@ -521,8 +538,9 @@ pub(crate) fn declare_var(&mut self, name: &str, pos: u32) -> PResult<()> {
+         // boundary erased exactly that association. `var f; { let f }` stays
+         // legal because there the `var` is recorded in the outer scope.
+         if let Some(scope) = self.scopes.last_mut() {
+-            if !scope.var.iter().any(|(n, _)| &**n == name) {
++            if !scope.var_all.contains(name) {
+                 scope.var.push((name.into(), pos));
++                scope.var_all.insert(name.into());
+             }
+         }
+         Ok(())
 diff --git a/crates/zipp-vm/src/vm/async_runtime.rs b/crates/zipp-vm/src/vm/async_runtime.rs
 index 4432ada..2bbf2da 100644
 --- a/crates/zipp-vm/src/vm/async_runtime.rs
