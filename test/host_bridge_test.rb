@@ -81,4 +81,19 @@ class HostBridgeTest < Minitest::Test
     @dom.run_timers(max: 5)
     assert_equal 2, @vm.eval("globalThis.__count")
   end
+
+  def test_async_fetch_resolved_by_ruby
+    @vm.eval('globalThis.__data = null; (async () => { globalThis.__data = await fetch("/api"); })();')
+    @dom.serve(->(url) { [true, "r:#{url}"] })
+    assert_equal "r:/api", @vm.eval("globalThis.__data")
+  end
+
+  def test_async_fetch_rejection_propagates
+    @vm.eval(<<~JS)
+      globalThis.__err = null;
+      (async () => { try { await fetch("/x"); } catch (e) { globalThis.__err = String((e && e.message) || e); } })();
+    JS
+    @dom.serve(->(_url) { [false, "down"] })
+    assert_equal "down", @vm.eval("globalThis.__err")
+  end
 end

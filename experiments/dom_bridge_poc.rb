@@ -89,6 +89,28 @@ dom.dispatch(stop.id, "click")
 dom.run_timers(max: 5)
 assert("clearInterval stopped the interval", vm.eval("globalThis.__count") == 2)
 
+puts "\n== async host IO (Ruby-backed fetch)"
+vm.eval(<<~JS)
+  globalThis.__data = null;
+  globalThis.__err = null;
+  (async () => {
+    try { globalThis.__data = await fetch("/api/greeting"); }
+    catch (e) { globalThis.__err = String((e && e.message) || e); }
+  })();
+JS
+dom.serve(->(url) { [true, "hello from #{url}"] })
+assert("await fetch resolved from Ruby", vm.eval("globalThis.__data") == "hello from /api/greeting")
+
+vm.eval(<<~JS)
+  globalThis.__err2 = null;
+  (async () => {
+    try { await fetch("/boom"); }
+    catch (e) { globalThis.__err2 = String((e && e.message) || e); }
+  })();
+JS
+dom.serve(->(_url) { [false, "network down"] })
+assert("fetch rejection propagates to JS", vm.eval("globalThis.__err2") == "network down")
+
 puts "\n== real bundle on top of the environment"
 vm.eval(File.read("/Users/maki/git/dommy-js-quickjs/test/fixtures/react.umd.js"))
 assert("react.umd.js defines React", vm.eval("typeof React") == "object")

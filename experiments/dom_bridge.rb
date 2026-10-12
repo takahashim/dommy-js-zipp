@@ -108,6 +108,24 @@ module DomBridge
       if (cb) cb();
     };
 
+    // Async host IO: `fetch` returns a Promise the Ruby side settles later via
+    // `__resolveFetch` (a pending id is the only thing that crosses to Ruby).
+    globalThis.__pending = {};
+    globalThis.__pendingSeq = 1;
+    function fetch(url) {
+      return new Promise((resolve, reject) => {
+        const id = globalThis.__pendingSeq++;
+        globalThis.__pending[id] = { resolve, reject };
+        __http("get", id, String(url));
+      });
+    }
+    globalThis.__resolveFetch = function (id, ok, payload) {
+      const p = globalThis.__pending[id];
+      if (!p) return;
+      delete globalThis.__pending[id];
+      if (ok) p.resolve(payload); else p.reject(new Error(String(payload)));
+    };
+
     globalThis.document = __wrapHost(0);
     globalThis.HTMLElement = function () {};
     globalThis.MutationObserver = function () { return { observe() {}, disconnect() {} }; };
@@ -119,6 +137,7 @@ module DomBridge
     dom.vm = vm
     vm.define_function("__host") { |op, id, key, value| dom.handle(op, id, key, value) }
     vm.define_function("__timer") { |op, id, delay| dom.timer(op, id, delay) }
+    vm.define_function("__http") { |op, id, url| dom.http(op, id, url) }
     vm.eval(PREAMBLE)
     dom
   end
@@ -146,6 +165,7 @@ module DomBridge
       @nodes = {}
       @events = Hash.new { |h, k| h[k] = [] }
       @timers = {}
+      @http = {}
       @document_id = 0
       @nodes[0] = Node.new(0, "#document")
     end
@@ -207,6 +227,25 @@ module DomBridge
       when "set" then set(id, key, value)
       when "call" then call_method(id, key, value)
       end
+    end
+
+    # Record a pending `fetch` (called by the JS shim).
+    def http(op, id, url)
+      @http[id] = url if op == "get"
+      nil
+    end
+
+    # Settle every pending `fetch` by calling `handler.call(url) -> [ok, value]`
+    # and re-entering JS with the result. Returns how many were served.
+    def serve(handler)
+      pending = @http
+      @http = {}
+      pending.each do |id, url|
+        ok, value = handler.call(url)
+        @vm.call("__resolveFetch", id, ok, value)
+      end
+      @vm.drain_jobs!
+      pending.size
     end
 
     # Deliver an event to the JS listeners registered on `node_id` (Ruby -> JS
