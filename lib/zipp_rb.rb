@@ -89,20 +89,20 @@ module ZippRb
 
     # Evaluate +src+ in the VM's global context and return the completion value.
     def eval(src)
-      check_owner!
+      check_usable!
       ZippRb._eval(@id, src)
     end
 
     # Call the JS global function +name+ with +args+, converting both ways.
     def call(name, *args)
-      check_owner!
+      check_usable!
       ZippRb._call(@id, name.to_s, args)
     end
 
     # Take a durable handle to the global +name+ (a function or any value), so
     # Ruby can hold it and use it later. Returns nil if the name is unbound.
     def handle(name)
-      check_owner!
+      check_usable!
       hid = ZippRb._handle(@id, name.to_s)
       hid && Handle.new(@id, hid)
     end
@@ -111,7 +111,7 @@ module ZippRb
     # return value cross between Ruby and JS (numbers, strings, booleans, nil,
     # Array and Hash).
     def define_function(name, &block)
-      check_owner!
+      check_usable!
       raise ArgumentError, "block required" unless block
 
       ZippRb._define_function(@id, name.to_s, block)
@@ -125,7 +125,7 @@ module ZippRb
     #   vm.set_module_provider("/app", { "/app/mod.mjs" => "export const x = 1;" })
     #   vm.eval("import('/app/mod.mjs').then(ns => ...)")
     def set_module_provider(root, sources, max_module_bytes: 64 * 1024 * 1024)
-      check_owner!
+      check_usable!
       ZippRb._set_module_provider(@id, root.to_s, sources, max_module_bytes)
       nil
     end
@@ -134,14 +134,14 @@ module ZippRb
     # namespace exports as a Hash. Requires a module loader, usually
     # #set_module_provider.
     def import(specifier)
-      check_owner!
+      check_usable!
       ZippRb._import(@id, specifier.to_s)
     end
 
     # Register +block+ to receive every console line as `(severity, message)`,
     # where severity is :log or :error. Replaces any previous listener.
     def on_log(&block)
-      check_owner!
+      check_usable!
       ZippRb._on_log(@id, block)
       nil
     end
@@ -149,14 +149,14 @@ module ZippRb
     # Register +block+ to receive the message of every unhandled Promise
     # rejection. Replaces any previous listener.
     def on_unhandled_rejection(&block)
-      check_owner!
+      check_usable!
       ZippRb._on_unhandled_rejection(@id, block)
       nil
     end
 
     # Run queued microtasks (promise reactions, queueMicrotask). Returns nil.
     def drain_jobs!
-      check_owner!
+      check_usable!
       ZippRb._drain_jobs(@id)
       nil
     end
@@ -183,6 +183,13 @@ module ZippRb
       return if Thread.current.equal?(@thread)
 
       raise ThreadError, "ZippRb::VM can only be used from the thread that created it"
+    end
+
+    # Usable from this thread and not yet disposed. Raises ZippRb::Error on a
+    # disposed VM (quickjs.rb raises on disposal too).
+    def check_usable!
+      check_owner!
+      raise ZippRb::Error, "the VM has been disposed" if @disposed
     end
   end
 end

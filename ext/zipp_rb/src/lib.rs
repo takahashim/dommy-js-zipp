@@ -267,7 +267,7 @@ fn import_module(ruby: &Ruby, id: u64, specifier: String) -> Result<Value, Error
         "globalThis[{k} + '_r'] = null; globalThis[{k} + '_e'] = null;\n\
          import({spec}).then(\n\
            ns => {{ const o = {{}}; for (const p of Object.keys(ns)) o[p] = ns[p]; globalThis[{k} + '_r'] = o; }},\n\
-           e => {{ globalThis[{k} + '_e'] = String((e && e.message) || e); }});",
+           e => {{ const n = (e && e.name) ? e.name + ': ' : ''; globalThis[{k} + '_e'] = n + String((e && e.message) || e); }});",
         k = k,
         spec = js_string(&specifier),
     );
