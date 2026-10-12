@@ -36,6 +36,45 @@ use zipp_vm::embed::{
 /// unrelated VM that happens to share the id.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Next timer id (binding-side).
+static NEXT_TIMER: AtomicU64 = AtomicU64::new(1);
+
+/// A scheduled timer for a VM.
+struct TimerEntry {
+    id: u64,
+    due_ms: u64,
+    repeat_ms: Option<u64>,
+}
+
+/// The JS `setTimeout`/`setInterval` shims installed by `enable_timers`. Their
+/// registrations cross to Rust via `__zippHostCallValue("zipp:timer:...")`;
+/// Rust fires them by re-entering `__zipp_fire_timer`.
+const TIMER_SHIMS: &str = r#"
+globalThis.__zipp_timer_cbs = {};
+globalThis.__zipp_timer_seq = 1;
+function setTimeout(fn, delay, ...args) {
+  const id = globalThis.__zipp_timer_seq++;
+  globalThis.__zipp_timer_cbs[id] = () => fn(...args);
+  __zippHostCallValue("zipp:timer:set", id, Math.max(0, Number(delay) || 0), 0);
+  return id;
+}
+function clearTimeout(id) {
+  delete globalThis.__zipp_timer_cbs[id];
+  __zippHostCallValue("zipp:timer:clear", id, 0, 0);
+}
+function setInterval(fn, delay, ...args) {
+  const id = globalThis.__zipp_timer_seq++;
+  globalThis.__zipp_timer_cbs[id] = () => fn(...args);
+  __zippHostCallValue("zipp:timer:set", id, Math.max(1, Number(delay) || 1), Math.max(1, Number(delay) || 1));
+  return id;
+}
+function clearInterval(id) {
+  delete globalThis.__zipp_timer_cbs[id];
+  __zippHostCallValue("zipp:timer:clear", id, 0, 0);
+}
+globalThis.__zipp_fire_timer = (id) => { const cb = globalThis.__zipp_timer_cbs[id]; if (cb) cb(); };
+"#;
+
 /// Wall-clock milliseconds, for timeout deadlines shared with a watchdog thread.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -86,6 +125,8 @@ thread_local! {
     static NEXT_IMPORT: Cell<u64> = const { Cell::new(1) };
     /// Resource limits per VM (instruction budget, heap ceiling, wall timeout).
     static LIMITS: RefCell<HashMap<u64, LimitState>> = RefCell::new(HashMap::new());
+    /// Scheduled timers per VM (opt-in `feature_timeout`).
+    static TIMERS: RefCell<HashMap<u64, Vec<TimerEntry>>> = RefCell::new(HashMap::new());
 }
 
 /// Create a VM with an empty global context; return its id.
@@ -248,6 +289,171 @@ fn define_function(
     let result = state.eval_in_context(&js).map_err(|e| runtime_error(ruby, e));
     put_vm(id, state);
     result.map(|_| ruby.to_symbol(name.as_str()))
+}
+
+/// Enable `setTimeout`/`setInterval` on VM `id` (opt-in, like quickjs.rb's
+/// `feature_timeout`): install the host handler and the JS shims that register
+/// timers with Rust.
+fn enable_timers(ruby: &Ruby, id: u64) -> Result<(), Error> {
+    let mut state = take_vm(ruby, id)?;
+    state.set_host_call_values(rb_handler(id));
+    let result = state
+        .eval_in_context_structured(TIMER_SHIMS)
+        .map_err(|e| js_error(ruby, &e));
+    put_vm(id, state);
+    result.map(|_| ())
+}
+
+/// Handle `__zippHostCallValue("zipp:timer:...", id, delay, repeat)`.
+fn handle_timer_op(vm_id: u64, op: &str, args: &[HostValue]) -> Result<HostValue, String> {
+    let id = match args.first() {
+        Some(HostValue::Number(n)) => *n as u64,
+        _ => return Err("TypeError: bad timer id".into()),
+    };
+    let delay = match args.get(1) {
+        Some(HostValue::Number(n)) => *n,
+        _ => 0.0,
+    };
+    let repeat = match args.get(2) {
+        Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as u64),
+        _ => None,
+    };
+    match op {
+        "set" => TIMERS.with(|m| {
+            m.borrow_mut()
+                .entry(vm_id)
+                .or_default()
+                .push(TimerEntry {
+                    id,
+                    due_ms: now_ms().saturating_add(delay as u64),
+                    repeat_ms: repeat,
+                })
+        }),
+        "clear" => TIMERS.with(|m| {
+            if let Some(list) = m.borrow_mut().get_mut(&vm_id) {
+                list.retain(|t| t.id != id);
+            }
+        }),
+        _ => {}
+    }
+    Ok(HostValue::Undefined)
+}
+
+/// Fire all due timers once, re-entering JS for each; repeating timers are
+/// rescheduled, one-shots removed. Returns whether anything fired.
+fn fire_due_timers(state: &mut ScriptState, vm_id: u64) -> Result<bool, JsError> {
+    let now = now_ms();
+    let due: Vec<u64> = TIMERS.with(|m| {
+        let mut map = m.borrow_mut();
+        let Some(list) = map.get_mut(&vm_id) else {
+            return Vec::new();
+        };
+        let mut due = Vec::new();
+        let mut i = 0;
+        while i < list.len() {
+            if list[i].due_ms <= now {
+                match list[i].repeat_ms {
+                    Some(r) => {
+                        list[i].due_ms = now.saturating_add(r.max(1));
+                        due.push(list[i].id);
+                        i += 1;
+                    }
+                    None => {
+                        due.push(list[i].id);
+                        list.remove(i);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        due
+    });
+    for tid in &due {
+        state
+            .call_global_structured("__zipp_fire_timer", &[HostValue::Number(*tid as f64)])?;
+    }
+    Ok(!due.is_empty())
+}
+
+/// The earliest pending timer deadline for a VM, if any.
+fn next_timer_due(vm_id: u64) -> Option<u64> {
+    TIMERS.with(|m| m.borrow().get(&vm_id).and_then(|l| l.iter().map(|t| t.due_ms).min()))
+}
+
+/// Await-capable evaluation (quickjs.rb's `eval_code` shape): run `src` as an
+/// async function body, then drive the event loop — draining microtasks and
+/// firing timers — until the top-level promise settles (or `max_ms` elapses).
+fn eval_async(ruby: &Ruby, id: u64, src: String, max_ms: u64) -> Result<Value, Error> {
+    let key = format!(
+        "__zipp_async_{}",
+        NEXT_IMPORT.with(|c| {
+            let v = c.get();
+            c.set(v.wrapping_add(1));
+            v
+        })
+    );
+    let k = js_string(&key);
+    // Store the settled result / a rendered error string (an Error object would
+    // cross as Opaque).
+    let js = format!(
+        "globalThis[{k}] = null;\n\
+         (async () => {{\n\
+           try {{ const v = await (async () => {{\n{src}\n}})(); globalThis[{k}] = {{ done: true, value: v }}; }}\n\
+           catch (e) {{ globalThis[{k}] = {{ done: true, error: ((e && e.name) ? e.name + ': ' : '') + String((e && e.message) || e) }}; }}\n\
+         }})();"
+    );
+    let mut state = take_vm(ruby, id)?;
+    let run = (|| -> Result<Value, Error> {
+        state
+            .eval_in_context_structured(&js)
+            .map_err(|e| js_error(ruby, &e))?;
+        let deadline = now_ms().saturating_add(max_ms);
+        loop {
+            state.run_microtasks();
+            match state.eval_in_context_structured(&format!(
+                "!!(globalThis[{k}] && globalThis[{k}].done)"
+            )) {
+                Ok(HostValue::Bool(true)) => break,
+                Ok(_) => {}
+                Err(e) => return Err(js_error(ruby, &e)),
+            }
+            if fire_due_timers(&mut state, id).map_err(|e| js_error(ruby, &e))? {
+                continue;
+            }
+            match next_timer_due(id) {
+                Some(due) if now_ms() < deadline => {
+                    let wait = due.saturating_sub(now_ms()).clamp(1, 20);
+                    std::thread::sleep(Duration::from_millis(wait));
+                }
+                // No timers: the promise can never settle here.
+                None => break,
+                // Deadline passed.
+                Some(_) => break,
+            }
+            if now_ms() >= deadline {
+                break;
+            }
+        }
+        let err = state
+            .eval_in_context_structured(&format!(
+                "(globalThis[{k}] && globalThis[{k}].error) || ''"
+            ))
+            .map_err(|e| js_error(ruby, &e))?;
+        if let HostValue::String(message) = &err {
+            if !message.is_empty() {
+                return Err(js_error_from_message(ruby, message));
+            }
+        }
+        match state.eval_in_context_structured(&format!(
+            "globalThis[{k}] ? globalThis[{k}].value : undefined"
+        )) {
+            Ok(hv) => Ok(host_to_ruby(ruby, &hv)),
+            Err(e) => Err(js_error(ruby, &e)),
+        }
+    })();
+    put_vm(id, state);
+    run
 }
 
 /// Evaluate ES module `specifier` (a dynamic `import()`), drive the job queue,
@@ -569,6 +775,9 @@ fn forget_vm(ruby: &Ruby, id: u64) {
     if let Some(l) = LIMITS.with(|m| m.borrow_mut().remove(&id)) {
         l.running.store(false, Ordering::Relaxed);
     }
+    TIMERS.with(|m| {
+        m.borrow_mut().remove(&id);
+    });
     HANDLES.with(|h| h.borrow_mut().retain(|_, (vm, _)| *vm != id));
 }
 
@@ -588,6 +797,10 @@ fn hash_const(ruby: &Ruby, name: &str) -> Option<RHash> {
 /// its dynamic scope) and restored on return, including on error.
 fn rb_handler(vm_id: u64) -> HostCallValues {
     Rc::new(move |ctx: &mut dyn HostCtx, kind: &str, args: &[HostValue]| -> Result<HostValue, String> {
+        // Timer registrations are handled in Rust, not dispatched to Ruby.
+        if let Some(op) = kind.strip_prefix("zipp:timer:") {
+            return handle_timer_op(vm_id, op, args);
+        }
         let ctx_ptr: *mut (dyn HostCtx + 'static) = unsafe { std::mem::transmute(ctx) };
         let prev = ACTIVE_CTX.with(|c| c.replace(Some((vm_id, ctx_ptr))));
         let result = call_ruby_back(kind, args);
@@ -819,6 +1032,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_define_function", function!(define_function, 3))?;
     module.define_singleton_method("_set_module_provider", function!(set_module_provider, 4))?;
     module.define_singleton_method("_import", function!(import_module, 2))?;
+    module.define_singleton_method("_enable_timers", function!(enable_timers, 1))?;
+    module.define_singleton_method("_eval_async", function!(eval_async, 3))?;
     module.define_singleton_method("_on_log", function!(on_log, 2))?;
     module.define_singleton_method("_on_unhandled_rejection", function!(on_unhandled_rejection, 2))?;
     module.define_singleton_method("_drain_jobs", function!(drain_jobs, 1))?;

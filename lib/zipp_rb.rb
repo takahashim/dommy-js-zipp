@@ -31,6 +31,9 @@ module ZippRb
     NAN = :NaN
   end
 
+  # Feature flag: provide setTimeout/setInterval (mirrors Quickjs::FEATURE_TIMEOUT).
+  FEATURE_TIMEOUT = :feature_timeout
+
   # A durable handle to a JS value (usually a function) the VM keeps alive, so
   # Ruby can hold it and call it later (e.g. an event listener). Returned by
   # VM#handle.
@@ -77,7 +80,8 @@ module ZippRb
     #   timeout_msec:  wall-clock deadline for each evaluation (ms)
     #   memory_limit:  heap ceiling in bytes
     #   step_limit:    instruction budget per evaluation
-    def initialize(timeout_msec: nil, memory_limit: nil, step_limit: nil)
+    #   features:      [:feature_timeout] enables setTimeout/setInterval
+    def initialize(timeout_msec: nil, memory_limit: nil, step_limit: nil, features: [])
       @id = ZippRb._create
       @thread = Thread.current
       @disposed = false
@@ -85,12 +89,22 @@ module ZippRb
       if timeout_msec || memory_limit || step_limit
         ZippRb._configure_limits(@id, step_limit, memory_limit, timeout_msec)
       end
+      ZippRb._enable_timers(@id) if features.include?(FEATURE_TIMEOUT)
     end
 
     # Evaluate +src+ in the VM's global context and return the completion value.
     def eval(src)
       check_usable!
       ZippRb._eval(@id, src)
+    end
+
+    # Await-capable eval (quickjs.rb's default shape): +src+ runs as an async
+    # function body, so it may use top-level +await+; the event loop drains
+    # microtasks and fires timers until the top-level promise settles. Requires
+    # +features: [FEATURE_TIMEOUT]+ for setTimeout.
+    def eval_async(src, max_ms: 5000)
+      check_usable!
+      ZippRb._eval_async(@id, src, max_ms)
     end
 
     # Call the JS global function +name+ with +args+, converting both ways.
