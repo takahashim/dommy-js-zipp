@@ -214,6 +214,16 @@ class ZippRbTest < Minitest::Test
     vm.dispose
   end
 
+  def test_gc_and_poisoned
+    vm = ZippRb::VM.new
+    vm.eval("var a = [1, 2, 3]")
+    assert_nil vm.gc!
+    refute vm.poisoned?
+    refute vm.memory_poisoned?
+  ensure
+    vm.dispose
+  end
+
   def test_dispose_is_idempotent
     vm = ZippRb::VM.new
     refute vm.disposed?

@@ -441,7 +441,7 @@ index 600c4ff..a8fce56 100644
              if let Some(chain) = self.inherited_with_shadows.get(name).cloned() {
                  for wname in chain {
 diff --git a/crates/zipp-vm/src/embed.rs b/crates/zipp-vm/src/embed.rs
-index 3ec6aa1..a63c413 100644
+index 3ec6aa1..3609bcb 100644
 --- a/crates/zipp-vm/src/embed.rs
 +++ b/crates/zipp-vm/src/embed.rs
 @@ -33,7 +33,7 @@
@@ -624,7 +624,20 @@ index 3ec6aa1..a63c413 100644
      }
  
      /// Evaluate `src` in the running script's global context and return its
-@@ -500,6 +612,7 @@ pub fn has_global_function(&mut self, name: &str) -> bool {
+@@ -486,6 +598,12 @@ pub fn has_global_function(&mut self, name: &str) -> bool {
+         .unwrap_or(false)
+     }
+ 
++    /// Collect garbage now. A no-op while the engine is in a state that
++    /// forbids collection (a host conversion in flight).
++    pub fn gc_now(&mut self) {
++        self.with_vm(|vm| vm.force_gc());
++    }
++
+     /// Run queued microtasks (promise reactions, `queueMicrotask`) to
+     /// completion.
+     ///
+@@ -500,6 +618,7 @@ pub fn has_global_function(&mut self, name: &str) -> bool {
      /// does nothing.
      pub fn run_microtasks(&mut self) {
          self.with_vm(|vm| vm.drain_microtasks());
@@ -632,7 +645,7 @@ index 3ec6aa1..a63c413 100644
      }
  
      /// Deliver console lines to `sink` as they are produced, each tagged with
-@@ -512,6 +625,26 @@ pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &str)>) {
+@@ -512,6 +631,26 @@ pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &str)>) {
          self.with_vm(|vm| vm.console_sink = Some(sink));
      }
  
@@ -659,7 +672,7 @@ index 3ec6aa1..a63c413 100644
      /// Take the `console.log`/`info`/`debug` lines produced so far, clearing the
      /// buffer. Un-drained output accumulates for the VM's lifetime, so a
      /// long-lived embedder should drain (or discard) periodically.
-@@ -725,14 +858,153 @@ pub fn set_slot(&mut self, index: u32, value: &HostValue) -> bool {
+@@ -725,14 +864,153 @@ pub fn set_slot(&mut self, index: u32, value: &HostValue) -> bool {
              .unwrap_or(false)
      }
  
@@ -815,7 +828,7 @@ index 3ec6aa1..a63c413 100644
      }
  
      /// [`Self::call_slot`] with the caller's own conversion budget for the
-@@ -817,6 +1089,7 @@ pub fn heap_bytes(&self) -> usize {
+@@ -817,6 +1095,7 @@ pub fn heap_bytes(&self) -> usize {
      /// Run pending microtasks without calling anything.
      pub fn pump(&mut self) {
          self.with_vm(|vm| vm.host_pump());
@@ -823,7 +836,7 @@ index 3ec6aa1..a63c413 100644
      }
  
      /// Evaluate `src` in the script's global context and marshal its
-@@ -832,8 +1105,11 @@ pub fn eval_in_context_rich(
+@@ -832,8 +1111,11 @@ pub fn eval_in_context_rich(
          src: &str,
          budget: &mut HostValueBudget,
      ) -> Result<HostValue, HostCallError> {
@@ -837,7 +850,7 @@ index 3ec6aa1..a63c413 100644
      }
  
      /// What this VM currently retains and has spent — see [`ResourceUsage`].
-@@ -2096,4 +2372,211 @@ fn resource_limit_status_is_typed_and_survives_microtask_rejection() {
+@@ -2096,4 +2378,211 @@ fn resource_limit_status_is_typed_and_survives_microtask_rejection() {
              .expect("recorder status survives promise rejection");
          assert!(error.contains("instruction budget"), "{error}");
      }
@@ -1363,10 +1376,34 @@ index 7e1cfed..5afbf05 100644
      }
  
 diff --git a/crates/zipp-vm/src/vm/gc.rs b/crates/zipp-vm/src/vm/gc.rs
-index 94492ed..73718c1 100644
+index 94492ed..dfab49d 100644
 --- a/crates/zipp-vm/src/vm/gc.rs
 +++ b/crates/zipp-vm/src/vm/gc.rs
-@@ -484,6 +484,13 @@ macro_rules! root_idx {
+@@ -391,6 +391,23 @@ pub(crate) fn record_closure_new_target(&mut self, closure: u32, new_target: Val
+         self.closure_new_target.insert(closure, new_target);
+     }
+ 
++    /// Collect now, on the host's request (e.g. a `gc!` binding API). A no-op
++    /// while a host conversion holds the GC lock, since the collector must not
++    /// run while the host is walking values.
++    #[cfg(not(feature = "safe-sandbox"))]
++    pub(crate) fn force_gc(&mut self) {
++        if self.gc_lock == 0 {
++            self.gc();
++        }
++    }
++
++    #[cfg(feature = "safe-sandbox")]
++    pub(crate) fn force_gc(&mut self) {
++        if self.gc_lock.get() == 0 {
++            self.gc();
++        }
++    }
++
+     fn gc(&mut self) {
+         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Gc);
+         let n = self.heap.len();
+@@ -484,6 +501,13 @@ macro_rules! root_idx {
          for &v in &self.host_result_roots {
              root_val!(v);
          }

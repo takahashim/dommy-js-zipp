@@ -161,6 +161,24 @@ module ZippRb
       ZippRb._memory_usage(@id)
     end
 
+    # Collect garbage now. Returns nil.
+    def gc!
+      check_usable!
+      ZippRb._gc(@id)
+      nil
+    end
+
+    # Zipp does not poison a VM on out-of-memory: a bounded VM raises a
+    # catchable error and stays usable. Present for quickjs.rb API parity.
+    def poisoned?
+      false
+    end
+
+    # See #poisoned? — Zipp has no separate memory-poison latch.
+    def memory_poisoned?
+      false
+    end
+
     # Register in-memory ES module sources. +sources+ maps a resolved module
     # path (String) to its source: a String, or a Proc called with the path
     # (for lazy loading). Dynamic `import()` of a path in +sources+ resolves

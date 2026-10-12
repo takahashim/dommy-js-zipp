@@ -292,6 +292,14 @@ fn eval(ruby: &Ruby, id: u64, src: String) -> Result<Value, Error> {
     }
 }
 
+/// Collect garbage now.
+fn gc(ruby: &Ruby, id: u64) -> Result<(), Error> {
+    let mut state = take_vm(ruby, id)?;
+    state.gc_now();
+    put_vm(id, state);
+    Ok(())
+}
+
 /// The VM's resource usage as a Ruby Hash (heap bytes, instruction steps,
 /// retained dynamic code). The closest analogue of quickjs.rb's `memory_usage`.
 fn memory_usage(ruby: &Ruby, id: u64) -> Result<RHash, Error> {
@@ -1169,6 +1177,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_dispose", function!(dispose, 1))?;
     module.define_singleton_method("_drop", function!(drop_vm, 1))?;
     module.define_singleton_method("_memory_usage", function!(memory_usage, 1))?;
+    module.define_singleton_method("_gc", function!(gc, 1))?;
     module.define_singleton_method("_disposed?", function!(disposed, 1))?;
     Ok(())
 }
