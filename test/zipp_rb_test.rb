@@ -214,6 +214,18 @@ class ZippRbTest < Minitest::Test
     vm.dispose
   end
 
+  def test_define_function_async
+    vm = ZippRb::VM.new(features: [ZippRb::FEATURE_TIMEOUT])
+    vm.define_function("later", :async) { 42 }
+    assert vm.eval("later() instanceof Promise")
+    assert_equal 42, vm.eval_async("return await later();")
+    vm.define_function("boom", :async) { raise "nope" }
+    assert_equal "caught:nope",
+                 vm.eval_async('try { await boom(); return "no"; } catch (e) { return "caught:" + e.message; }')
+  ensure
+    vm.dispose
+  end
+
   def test_gc_and_poisoned
     vm = ZippRb::VM.new
     vm.eval("var a = [1, 2, 3]")

@@ -378,6 +378,7 @@ fn define_function(
     id: u64,
     name: Value,
     block: Value,
+    is_async: bool,
 ) -> Result<Symbol, Error> {
     let segments = name_segments(name);
     let Some(last) = segments.last().cloned() else {
@@ -410,10 +411,20 @@ fn define_function(
         js.push_str(&format!("{path} = {path} || {{}};\n"));
         base = path;
     }
+    // An `:async` function returns a Promise (resolved with the host result, or
+    // rejected with its throw), matching quickjs.rb's `define_function(:async)`.
+    let body = if is_async {
+        format!(
+            "try {{ return Promise.resolve(__zippHostCallValue({k}, ...args)); }} \
+             catch (e) {{ return Promise.reject(e); }}",
+            k = js_string(&kind),
+        )
+    } else {
+        format!("return __zippHostCallValue({}, ...args);", js_string(&kind))
+    };
     js.push_str(&format!(
-        "{base}[{}] = function(...args) {{ return __zippHostCallValue({}, ...args); }};",
+        "{base}[{}] = function(...args) {{ {body} }};",
         js_string(&last),
-        js_string(&kind),
     ));
     let result = state.eval_in_context(&js).map_err(|e| runtime_error(ruby, e));
     put_vm(id, state);
@@ -1166,7 +1177,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_call_handle", function!(call_handle, 3))?;
     module.define_singleton_method("_get_handle", function!(get_handle, 2))?;
     module.define_singleton_method("_release_handle", function!(release_handle, 2))?;
-    module.define_singleton_method("_define_function", function!(define_function, 3))?;
+    module.define_singleton_method("_define_function", function!(define_function, 4))?;
     module.define_singleton_method("_set_module_provider", function!(set_module_provider, 4))?;
     module.define_singleton_method("_import", function!(import_module, 2))?;
     module.define_singleton_method("_enable_timers", function!(enable_timers, 1))?;

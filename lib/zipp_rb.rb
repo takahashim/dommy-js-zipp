@@ -146,11 +146,13 @@ module ZippRb
     # Arguments and the return value cross between Ruby and JS (numbers,
     # strings, booleans, nil, Array and Hash). Returns a Symbol, or an Array of
     # Symbols for a path (quickjs.rb's shape).
-    def define_function(name, &block)
+    # A trailing `:async` flag makes the JS function return a Promise (resolved
+    # with the block's value, rejected when it raises) — quickjs.rb's shape.
+    def define_function(name, *flags, &block)
       check_usable!
       raise ArgumentError, "block required" unless block
 
-      result = ZippRb._define_function(@id, name, block)
+      result = ZippRb._define_function(@id, name, block, flags.include?(:async))
       name.is_a?(Array) ? name.map(&:to_sym) : result
     end
 
