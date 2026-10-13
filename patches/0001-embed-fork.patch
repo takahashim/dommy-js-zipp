@@ -441,7 +441,7 @@ index 600c4ff..a8fce56 100644
              if let Some(chain) = self.inherited_with_shadows.get(name).cloned() {
                  for wname in chain {
 diff --git a/crates/zipp-vm/src/embed.rs b/crates/zipp-vm/src/embed.rs
-index 3ec6aa1..3609bcb 100644
+index 3ec6aa1..7c1447e 100644
 --- a/crates/zipp-vm/src/embed.rs
 +++ b/crates/zipp-vm/src/embed.rs
 @@ -33,7 +33,7 @@
@@ -510,10 +510,10 @@ index 3ec6aa1..3609bcb 100644
 +            raw: (vm_id << 32) | index as u64,
 +        }
 +    }
-+    fn vm_id(self) -> u64 {
++    pub(crate) fn vm_id(self) -> u64 {
 +        self.raw >> 32
 +    }
-+    fn index(self) -> u32 {
++    pub(crate) fn index(self) -> u32 {
 +        self.raw as u32
 +    }
 +}
@@ -535,15 +535,26 @@ index 3ec6aa1..3609bcb 100644
  }
  
  self_cell::self_cell!(
-@@ -261,6 +322,7 @@ pub(crate) fn from_program(program: Program) -> ScriptState {
+@@ -256,12 +317,16 @@ pub(crate) fn from_program(program: Program) -> ScriptState {
+             vm.host_262 = false;
+             vm
+         });
+-        ScriptState {
++        let mut state = ScriptState {
+             vm: Some(cell),
              // Unkeyed until a host supplies randomness. Documented on
              // set_fingerprint_seed: a fixed start is solvable.
              fp_seed: 0,
+-        }
 +            vm_id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-         }
++        };
++        let vm_id = state.vm_id;
++        state.with_vm(|vm| vm.host_owner_id = vm_id);
++        state
      }
  
-@@ -302,6 +364,25 @@ pub fn set_host_call_ctx(&mut self, host: HostCallCtx) {
+     /// The VM, shared. `None` once torn down.
+@@ -302,6 +367,25 @@ pub fn set_host_call_ctx(&mut self, host: HostCallCtx) {
          self.with_vm(|vm| vm.host_ctx = Some(host));
      }
  
@@ -569,7 +580,7 @@ index 3ec6aa1..3609bcb 100644
      /// Enable filesystem module loading, confined to one canonical directory.
      ///
      /// Embedded scripts normally have no module loader at all. A host that
-@@ -346,6 +427,34 @@ pub fn set_confined_module_loader(
+@@ -346,6 +430,34 @@ pub fn set_confined_module_loader(
          Err("filesystem module loader is disabled in this build".into())
      }
  
@@ -604,7 +615,7 @@ index 3ec6aa1..3609bcb 100644
      /// Disable the VM's native code generators for this script state.
      ///
      /// Sandboxed callers should also disable regress' process-global regex JIT
-@@ -381,11 +490,14 @@ pub fn enable_vm_jit(&mut self) {
+@@ -381,11 +493,14 @@ pub fn enable_vm_jit(&mut self) {
      /// throw is preserved and still readable via [`Self::take_output`] — the
      /// engine flushes what it managed to print, like a real one.
      pub fn run_init(&mut self) -> Result<JsValue, String> {
@@ -624,7 +635,7 @@ index 3ec6aa1..3609bcb 100644
      }
  
      /// Evaluate `src` in the running script's global context and return its
-@@ -486,6 +598,12 @@ pub fn has_global_function(&mut self, name: &str) -> bool {
+@@ -486,6 +601,12 @@ pub fn has_global_function(&mut self, name: &str) -> bool {
          .unwrap_or(false)
      }
  
@@ -637,7 +648,7 @@ index 3ec6aa1..3609bcb 100644
      /// Run queued microtasks (promise reactions, `queueMicrotask`) to
      /// completion.
      ///
-@@ -500,6 +618,7 @@ pub fn has_global_function(&mut self, name: &str) -> bool {
+@@ -500,6 +621,7 @@ pub fn has_global_function(&mut self, name: &str) -> bool {
      /// does nothing.
      pub fn run_microtasks(&mut self) {
          self.with_vm(|vm| vm.drain_microtasks());
@@ -645,7 +656,7 @@ index 3ec6aa1..3609bcb 100644
      }
  
      /// Deliver console lines to `sink` as they are produced, each tagged with
-@@ -512,6 +631,26 @@ pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &str)>) {
+@@ -512,6 +634,26 @@ pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &str)>) {
          self.with_vm(|vm| vm.console_sink = Some(sink));
      }
  
@@ -672,7 +683,7 @@ index 3ec6aa1..3609bcb 100644
      /// Take the `console.log`/`info`/`debug` lines produced so far, clearing the
      /// buffer. Un-drained output accumulates for the VM's lifetime, so a
      /// long-lived embedder should drain (or discard) periodically.
-@@ -725,14 +864,153 @@ pub fn set_slot(&mut self, index: u32, value: &HostValue) -> bool {
+@@ -725,14 +867,153 @@ pub fn set_slot(&mut self, index: u32, value: &HostValue) -> bool {
              .unwrap_or(false)
      }
  
@@ -828,7 +839,7 @@ index 3ec6aa1..3609bcb 100644
      }
  
      /// [`Self::call_slot`] with the caller's own conversion budget for the
-@@ -817,6 +1095,7 @@ pub fn heap_bytes(&self) -> usize {
+@@ -817,6 +1098,7 @@ pub fn heap_bytes(&self) -> usize {
      /// Run pending microtasks without calling anything.
      pub fn pump(&mut self) {
          self.with_vm(|vm| vm.host_pump());
@@ -836,7 +847,7 @@ index 3ec6aa1..3609bcb 100644
      }
  
      /// Evaluate `src` in the script's global context and marshal its
-@@ -832,8 +1111,11 @@ pub fn eval_in_context_rich(
+@@ -832,8 +1114,11 @@ pub fn eval_in_context_rich(
          src: &str,
          budget: &mut HostValueBudget,
      ) -> Result<HostValue, HostCallError> {
@@ -850,7 +861,29 @@ index 3ec6aa1..3609bcb 100644
      }
  
      /// What this VM currently retains and has spent — see [`ResourceUsage`].
-@@ -2096,4 +2378,211 @@ fn resource_limit_status_is_typed_and_survives_microtask_rejection() {
+@@ -898,6 +1183,21 @@ pub fn set_limits(
+         });
+     }
+ 
++    /// Stop the script once `deadline` passes, as if the abort flag passed to
++    /// [`Self::set_limits`] had been set (the same "aborted by the host"
++    /// error), checked at the same poll points. `None` clears it. Requires
++    /// [`Self::set_limits`] first, which resets it; without a recorder this is
++    /// a no-op. A host that only needs a time bound can use this instead of a
++    /// timer thread driving the abort flag.
++    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
++    pub fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
++        self.with_vm(|vm| {
++            if let Some(rec) = vm.instr_rec.as_mut() {
++                rec.deadline = deadline;
++            }
++        });
++    }
++
+     /// Bound runtime compilation for this script state.
+     ///
+     /// The source/call gate covers every path through the VM's common dynamic
+@@ -2096,4 +2396,258 @@ fn resource_limit_status_is_typed_and_survives_microtask_rejection() {
              .expect("recorder status survives promise rejection");
          assert!(error.contains("instruction budget"), "{error}");
      }
@@ -943,6 +976,53 @@ index 3ec6aa1..3609bcb 100644
 +            seen.borrow().iter().any(|m| m.contains("boom")),
 +            "sink saw {:?}",
 +            seen.borrow()
++        );
++    }
++
++    #[test]
++    fn host_ctx_reaches_handles_of_its_own_vm_only() {
++        let mut other = compile_script("function other() { return 1 }").expect("compiles");
++        other.run_init().expect("runs");
++        let foreign = other.handle_of_global("other").expect("handle");
++
++        let mut st = compile_script("function dbl(x) { return x * 2 }").expect("compiles");
++        st.run_init().expect("runs");
++        let own = st.handle_of_global("dbl").expect("handle");
++        st.set_host_call_values(std::rc::Rc::new(
++            move |ctx: &mut dyn HostCtx, kind: &str, args: &[HostValue]| match kind {
++                "call" => ctx.call_handle_value(own, args),
++                "read" => ctx.read_handle_value(own).map(|v| HostValue::Bool(v == HostValue::Opaque)),
++                "foreign" => ctx.call_handle_value(foreign, args),
++                "release" => Ok(HostValue::Bool(ctx.release_handle_value(own))),
++                other => Err(format!("Error: unknown {other}")),
++            },
++        ));
++        let mut budget = HostValueBudget::default();
++        assert_eq!(
++            st.eval_in_context_rich("__zippHostCallValue('call', 21)", &mut budget),
++            Ok(HostValue::Number(42.0))
++        );
++        assert_eq!(
++            st.eval_in_context_rich("__zippHostCallValue('read')", &mut budget),
++            Ok(HostValue::Bool(true)),
++            "a function reads as Opaque"
++        );
++        let refused = st.eval_in_context_rich(
++            "try { __zippHostCallValue('foreign'); 'no' } catch (e) { String(e.message) }",
++            &mut budget,
++        );
++        assert!(
++            matches!(&refused, Ok(HostValue::String(m)) if m.contains("another VM")),
++            "a foreign handle is refused: {refused:?}"
++        );
++        assert_eq!(
++            st.eval_in_context_rich("__zippHostCallValue('release')", &mut budget),
++            Ok(HostValue::Bool(true))
++        );
++        assert_eq!(
++            st.eval_in_context_rich("__zippHostCallValue('release')", &mut budget),
++            Ok(HostValue::Bool(false)),
++            "a released handle is not live"
 +        );
 +    }
 +
@@ -1218,22 +1298,23 @@ index 4432ada..2bbf2da 100644
  
      /// The full event loop: deliver cross-thread waitAsync wakes, drain
 diff --git a/crates/zipp-vm/src/vm/engine/boot.rs b/crates/zipp-vm/src/vm/engine/boot.rs
-index a2546f6..969367a 100644
+index a2546f6..b7662ea 100644
 --- a/crates/zipp-vm/src/vm/engine/boot.rs
 +++ b/crates/zipp-vm/src/vm/engine/boot.rs
-@@ -219,6 +219,11 @@ pub fn new(program: &'p Program) -> Vm<'p> {
+@@ -219,6 +219,12 @@ pub fn new(program: &'p Program) -> Vm<'p> {
              console_sink: None,
              host: None,
              host_ctx: None,
 +            host_reentrant: None,
 +            host_values: None,
++            host_owner_id: 0,
 +            unhandled_rejection_sink: None,
 +            host_handles: Vec::new(),
 +            host_handle_free: Vec::new(),
              start_mono_ms: crate::vm::clock::now_mono_ms(),
              pending_throw: None,
              pending_new_target: Value::UNDEFINED,
-@@ -423,6 +428,7 @@ pub fn new(program: &'p Program) -> Vm<'p> {
+@@ -423,6 +429,7 @@ pub fn new(program: &'p Program) -> Vm<'p> {
              module_base_dir: None,
              module_root: None,
              module_max_bytes: None,
@@ -1418,7 +1499,7 @@ index 94492ed..dfab49d 100644
          // (function, constant-slot). The cache is bounded and its Values are
          // roots just like the region-embedded constant strings below.
 diff --git a/crates/zipp-vm/src/vm/host_api.rs b/crates/zipp-vm/src/vm/host_api.rs
-index f3342f6..30704c8 100644
+index f3342f6..ef74470 100644
 --- a/crates/zipp-vm/src/vm/host_api.rs
 +++ b/crates/zipp-vm/src/vm/host_api.rs
 @@ -692,6 +692,50 @@ pub fn into_message(self) -> String {
@@ -1767,7 +1848,7 @@ index f3342f6..30704c8 100644
      /// How many host completion values are currently rooted — zero between
      /// host entries. Test-only: pins that every exit releases its root.
      pub(crate) fn host_result_roots_len(&self) -> usize {
-@@ -1968,6 +2286,28 @@ fn typed_array_regions(&mut self, names: &[&str]) -> Result<Vec<(usize, usize, u
+@@ -1968,6 +2286,51 @@ fn typed_array_regions(&mut self, names: &[&str]) -> Result<Vec<(usize, usize, u
      /// Runs the guest re-entrantly inside the host call; the guest cannot make
      /// a nested host call while it does.
      fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, String>;
@@ -1793,10 +1874,33 @@ index f3342f6..30704c8 100644
 +    fn call_global_value(&mut self, _name: &str, _args: &[HostValue]) -> Result<HostValue, String> {
 +        Err("TypeError: this host context cannot call globals".into())
 +    }
++    /// Call the function a durable handle roots, from inside the host call —
++    /// [`crate::embed::ScriptState::call_handle`] for a host that is already
++    /// serving a call into the same VM (a Ruby event listener invoking the
++    /// JS handler it holds). A handle from another VM is refused. The
++    /// default implementation refuses.
++    fn call_handle_value(
++        &mut self,
++        _handle: crate::embed::HostHandle,
++        _args: &[HostValue],
++    ) -> Result<HostValue, String> {
++        Err("TypeError: this host context cannot call handles".into())
++    }
++    /// Read the value a durable handle roots, from inside the host call. The
++    /// default implementation refuses.
++    fn read_handle_value(&mut self, _handle: crate::embed::HostHandle) -> Result<HostValue, String> {
++        Err("TypeError: this host context cannot read handles".into())
++    }
++    /// Release a durable handle from inside the host call; `false` for one
++    /// that is not live in this VM. The default implementation releases
++    /// nothing.
++    fn release_handle_value(&mut self, _handle: crate::embed::HostHandle) -> bool {
++        false
++    }
  }
  
  /// The context-taking twin of [`crate::embed::HostCall`]: the same string
-@@ -2160,4 +2500,36 @@ fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, Strin
+@@ -2160,4 +2523,61 @@ fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, Strin
          self.to_number_strict(v)
              .map_err(|t| self.take_host_throw(t))
      }
@@ -1832,12 +1936,188 @@ index f3342f6..30704c8 100644
 +        self.marshal_after_drain(res, &mut budget, true)
 +            .map_err(HostCallError::into_message)
 +    }
++
++    fn call_handle_value(
++        &mut self,
++        handle: crate::embed::HostHandle,
++        args: &[HostValue],
++    ) -> Result<HostValue, String> {
++        if handle.vm_id() != self.host_owner_id {
++            return Err("zipp: handle belongs to another VM".into());
++        }
++        let mut budget = HostValueBudget::default();
++        self.host_handle_call(handle.index(), args, &mut budget, true)
++            .map_err(HostCallError::into_message)
++    }
++
++    fn read_handle_value(&mut self, handle: crate::embed::HostHandle) -> Result<HostValue, String> {
++        if handle.vm_id() != self.host_owner_id {
++            return Err("zipp: handle belongs to another VM".into());
++        }
++        let mut budget = HostValueBudget::default();
++        self.host_handle_read(handle.index(), &mut budget)
++    }
++
++    fn release_handle_value(&mut self, handle: crate::embed::HostHandle) -> bool {
++        handle.vm_id() == self.host_owner_id && self.host_handle_release(handle.index())
++    }
  }
+diff --git a/crates/zipp-vm/src/vm/instrument.rs b/crates/zipp-vm/src/vm/instrument.rs
+index fee95d8..1618624 100644
+--- a/crates/zipp-vm/src/vm/instrument.rs
++++ b/crates/zipp-vm/src/vm/instrument.rs
+@@ -432,6 +432,10 @@ pub(crate) struct Recorder {
+     steps_base: u64,
+     /// Set by another thread to stop a running script.
+     pub(crate) abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
++    /// A wall-clock deadline, checked wherever `abort` is polled: passing it
++    /// stops the script exactly as the flag would. Lets a host bound run time
++    /// without a timer thread that only flips `abort`.
++    pub(crate) deadline: Option<std::time::Instant>,
+     /// Approximate heap ceiling in bytes; `usize::MAX` means unlimited.
+     ///
+     /// Checked on the same schedule as the abort flag, for the same reason:
+@@ -530,6 +534,7 @@ pub(crate) fn new() -> Self {
+             #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
+             steps_base: 0,
+             abort: None,
++            deadline: None,
+             heap_limit: usize::MAX,
+             output_limit: usize::MAX,
+             output_used: 0,
+@@ -645,6 +650,19 @@ pub(crate) fn finite_remaining(&self) -> Option<u64> {
+         Some(self.remaining.max(0) as u64)
+     }
+ 
++    /// Whether the host asked this run to stop: the abort flag is set, or the
++    /// deadline has passed. Read at the abort-poll points only (every
++    /// `ABORT_CHECK_MASK + 1` instructions, and once per native entry), so the
++    /// clock read is amortised the same way the flag read is.
++    #[cfg(not(feature = "meter-only"))]
++    #[inline]
++    pub(crate) fn abort_requested(&self) -> bool {
++        self.abort
++            .as_ref()
++            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
++            || self.deadline.is_some_and(|d| std::time::Instant::now() >= d)
++    }
++
+     #[inline]
+     fn terminal_message(&self) -> Option<&'static str> {
+         self.exhaustion.map(ResourceExhaustion::message)
+@@ -1388,12 +1406,10 @@ pub(crate) fn meter_lend(&mut self) -> i64 {
+         // a hot loop is running natively.
+         #[cfg(not(feature = "meter-only"))]
+         {
+-            if let Some(flag) = rec.abort.as_ref() {
+-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+-                    rec.exhaust(ResourceExhaustion::Abort);
+-                    self.jit_steps = 0;
+-                    return 0;
+-                }
++            if rec.abort_requested() {
++                rec.exhaust(ResourceExhaustion::Abort);
++                self.jit_steps = 0;
++                return 0;
+             }
+         }
+         // The heap ceiling needs checking here for the same reason: compiled
+@@ -1586,11 +1602,7 @@ pub(crate) fn native_kernel_admits(&self, cost: u64, transient: usize) -> bool {
+             if rec.tracing {
+                 return false;
+             }
+-            if rec
+-                .abort
+-                .as_ref()
+-                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+-            {
++            if rec.abort_requested() {
+                 return false;
+             }
+         }
+@@ -1618,12 +1630,7 @@ pub(crate) fn native_kernel_budget(&self) -> Option<(bool, usize, Option<u64>)>
+         let mut open = rec.terminal_message().is_none();
+         #[cfg(not(feature = "meter-only"))]
+         {
+-            open = open
+-                && !rec.tracing
+-                && !rec
+-                    .abort
+-                    .as_ref()
+-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
++            open = open && !rec.tracing && !rec.abort_requested();
+         }
+         let room = if rec.heap_limit == usize::MAX {
+             usize::MAX
+@@ -1642,10 +1649,7 @@ pub(crate) fn native_kernel_budget(&self) -> Option<(bool, usize, Option<u64>)>
+     pub(crate) fn native_kernel_interrupted(&self) -> bool {
+         #[cfg(not(feature = "meter-only"))]
+         if let Some(rec) = self.instr_rec.as_ref() {
+-            return rec
+-                .abort
+-                .as_ref()
+-                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
++            return rec.abort_requested();
+         }
+         false
+     }
+@@ -1834,7 +1838,7 @@ pub(crate) fn instrument_step(&mut self, base: usize, ip: usize, instr: &Instr)
+         // opcode dispatch; trace completion, atomics, and row construction stay
+         // in the out-of-line path below. `pending` is checked independently so
+         // ending a trace can never strand its final row.
+-        if rec.tracing || rec.pending.is_some() || rec.abort.is_some() {
++        if rec.tracing || rec.pending.is_some() || rec.abort.is_some() || rec.deadline.is_some() {
+             return self.instrument_step_slow(base, ip, instr);
+         }
+         if let Some(message) = rec.terminal_message() {
+@@ -1919,12 +1923,8 @@ fn instrument_step_slow(&mut self, base: usize, ip: usize, instr: &Instr) -> Tic
+         // Advance it only after the budget check: an instruction rejected at
+         // zero remaining steps did not execute and must not be billed.
+         rec.ticks = rec.ticks.wrapping_add(1);
+-        if rec.ticks & ABORT_CHECK_MASK == 0 {
+-            if let Some(flag) = rec.abort.as_ref() {
+-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+-                    return Err(rec.exhaust(ResourceExhaustion::Abort));
+-                }
+-            }
++        if rec.ticks & ABORT_CHECK_MASK == 0 && rec.abort_requested() {
++            return Err(rec.exhaust(ResourceExhaustion::Abort));
+         }
+         let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
+         let tracing = rec.tracing;
+@@ -3077,6 +3077,27 @@ fn abort_has_typed_sticky_status_and_exact_accounting() {
+         assert_eq!(aborted.instrument_resource_limit_error(), Some(ABORT_MSG));
+     }
+ 
++    #[cfg(not(feature = "meter-only"))]
++    #[test]
++    fn deadline_stops_execution_like_abort() {
++        let mut late = crate::vm::Vm::new(program("while (true) {}"));
++        let mut rec = Recorder::new();
++        rec.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(20));
++        late.set_instrumentation(rec);
++        let started = std::time::Instant::now();
++        late.run().expect_err("a passed deadline stops execution");
++        assert!(started.elapsed() < std::time::Duration::from_secs(5));
++        assert_eq!(late.instr_rec.as_ref().unwrap().exhaustion, Some(ResourceExhaustion::Abort));
++        assert_eq!(late.instrument_resource_limit_error(), Some(ABORT_MSG));
++
++        // A deadline still ahead does not disturb a run that finishes first.
++        let mut early = crate::vm::Vm::new(program("var n = 0; for (let i = 0; i < 1000; i++) n += i;"));
++        let mut rec = Recorder::new();
++        rec.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
++        early.set_instrumentation(rec);
++        early.run().expect("a run that ends before its deadline completes");
++    }
++
+     #[test]
+     fn postflight_heap_has_typed_sticky_status() {
+         let mut heap = instrumented_vm("var answer = 42;");
 diff --git a/crates/zipp-vm/src/vm/mod.rs b/crates/zipp-vm/src/vm/mod.rs
-index cdf1e5f..1ab1171 100644
+index cdf1e5f..c90a571 100644
 --- a/crates/zipp-vm/src/vm/mod.rs
 +++ b/crates/zipp-vm/src/vm/mod.rs
-@@ -1659,6 +1659,46 @@ pub struct Vm<'p> {
+@@ -1659,6 +1659,51 @@ pub struct Vm<'p> {
      /// call runs. Preferred over `host` when both are installed; taken out
      /// of the `Vm` for the duration of the call like `host`.
      pub(crate) host_ctx: Option<crate::vm::host_api::HostCallCtx>,
@@ -1873,6 +2153,11 @@ index cdf1e5f..1ab1171 100644
 +            ) -> Result<crate::vm::host_api::HostValue, String>,
 +        >,
 +    >,
++    /// The owning `ScriptState`'s id, so a [`crate::embed::HostHandle`] used
++    /// through [`crate::vm::host_api::HostCtx`] can be checked against this
++    /// VM as `ScriptState`'s own handle methods check it. 0 outside a
++    /// `ScriptState`.
++    pub(crate) host_owner_id: u64,
 +    /// Durable roots a host holds across re-entries via
 +    /// [`crate::embed::HostHandle`]. A `Some` entry is a live JS value the
 +    /// collector must trace (see `mark_roots`); a `None` entry is a released
@@ -1884,7 +2169,7 @@ index cdf1e5f..1ab1171 100644
      /// Monotonic-clock reading at VM start — the zero point for
      /// `performance.now()` (which reports fractional milliseconds elapsed
      /// since the program began). A host-installed clock's reading when one
-@@ -2445,6 +2485,14 @@ pub struct Vm<'p> {
+@@ -2445,6 +2490,14 @@ pub struct Vm<'p> {
      /// Maximum bytes read from any one module while `module_root` is active.
      /// `None` preserves the unrestricted compatibility loader.
      module_max_bytes: Option<u64>,
