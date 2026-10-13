@@ -734,6 +734,33 @@ impl<'p> Vm<'p> {
         Ok(completion)
     }
 
+    /// Run `code` as a classic script in the live realm — what a browser does
+    /// with a `<script>`: script GlobalDeclarationInstantiation, so its
+    /// top-level `var`s and functions become global-object properties and its
+    /// `let`/`const`/`class` global lexicals visible to later scripts, even
+    /// when the script is strict (an indirect eval would keep both to
+    /// itself). Returns the completion value.
+    pub(crate) fn host_run_script(&mut self, code: &str) -> Result<Value, Thrown> {
+        self.require_external_code_enabled()?;
+        let ast = crate::front::parse_script(code).map_err(Thrown)?;
+        let prog = crate::compile::compile_script_with_completion(&ast, code)
+            .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
+        self.eval_script_gdi = true;
+        let (completion, _gmap) = self.run_eval_program(
+            prog,
+            None,
+            false,
+            None,
+            None,
+            Value::UNDEFINED,
+            None,
+            true,
+            None,
+            None,
+        )?;
+        Ok(completion)
+    }
+
     pub(crate) fn run_eval_program(
         &mut self,
         eval_prog: crate::bytecode::Program,

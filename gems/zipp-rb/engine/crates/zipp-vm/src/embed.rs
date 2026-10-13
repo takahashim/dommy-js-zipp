@@ -562,12 +562,14 @@ impl ScriptState {
         .unwrap_or_else(torn_down)
     }
 
-    /// [`Self::eval_in_context`] for its side effects: the completion value is
-    /// not marshalled, and a throw is reported as a structured [`JsError`]
-    /// (with its `stack`), not just its message.
+    /// Run `src` as a classic script (a browser's `<script>`: its top-level
+    /// declarations reach the global even when it is strict, unlike
+    /// [`Self::eval_in_context`]'s indirect eval) for its side effects. The
+    /// completion value is not marshalled; a throw is reported as a
+    /// structured [`JsError`] (with its `stack`).
     pub fn load_in_context(&mut self, src: &str) -> Result<(), JsError> {
         self.with_vm(|vm| {
-            let result = match eval_indirect(vm, src) {
+            let result = match vm.host_run_script(src) {
                 Ok(_) => Ok(()),
                 Err(thrown) => Err(vm.take_host_throw_structured(thrown)),
             };

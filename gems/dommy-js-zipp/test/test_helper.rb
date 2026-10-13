@@ -6,3 +6,4 @@ require "dommy/js/zipp"
 require "minitest/autorun"
 
 require_relative "support/browser_harness"
+require_relative "support/wpt_harness"

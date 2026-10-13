@@ -168,6 +168,9 @@ struct Compiler {
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
     eval_mode: bool,
+    /// A SCRIPT (not an eval) whose top level still yields its completion
+    /// value, for a host that runs scripts and reads what they evaluate to.
+    script_completion: bool,
     /// Set for a DIRECT eval from a class-member context: the eval's top-level
     /// script (and its arrows) inherits the caller's home class for `super`
     /// (compiled against the u32::MAX sentinel).

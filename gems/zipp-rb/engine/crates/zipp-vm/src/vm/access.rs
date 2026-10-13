@@ -1757,6 +1757,9 @@ impl<'p> Vm<'p> {
             // `.prototype` getter see. ANY value is honoured (incl. a non-object —
             // undefined/null/primitive — which the heap-only `prototypes` cache can't
             // hold), via `fn_proto_override` which the reads consult first.
+            if key == "prototype" && self.fn_proto_readonly.contains(&idx) {
+                return self.reject_write(key, strict);
+            }
             if key == "prototype" {
                 self.fn_proto_override.insert(idx, val);
                 if val.is_heap() {
@@ -2309,7 +2312,9 @@ impl<'p> Vm<'p> {
         // synthesize one, so it need not be materialized here).
         if key == "prototype" && self.callable_has_prototype(obj) {
             let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
-            return Some(data(!is_class || self.fn_proto_override.contains_key(&idx)));
+            let writable = (!is_class || self.fn_proto_override.contains_key(&idx))
+                && !self.fn_proto_readonly.contains(&idx);
+            return Some(data(writable));
         }
         // A String wrapper's index/`length` and a RegExp's `lastIndex`.
         if let Some((_, len)) = self.string_exotic_chars(obj) {

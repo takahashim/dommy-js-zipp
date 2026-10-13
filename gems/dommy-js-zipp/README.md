@@ -28,6 +28,18 @@ The real Turbo, Stimulus, React, Vue, Alpine, htmx, Lit and Solid bundles run
 unmodified (`test/dommy/js/test_*_integration.rb`), as do classic and module
 scripts, import maps and dynamic `import()`.
 
+## Integrations
+
+- `require "dommy/js/zipp/rack"` — `Dommy::Rack::Session.new(app, javascript: true)`
+  on Zipp.
+- `require "dommy/js/zipp/capybara"` — script results as Capybara nodes, scripts
+  run in the driver's current frame, and `evaluate_async_script`, for a
+  `Capybara::Dommy::Driver` built with `javascript: true`.
+- `Runtime.register_module(name, source:)` / `Runtime.new(preload_modules:)` —
+  modules kept per process and found by name before the module loader is
+  asked (dommy's `ModulePreload` uses them).
+- `Runtime#wasm_bridge` — handle-oriented JS access for a wasm guest.
+
 ## Differences from dommy-js-quickjs
 
 - **Stack positions are per statement.** An Error's `stack` names the
@@ -35,11 +47,12 @@ scripts, import maps and dynamic `import()`.
   arrow), not the exact expression; names come from declarations, so an
   arrow assigned to a variable reports as anonymous.
 - **No bytecode cache.** `load_script_cached` and the bridge's runtime bundles
-  are parsed on every Runtime (Zipp parses the bundles in tens of ms), and
-  there is no `register_module` / `preload_modules:`.
+  are parsed on every Runtime (Zipp parses the bundles in tens of ms); a
+  preloaded module saves the fetch, not the parse.
 - **Out of memory is not fatal.** Zipp raises a catchable `RangeError` at the
   heap ceiling and the VM stays usable; a VM is only "poisoned" once disposed
   or discarded after an engine panic.
+- **Intl is native**, so pages get a browser's formatting (`"a, b, and c"`).
 - **Errors** are `ZippRb::Error` and its subclasses (`ZippRb::TypeError`, …,
   `ZippRb::InterruptedError` at the deadline).
 
@@ -49,8 +62,15 @@ dommy-js-quickjs.
 ## Tests
 
 ```sh
-bundle exec rake test   # from this directory; compile zipp-rb first
+bundle exec rake test              # from this directory; compile zipp-rb first
+bundle exec rake test:all          # plus the heavy WPT files
+bundle exec rake wpt:conformance   # the vendored WPT corpus, as a pass rate
+bundle exec rake turbo:conformance stimulus:conformance
+bundle exec rake capybara:compliance
 ```
 
-The suite is ported from dommy-js-quickjs; the vendored framework bundles live
-in `test/fixtures`. The WPT, Capybara and Rack suites are not ported yet.
+The suite is ported from dommy-js-quickjs; the vendored framework bundles and
+the WPT corpus live in `test/fixtures` (`script/` rebuilds them). Capybara's
+compliance suite still fails where capybara-dommy lacks a feature (geometry,
+drag and drop), a page needs a server (puma) or loads a library from a CDN;
+Stimulus's three ApplicationStartTests need per-iframe realms.

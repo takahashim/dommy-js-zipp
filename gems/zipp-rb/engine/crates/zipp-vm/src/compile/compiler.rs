@@ -108,6 +108,7 @@ impl Compiler {
             source,
             line_starts: None,
             eval_mode: false,
+            script_completion: false,
             eval_inherit_super: None,
             in_field_init: false,
             module_mode: false,
@@ -360,7 +361,7 @@ impl Compiler {
         // loop body — which alone demoted such loops off the INT register
         // tier (3× on the isolated nest). Eval scripts keep it: `eval()`'s
         // RESULT is the completion value.
-        let eval_completion = is_script && self.eval_mode && !self.module_mode;
+        let eval_completion = is_script && (self.eval_mode || self.script_completion) && !self.module_mode;
         // A real function body leaves any enclosing field-initializer context
         // (the eval ROOT script keeps it: PerformEval's ContainsArguments check
         // spans the eval program's top level and its arrows).

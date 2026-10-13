@@ -147,6 +147,24 @@ impl<'p> Vm<'p> {
                     vm.get_member(Value::heap(cur), key, receiver)
                 });
             }
+            // A CLASS or a function in the chain — `Reflect.setPrototypeOf(fn,
+            // SomeClass)`, as Stimulus's `bless` does — keeps its own members in
+            // the class's statics or the callable side table, which
+            // `own_member` does not see: `fn.staticOfTheClass` read undefined.
+            if matches!(
+                self.heap.get(cur),
+                HeapObj::Class(_)
+                    | HeapObj::Func(_)
+                    | HeapObj::Closure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Wrapped { .. }
+                    | HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. }
+            ) {
+                return self.with_native_recursion_guard(|vm| {
+                    vm.get_member(Value::heap(cur), key, receiver)
+                });
+            }
             if let Some((attr, raw)) = self.own_member(cur, key) {
                 return if attr.accessor {
                     if raw == Value::UNDEFINED {

@@ -102,6 +102,29 @@ candidate to propose upstream.
 
 ## Correctness (crates/zipp-vm/src)
 
+- **A host runs classic scripts, not evals** — `Vm::host_run_script`
+  (vm/engine/eval_prog.rs, with `compile_script_with_completion` /
+  `Compiler::script_completion` in compile/) runs a script with script
+  GlobalDeclarationInstantiation (the `$262.evalScript` path) and its
+  completion value. `ScriptState::load_in_context`,
+  `eval_in_context_structured` (`host_eval_structured`) and
+  `HostCtx::eval_script` use it (vm/host_api.rs, embed.rs): as indirect
+  evals, a strict script's `var`s and functions stayed inside it, and no
+  script's `let`/`const`/`class` reached later ones (WPT's `common.js`
+  files are strict). Test: `test/engine_fixes_test.rb`.
+- **`obj.hasOwnProperty(k)` on a Proxy runs its trap** — the builtin-method
+  lane (vm/builtins.rs) used the trap-less `has_own_property`; it now uses
+  `has_own_property_dyn`, as the native does (testharness.js's
+  `assert_array_equals` reads a NodeList this way).
+- **A function's `prototype` can be made non-writable** — `fn_proto_readonly`
+  (vm/mod.rs; vm/props/define.rs, descriptors.rs, vm/access.rs): a
+  `defineProperty(fn, "prototype", {writable: false})` was accepted and
+  dropped, so WebIDL's `Image` reported a writable prototype.
+- **A class or function in a [[Prototype]] chain is searched** —
+  `proto_member_get` (vm/props/member.rs) skipped class statics and a
+  callable's own properties when one was spliced into a chain
+  (`Reflect.setPrototypeOf(fn, SomeClass)`, Stimulus's `bless`), so
+  `fn.staticOfTheClass` read undefined.
 - **A builtin replaced on the global object is the binding later scripts
   see** — `eval_global_slot` seeded a later script's fresh slot for a builtin
   name (`setTimeout`, `Map`, …) from the boot intrinsic, ignoring an own data

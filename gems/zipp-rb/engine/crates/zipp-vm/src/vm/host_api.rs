@@ -1605,23 +1605,9 @@ impl<'p> Vm<'p> {
     /// structured [`HostValue`], with a throw reported as a structured
     /// [`JsError`]. Mirrors [`Self::host_eval_rich`] otherwise.
     pub(crate) fn host_eval_structured(&mut self, src: &str) -> Result<HostValue, JsError> {
-        let res = self.do_eval(
-            src,
-            false,
-            false,
-            None,
-            None,
-            false,
-            false,
-            Value::UNDEFINED,
-            None,
-            true,
-            None,
-            Vec::new(),
-            None,
-            None,
-            None,
-        );
+        // A host's evaluation is a classic script, not an eval: a strict one's
+        // declarations still reach the global (see `host_run_script`).
+        let res = self.host_run_script(src);
         let mut budget = HostValueBudget::default();
         self.marshal_after_drain_structured(res, &mut budget, true)
     }
@@ -2517,7 +2503,8 @@ impl<'p> HostCtx for Vm<'p> {
     /// stay queued for the outermost entry (see [`HostCtx::eval_script`]).
     fn eval_script(&mut self, src: &str) -> Result<HostValue, String> {
         let mut budget = HostValueBudget::default();
-        self.host_eval_rich_opts(src, &mut budget, false)
+        let res = self.host_run_script(src);
+        self.marshal_after_drain(res, &mut budget, false)
             .map_err(HostCallError::into_message)
     }
 
