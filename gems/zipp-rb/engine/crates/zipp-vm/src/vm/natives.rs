@@ -1,0 +1,7934 @@
+#![allow(unused_imports)]
+use super::*;
+use crate::bytecode::{Instr, Program, UpvalSource};
+use crate::heap::{
+    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
+    PromiseState, PropAttr, ReactionPair, Reactions,
+};
+use crate::value::Value;
+
+/// Host timers are not ECMAScript objects, so reject non-finite delays instead
+/// of passing them to `Duration::from_secs_f64` (which panics for +Infinity).
+/// Finite but unrepresentably distant deadlines are capped to one year, as the
+/// Atomics waiter deadline path already does.
+fn host_timeout_duration(timeout_ms: f64) -> Result<std::time::Duration, Thrown> {
+    if !timeout_ms.is_finite() {
+        return Err(Thrown::from_static("RangeError: timer delay must be finite"));
+    }
+    let seconds = (timeout_ms.max(0.0) / 1000.0).min(86_400.0 * 365.0);
+    Ok(std::time::Duration::from_secs_f64(seconds))
+}
+
+/// Upper bound for one event-loop pass over a timer queue: two linear passes
+/// plus the in-place comparison sort of all timers that may be due together.
+fn timer_queue_work_bound(len: usize) -> u64 {
+    let n = len as u64;
+    let sort_levels = if n <= 1 {
+        0
+    } else {
+        u64::BITS - (n - 1).leading_zeros()
+    } as u64;
+    n.saturating_mul(sort_levels.saturating_add(2))
+}
+
+/// The element source of one `Object.groupBy`/`Map.groupBy` call: either a
+/// pristine-iteration Array walked in place, or a real iterator stepped with
+/// IteratorStepValue (and closed on an abrupt callback / key coercion).
+struct GroupByWalk {
+    array: Option<Value>,
+    iter: Value,
+}
+
+impl GroupByWalk {
+    fn new(vm: &mut Vm<'_>, src: Value) -> Result<GroupByWalk, Thrown> {
+        if matches!(vm.heap.get(src.heap_index()), HeapObj::Array(_)) {
+            // `get_iterator` answers the array itself only while its
+            // @@iterator and %ArrayIteratorPrototype%.next are pristine.
+            let it = vm.get_iterator(src)?;
+            return Ok(if it == src {
+                GroupByWalk {
+                    array: Some(src),
+                    iter: Value::UNDEFINED,
+                }
+            } else {
+                GroupByWalk {
+                    array: None,
+                    iter: it,
+                }
+            });
+        }
+        let iter = vm.get_iterator_object(src)?;
+        if !vm.is_object_value(iter) {
+            return Err(Thrown::from_static(
+                "TypeError: Result of the Symbol.iterator method is not an object",
+            ));
+        }
+        Ok(GroupByWalk { array: None, iter })
+    }
+
+    /// The `k`-th element, or `None` once the source is exhausted.
+    fn step(&mut self, vm: &mut Vm<'_>, k: usize) -> Result<Option<Value>, Thrown> {
+        match self.array {
+            Some(arr) => {
+                if k >= vm.js_array_len(arr.heap_index()) {
+                    return Ok(None);
+                }
+                vm.get_index(arr, Value::num(k as f64)).map(Some)
+            }
+            None => vm.iterator_step(self.iter),
+        }
+    }
+
+    /// Run `f`; on an abrupt completion close the iterator first
+    /// (IfAbruptCloseIterator), keeping the original error.
+    fn close_on_err<T>(
+        &mut self,
+        vm: &mut Vm<'_>,
+        f: impl FnOnce(&mut Vm<'_>) -> Result<T, Thrown>,
+    ) -> Result<T, Thrown> {
+        let r = f(vm);
+        if r.is_err() && self.array.is_none() {
+            vm.iterator_close_quiet(self.iter);
+        }
+        r
+    }
+}
+
+impl<'p> Vm<'p> {
+
+    /// IteratorToList with a PRE-FETCHED @@iterator method (the observable
+    /// trace: no second @@iterator get; `next` fetched once and cached; per
+    /// step `done` is read BEFORE `value`, and `value` is skipped once done).
+    pub(crate) fn iterator_to_list(
+        &mut self,
+        src: Value,
+        method: Value,
+    ) -> Result<Vec<Value>, Thrown> {
+        let iter = self.call_value(method, src, &[])?;
+        if !self.is_object_value(iter) {
+            return Err(Thrown::from_static("TypeError: iterator is not an object"));
+        }
+        let next = self.get_prop(iter, "next")?;
+        let mut out = Vec::new();
+        loop {
+            let res = self.call_value(next, iter, &[])?;
+            if !self.is_object_value(res) {
+                return Err(Thrown::from_static("TypeError: iterator result is not an object"));
+            }
+            let done = self.get_prop(res, "done")?;
+            if self.truthy(done) {
+                break;
+            }
+            let next_count = out.len().saturating_add(1);
+            if let Err(error) = self.preflight_native_iteration_work(next_count as u64) {
+                self.iterator_close_quiet(iter);
+                return Err(error);
+            }
+            let value = self.get_prop(res, "value")?;
+            if out.try_reserve(1).is_err() {
+                self.iterator_close_quiet(iter);
+                return Err(Thrown::from_static(
+                    "RangeError: iterator result allocation failed",
+                ));
+            }
+            out.push(value);
+            if let Err(error) = self.instrument_drain_heap_check(out.len()) {
+                self.iterator_close_quiet(iter);
+                return Err(error);
+            }
+        }
+        Ok(out)
+    }
+
+    /// %TypedArray%.from's source step: GetMethod(source, @@iterator) once (a
+    /// defined non-callable is a TypeError); an iterable source drains to a
+    /// list via the pre-fetched method, while an ARRAY-LIKE source only reads
+    /// ToLength(length) here — its element Gets are deferred until AFTER the
+    /// target is constructed (spec step 12.b runs per-k against the target).
+    fn ta_from_source(&mut self, src: Value) -> Result<(usize, Option<Vec<Value>>), Thrown> {
+        if src == Value::UNDEFINED || src == Value::NULL {
+            return Err(Thrown::from_static(
+                "TypeError: TypedArray.from source is null or undefined",
+            ));
+        }
+        let method = self.get_prop(src, "@@iterator")?;
+        if method != Value::UNDEFINED && method != Value::NULL && !self.is_callable(method) {
+            return Err(Thrown::from_static("TypeError: source is not iterable"));
+        }
+        if self.is_callable(method) {
+            let list = self.iterator_to_list(src, method)?;
+            return Ok((list.len(), Some(list)));
+        }
+        let lenv = self.get_prop(src, "length")?;
+        // ToLength runs the OBSERVABLE ToNumber (a poisoned valueOf throws).
+        let nf = self.to_number_strict(lenv)?;
+        let n = if nf.is_nan() || nf <= 0.0 {
+            0
+        } else if nf > super::typedarray::MAX_ARRAY_BUFFER_LEN as f64 {
+            return Err(Thrown::from_static(
+                "RangeError: typed array length exceeds the maximum",
+            ));
+        } else {
+            nf as usize
+        };
+        self.preflight_native_iteration_work(n as u64)?;
+        Ok((n, None))
+    }
+
+    /// OrdinarySetWithOwnDescriptor's receiver tail for Reflect.set when the
+    /// governing descriptor is a writable data property (a TypedArray element
+    /// included) but the Receiver differs from its holder: CreateDataProperty
+    /// on the RECEIVER with the RAW (uncoerced) value. A TypedArray receiver's
+    /// canonical keys instead use its own element semantics (a valid index
+    /// writes the coerced element; anything else refuses without coercing);
+    /// an accessor / non-writable / non-extensible-and-absent receiver own
+    /// descriptor refuses.
+    /// `target.[[Set]](P, V, Receiver)` — OrdinarySet with a Receiver that
+    /// may differ from the target (9.1.9.1 OrdinarySetWithOwnDescriptor),
+    /// Proxy-trap-aware on both sides. Returns the [[Set]] BOOLEAN; the caller
+    /// decides whether a false is silent (sloppy assignment) or a TypeError.
+    ///
+    /// This is `Reflect.set`'s whole body, lifted so `super.x = v` — which is
+    /// literally `GetSuperBase().[[Set]](x, v, this)` — can share it instead of
+    /// approximating it with `Set(this, …)`. `kv` is the ALREADY-coerced
+    /// property key (ToPropertyKey runs once, at the call site).
+    pub(crate) fn ordinary_set_with_receiver(
+        &mut self,
+        a0: Value,
+        kv: Value,
+        value: Value,
+        receiver: Value,
+    ) -> Result<bool, Thrown> {
+        let key = self.key_of(kv);
+        // Module Namespace exotic [[Set]]: always false.
+        if self.module_namespaces.contains_key(&a0.heap_index()) {
+            return Ok(false);
+        }
+        // A Proxy's [[Set]] is its `set` trap: Reflect.set reports the trap's
+        // boolean (an assignment swallows a falsish result). With NO trap,
+        // [[Set]] forwards to the target with the SAME receiver — the
+        // receiver-aware forward also reports the [[Set]] boolean (a
+        // rejected exotic write — RegExp flags, fn length, a frozen
+        // target — must read false, not true).
+        if let Some(b) = self.proxy_set_bool(a0, &key, value, receiver)? {
+            return Ok(b);
+        }
+        if let Some((t, _, _)) = self.proxy_parts(a0.heap_index()) {
+            let b = self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false)?;
+            return Ok(b);
+        }
+        self.materialize_regexp_result_prop_for_key(a0.heap_index(), &key);
+        // TypedArray [[Set]] (10.4.5.5) step 1, for any canonical numeric
+        // key: SameValue(O, Receiver) runs TypedArraySetElement (coerce the
+        // value — observable — then bounds-checked write or silent drop) and
+        // returns true; an altered Receiver with an INVALID index returns
+        // true with NO coercion; a valid index continues OrdinarySet on the
+        // RECEIVER with the RAW value (the element is a writable data prop).
+        if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
+            && self.is_canonical_numeric_index(&key)
+        {
+            if self.same_value(a0, receiver) {
+                match self.ta_valid_index(a0.heap_index(), &key) {
+                    Some(i) => self.ta_element_set(a0.heap_index(), i, value)?,
+                    None => self.ta_coerce_for_set(a0.heap_index(), value)?,
+                }
+                return Ok(true);
+            }
+            if self.ta_valid_index(a0.heap_index(), &key).is_none() {
+                return Ok(true);
+            }
+            let b = self.reflect_set_on_receiver(receiver, kv, value)?;
+            return Ok(b);
+        }
+        // ArraySetLength via Reflect.set: ToUint32 + ToNumber BOTH run
+        // (valueOf twice), non-uint32 is a RangeError, and a non-writable
+        // `length` (made so even DURING the coercion) reports FALSE — the
+        // ordinary assignment path can only no-op or throw.
+        //
+        // ONLY when the receiver is the array itself. `length` is an ordinary
+        // (writable) own data property as far as OrdinarySet is concerned, so
+        // a DIFFERENT receiver takes the generic path: the value is defined on
+        // the RECEIVER and the array is untouched. Running ArraySetLength
+        // regardless truncated the array and skipped the receiver's
+        // [[GetOwnProperty]]/[[DefineOwnProperty]] — which is exactly the pair
+        // of trap calls sm/Array/{pop,shift}-no-has-trap.js counts, since
+        // Array.prototype.pop's `Set(O,"length",…)` goes through the proxy.
+        if key == "length"
+            && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_))
+            && self.same_value(a0, receiver)
+        {
+            let nu = self.to_number_strict(value)?;
+            let u = if nu.is_finite() {
+                (nu.trunc() as i64 as u32) as f64
+            } else {
+                0.0
+            };
+            let number_len = self.to_number_strict(value)?;
+            if u != number_len {
+                return Err(Thrown::from_static("RangeError: Invalid array length"));
+            }
+            let aidx = a0.heap_index();
+            if self.array_length_nonwritable.contains(&aidx)
+                || self.arr_props.get(&aidx).is_some_and(|m| m.frozen)
+            {
+                return Ok(false);
+            }
+            // Mirror the ordinary `arr.length = n` path: stop the shrink
+            // at a non-configurable index, sweep the doomed arr_props
+            // entries, and keep the virtual (sparse) length consistent.
+            let mut final_len = u as usize;
+            let blocked = self.array_shrink_blocker(aidx, final_len);
+            if let Some(ki) = blocked {
+                final_len = ki + 1;
+            }
+            self.array_apply_length(aidx, final_len);
+            // ArraySetLength step 17.b.iii: a blocked shrink is partial AND false.
+            return Ok(blocked.is_none());
+        }
+        // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
+        // (target's own, then up the prototype chain). Only ordinary Object
+        // links carry inline descriptors here; an exotic link falls back to
+        // the simpler target-write below. A class instance's inherited members
+        // are real properties of its (materialized) prototype objects, which
+        // `object_get_prototype_of` walks into like any other chain.
+        let mut governing: Option<(bool, bool, Value)> = None; // (accessor, writable, setter)
+        let mut fell_back = false;
+        let mut ta_chain_node: Option<u32> = None;
+        let mut proxy_chain_node: Option<Value> = None;
+        let mut cur = a0;
+        loop {
+            match self.heap.get(cur.heap_index()) {
+                HeapObj::Object(m) => {
+                    if let Some(i) = m.pos(&key) {
+                        governing = Some((
+                            m.attr_at(i).accessor,
+                            m.attr_at(i).writable,
+                            m.attr_at(i).setter,
+                        ));
+                        break;
+                    }
+                    // A private name is never a prototype property: keep the
+                    // class-aware target write for it.
+                    if m.class.is_some() && key.starts_with('#') {
+                        fell_back = true;
+                        break;
+                    }
+                }
+                // A TypedArray on the prototype chain ABSORBS canonical
+                // numeric keys (its [[Set]] governs); handled below.
+                HeapObj::TypedArray { .. } if self.is_canonical_numeric_index(&key) => {
+                    ta_chain_node = Some(cur.heap_index());
+                    break;
+                }
+                // A PROXY on the prototype chain GOVERNS the write: OrdinarySet
+                // recurses as parent.[[Set]](P, V, Receiver), so the `set` trap
+                // runs with the ORIGINAL receiver. Falling through to the generic
+                // arm below skipped the trap entirely, which is what
+                // `super.prop = v` reaching a proxied prototype hit
+                // (staging/sm/class/superPropProxies.js line 23).
+                HeapObj::Proxy { .. } => {
+                    proxy_chain_node = Some(cur);
+                    break;
+                }
+                _ => {
+                    fell_back = true;
+                    break;
+                }
+            }
+            let p = self.object_get_prototype_of(cur);
+            if !p.is_heap() {
+                break;
+            }
+            cur = p;
+        }
+        if let Some(p) = proxy_chain_node {
+            // Same two steps the `a0`-is-a-Proxy case above takes: the trap's
+            // boolean, or (no trap) a receiver-aware forward to the target.
+            if let Some(b) = self.proxy_set_bool(p, &key, value, receiver)? {
+                return Ok(b);
+            }
+            if let Some((t, _, _)) = self.proxy_parts(p.heap_index()) {
+                return self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false);
+            }
+        }
+        if let Some(c) = ta_chain_node {
+            // parent.[[Set]](P, V, Receiver) reached the TypedArray: same
+            // TA [[Set]] step 1 as above, with the ORIGINAL receiver.
+            if self.same_value(Value::heap(c), receiver) {
+                match self.ta_valid_index(c, &key) {
+                    Some(i) => self.ta_element_set(c, i, value)?,
+                    None => self.ta_coerce_for_set(c, value)?,
+                }
+                return Ok(true);
+            }
+            if self.ta_valid_index(c, &key).is_none() {
+                return Ok(true);
+            }
+            let b = self.reflect_set_on_receiver(receiver, kv, value)?;
+            return Ok(b);
+        }
+        // A String exotic object's `length` and in-range char indices are
+        // NON-WRITABLE own data properties, so [[Set]] rejects them. They
+        // live in neither the ObjMap nor `arr_props`, so the fell-back
+        // descriptor probe below saw "absent + extensible" and reported TRUE
+        // for `Reflect.set(new String("hello"), "0", "y")` — the write
+        // no-opped, but the boolean was wrong (sm/Reflect/set.js).
+        if let Some((_, len)) = self.string_exotic_chars(a0) {
+            if key == "length" || canonical_index_str(&key).is_some_and(|i| i < len) {
+                return Ok(false);
+            }
+        }
+        // Does the target's OWN descriptor for `key` (the one the fell-back
+        // arm consults) name an accessor? An accessor's setter runs against
+        // the target here; anything else is a data/absent case whose write
+        // belongs on the RECEIVER when the two differ.
+        let target_own_accessor = match self.heap.get(a0.heap_index()) {
+            HeapObj::Object(m) => m.pos(&key).is_some_and(|i| m.attr_at(i).accessor),
+            _ => {
+                let h = a0.heap_index();
+                let side = match self.heap.get(h) {
+                    HeapObj::Func(_)
+                    | HeapObj::Closure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
+                    _ => self.arr_props.get(&h),
+                };
+                side.and_then(|m| m.pos(&key).map(|i| m.attr_at(i).accessor))
+                    .unwrap_or(false)
+            }
+        };
+        // A class constructor's static properties (and any accessor defined on
+        // it, which lives among them) are resolved by the static-accessor walk:
+        // its setter runs with the receiver, a getter-only accessor or a
+        // non-writable static rejects, anything else is an ordinary write.
+        if fell_back && matches!(self.heap.get(a0.heap_index()), HeapObj::Class(_)) {
+            return match self.lookup_static_accessor(Some(a0.heap_index()), &key) {
+                Some(Some(setter)) => {
+                    self.call_value(setter, receiver, &[value])?;
+                    Ok(true)
+                }
+                Some(None) => Ok(false),
+                None if self.same_value(a0, receiver) => self.set_prop(a0, &key, value, false),
+                None => self.reflect_set_on_receiver(receiver, kv, value),
+            };
+        }
+        let result = if fell_back {
+            let ok = match self.heap.get(a0.heap_index()) {
+                HeapObj::Object(m) => match m.pos(&key) {
+                    Some(i) => {
+                        if m.attr_at(i).accessor {
+                            m.attr_at(i).setter != Value::UNDEFINED
+                        } else {
+                            m.attr_at(i).writable
+                        }
+                    }
+                    None => m.extensible,
+                },
+                // Exotic/callable targets keep defineProperty'd descriptors
+                // in the arr_props/fn_props side tables — honour them:
+                // accessor-without-setter and non-writable data reject, a
+                // NEW named prop on a non-extensible target rejects.
+                _ => {
+                    let h = a0.heap_index();
+                    let side = match self.heap.get(h) {
+                        HeapObj::Func(_)
+                        | HeapObj::Closure { .. }
+                        | HeapObj::Bound { .. }
+                        | HeapObj::Native(_)
+                        | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
+                        _ => self.arr_props.get(&h),
+                    };
+                    match side.and_then(|m| {
+                        m.pos(&key).map(|i| {
+                            (
+                                m.attr_at(i).accessor,
+                                m.attr_at(i).writable,
+                                m.attr_at(i).setter,
+                            )
+                        })
+                    }) {
+                        Some((true, _, setter)) => setter != Value::UNDEFINED,
+                        Some((_, w, _)) => w,
+                        // A dense array element has no attributes of its own, so
+                        // its writability is the array's integrity level — the
+                        // same predicate the assignment path uses. Reporting a
+                        // flat `true` made `Reflect.set` on a frozen element, a
+                        // sealed hole or a non-extensible new index answer `true`
+                        // for a write it then dropped.
+                        None => match canonical_index_str(&key) {
+                            Some(i) => !self.array_index_write_rejected(h, i),
+                            None => side.map_or(true, |m| m.extensible),
+                        },
+                    }
+                }
+            };
+            if ok {
+                // OrdinarySetWithOwnDescriptor: only an ACCESSOR ownDesc
+                // writes through the target. A data (or absent) ownDesc with
+                // a DIFFERENT Receiver defines on the receiver and leaves the
+                // target untouched — `Reflect.set([1,2,3], "length", 0, {})`
+                // must give the plain object a `length` of 0 and keep the
+                // array at 3, which is the [[GetOwnProperty]]/
+                // [[DefineOwnProperty]] pair `Array.prototype.pop`'s
+                // `Set(O,"length",…)` shows on a proxy receiver
+                // (sm/Array/{pop,shift}-no-has-trap.js).
+                if target_own_accessor || self.same_value(a0, receiver) {
+                    self.set_index(a0, kv, value, false)?;
+                } else {
+                    return self.reflect_set_on_receiver(receiver, kv, value);
+                }
+            }
+            ok
+        } else {
+            match governing {
+                // Accessor: invoke its setter with the RECEIVER as `this`.
+                Some((true, _, setter)) => {
+                    if setter == Value::UNDEFINED {
+                        false
+                    } else {
+                        self.call_value(setter, receiver, &[value])?;
+                        true
+                    }
+                }
+                // Non-writable data property: rejected.
+                Some((false, false, _)) => false,
+                // Writable data property, or a new property: write to the
+                // RECEIVER (CreateDataProperty / overwrite its data prop),
+                // rejecting a non-object receiver or a conflicting own prop.
+                // Receiver.[[GetOwnProperty]] → reject an own accessor or
+                // non-writable data prop, else DefineOwnProperty. (Inlining
+                // only the plain-Object case here reported TRUE for every
+                // rejected write on an exotic receiver — a frozen array's
+                // element, a frozen function's new prop — and for a NEW prop
+                // on ANY non-extensible receiver, where CreateDataProperty
+                // returns false.)
+                _ => self.reflect_set_on_receiver(receiver, kv, value)?,
+            }
+        };
+        Ok(result)
+    }
+
+    pub(crate) fn reflect_set_on_receiver(
+        &mut self,
+        receiver: Value,
+        kv: Value,
+        value: Value,
+    ) -> Result<bool, Thrown> {
+        if !self.is_object_value(receiver) {
+            return Ok(false);
+        }
+        let key = self.key_of(kv);
+        let ridx = receiver.heap_index();
+        // OrdinarySetWithOwnDescriptor on a Proxy receiver: read its own
+        // descriptor ([[GetOwnProperty]] → the gopd trap), then define
+        // ([[DefineOwnProperty]] → the defineProperty trap) — NEVER its `set`
+        // trap. A trap that calls `Reflect.set(target, k, v, proxy)` (the
+        // forwarding shape every logging proxy uses) would otherwise re-enter
+        // itself forever.
+        if self.proxy_parts(ridx).is_some() {
+            let existing = self.proxy_gopd(receiver, &key)?.unwrap_or(Value::UNDEFINED);
+            let mut m = crate::heap::ObjMap::new();
+            m.set("value", value);
+            if self.is_object_value(existing) {
+                let g = self.get_prop(existing, "get")?;
+                let s = self.get_prop(existing, "set")?;
+                let w = self.get_prop(existing, "writable")?;
+                if g != Value::UNDEFINED || s != Value::UNDEFINED || !self.truthy(w) {
+                    return Ok(false);
+                }
+                // valueDesc = { [[Value]]: V } only.
+            } else {
+                // CreateDataProperty(Receiver, P, V).
+                m.set("writable", Value::TRUE);
+                m.set("enumerable", Value::TRUE);
+                m.set("configurable", Value::TRUE);
+            }
+            let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+            return match self.object_define_property(receiver, &key, desc) {
+                Ok(()) => Ok(true),
+                // OrdinarySetWithOwnDescriptor steps 3.e.iv / 3.f RETURN the
+                // [[DefineOwnProperty]] boolean — a `defineProperty` trap that
+                // answers falsish makes the whole [[Set]] false (Reflect.set
+                // reports it; an assignment silently no-ops). Propagating the
+                // internal rejection as a throw made `Reflect.set(obj, k, v,
+                // proxyReceiver)` raise a TypeError instead
+                // (staging/sm/Reflect/set.js line 275). The trap's OWN abrupt
+                // completion still propagates — the same message discrimination
+                // Reflect.defineProperty uses.
+                Err(e)
+                    if e.0
+                        .starts_with("TypeError: proxy 'defineProperty' trap returned falsish") =>
+                {
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            };
+        }
+        self.materialize_regexp_result_prop_for_key(ridx, &key);
+        if matches!(self.heap.get(ridx), HeapObj::TypedArray { .. })
+            && self.is_canonical_numeric_index(&key)
+        {
+            return match self.ta_valid_index(ridx, &key) {
+                Some(i) => {
+                    self.ta_element_set(ridx, i, value)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            };
+        }
+        // Receiver.[[GetOwnProperty]](P). An ordinary object's own properties
+        // are its map; every other receiver answers through the general
+        // descriptor routine, which also SYNTHESIZES the exotic own properties
+        // no side table stores — an Array's `length` and dense elements (with
+        // the integrity level's writability), a function's `name`/`length`/
+        // `prototype`, a RegExp's `lastIndex`, a String wrapper's `length` and
+        // indices. Probing only the side tables reported those "absent", so a
+        // full CreateDataProperty descriptor then collided with them.
+        let own: Option<(bool, bool)> = match self.heap.get(ridx) {
+            HeapObj::Object(m) => m
+                .pos(&key)
+                .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable)),
+            _ => {
+                let d = self.object_get_own_property_descriptor(receiver, &key);
+                if d.is_undefined() {
+                    None
+                } else {
+                    let (_, get, set, wr, _, _) = self.read_descriptor(d)?;
+                    Some((get.is_some() || set.is_some(), wr.unwrap_or(false)))
+                }
+            }
+        };
+        match own {
+            Some((true, _)) => Ok(false),
+            Some((false, false)) => Ok(false),
+            None => {
+                let ext = match self.heap.get(ridx) {
+                    HeapObj::Object(m) => m.extensible,
+                    _ => self.arr_props.get(&ridx).map_or(true, |m| m.extensible),
+                };
+                if !ext {
+                    return Ok(false);
+                }
+                // CreateDataProperty(Receiver, P, V) — an OWN define, exactly as
+                // the Proxy-receiver branch above already does, and for the same
+                // reason. This used to be `set_index`, i.e. a full [[Set]], which
+                // walks the RECEIVER's prototype chain — so an inherited accessor
+                // of the same name ran its setter instead of being shadowed. For
+                // a class instance whose derived setter is `set v(x){ super.v =
+                // x }`, the super write falling through to the receiver (parent
+                // slot deleted, or replaced by a data property) re-entered that
+                // very setter: unbounded recursion, native stack overflow, and —
+                // under `panic = "abort"` — a dead process from two lines of JS.
+                // The same wrong path made `Reflect.set(t, k, v, receiver)` call
+                // a setter inherited by the receiver where the spec defines an
+                // own property and never consults the chain.
+                let mut m = crate::heap::ObjMap::new();
+                m.set("value", value);
+                m.set("writable", Value::TRUE);
+                m.set("enumerable", Value::TRUE);
+                m.set("configurable", Value::TRUE);
+                let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+                self.object_define_property(receiver, &key, desc)?;
+                Ok(true)
+            }
+            // A writable own data property. On an ordinary object the value is
+            // replaced in place; an exotic receiver takes the spec's
+            // DefineOwnProperty({[[Value]]: V}) — ArraySetLength for an Array's
+            // `length` (a blocked shrink reports false), a plain value swap for
+            // the rest. Only a rejection maps to false; an abrupt coercion
+            // (the length's ToNumber, say) still propagates.
+            _ => {
+                if matches!(self.heap.get(ridx), HeapObj::Object(_)) {
+                    self.set_index(receiver, kv, value, false)?;
+                    return Ok(true);
+                }
+                let mut m = crate::heap::ObjMap::new();
+                m.set("value", value);
+                let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+                match self.object_define_property(receiver, &key, desc) {
+                    Ok(()) => Ok(true),
+                    Err(e)
+                        if e.0.starts_with("TypeError: Cannot redefine property")
+                            || e.0.starts_with("TypeError: Cannot define property") =>
+                    {
+                        Ok(false)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// The bare name of a callable value, for the `function <name>() { [native
+    /// code] }` form of `toString`. Synthetic names (`<arrow>`, `<anonymous>`)
+    /// and `Class.method` qualifiers are stripped; unknown → empty.
+    pub(crate) fn callable_name(&self, v: Value) -> String {
+        if !v.is_heap() {
+            return String::new();
+        }
+        let raw: String = match self.heap.get(v.heap_index()) {
+            HeapObj::Func(id) => self.func(*id as usize).name.clone(),
+            HeapObj::Closure { func, .. } => self.func(*func as usize).name.clone(),
+            HeapObj::Class(c) => c.name.clone(),
+            HeapObj::Native(nid) => native::static_name_length(*nid)
+                .map(|(n, _)| n.to_string())
+                .or_else(|| native::proto_method(*nid).map(|(n, _, _)| n.to_string()))
+                // The Math namespace methods live in their own table, so
+                // `Math.asin.toString()` rendered the anonymous
+                // `function () { [native code] }`
+                // (staging/sm/Function/function-toString-builtin-name.js).
+                .or_else(|| native::math_method(*nid).map(|(n, _, _)| n.to_string()))
+                .unwrap_or_default(),
+            // A state-carrying builtin has no entry in the static id tables — it
+            // stores its CreateBuiltinFunction name inline.
+            HeapObj::NativeClosure { name, .. } => (*name).to_string(),
+            // A constructor global (Array, Date, …) is modelled as an is_ctor
+            // Object whose `name` is a real own property — same omission as above.
+            // A redefined/deleted `name` does not change the rendered
+            // NativeFunction: the initial name was captured before it went.
+            HeapObj::Object(m) if m.is_ctor => match self.ctor_initial_name.get(&v.heap_index()) {
+                Some(n) => n.clone(),
+                None => m
+                    .get("name")
+                    .filter(|v| v.is_heap() && self.heap.is_str_like(v.heap_index()))
+                    .map(|v| self.display(v))
+                    .unwrap_or_default(),
+            },
+            _ => String::new(),
+        };
+        if raw.is_empty() || raw.starts_with('<') {
+            String::new()
+        } else if raw.contains('[') {
+            // A computed "[Symbol.xxx]" name (optionally "get/set [Symbol.xxx]")
+            // contains a '.' INSIDE the brackets that must NOT be treated as a
+            // namespace-qualifier separator — keep it whole so toString renders
+            // `function [Symbol.match]() { [native code] }` per the spec grammar.
+            raw
+        } else {
+            raw.rsplit('.').next().unwrap_or(&raw).to_string()
+        }
+    }
+
+    /// thisSymbolValue(value): the underlying Symbol primitive for a Symbol
+    /// `this`, OR a boxed Symbol wrapper (`Object(sym)` → Boxed{kind:3}); else a
+    /// TypeError. Lets the Symbol.prototype methods work on a wrapper receiver.
+    fn this_symbol_value(&self, this: Value, method: &str) -> Result<Value, Thrown> {
+        if this.is_heap() {
+            match self.heap.get(this.heap_index()) {
+                HeapObj::Symbol { .. } => return Ok(this),
+                HeapObj::Boxed { kind: 3, value } => return Ok(*value),
+                _ => {}
+            }
+        }
+        Err(Thrown(format!(
+            "TypeError: Symbol.prototype.{method} requires that 'this' be a Symbol"
+        )))
+    }
+
+    /// Invoke a native (built-in) function by id with `this` and `args`. Backs
+    /// first-class builtin values (`Object.defineProperty`, `Array.isArray`,
+    /// `Object.prototype.hasOwnProperty`, `Function.prototype.call`, …).
+    /// `$262.createRealm()` — a minimal new realm. Returns `{ global }` where
+    /// `global` exposes a DISTINCT constructor object (with its own distinct
+    /// `prototype`) for each intrinsic, plus fresh namespace objects. The realm
+    /// constructors are recognised as constructors (`is_ctor`) so they serve as a
+    /// foreign `newTarget` for `Reflect.construct`/`super` (the dominant
+    /// cross-realm test shape); they are not yet independently functional.
+    pub(crate) fn create_realm(&mut self) -> Value {
+        let ne = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let ctor_attr = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let proto_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let data = PropAttr::data();
+        // A fresh realm id; realms[r] maps each MAIN-realm intrinsic prototype to
+        // this realm's corresponding prototype (for GetPrototypeFromConstructor's
+        // GetFunctionRealm fallback).
+        let r = self.realms.len() as u32;
+        self.realms.push(std::collections::HashMap::new());
+        // (constructor name, its MAIN-realm prototype heap index — 0 = no mapping)
+        let mut ctors: Vec<(&str, u32)> = vec![
+            ("Object", self.obj_proto),
+            ("Array", self.arr_proto),
+            ("Function", self.fn_proto),
+            ("String", self.str_proto),
+            ("Number", self.num_proto),
+            ("Boolean", self.bool_proto),
+            ("Symbol", self.symbol_proto),
+            ("BigInt", self.bigint_proto),
+            ("Error", self.error_protos[0]),
+            ("TypeError", self.error_protos[1]),
+            ("RangeError", self.error_protos[2]),
+            ("SyntaxError", self.error_protos[3]),
+            ("ReferenceError", self.error_protos[4]),
+            ("EvalError", self.error_protos[5]),
+            ("URIError", self.error_protos[6]),
+            ("AggregateError", self.error_protos[7]),
+            ("Map", self.map_proto),
+            ("Set", self.set_proto),
+            ("WeakMap", self.weakmap_proto),
+            ("WeakSet", self.weakset_proto),
+            ("WeakRef", self.weakref_proto),
+            ("FinalizationRegistry", self.finreg_proto),
+            ("RegExp", self.regexp_proto),
+            ("Promise", self.promise_proto),
+            ("Date", self.date_proto),
+            ("Proxy", 0),
+            ("ArrayBuffer", self.arraybuffer_proto),
+            ("SharedArrayBuffer", self.sab_proto),
+            ("DataView", self.dataview_proto),
+            ("Iterator", self.iterator_proto_root),
+            ("DisposableStack", self.disposablestack_proto),
+            ("AsyncDisposableStack", self.asyncdisposablestack_proto),
+            ("SuppressedError", self.suppressederror_proto),
+            ("ShadowRealm", self.shadowrealm_proto),
+        ];
+        for (k, t) in native::TA_KINDS.iter().enumerate() {
+            ctors.push((t.0, self.ta_protos[k]));
+        }
+        let mut g = ObjMap::new();
+        for (name, main_proto) in ctors {
+            let proto_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+            let name_v = self.alloc_str(name.to_string());
+            let mut cmap = ObjMap::new();
+            cmap.is_ctor = true;
+            cmap.define("prototype", Value::heap(proto_idx), proto_attr);
+            cmap.define("name", name_v, ne);
+            cmap.define("length", Value::int(1), ne);
+            let ctor_idx = self.heap.alloc(HeapObj::Object(Box::new(cmap)));
+            if let HeapObj::Object(pm) = self.heap.get_mut(proto_idx) {
+                // `X.prototype.constructor` is { [[Writable]]: true,
+                // [[Enumerable]]: false, [[Configurable]]: true } — NOT the
+                // read-only `ne` the ctor's own name/length use. Sharing `ne`
+                // here made a plain `otherRealmInstance.constructor = C` a strict
+                // TypeError once the receiver's [[Set]] began consulting the
+                // prototype chain (staging/sm/TypedArray/slice-bitwise-same.js).
+                pm.define("constructor", Value::heap(ctor_idx), ctor_attr);
+            }
+            // Copy the MAIN ctor's own STATIC props (skip prototype/name/length) so
+            // the realm ctor is functional (`OSymbol.for`, `OArray.from`, well-known
+            // symbols, …): methods become fresh same-id Natives (distinct identity),
+            // data/symbol values are shared by value.
+            if let Some(&main_ctor) = self.builtin_globals.get(name) {
+                // Route `new other.X()` / `other.X(...)` to the real ctor's logic.
+                self.realm_ctor_main.insert(ctor_idx, main_ctor);
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ctor) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals_slice().iter())
+                        .zip(mm.attrs_iter())
+                        .filter(|((k, _), _)| {
+                            k.as_str() != "prototype"
+                                && k.as_str() != "name"
+                                && k.as_str() != "length"
+                        })
+                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    if let HeapObj::Object(cm) = self.heap.get_mut(ctor_idx) {
+                        cm.define(&k, copy, a);
+                    }
+                }
+            }
+            // Copy the MAIN prototype's own props (methods, accessors like the
+            // RegExp flag getters or Error.prototype.stack) onto the realm
+            // prototype the same way — `other.RegExp.prototype.global` etc.
+            // resolve, with distinct same-behaviour identities. `constructor`
+            // stays the realm constructor defined above.
+            if main_proto != 0 {
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_proto) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals_slice().iter())
+                        .zip(mm.attrs_iter())
+                        .filter(|((k, _), _)| k.as_str() != "constructor")
+                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    if let HeapObj::Object(pm) = self.heap.get_mut(proto_idx) {
+                        pm.define(&k, copy, a);
+                    }
+                }
+            }
+            // Tag both objects with this realm, and map the main proto → realm proto
+            // so GetFunctionRealm's GetPrototypeFromConstructor fallback works.
+            self.obj_realm.insert(ctor_idx, r);
+            self.obj_realm.insert(proto_idx, r);
+            if main_proto != 0 {
+                self.realms[r as usize].insert(main_proto, proto_idx);
+            }
+            g.define(name, Value::heap(ctor_idx), data);
+        }
+        // Mirror the MAIN prototype chain structure between the realm prototypes:
+        // realm `TypeError.prototype` → realm `Error.prototype`, every other realm
+        // prototype → realm `Object.prototype` (which keeps its implicit link to
+        // the shared %Object.prototype% — stage-1 single-intrinsics model).
+        {
+            let realm_obj_proto = self.realms[r as usize].get(&self.obj_proto).copied();
+            let realm_err_proto = self.realms[r as usize].get(&self.error_protos[0]).copied();
+            let pairs: Vec<(u32, u32)> = self.realms[r as usize]
+                .iter()
+                .map(|(&m, &p)| (m, p))
+                .collect();
+            for (main_p, realm_p) in pairs {
+                if main_p == self.obj_proto {
+                    continue;
+                }
+                let target = if self.error_protos[1..].contains(&main_p) {
+                    realm_err_proto
+                } else {
+                    realm_obj_proto
+                };
+                if let Some(t) = target {
+                    self.proto_of.insert(realm_p, Value::heap(t));
+                }
+            }
+        }
+        // HIDDEN %TypedArray% intrinsic. `Int8Array.prototype`'s OWN properties
+        // are only `constructor` and `BYTES_PER_ELEMENT` — every method lives on
+        // %TypedArray%.prototype, and `from`/`of`/`@@species` live on
+        // %TypedArray% itself. Neither is a named global, so the loop above never
+        // gave them a realm image, and the chain mirroring then pointed each
+        // per-kind prototype at the realm's `Object.prototype`, severing the
+        // inheritance that would have supplied them. A child realm's
+        // `Int8Array.prototype.at` was `undefined`.
+        //
+        // Built AFTER the mirroring block on purpose: that block walks
+        // `realms[r]` and would re-target these to `Object.prototype`.
+        {
+            let realm_obj_proto = self.realms[r as usize].get(&self.obj_proto).copied();
+            let realm_fn_proto = self.realms[r as usize].get(&self.fn_proto).copied();
+            let ta_proto_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+            let mut cmap = ObjMap::new();
+            cmap.is_ctor = true;
+            cmap.define("prototype", Value::heap(ta_proto_idx), proto_attr);
+            let ta_ctor_idx = self.heap.alloc(HeapObj::Object(Box::new(cmap)));
+            if let HeapObj::Object(pm) = self.heap.get_mut(ta_proto_idx) {
+                pm.define("constructor", Value::heap(ta_ctor_idx), ne);
+            }
+            // Same own-property copy the named pairs get.
+            for (src, dst, skip_ctor) in [
+                (self.ta_base_proto, ta_proto_idx, true),
+                (self.ta_base_ctor, ta_ctor_idx, false),
+            ] {
+                if src == 0 {
+                    continue;
+                }
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(src) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals_slice().iter())
+                        .zip(mm.attrs_iter())
+                        .filter(|((k, _), _)| {
+                            let k = k.as_str();
+                            if skip_ctor {
+                                k != "constructor"
+                            } else {
+                                k != "prototype" && k != "name" && k != "length"
+                            }
+                        })
+                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    if let HeapObj::Object(m) = self.heap.get_mut(dst) {
+                        m.define(&k, copy, a);
+                    }
+                }
+            }
+            self.obj_realm.insert(ta_ctor_idx, r);
+            self.obj_realm.insert(ta_proto_idx, r);
+            if self.ta_base_proto != 0 {
+                self.realms[r as usize].insert(self.ta_base_proto, ta_proto_idx);
+            }
+            if self.ta_base_ctor != 0 {
+                self.realms[r as usize].insert(self.ta_base_ctor, ta_ctor_idx);
+                self.realm_ctor_main.insert(ta_ctor_idx, self.ta_base_ctor);
+            }
+            if let Some(t) = realm_obj_proto {
+                self.proto_of.insert(ta_proto_idx, Value::heap(t));
+            }
+            if let Some(t) = realm_fn_proto {
+                self.proto_of.insert(ta_ctor_idx, Value::heap(t));
+            }
+            // Re-link every per-kind pair onto it: prototype -> %TypedArray%
+            // .prototype (methods) and constructor -> %TypedArray% (`from`/`of`).
+            for (k, kind) in native::TA_KINDS.iter().enumerate() {
+                if let Some(&rp) = self.realms[r as usize].get(&self.ta_protos[k]) {
+                    self.proto_of.insert(rp, Value::heap(ta_proto_idx));
+                }
+                if let Some(cv) = g.get(kind.0) {
+                    if cv.is_heap() {
+                        self.proto_of
+                            .insert(cv.heap_index(), Value::heap(ta_ctor_idx));
+                    }
+                }
+            }
+        }
+        // HIDDEN dynamic-function intrinsics: per-realm %GeneratorFunction% /
+        // %AsyncFunction% / %AsyncGeneratorFunction% facades, their `.prototype`
+        // images, and (for the generator kinds) the %GeneratorPrototype% /
+        // %AsyncGeneratorPrototype% instance-proto images. Not globals — reached
+        // via a realm function's `.constructor` — but GetPrototypeFromConstructor's
+        // realm fallback (newtarget_proto_override) and realm-born generator/async
+        // functions (callable_dynfn_proto, the lazy `.prototype` link) need
+        // per-realm identities. Placed AFTER the chain-mirroring block so the
+        // [[Prototype]] links set here are not overwritten: fn-proto image → the
+        // realm's %Function.prototype% image; %GeneratorPrototype% image → the
+        // realm's %Iterator.prototype% image; %AsyncGeneratorPrototype% image →
+        // the realm's %Object.prototype% image with %AsyncIteratorPrototype%'s
+        // own props flattened on (stage-1 single-level model).
+        {
+            let realm_obj_proto = self.realms[r as usize].get(&self.obj_proto).copied();
+            let realm_fn_proto = self.realms[r as usize].get(&self.fn_proto).copied();
+            let realm_iter_proto = self.realms[r as usize]
+                .get(&self.iterator_proto_root)
+                .copied();
+            let async_iter_root = self
+                .proto_of
+                .get(&self.asyncgen_proto)
+                .and_then(|v| v.is_heap().then(|| v.heap_index()));
+            let kinds: [(&str, u32, u32, u32, Option<u32>, Option<u32>); 3] = [
+                (
+                    "GeneratorFunction",
+                    self.gen_fn_ctor,
+                    self.gen_fn_proto,
+                    self.gen_proto,
+                    realm_iter_proto.or(realm_obj_proto),
+                    None,
+                ),
+                (
+                    "AsyncFunction",
+                    self.async_fn_ctor,
+                    self.async_fn_proto,
+                    0,
+                    None,
+                    None,
+                ),
+                (
+                    "AsyncGeneratorFunction",
+                    self.asyncgen_fn_ctor,
+                    self.asyncgen_fn_proto,
+                    self.asyncgen_proto,
+                    realm_obj_proto,
+                    async_iter_root,
+                ),
+            ];
+            for (name, main_ctor, main_fn_proto, main_inst_proto, inst_chain, flatten) in kinds {
+                if main_ctor == 0 || main_fn_proto == 0 {
+                    continue;
+                }
+                // The `.prototype` image (%GeneratorFunction.prototype% etc.):
+                // main own props copied (fresh same-id natives / shared data),
+                // `constructor`/`prototype` re-pointed at the realm identities.
+                let fnp_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_fn_proto) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals_slice().iter())
+                        .zip(mm.attrs_iter())
+                        .filter(|((k, _), _)| {
+                            k.as_str() != "constructor" && k.as_str() != "prototype"
+                        })
+                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    if let HeapObj::Object(pm) = self.heap.get_mut(fnp_idx) {
+                        pm.define(&k, copy, a);
+                    }
+                }
+                if let Some(fp) = realm_fn_proto {
+                    self.proto_of.insert(fnp_idx, Value::heap(fp));
+                }
+                // The facade constructor (same shape as the visible facades).
+                let name_v = self.alloc_str(name.to_string());
+                let mut cmap = ObjMap::new();
+                cmap.is_ctor = true;
+                cmap.define("prototype", Value::heap(fnp_idx), proto_attr);
+                cmap.define("name", name_v, ne);
+                cmap.define("length", Value::int(1), ne);
+                let ctor_idx = self.heap.alloc(HeapObj::Object(Box::new(cmap)));
+                if let HeapObj::Object(pm) = self.heap.get_mut(fnp_idx) {
+                    pm.define("constructor", Value::heap(ctor_idx), ne);
+                }
+                // Route `Reflect.construct(facade, …)` / calls to the main
+                // ctor's logic with this realm ACTIVE (fn-like compile).
+                self.realm_ctor_main.insert(ctor_idx, main_ctor);
+                self.obj_realm.insert(ctor_idx, r);
+                self.obj_realm.insert(fnp_idx, r);
+                self.realms[r as usize].insert(main_fn_proto, fnp_idx);
+                // The instance-proto image (%GeneratorPrototype% /
+                // %AsyncGeneratorPrototype%): next/return/throw etc. as fresh
+                // same-id natives, plus the flattened %AsyncIteratorPrototype%
+                // props for the async kind; `prototype`/`constructor` linkage
+                // mirrors setup.rs (the OBJECT back-reference, w:f e:f c:t).
+                if main_inst_proto != 0 {
+                    let instp_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                    let mut sources = vec![main_inst_proto];
+                    if let Some(f) = flatten {
+                        sources.push(f);
+                    }
+                    for srcp in sources {
+                        let props: Vec<(String, Value, PropAttr)> = match self.heap.get(srcp) {
+                            HeapObj::Object(mm) => mm
+                                .keys
+                                .iter()
+                                .zip(mm.vals_slice().iter())
+                                .zip(mm.attrs_iter())
+                                .filter(|((k, _), _)| k.as_str() != "constructor")
+                                .map(|((k, v), a)| (k.clone(), *v, a))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        for (k, v, mut a) in props {
+                            let copy = self.realm_copy_value(v, r);
+                            if a.accessor {
+                                a.setter = self.realm_copy_value(a.setter, r);
+                            }
+                            if let HeapObj::Object(pm) = self.heap.get_mut(instp_idx) {
+                                if pm.pos(&k).is_none() {
+                                    pm.define(&k, copy, a);
+                                }
+                            }
+                        }
+                    }
+                    let link = PropAttr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    };
+                    if let HeapObj::Object(pm) = self.heap.get_mut(fnp_idx) {
+                        pm.define("prototype", Value::heap(instp_idx), link);
+                    }
+                    if let HeapObj::Object(pm) = self.heap.get_mut(instp_idx) {
+                        pm.define("constructor", Value::heap(fnp_idx), link);
+                    }
+                    if let Some(t) = inst_chain {
+                        self.proto_of.insert(instp_idx, Value::heap(t));
+                    }
+                    self.obj_realm.insert(instp_idx, r);
+                    self.realms[r as usize].insert(main_inst_proto, instp_idx);
+                }
+            }
+        }
+        // HIDDEN built-in iterator prototypes. Array/Map/Set/String iterator
+        // objects expose these through Object.getPrototypeOf even though no
+        // constructor global names them. A realm-copied `values`/`entries`
+        // native must therefore create an iterator whose `next` method and
+        // @@toStringTag live in that native's own realm, not the caller's.
+        // RegExp String Iterators use the same mechanism for `matchAll`.
+        {
+            let realm_iter_proto = self.realms[r as usize]
+                .get(&self.iterator_proto_root)
+                .copied();
+            for main_proto in [
+                self.array_iter_proto,
+                self.map_iter_proto,
+                self.set_iter_proto,
+                self.string_iter_proto,
+                self.regexp_string_iter_proto,
+            ] {
+                if main_proto == 0 {
+                    continue;
+                }
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_proto) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals_slice().iter())
+                        .zip(mm.attrs_iter())
+                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let proto_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    if let HeapObj::Object(pm) = self.heap.get_mut(proto_idx) {
+                        pm.define(&k, copy, a);
+                    }
+                }
+                if let Some(root) = realm_iter_proto {
+                    self.proto_of.insert(proto_idx, Value::heap(root));
+                }
+                self.obj_realm.insert(proto_idx, r);
+                self.realms[r as usize].insert(main_proto, proto_idx);
+            }
+        }
+        // Namespace objects: fresh per realm, with the main namespace's props
+        // copied (fresh same-id Natives / shared data) so `other.Reflect.construct`
+        // etc. are functional.
+        for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl", "console"] {
+            let mut m = ObjMap::new();
+            if let Some(&main_ns) = self.builtin_globals.get(ns) {
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ns) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals_slice().iter())
+                        .zip(mm.attrs_iter())
+                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    m.define(&k, copy, a);
+                }
+            }
+            let o_idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
+            self.obj_realm.insert(o_idx, r);
+            g.define(ns, Value::heap(o_idx), data);
+        }
+        // Bare global functions (`other.parseInt`, …) as fresh same-id Natives,
+        // and the global value properties (non-writable, non-configurable).
+        for name in [
+            "parseInt",
+            "parseFloat",
+            "isNaN",
+            "isFinite",
+            "encodeURI",
+            "encodeURIComponent",
+            "decodeURI",
+            "decodeURIComponent",
+            "escape",
+            "unescape",
+            "print",
+        ] {
+            if let Some(&main_fn) = self.builtin_globals.get(name) {
+                let copy = self.realm_copy_value(Value::heap(main_fn), r);
+                self.obj_realm.insert(copy.heap_index(), r);
+                g.define(name, copy, data);
+            }
+        }
+        let frozen = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        g.define("undefined", Value::UNDEFINED, frozen);
+        g.define("NaN", Value::num(f64::NAN), frozen);
+        g.define("Infinity", Value::num(f64::INFINITY), frozen);
+        let g_idx = self.heap.alloc(HeapObj::Object(Box::new(g)));
+        self.obj_realm.insert(g_idx, r);
+        // Register as a child-realm global: keys the realm's own binding table
+        // (active_realm / realm_globals) and the get/set interception that makes
+        // `other.x` read/write the same binding a bare `x` sees inside the realm.
+        self.realm_global_objs.insert(g_idx, r);
+        // Excluded receiver (ic_obj_ok): defines continue on this map after
+        // alloc with no version bump, so its mirror must never be guardable.
+        self.heap.pin_mirror_dict(g_idx);
+        // The realm's own `eval`: a distinct function object whose call runs the
+        // code against THIS realm's global bindings (call_value intercepts it).
+        let eval_idx = self.heap.alloc(HeapObj::Native(native::GLOBAL_EVAL));
+        self.obj_realm.insert(eval_idx, r);
+        self.realm_fns.insert(eval_idx, (g_idx, 0));
+        // `globalThis` is the realm's global object itself.
+        if let HeapObj::Object(gm) = self.heap.get_mut(g_idx) {
+            gm.define("globalThis", Value::heap(g_idx), data);
+            gm.define("eval", Value::heap(eval_idx), data);
+        }
+        // The realm object mirrors the $262 surface (agent/gc/createRealm/… are
+        // realm-agnostic and shared by copy), with a realm-bound `evalScript`
+        // and this realm's `global`.
+        let mut realm = ObjMap::new();
+        if self.dollar262 != 0 {
+            let props: Vec<(String, Value, PropAttr)> = match self.heap.get(self.dollar262) {
+                HeapObj::Object(mm) => mm
+                    .keys
+                    .iter()
+                    .zip(mm.vals_slice().iter())
+                    .zip(mm.attrs_iter())
+                    .filter(|((k, _), _)| k.as_str() != "global" && k.as_str() != "evalScript")
+                    .map(|((k, v), a)| (k.clone(), *v, a))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for (k, v, a) in props {
+                let copy = self.realm_copy_value(v, r);
+                realm.define(&k, copy, a);
+            }
+        }
+        let script_idx = self
+            .heap
+            .alloc(HeapObj::Native(native::DOLLAR262_EVAL_SCRIPT));
+        self.obj_realm.insert(script_idx, r);
+        self.realm_fns.insert(script_idx, (g_idx, 1));
+        realm.define("evalScript", Value::heap(script_idx), PropAttr::data());
+        realm.define("global", Value::heap(g_idx), data);
+        let realm_val = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(realm))));
+        // INTERPRETING.md requires the child realm to carry `$262` on its OWN
+        // global, not merely for the parent to receive it as the return value —
+        // a test that does `$262.createRealm().global.$262.detachArrayBuffer(…)`
+        // is exercising the child's host hooks, and saw `undefined`.
+        if let HeapObj::Object(gm) = self.heap.get_mut(g_idx) {
+            gm.define("$262", realm_val, PropAttr::data());
+        }
+        realm_val
+    }
+
+    /// The GLOBAL object of createRealm child `r` (None for the main realm or a
+    /// realm id with no registered global — e.g. a pre-stage-1 tag).
+    pub(crate) fn realm_global_obj(&self, r: u32) -> Option<u32> {
+        if r == 0 {
+            return None;
+        }
+        self.realm_global_objs
+            .iter()
+            .find(|&(_, &rid)| rid == r)
+            .map(|(&g, _)| g)
+    }
+
+    /// Whether `main` is one of the dynamic-function constructors — a realm
+    /// facade routing to it must compile the source with the realm ACTIVE so the
+    /// new function's globals bind in the realm's own table.
+    pub(crate) fn realm_main_ctor_is_fn_like(&self, main: u32) -> bool {
+        main != 0
+            && [
+                self.function_ctor,
+                self.gen_fn_ctor,
+                self.async_fn_ctor,
+                self.asyncgen_fn_ctor,
+            ]
+            .contains(&main)
+    }
+
+    /// The createRealm child whose code is CURRENTLY running: the `active_realm`
+    /// switch (a realm `eval`/`Function` compile+run) or the realm tag of the
+    /// innermost frame's callee — i.e. the spec's "current Realm Record",
+    /// approximated. `None` in the main realm (the common case: one map check).
+    pub(crate) fn current_realm_id(&self) -> Option<u32> {
+        if self.realm_global_objs.is_empty() {
+            return None;
+        }
+        if let Some(rid) = self.active_realm {
+            if let Some(&r) = self.realm_global_objs.get(&rid) {
+                return Some(r);
+            }
+        }
+        if let Some(f) = self.frames.last() {
+            let r = self.get_function_realm(f.callee);
+            if r != 0 {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    /// The %ThrowTypeError% intrinsic of createRealm child `r` — ONE per realm
+    /// (`gOPD(args, 'callee').get` is identical across that realm's strict
+    /// arguments objects, distinct from the main realm's), realm-tagged so
+    /// calling it throws the CHILD's TypeError. Lazily created, cached + rooted.
+    pub(crate) fn realm_throw_type_error(&mut self, r: u32) -> Value {
+        if let Some(&i) = self.realm_throw_type_errors.get(&r) {
+            return Value::heap(i);
+        }
+        let idx = self
+            .heap
+            .alloc(HeapObj::Native(native::FN_THROW_TYPE_ERROR));
+        self.obj_realm.insert(idx, r);
+        self.realm_throw_type_errors.insert(r, idx);
+        Value::heap(idx)
+    }
+
+    /// The HOME object of the built-in currently executing via `call_value`'s
+    /// native dispatch: a realm-COPIED native's home is its realm's image of
+    /// `main_proto` (`this === %RegExp.prototype%`-style checks), else the main
+    /// intrinsic itself.
+    #[inline]
+    pub(crate) fn native_home(&self, main_proto: u32) -> u32 {
+        if let Some(r) = self.native_callee_realm {
+            if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_proto)) {
+                return rp;
+            }
+        }
+        main_proto
+    }
+
+    /// ArrayCreate for a built-in's result. 10.4.2.2 makes the new array's
+    /// [[Prototype]] the CURRENT Realm Record's %Array.prototype%, and for a
+    /// built-in the current realm is its own [[Realm]] — so
+    /// `otherRealm.Array.prototype.toSorted.call(mainArray)` must return an
+    /// array whose prototype is the OTHER realm's, not the caller's. Identity
+    /// (one Option check) for a main-realm built-in, which is every call until
+    /// `$262.createRealm()` hands a realm-copied method to another realm.
+    pub(crate) fn alloc_array_current_realm(&mut self, items: Vec<Value>) -> Value {
+        let idx = self.heap.alloc(HeapObj::Array(items));
+        if let Some(r) = self.native_callee_realm {
+            let home = self.native_home(self.arr_proto);
+            if home != self.arr_proto {
+                self.proto_of.insert(idx, Value::heap(home));
+                self.obj_realm.insert(idx, r);
+            }
+        }
+        Value::heap(idx)
+    }
+
+    /// OrdinaryObjectCreate for a built-in's result. As with ArrayCreate above,
+    /// the implicit `%Object.prototype%` comes from the built-in's own realm.
+    /// Main-realm calls pay only the same single Option check.
+    pub(crate) fn alloc_object_current_realm(&mut self, map: ObjMap) -> Value {
+        let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
+        if let Some(r) = self.native_callee_realm {
+            let home = self.native_home(self.obj_proto);
+            if home != self.obj_proto {
+                self.proto_of.insert(idx, Value::heap(home));
+                self.obj_realm.insert(idx, r);
+            }
+        }
+        Value::heap(idx)
+    }
+
+    /// Attach an exotic result object to the built-in native's own realm.
+    /// Unlike ordinary objects/arrays, exotics have a kind-specific implicit
+    /// prototype, so a foreign result needs both an explicit prototype link
+    /// and the realm tag used by GetFunctionRealm/constructor fallbacks.
+    pub(crate) fn adopt_native_result_realm(&mut self, idx: u32, main_proto: u32) {
+        if let Some(r) = self.native_callee_realm {
+            self.adopt_fresh_result_to_realm(idx, main_proto, r);
+        }
+    }
+
+    /// Explicit-realm form for a newly allocated result whose realm comes from
+    /// another spec input rather than the currently executing native (notably
+    /// NewPromiseCapability's constructor C). Callers must pass a fresh object:
+    /// this intentionally cannot be used to retag user-provided inputs.
+    pub(crate) fn adopt_fresh_result_to_realm(&mut self, idx: u32, main_proto: u32, realm: u32) {
+        if realm == 0 {
+            return;
+        }
+        if let Some(&home) = self
+            .realms
+            .get(realm as usize)
+            .and_then(|m| m.get(&main_proto))
+        {
+            self.proto_of.insert(idx, Value::heap(home));
+            self.obj_realm.insert(idx, realm);
+        }
+    }
+
+    /// The CURRENT realm's image of a main intrinsic prototype: primitive member
+    /// access inside a createRealm child resolves through the CHILD's prototype
+    /// (`other.Number.prototype.x` is visible to `(1).x` inside the child).
+    /// Identity in the main realm — the common case is one is_empty check.
+    #[inline]
+    pub(crate) fn active_realm_proto(&self, main_proto: u32) -> u32 {
+        if !self.realm_global_objs.is_empty() {
+            if let Some(r) = self.current_realm_id() {
+                if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_proto)) {
+                    return rp;
+                }
+            }
+        }
+        main_proto
+    }
+
+    /// OrdinaryObjectCreate / ArrayCreate take their [[Prototype]] from the
+    /// CURRENT Realm Record's intrinsics (10.1.12, 10.4.2.2). zipp leaves an
+    /// ordinary object's [[Prototype]] IMPLICIT — no `proto_of` entry means
+    /// %Object.prototype% / %Array.prototype% — which silently bound EVERY
+    /// object born inside a `$262.createRealm()` child to the MAIN realm's
+    /// intrinsics: `g.eval("var a = [1,2,3]")` produced an array whose
+    /// `constructor` was the main `Array`, so ArraySpeciesCreate on it picked
+    /// the wrong realm's %Array% (staging/sm/Array/species.js line 156) and
+    /// `new g.AggregateError([x]).errors` had the main %Array.prototype%
+    /// (staging/sm/Error/AggregateError.js line 85).
+    ///
+    /// Write the link EXPLICITLY when a child realm's code is what created the
+    /// object. `realm_global_objs` is empty until `$262.createRealm()` is called,
+    /// so this is one `is_empty` branch for every ordinary program.
+    #[inline]
+    pub(crate) fn realm_born(&mut self, idx: u32, main_proto: u32) {
+        if self.realm_global_objs.is_empty() {
+            return;
+        }
+        let r = match self.current_realm_id() {
+            Some(r) => r,
+            None => return,
+        };
+        if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_proto)) {
+            self.proto_of.insert(idx, Value::heap(rp));
+        }
+        self.obj_realm.insert(idx, r);
+    }
+
+    /// Final shape for a `FinalizeObject` plan: the exact fold `shape::add`
+    /// would produce via per-field data appends, memoized per (unified func id,
+    /// plan index) on this VM's thread. Shape ids are thread-local and the
+    /// transition tree never reissues ids, so an entry stays valid for the
+    /// VM's life; the fold's result is deterministic in tree state, which only
+    /// grows, so recomputation could never disagree with the memo.
+    pub(crate) fn finalize_shape(
+        &mut self,
+        func_id: u32,
+        plan_idx: u16,
+        plan: &crate::bytecode::StaticKeyPlan,
+    ) -> u32 {
+        if let Some(&shape) = self.finalize_shapes.get(&(func_id, plan_idx)) {
+            return shape;
+        }
+        let data = crate::shape::attr_bits(true, true, true, false);
+        let mut shape = crate::shape::EMPTY;
+        for key in plan.keys() {
+            shape = crate::shape::add(shape, key, data);
+        }
+        self.finalize_shapes.insert((func_id, plan_idx), shape);
+        shape
+    }
+
+    /// Tag a freshly-created function/class with the realm whose code created it
+    /// (no-op in the main realm) — functions born inside a child realm's
+    /// eval/Function code carry the child's realm for GetFunctionRealm,
+    /// OrdinaryCallBindThis, and error-identity purposes.
+    #[inline]
+    pub(crate) fn realm_tag_new(&mut self, idx: u32) {
+        if !self.realm_global_objs.is_empty() {
+            if let Some(r) = self.current_realm_id() {
+                self.obj_realm.insert(idx, r);
+            }
+        }
+    }
+
+    /// Re-link a freshly-synthesised internal error to the CURRENT realm's facade
+    /// prototype (`thrown.constructor === otherRealm.TypeError`): a throw
+    /// materializes while the throwing function's frame is still on the stack,
+    /// so the frame-derived realm IS the spec's current realm. No-op in the main
+    /// realm, or when the error's prototype has no realm image.
+    pub(crate) fn realm_adopt_error(&mut self, err: Value) {
+        if self.realm_global_objs.is_empty() || !err.is_heap() {
+            return;
+        }
+        let Some(r) = self.current_realm_id() else {
+            return;
+        };
+        self.realm_adopt_error_to(err, r);
+    }
+
+    /// An internal built-in error raised where the built-in is EMULATED inline
+    /// instead of being invoked as a function value — the %DataView.prototype%
+    /// / %TypedArray%.prototype accessors that `proto_member_get` answers from
+    /// the instance. `call_value`'s realm plumbing never runs for those, so the
+    /// throw would carry the CALLER's error constructors; the spec creates it
+    /// with the realm of the accessor, which is the realm that owns the
+    /// prototype the walk reached (`Object.create(otherRealmView).buffer` must
+    /// throw `other.TypeError` — staging/sm/extensions/dataview.js line 1568).
+    pub(crate) fn realm_thrown_from_proto(&mut self, obj_idx: u32, msg: String) -> Thrown {
+        if !self.realm_global_objs.is_empty() && self.pending_throw.is_none() {
+            let proto = self
+                .proto_of
+                .get(&obj_idx)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
+            let r = self.get_function_realm(proto);
+            if r != 0 {
+                let e = self.alloc_error_from_message(&msg);
+                self.realm_adopt_error_to(e, r);
+                self.pending_throw = Some(e);
+            }
+        }
+        Thrown(msg)
+    }
+
+    /// `realm_adopt_error` with an explicit target realm (used where the FUNCTION
+    /// whose call failed is known, e.g. calling a realm class without `new`).
+    pub(crate) fn realm_adopt_error_to(&mut self, err: Value, r: u32) {
+        if !err.is_heap() {
+            return;
+        }
+        let idx = err.heap_index();
+        let main_p = match self.proto_of.get(&idx) {
+            Some(v) if v.is_heap() => v.heap_index(),
+            _ => return,
+        };
+        if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_p)) {
+            self.proto_of.insert(idx, Value::heap(rp));
+            self.obj_realm.insert(idx, r);
+        }
+    }
+
+    /// After boxing a primitive `this` for a sloppy CALLEE from a child realm,
+    /// re-link the wrapper to the realm's prototype (`func.call(true)` inside a
+    /// realm function sees a Boolean whose `.constructor` is the realm's).
+    pub(crate) fn realm_retag_boxed(&mut self, callee: Value, boxed: Value) {
+        if self.realm_global_objs.is_empty() || !boxed.is_heap() {
+            return;
+        }
+        let r = self.get_function_realm(callee);
+        if r != 0 {
+            self.realm_box_proto(boxed, r);
+        }
+    }
+
+    /// Re-link a primitive wrapper created BY realm `r`'s machinery (sloppy
+    /// `this` boxing, `other.Object(bigint)`) to the realm's wrapper prototype.
+    pub(crate) fn realm_box_proto(&mut self, boxed: Value, r: u32) {
+        if !boxed.is_heap() {
+            return;
+        }
+        let main_p = match self.heap.get(boxed.heap_index()) {
+            HeapObj::Boxed { kind: 0, .. } => self.str_proto,
+            HeapObj::Boxed { kind: 1, .. } => self.num_proto,
+            HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
+            HeapObj::Boxed { kind: 3, .. } => self.symbol_proto,
+            HeapObj::Boxed { kind: 4, .. } => self.bigint_proto,
+            _ => return,
+        };
+        if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_p)) {
+            self.proto_of.insert(boxed.heap_index(), Value::heap(rp));
+            self.obj_realm.insert(boxed.heap_index(), r);
+        }
+    }
+
+    /// `this` for OrdinaryCallBindThis's global substitution: the CALLEE realm's
+    /// global object (a createRealm child function binds the CHILD's global).
+    pub(crate) fn callee_this_global(&self, callee: Value) -> u32 {
+        if !self.realm_global_objs.is_empty() {
+            let r = self.get_function_realm(callee);
+            if r != 0 {
+                if let Some(g) = self.realm_global_obj(r) {
+                    return g;
+                }
+            }
+        }
+        self.global_this
+    }
+
+    /// A child realm's `eval(src)` / `evalScript(src)` (`kind` 0 / 1): compile +
+    /// run `src` with the child ACTIVE, so global reads/writes inside it resolve
+    /// to the child's binding table and new declarations land on its global.
+    /// Mirrors the main GLOBAL_EVAL/DOLLAR262_EVAL_SCRIPT natives otherwise.
+    pub(crate) fn realm_eval_call(
+        &mut self,
+        gidx: u32,
+        kind: u8,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let is_str = a0.is_heap()
+            && matches!(
+                self.heap.get(a0.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            );
+        if !is_str {
+            // eval(x): a non-String x is returned unchanged (spec 19.2.1).
+            return Ok(a0);
+        }
+        let code = self.display(a0);
+        let exact = self.heap.str_exact_if_not_wellformed(a0.heap_index());
+        let prev_realm = self.active_realm;
+        self.active_realm = Some(gidx);
+        // Both kinds run the EVAL pipeline (global sloppy scope, var/function
+        // declarations land on the realm global via var_env_global): unlike the
+        // main `$262.evalScript` program path it returns the COMPLETION VALUE,
+        // which realm tests rely on (`other.evalScript('(function(){…})')`).
+        let _ = kind;
+        // PerformEval for an INDIRECT eval runs in the eval function's own realm,
+        // so its ThisBinding is the CHILD's global object — `other.eval("this")`
+        // (and `eval = other.eval; eval("this")`) must not answer the caller's.
+        let this_realm_global = Some(Value::heap(gidx));
+        let evaled = self.do_eval(
+            &code,
+            false,
+            false,
+            this_realm_global,
+            None,
+            false,
+            false,
+            Value::UNDEFINED,
+            None,
+            true,
+            None,
+            Vec::new(),
+            None,
+            None,
+            exact.as_deref(),
+        );
+        self.active_realm = prev_realm;
+        let v = evaled?;
+        // The completion value (typically a function/class the caller will use)
+        // carries the realm tag for GetFunctionRealm / error identity.
+        if v.is_heap() && self.is_callable(v) {
+            if let Some(&r) = self.realm_global_objs.get(&gidx) {
+                self.obj_realm.insert(v.heap_index(), r);
+            }
+        }
+        Ok(v)
+    }
+
+    /// Copy a value into realm `r`: a built-in method (`HeapObj::Native`) becomes
+    /// a FRESH Native with the same id (distinct identity, identical behaviour —
+    /// so `OSymbol.for !== Symbol.for` while the shared registry still works),
+    /// realm-TAGGED so GetFunctionRealm and error-identity adoption see the
+    /// child; everything else (well-known symbol values, data) is shared by value.
+    fn realm_copy_value(&mut self, v: Value, r: u32) -> Value {
+        if v.is_heap() {
+            if let HeapObj::Native(id) = self.heap.get(v.heap_index()) {
+                let id = *id;
+                let idx = self.heap.alloc(HeapObj::Native(id));
+                self.obj_realm.insert(idx, r);
+                return Value::heap(idx);
+            }
+        }
+        v
+    }
+
+    /// GetFunctionRealm — the realm id a constructor/object belongs to (0 = main).
+    /// Pierces BOUND functions and PROXIES (the spec recurses to the target —
+    /// before the tag check, since `new other.Proxy(mainTarget, …)` realm-tags
+    /// the proxy object itself while its function realm is the TARGET's).
+    pub(crate) fn get_function_realm(&self, mut f: Value) -> u32 {
+        // B242: with no child realm ever created, EVERY function's realm is
+        // the main one, bound/proxy piercing included — so the answer is
+        // known before the probe. This is a hot-call-path question (the
+        // same-proto leaf guard asks it per call), and the probe was 4.5% of
+        // calls-closures for a map that no ordinary program ever fills.
+        if self.obj_realm.is_empty() {
+            return 0;
+        }
+        loop {
+            if !f.is_heap() {
+                return 0;
+            }
+            match self.heap.get(f.heap_index()) {
+                HeapObj::Bound { target, .. } | HeapObj::Proxy { target, .. } => {
+                    f = *target;
+                }
+                _ => return self.obj_realm.get(&f.heap_index()).copied().unwrap_or(0),
+            }
+        }
+    }
+
+    /// One step of a LIVE array-like `%ArrayIteratorPrototype%` iterator, WITHOUT
+    /// materialising the `{value, done}` result object. `None` means "not that
+    /// kind of iterator" and the caller falls through to the general path.
+    ///
+    /// This mirrors `regexp_string_iter_step`, which exists for the same reason
+    /// and states it at its call site: the object `CreateIterResultObject` builds
+    /// is engine-internal whenever the INTRINSIC `next` is what steps the
+    /// iterator, and its `done`/`value` reads cannot be observed — 7.4.14 makes
+    /// an ordinary object with two own DATA properties, which shadow anything on
+    /// `Object.prototype`, so neither Get can run user code and the object's
+    /// identity never escapes the loop.
+    ///
+    /// A consumer that destructures it immediately can therefore skip the whole
+    /// thing. `for (v of a.values())` measured 143ns/step against node's 0.55,
+    /// about 90ns of which is this object.
+    ///
+    /// The `next` method being the PRISTINE intrinsic is the caller's
+    /// precondition: a patched `%ArrayIteratorPrototype%.next` must still be
+    /// honoured, so `IterNext` checks that before calling here.
+    ///
+    /// Semantics preserved exactly from the `ITER_NEXT` native this was lifted
+    /// out of: the length is re-read EVERY step, so mutations made during
+    /// iteration (push/pop/`length` writes/element writes) are observed, and
+    /// exhaustion LATCHES via `usize::MAX` so a later grow is not iterated.
+    pub(crate) fn array_iter_step(&mut self, it_idx: u32) -> Option<Result<(Value, bool), Thrown>> {
+        let (live, index) = match self.heap.get(it_idx) {
+            HeapObj::Iterator { live, index, .. } => (*live, *index),
+            _ => return None,
+        };
+        let (coll, kind) = live?;
+        // The Array Iterator brand is its live array-like backing slot, not the
+        // realm identity of its prototype: a foreign intrinsic `next` may be
+        // transplanted onto a main-realm Array Iterator (and vice versa).
+        if matches!(
+            self.heap.get(coll),
+            HeapObj::TypedArray { .. } | HeapObj::Map { .. } | HeapObj::Set(_)
+        ) {
+            return None;
+        }
+        Some(self.array_iter_step_inner(it_idx, coll, kind, index))
+    }
+
+    fn array_iter_step_inner(
+        &mut self,
+        it_idx: u32,
+        coll: u32,
+        kind: u8,
+        mut index: usize,
+    ) -> Result<(Value, bool), Thrown> {
+        let result = if index == usize::MAX {
+            (Value::UNDEFINED, true)
+        } else {
+            let n = match self.heap.get(coll) {
+                // Sparse/very large Arrays keep their live JS length outside
+                // the dense prefix. Re-read that authoritative length every
+                // step just like the ordinary object `length` path below.
+                HeapObj::Array(_) => self.js_array_len(coll),
+                _ => {
+                    let lv = self.get_prop(Value::heap(coll), "length")?;
+                    let lf = self.to_number_strict(lv)?;
+                    if lf.is_nan() || lf <= 0.0 {
+                        0
+                    } else {
+                        lf.trunc().min(9_007_199_254_740_991.0) as usize
+                    }
+                }
+            };
+            if index >= n {
+                (Value::UNDEFINED, true)
+            } else {
+                let v = match kind {
+                    0 => Value::num(index as f64),
+                    1 => self.get_index(Value::heap(coll), Value::num(index as f64))?,
+                    _ => {
+                        let e = self.get_index(Value::heap(coll), Value::num(index as f64))?;
+                        self.alloc_array_current_realm(vec![Value::num(index as f64), e])
+                    }
+                };
+                index += 1;
+                (v, false)
+            }
+        };
+        let store = if result.1 { usize::MAX } else { index };
+        if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+            *i = store;
+        }
+        Ok(result)
+    }
+
+    /// One step of a live Map/Set iterator, or of a snapshot iterator, WITHOUT
+    /// materialising the `{value, done}` result object.
+    ///
+    /// `None` only for a TypedArray-backed iterator, whose per-step
+    /// out-of-bounds check can THROW and therefore keeps its own path.
+    ///
+    /// Same elision argument as `array_iter_step`, and the same measured shape:
+    /// `map.keys()` cost 155.7ns/step against node's 3.3 while `for (e of map)`
+    /// — which already had a positional fast path — cost 51.7. The gap is the
+    /// object.
+    ///
+    /// Semantics preserved exactly: tombstoned (deleted) slots are skipped,
+    /// entries appended after the iterator was created ARE seen, and exhaustion
+    /// LATCHES via `usize::MAX` so a later add is not iterated.
+    pub(crate) fn collection_iter_step(
+        &mut self,
+        it_idx: u32,
+    ) -> Result<Option<(Value, bool)>, Thrown> {
+        let (live, mut index) = match self.heap.get(it_idx) {
+            HeapObj::Iterator { live, index, .. } => (*live, *index),
+            _ => return Ok(None),
+        };
+        if let Some((coll, _)) = live {
+            if matches!(self.heap.get(coll), HeapObj::TypedArray { .. }) {
+                return Ok(None);
+            }
+        }
+        let out = if let Some((coll, kind)) = live {
+            let mut result = (Value::UNDEFINED, true);
+            if index != usize::MAX {
+                let mut scanned = 0u64;
+                loop {
+                    // Copy out the (key, value) at `index` (or stop), releasing
+                    // the heap borrow before any allocation below.
+                    let pair: Option<(Value, Value)> = match self.heap.get(coll) {
+                        HeapObj::Set(items) => {
+                            if index >= items.len() {
+                                break;
+                            }
+                            let v = items[index];
+                            (!v.is_hole()).then_some((v, v))
+                        }
+                        HeapObj::Map { keys, vals } => {
+                            if index >= keys.len() {
+                                break;
+                            }
+                            let k = keys[index];
+                            (!k.is_hole()).then_some((k, vals[index]))
+                        }
+                        _ => break, // collection gone
+                    };
+                    scanned = scanned.saturating_add(1);
+                    self.preflight_native_iteration_work(scanned)?;
+                    index += 1;
+                    if let Some((k, v)) = pair {
+                        let yielded = match kind {
+                            0 => k,
+                            1 => v,
+                            _ => self.alloc_array_current_realm(vec![k, v]),
+                        };
+                        result = (yielded, false);
+                        break;
+                    }
+                }
+            }
+            // Persist the cursor; on exhaustion latch permanent-done.
+            let store = if result.1 { usize::MAX } else { index };
+            if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                *i = store;
+            }
+            result
+        } else {
+            match self.heap.get_mut(it_idx) {
+                HeapObj::Iterator {
+                    items, index: i, ..
+                } => {
+                    if *i < items.len() {
+                        let v = items[*i];
+                        *i += 1;
+                        (v, false)
+                    } else {
+                        (Value::UNDEFINED, true)
+                    }
+                }
+                _ => return Ok(None),
+            }
+        };
+        Ok(Some(out))
+    }
+
+    pub(crate) fn call_native(
+        &mut self,
+        id: u16,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        use native::*;
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        // Temporal prototype field getter: brand-check `this` is a Temporal
+        // instance, then read the field (the fast get_member path computes it).
+        #[cfg(not(feature = "wasm-lite"))]
+        if (native::TEMPORAL_GETTER_BASE
+            ..native::TEMPORAL_GETTER_BASE + native::TEMPORAL_GETTER_FIELDS.len() as u16)
+            .contains(&id)
+        {
+            if !matches!(
+                this.is_heap().then(|| self.heap.get(this.heap_index())),
+                Some(HeapObj::Temporal { .. })
+            ) {
+                return Err(Thrown::from_static(
+                    "TypeError: Temporal field getter called on a non-Temporal receiver",
+                ));
+            }
+            let field =
+                native::TEMPORAL_GETTER_FIELDS[(id - native::TEMPORAL_GETTER_BASE) as usize];
+            return self.get_prop(this, field);
+        }
+        Ok(match id {
+            OBJ_DEFINE_PROPERTY => {
+                // Step 1 (O must be an Object) precedes ToPropertyKey(P): a
+                // primitive target throws before the key's toString can run.
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Object.defineProperty called on non-object",
+                    ));
+                }
+                let key = self.to_property_key(a1)?;
+                self.object_define_property(
+                    a0,
+                    &key,
+                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                a0
+            }
+            OBJ_DEFINE_PROPERTIES => {
+                // Object.defineProperties(O, Properties): Type(O) must be Object
+                // (a number/string/bool primitive throws, not just null/undefined).
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Object.defineProperties called on non-object",
+                    ));
+                }
+                self.object_define_properties(a0, a1)?;
+                a0
+            }
+            OBJ_GET_OWN_DESC => {
+                let key = self.to_property_key(a1)?;
+                self.require_object_coercible(a0)?; // ToObject(O)
+                let o = self.to_object(a0)?;
+                self.ns_tdz_check(o, &key)?;
+                match self.proxy_gopd(o, &key)? {
+                    Some(d) => d,
+                    None => self.object_get_own_property_descriptor(o, &key),
+                }
+            }
+            OBJ_GET_OWN_NAMES => {
+                self.require_object_coercible(a0)?; // ToObject(O)
+                let o = self.to_object(a0)?;
+                self.object_own_property_names(o)?
+            }
+            OBJ_GET_PROTO => {
+                self.require_object_coercible(a0)?; // ToObject(O): null/undefined throw
+                let o = self.to_object(a0)?;
+                self.get_prototype_of_checked(o)?
+            }
+            OBJ_KEYS => {
+                self.require_object_coercible(a0)?; // ToObject(O)
+                let o = self.to_object(a0)?;
+                self.object_enum_own(o, EnumWhat::Keys)?
+            }
+            OBJ_VALUES => {
+                self.require_object_coercible(a0)?;
+                let o = self.to_object(a0)?;
+                self.object_enum_own(o, EnumWhat::Values)?
+            }
+            OBJ_ENTRIES => {
+                self.require_object_coercible(a0)?;
+                let o = self.to_object(a0)?;
+                self.object_enum_own(o, EnumWhat::Entries)?
+            }
+            OBJ_ASSIGN => self.object_assign(args)?,
+            OBJ_CREATE => {
+                // Object.create(O, Properties): O must be Object or null.
+                if a0 != Value::NULL && !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Object prototype may only be an Object or null",
+                    ));
+                }
+                let o = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
+                if a0 != Value::UNDEFINED {
+                    self.proto_of.insert(o.heap_index(), a0);
+                }
+                if a1 != Value::UNDEFINED {
+                    // `o` is only a Rust local while the descriptor bag's getters
+                    // and ToPropertyDescriptor field getters run.
+                    self.with_host_roots(&[o], |vm| vm.object_define_properties(o, a1))?;
+                }
+                o
+            }
+            PROTO_HAS_OWN => {
+                if let Some(b) = self.has_own_index_fast(this, a0) {
+                    self.require_object_coercible(this)?;
+                    return Ok(Value::bool(b));
+                }
+                let k = self.to_property_key(a0)?;
+                self.require_object_coercible(this)?; // ToObject(this)
+                Value::bool(self.has_own_property_dyn(this, &k)?)
+            }
+            PROTO_PROP_ENUM => {
+                let k = self.to_property_key(a0)?;
+                self.require_object_coercible(this)?; // ToObject(this)
+                self.ns_tdz_check(this, &k)?; // [[GetOwnProperty]] of uninit throws
+                Value::bool(self.own_is_enumerable_dyn(this, &k)?)
+            }
+            // isPrototypeOf: a non-object argument is `false` BEFORE ToObject(this).
+            PROTO_IS_PROTO_OF => {
+                if self.is_object_value(a0) {
+                    self.require_object_coercible(this)?;
+                }
+                Value::bool(self.is_prototype_of(this, a0))
+            }
+            PROTO_VALUE_OF => {
+                // Object.prototype.valueOf returns ToObject(this): null/undefined
+                // throw a TypeError, and a primitive is boxed into its wrapper object
+                // (so `Object.prototype.valueOf.call(true)` is a Boolean object).
+                self.require_object_coercible(this)?;
+                self.to_object(this)?
+            }
+            PROTO_TO_STRING => {
+                let tag = self.object_to_string_tag(this)?;
+                let total = tag
+                    .len()
+                    .checked_add(9)
+                    .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
+                let mut out = self.guest_string_with_capacity(total)?;
+                out.push_str("[object ");
+                out.push_str(&tag);
+                out.push(']');
+                self.alloc_str(out)
+            }
+            ERROR_TO_STRING => {
+                // Step 2: a non-Object receiver is a TypeError (before any Get).
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Error.prototype.toString called on a non-object",
+                    ));
+                }
+                // `name` (default "Error") + ": " + `message` (default ""), dropping
+                // the separator when either part is empty. Both parts are WTF-8,
+                // so a lone surrogate in either survives.
+                let nv = self.get_prop(this, "name")?;
+                let name = if nv == Value::UNDEFINED {
+                    b"Error".to_vec()
+                } else {
+                    self.to_wtf8_string(nv)?
+                };
+                let mv = self.get_prop(this, "message")?;
+                let msg = if mv == Value::UNDEFINED {
+                    Vec::new()
+                } else {
+                    self.to_wtf8_string(mv)?
+                };
+                let sep: &[u8] = if name.is_empty() || msg.is_empty() {
+                    b""
+                } else {
+                    b": "
+                };
+                let mut out = Vec::new();
+                self.reserve_guest_wtf8(
+                    &mut out,
+                    name.len().saturating_add(sep.len()).saturating_add(msg.len()),
+                )?;
+                out.extend_from_slice(&name);
+                out.extend_from_slice(sep);
+                crate::heap::wtf8_push(&mut out, &msg);
+                self.alloc_wtf8_str(out)
+            }
+            SYMBOL_TO_STRING => {
+                // `Symbol.prototype.toString` → "Symbol(description)".
+                let sym = self.this_symbol_value(this, "toString")?;
+                self.symbol_descriptive_value(sym)?
+            }
+            SYMBOL_VALUE_OF => {
+                // `Symbol.prototype.valueOf` → the Symbol primitive itself.
+                self.this_symbol_value(this, "valueOf")?
+            }
+            SYMBOL_TO_PRIMITIVE => {
+                // `Symbol.prototype[Symbol.toPrimitive](hint)` → the Symbol itself.
+                self.this_symbol_value(this, "[Symbol.toPrimitive]")?
+            }
+            FN_HAS_INSTANCE => {
+                // `Function.prototype[Symbol.hasInstance](V)` → OrdinaryHasInstance.
+                Value::bool(self.ordinary_has_instance(this, a0)?)
+            }
+            FN_THROW_TYPE_ERROR => {
+                // %ThrowTypeError%: the restricted caller/arguments accessor — read
+                // OR write of Function.prototype.caller/arguments throws here.
+                return Err(Thrown::from_static(
+                    "TypeError: 'caller' and 'arguments' may not be accessed on this function",
+                ));
+            }
+            FINALLY_THEN | FINALLY_CATCH => {
+                // ThenFinally/CatchFinally (bound to [onFinally, C]); invoked by the
+                // receiver's `then` with the fulfilment value / rejection reason as
+                // the trailing arg. Per spec: result = onFinally(); promise =
+                // PromiseResolve(C, result); return promise.then(thunk), where the
+                // thunk passes the original value through (then) or re-throws the
+                // original reason (catch) once `onFinally`'s result settles.
+                let on_finally = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let ctor = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let carried = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                // Hold un-rooted Values across the onFinally / then re-entry.
+                let _gc = self.gc_lock_guard();
+                let result = self.call_value(on_finally, Value::UNDEFINED, &[])?;
+                let promise = self.call_native(PROMISE_RESOLVE, ctor, &[result])?;
+                let thunk_id = if id == FINALLY_THEN {
+                    FINALLY_VALUE_THUNK
+                } else {
+                    FINALLY_THROWER
+                };
+                let thunk_fn = Value::heap(self.heap.alloc(HeapObj::Native(thunk_id)));
+                let thunk = Value::heap(self.heap.alloc(HeapObj::Bound {
+                    target: thunk_fn,
+                    this: Value::UNDEFINED,
+                    args: vec![carried],
+                }));
+                let then_fn = self.get_prop(promise, "then")?;
+                self.call_value(then_fn, promise, &[thunk])?
+            }
+            FINALLY_VALUE_THUNK => {
+                // `() => value`: ignores its call argument, returns the bound value.
+                args.first().copied().unwrap_or(Value::UNDEFINED)
+            }
+            FINALLY_THROWER => {
+                // `() => { throw reason }`: re-throws the bound reason value.
+                let reason = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.pending_throw = Some(reason);
+                return Err(Thrown(self.throw_message(reason)));
+            }
+            DATE_TO_PRIMITIVE => {
+                // `Date.prototype[Symbol.toPrimitive](hint)`: O must be an Object.
+                // hint "string"/"default" → OrdinaryToPrimitive(O, "string"),
+                // hint "number" → OrdinaryToPrimitive(O, "number"); any other hint
+                // (including a non-string value) is a TypeError. The hint is matched
+                // by exact string value (no coercion), per spec.
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Date.prototype[Symbol.toPrimitive] called on a non-object",
+                    ));
+                }
+                let hint = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let hint_s = if hint.is_heap() && self.heap.is_str_like(hint.heap_index()) {
+                    self.to_js_string(hint)?
+                } else {
+                    String::new()
+                };
+                let order: [&str; 2] = match hint_s.as_str() {
+                    "string" | "default" => ["toString", "valueOf"],
+                    "number" => ["valueOf", "toString"],
+                    _ => return Err(Thrown::from_static(
+                        "TypeError: Date.prototype[Symbol.toPrimitive] called with an invalid hint",
+                    )),
+                };
+                self.ordinary_to_primitive(this, order)?
+            }
+            DATE_TO_JSON => {
+                // Date.prototype.toJSON(key): generic, NOT Date-branded.
+                //   O = ToObject(this); tv = ToPrimitive(O, number);
+                //   if tv is a non-finite Number, return null;
+                //   return Invoke(O, "toISOString").
+                let o = self.to_object(this)?;
+                let tv = self.to_primitive_number(o)?;
+                if tv.is_double() && !tv.as_f64().is_finite() {
+                    Value::NULL
+                } else {
+                    let m = self.get_prop(o, "toISOString")?;
+                    if !self.is_callable(m) {
+                        return Err(Thrown::from_static(
+                            "TypeError: Date.prototype.toJSON: toISOString is not callable",
+                        ));
+                    }
+                    self.call_value(m, o, &[])?
+                }
+            }
+            SYMBOL_DESCRIPTION_GET => {
+                // `get Symbol.prototype.description` → the symbol's description.
+                let sym = self.this_symbol_value(this, "description")?;
+                match self.heap.get(sym.heap_index()) {
+                    HeapObj::Symbol { desc, .. } => *desc,
+                    _ => Value::UNDEFINED,
+                }
+            }
+            STR_ITERATOR => {
+                // `String.prototype[Symbol.iterator]()` — RequireObjectCoercible +
+                // ToString, then a String Iterator yielding one code POINT at a time.
+                if this.is_nullish() {
+                    return Err(Thrown::from_static(
+                        "TypeError: String.prototype[Symbol.iterator] called on null or undefined",
+                    ));
+                }
+                // A string receiver iterates its EXACT code points (a lone
+                // surrogate yields a real 1-unit surrogate string); other
+                // receivers coerce through ToString (observable, may throw).
+                let cp_list: Vec<u32> =
+                    if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
+                        let si = this.heap_index();
+                        self.heap.flatten(si);
+                        let byte_len = match self.heap.get(si) {
+                            HeapObj::Str(js) => js.as_bytes().len(),
+                            _ => 0,
+                        };
+                        self.preflight_native_iteration_work(byte_len as u64)?;
+                        let mut list = Vec::new();
+                        list.try_reserve_exact(byte_len).map_err(|_| {
+                            Thrown::from_static("RangeError: string iterator allocation failed")
+                        })?;
+                        if let HeapObj::Str(js) = self.heap.get(si) {
+                            list.extend(js.code_points());
+                        }
+                        list
+                    } else {
+                        let s = self.to_js_string(this)?;
+                        self.preflight_native_iteration_work(s.len() as u64)?;
+                        let mut list = Vec::new();
+                        list.try_reserve_exact(s.len()).map_err(|_| {
+                            Thrown::from_static("RangeError: string iterator allocation failed")
+                        })?;
+                        list.extend(s.chars().map(u32::from));
+                        list
+                    };
+                let mut cps: Vec<Value> = Vec::new();
+                cps.try_reserve_exact(cp_list.len())
+                    .map_err(|_| Thrown::from_static("RangeError: string iterator allocation failed"))?;
+                for cp in cp_list {
+                    cps.push(self.str_from_cp(cp));
+                }
+                self.make_iterator(cps, self.string_iter_proto)
+            }
+            SYMBOL_FOR => {
+                // `Symbol.for(key)`: shared registry symbol for the ToString(key).
+                let key = self.to_js_string(a0)?;
+                if let Some(&sym) = self.symbol_registry.get(&key) {
+                    sym
+                } else {
+                    let desc = self.alloc_str(key.clone());
+                    let mut prop_key = String::new();
+                    self.append_guest_string(&mut prop_key, "@@for:")?;
+                    self.append_guest_string(&mut prop_key, &key)?;
+                    let sym = self.make_named_symbol(desc, &prop_key);
+                    self.symbol_registry.insert(key, sym);
+                    sym
+                }
+            }
+            SYMBOL_KEY_FOR => {
+                // `Symbol.keyFor(sym)`: the registry key for a registered symbol, else undefined.
+                if !matches!(
+                    a0.is_heap().then(|| self.heap.get(a0.heap_index())),
+                    Some(HeapObj::Symbol { .. })
+                ) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Symbol.keyFor requires that the argument be a Symbol",
+                    ));
+                }
+                let key = self
+                    .symbol_registry
+                    .iter()
+                    .find(|(_, v)| v.bits() == a0.bits())
+                    .map(|(k, _)| k.clone());
+                match key {
+                    Some(k) => self.alloc_str(k),
+                    None => Value::UNDEFINED,
+                }
+            }
+            BIGINT_TO_STRING => {
+                let n =
+                    match self.this_bigint_val(this) {
+                        Some(n) => n,
+                        None => return Err(Thrown::from_static(
+                            "TypeError: BigInt.prototype.toString requires that 'this' be a BigInt",
+                        )),
+                    };
+                // radix = ToIntegerOrInfinity(arg): ToNumber first, so a BigInt or
+                // Symbol radix is a TypeError (the lenient `to_number` would accept a
+                // BigInt). The this-value's brand check above still comes first.
+                let radix = if a0 == Value::UNDEFINED {
+                    10
+                } else {
+                    self.to_number_strict(a0)? as i64
+                };
+                if !(2..=36).contains(&radix) {
+                    return Err(Thrown::from_static(
+                        "RangeError: toString() radix must be between 2 and 36",
+                    ));
+                }
+                self.alloc_str(n.to_radix_string(radix as u32))
+            }
+            BIGINT_TO_LOCALE_STRING => {
+                // ECMA-402 BigInt.prototype.toLocaleString: brand-check `this`,
+                // then Construct an Intl.NumberFormat from (locales, options)
+                // and format through it — so a bad locale/option throws exactly
+                // what the constructor would.
+                let Some(n) = self.this_bigint_val(this) else {
+                    return Err(Thrown::from_static(
+                        "TypeError: BigInt.prototype.toLocaleString requires that 'this' be a BigInt",
+                    ));
+                };
+                #[cfg(not(feature = "wasm-lite"))]
+                {
+                    let nf = self.make_intl(native::INTL_NUMBERFORMAT, a0, a1)?;
+                    let resolved = match self.heap.get(nf.heap_index()) {
+                        HeapObj::Intl { resolved, .. } => *resolved,
+                        _ => return Err(Thrown::from_static("TypeError: NumberFormat expected")),
+                    };
+                    let prim = self.make_bigint_val(n);
+                    self.intl_number_format(resolved, prim)?
+                }
+                #[cfg(feature = "wasm-lite")]
+                {
+                    self.alloc_str(n.to_radix_string(10))
+                }
+            }
+            BIGINT_VALUE_OF => match self.this_bigint_val(this) {
+                Some(n) => self.make_bigint_val(n),
+                None => {
+                    return Err(Thrown::from_static(
+                        "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt",
+                    ))
+                }
+            },
+            BIGINT_AS_INTN | BIGINT_AS_UINTN => {
+                // bits = ToIndex(bits) (RangeError if negative / > 2^53-1) FIRST,
+                // then x = ToBigInt(value) — STRICT: a Number value is a TypeError
+                // (unlike the lenient BigInt() ctor coercion `to_bigint` allows).
+                let bits = self.to_index(a0)?;
+                if a1.is_number() {
+                    return Err(Thrown::from_static(
+                        "TypeError: cannot convert a Number to a BigInt",
+                    ));
+                }
+                let x = self.to_bigint(a1)?;
+                if id == BIGINT_AS_INTN {
+                    self.bigint_as_intn_val(bits as u64, x)?
+                } else {
+                    self.bigint_as_uintn_val(bits as u64, x)?
+                }
+            }
+            REGEXP_EXEC => {
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::RegExp { .. })
+                ) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.exec called on a non-RegExp",
+                    ));
+                }
+                self.regexp_exec(this.heap_index(), a0)?
+            }
+            REGEXP_TEST => {
+                // 22.2.6.16: the receiver need only be an OBJECT. The
+                // [[RegExpMatcher]] brand check belongs to RegExpBuiltinExec,
+                // which RegExpExec reaches only when `exec` is not callable — so
+                // requiring a real RegExp up front made
+                // `RegExp.prototype.test.call({ exec() {…} }, "")` throw, and
+                // made a patched `re.exec` invisible to `re.test`.
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.test called on a non-object",
+                    ));
+                }
+                let is_re = this.is_heap()
+                    && matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. });
+                // Fast path: a pristine RegExp whose `exec` is still the
+                // intrinsic. The Get and the call are then unobservable, so go
+                // straight to the builtin and skip the match-array build too.
+                // The proof must remain valid across ToString(S), which occurs
+                // before RegExpExec reads `exec`. Primitive coercion cannot run
+                // user code; an object can patch `exec`, so it takes the full
+                // protocol below and performs the Get after coercion.
+                if is_re && !self.is_object_value(a0) && self.regexp_exec_fast_ok(this.heap_index())
+                {
+                    let r = self.regexp_exec_impl(this.heap_index(), a0, false)?;
+                    return Ok(Value::bool(r != Value::NULL));
+                }
+                // ToString(S) precedes RegExpExec, so a custom `exec` receives
+                // the coerced string rather than the raw argument.
+                let s = self.to_str_value(a0)?;
+                let exec = self.get_prop(this, "exec")?;
+                if self.is_callable(exec) {
+                    let res = self.call_value(exec, this, &[s])?;
+                    if res != Value::NULL && !self.is_object_value(res) {
+                        return Err(Thrown::from_static(
+                            "TypeError: RegExp exec method returned something other than an Object or null",
+                        ));
+                    }
+                    return Ok(Value::bool(res != Value::NULL));
+                }
+                if !is_re {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.test called on a non-RegExp",
+                    ));
+                }
+                let r = self.regexp_exec_impl(this.heap_index(), s, false)?;
+                Value::bool(r != Value::NULL)
+            }
+            REGEXP_COMPILE => {
+                // RegExp.prototype.compile(pattern, flags): recompile in place.
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::RegExp { .. })
+                ) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.compile called on a non-RegExp",
+                    ));
+                }
+                // AnnexB: compile is a LEGACY feature — an instance created by a
+                // AnnexB step 1c: SameRealm(O, this compile function) — a
+                // receiver from another realm is a TypeError (thrown with the
+                // FUNCTION's realm identity via the call_value adoption).
+                if !self.realm_global_objs.is_empty()
+                    && self.get_function_realm(this) != self.native_callee_realm.unwrap_or(0)
+                {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.compile: receiver belongs to another realm",
+                    ));
+                }
+                // RegExp SUBCLASS (its [[Prototype]] is not %RegExp.prototype% —
+                // the COMPILE function's own realm's) throws TypeError rather
+                // than recompiling.
+                if self.proto_of.get(&this.heap_index()).map_or(false, |p| {
+                    !p.is_heap() || p.heap_index() != self.native_home(self.regexp_proto)
+                }) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.compile may not be used on a subclass instance",
+                    ));
+                }
+                // AnnexB step 3: if pattern has [[RegExpMatcher]], flags must be
+                // undefined (TypeError) — never stringified into a flags string.
+                if matches!(
+                    a0.is_heap().then(|| self.heap.get(a0.heap_index())),
+                    Some(HeapObj::RegExp { .. })
+                ) && a1 != Value::UNDEFINED
+                {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.compile: flags must be undefined when pattern is a RegExp",
+                    ));
+                }
+                // Reuse the constructor path (validates flags, builds and
+                // preflights the matcher), then move the freshly built fields
+                // into the receiver. Sharing this Arc also avoids compiling and
+                // retaining an un-preflighted duplicate program.
+                let built = self.build_regexp(a0, a1)?;
+                let (regex, source, flags) = match self.heap.get(built.heap_index()) {
+                    HeapObj::RegExp {
+                        regex,
+                        source,
+                        flags,
+                        ..
+                    } => (regex.clone(), source.clone(), flags.clone()),
+                    _ => unreachable!(),
+                };
+                // EXACT pattern bytes (lone surrogates): `build_regexp` recorded
+                // them for the throwaway `built` — take the entry so it can move
+                // to the receiver below (the struct's `source` is lossy).
+                let exact = self.regexp_exact_source.remove(&built.heap_index());
+                if let HeapObj::RegExp {
+                    regex: r,
+                    source: s,
+                    flags: fl,
+                    ascii_twin,
+                    ..
+                } = self.heap.get_mut(this.heap_index())
+                {
+                    *r = regex;
+                    *s = source;
+                    *fl = flags;
+                    // The byte-optimized ASCII twin compiled the OLD pattern —
+                    // drop it (rebuilt lazily on the next ASCII-subject exec).
+                    *ascii_twin = None;
+                }
+                // Move the exact-source entry onto the receiver — or clear a
+                // stale one when the new pattern is well-formed.
+                match exact {
+                    Some(b) => {
+                        self.regexp_exact_source.insert(this.heap_index(), b);
+                    }
+                    None => {
+                        self.regexp_exact_source.remove(&this.heap_index());
+                    }
+                }
+                // RegExpInitialize step 12: Set(obj, "lastIndex", 0, true) AFTER
+                // the slots update — a non-writable lastIndex throws TypeError
+                // with source/flags already recompiled.
+                self.set_prop(this, "lastIndex", Value::int(0), true)?;
+                this
+            }
+            REGEXP_ESCAPE => {
+                // RegExp.escape(S): escape S so it matches itself literally. Throws
+                // TypeError unless S is a String (no coercion).
+                if !(a0.is_heap() && self.heap.is_str_like(a0.heap_index())) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.escape called with a non-string argument",
+                    ));
+                }
+                // EXACT code points (the argument is a string by the check
+                // above): a lone surrogate must escape as \uNNNN, which the
+                // lossy &str view could never carry.
+                let bytes: Vec<u8> = self
+                    .heap
+                    .str_wtf8_cow(a0.heap_index())
+                    .unwrap()
+                    .into_owned();
+                self.preflight_native_iteration_work((bytes.len() as u64).saturating_mul(2))?;
+                let out_len = regexp_escape_output_len(&bytes)?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                regexp_escape_into(&bytes, &mut out);
+                debug_assert_eq!(out.len(), out_len);
+                self.alloc_str(out)
+            }
+            REGEXP_TO_STRING => {
+                // 22.2.6.14 step 2: a non-Object receiver is a TypeError before any
+                // Get — a primitive would otherwise render as "/undefined/undefined".
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype.toString called on a non-object",
+                    ));
+                }
+                let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::RegExp { source, flags, .. }) => {
+                        // Spec reads the `flags` getter, which assembles the
+                        // canonical `dgimsuvy` order regardless of storage order.
+                        let (s, f) = (source.clone(), super::proxy_regexp::canonical_flags(flags));
+                        // Lone-surrogate pattern (exact-source side table):
+                        // assemble `/src/flags` over the exact WTF-8 bytes so
+                        // toString round-trips the surrogates too.
+                        if let Some(b) = self.regexp_exact_source.get(&this.heap_index()) {
+                            self.preflight_native_iteration_work(
+                                (b.len() as u64).saturating_mul(2),
+                            )?;
+                            let esc = self.escaped_source_wtf8(b)?;
+                            let total = esc
+                                .len()
+                                .checked_add(f.len())
+                                .and_then(|n| n.checked_add(2))
+                                .ok_or_else(invalid_native_string_length)?;
+                            self.preflight_guest_string_size(total)?;
+                            let mut out = Vec::new();
+                            out.try_reserve_exact(total).map_err(|_| {
+                                Thrown::from_static("RangeError: string allocation failed")
+                            })?;
+                            out.push(b'/');
+                            out.extend_from_slice(&esc);
+                            out.push(b'/');
+                            out.extend_from_slice(f.as_bytes());
+                            let js = crate::heap::JsStr::from_wtf8(out);
+                            return Ok(Value::heap(self.heap.alloc_js(js)));
+                        }
+                        self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                        (self.escaped_source(&s)?, f)
+                    }
+                    // Steps 3-4 interleave each Get with its ToString: `source`'s
+                    // toString runs before `flags` is even read.
+                    _ => {
+                        let s = self.get_prop(this, "source")?;
+                        let src = self.to_js_string(s)?;
+                        let f = self.get_prop(this, "flags")?;
+                        (src, self.to_js_string(f)?)
+                    }
+                };
+                let total = src
+                    .len()
+                    .checked_add(flg.len())
+                    .and_then(|n| n.checked_add(2))
+                    .ok_or_else(invalid_native_string_length)?;
+                let mut out = self.guest_string_with_capacity(total)?;
+                out.push('/');
+                out.push_str(&src);
+                out.push('/');
+                out.push_str(&flg);
+                self.alloc_str(out)
+            }
+            REGEXP_GET_SOURCE => {
+                if !this.is_heap() {
+                    return Err(Thrown::from_static(
+                        "TypeError: get source called on a non-object",
+                    ));
+                }
+                let idx = this.heap_index();
+                if idx == self.native_home(self.regexp_proto) {
+                    self.alloc_str("(?:)".to_string())
+                } else if let HeapObj::RegExp { source, .. } = self.heap.get(idx) {
+                    let s = source.clone();
+                    // Exact-WTF-8 when the side table has the pattern's exact
+                    // bytes (lone surrogates round-trip), else lossy.
+                    self.regexp_source_value(idx, &s)?
+                } else {
+                    return Err(Thrown::from_static(
+                        "TypeError: get source called on a non-RegExp object",
+                    ));
+                }
+            }
+            REGEXP_GET_FLAGS => {
+                // Generic getter: Type(R) must be Object; reads each flag property.
+                let is_obj = this.is_heap()
+                    && !matches!(
+                        self.heap.get(this.heap_index()),
+                        HeapObj::Str(_)
+                            | HeapObj::Cons { .. }
+                            | HeapObj::BigInt(_)
+                            | HeapObj::BigIntBig(_)
+                            | HeapObj::Symbol { .. }
+                    );
+                if !is_obj {
+                    return Err(Thrown::from_static("TypeError: get flags called on a non-object"));
+                }
+                let mut out = String::new();
+                for (prop, ch) in [
+                    ("hasIndices", 'd'),
+                    ("global", 'g'),
+                    ("ignoreCase", 'i'),
+                    ("multiline", 'm'),
+                    ("dotAll", 's'),
+                    ("unicode", 'u'),
+                    ("unicodeSets", 'v'),
+                    ("sticky", 'y'),
+                ] {
+                    let v = self.get_prop(this, prop)?;
+                    if self.truthy(v) {
+                        out.push(ch);
+                    }
+                }
+                self.alloc_str(out)
+            }
+            REGEXP_SYM_SEARCH => {
+                // Spec-generic: Type(this) need only be Object (a plain object with
+                // a custom `exec`/`lastIndex` works); RegExpExec dispatches to its exec.
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.search] called on a non-object",
+                    ));
+                }
+                self.regexp_search_impl(this, a0)?
+            }
+            REGEXP_SYM_MATCH => {
+                // Generic over any Object `this` (the observable protocol lives in
+                // regexp_match_impl, honouring a user `exec`/`flags`/`lastIndex`).
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.match] called on a non-object",
+                    ));
+                }
+                self.regexp_match_impl(this.heap_index(), a0)?
+            }
+            REGEXP_SYM_SPLIT => {
+                // Generic over any Object `this` (the observable protocol —
+                // SpeciesConstructor + sticky splitter — lives in regexp_split_impl).
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.split] called on a non-object",
+                    ));
+                }
+                self.regexp_split_impl(this.heap_index(), a0, a1)?
+            }
+            REGEXP_SYM_REPLACE => {
+                // RegExp.prototype[Symbol.replace] is generic over any Object `this`
+                // (a plain object with a custom `exec` works); the observable
+                // protocol lives in regexp_symbol_replace.
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.replace] called on a non-object",
+                    ));
+                }
+                self.regexp_symbol_replace(this, a0, a1)?
+            }
+            REGEXP_SYM_MATCHALL => {
+                // RegExp.prototype[Symbol.matchAll](string): an iterator over all
+                // matches. The matcher is built via SpeciesConstructor(R, %RegExp%) +
+                // Construct(C, «R, flags») (so a custom constructor / @@species is
+                // observed), and its lastIndex copies R's via ToLength(Get(R,
+                // "lastIndex")). Eagerly computed over the (real-RegExp) clone.
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp.prototype[Symbol.matchAll] called on a non-object",
+                    ));
+                }
+                // A custom @@species Construct re-enters the interpreter; hold the
+                // un-rooted match Values across it by suspending GC.
+                let _gc = self.gc_lock_guard();
+                // ToString(string) — IDENTITY for a string value (exact WTF-8).
+                let s_val = self.to_str_value(a0)?;
+                // ── pristine fast path ──
+                // Every step of the observable protocol below is guaranteed to
+                // return the intrinsic when `regexp_matchall_fast_ok` holds, so
+                // the whole sequence reduces to cloning the compiled regex. The
+                // slow path costs ~6 property lookups, 3 string allocations and a
+                // full Construct (which re-derives the pattern) — 1.2us per
+                // `matchAll` call before a single match is attempted, against
+                // node's 47ns.
+                if let Some(re_idx) = self.as_regexp(this) {
+                    // `lastIndex = ToLength(Get(R, "lastIndex"))` is OBSERVABLE when
+                    // the slot holds an object — `valueOf` runs and may throw
+                    // (test262 Symbol.matchAll/this-tolength-lastindex-throws). Only
+                    // a plain number can take the fast path.
+                    let li_number = matches!(
+                        self.heap.get(re_idx),
+                        HeapObj::RegExp { last_index, .. } if last_index.is_number()
+                    );
+                    if li_number && self.regexp_matchall_fast_ok_cached(re_idx) {
+                        let (regex, source, flags, li_raw, twin) = match self.heap.get(re_idx) {
+                            HeapObj::RegExp {
+                                regex,
+                                source,
+                                flags,
+                                last_index,
+                                ascii_twin,
+                            } => (
+                                regex.clone(),
+                                source.clone(),
+                                flags.clone(),
+                                *last_index,
+                                ascii_twin.clone(),
+                            ),
+                            _ => unreachable!("as_regexp checked the tag"),
+                        };
+                        // Still needs the same ToLength clamp the slow path
+                        // applies: truncate toward zero, floor at 0, cap 2^53-1.
+                        let li = {
+                            let d = li_raw.as_f64().trunc();
+                            let d = if d.is_nan() { 0.0 } else { d };
+                            d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize
+                        };
+                        let global = flags.contains('g');
+                        let full_unicode = flags.contains('u') || flags.contains('v');
+                        // Fused-step eligibility (B118), decided ONCE here: this
+                        // arm's matcher is an engine-internal clone (no user
+                        // reference can ever exist to `compile()` it or shadow
+                        // its own props), so the flag bits below stay true for
+                        // the iterator's whole life. The subject must be a
+                        // flat-ASCII string — immutable, so that bit holds too
+                        // — which is what makes the per-step empty-match
+                        // advance exactly +1. `global` gates it because only
+                        // the global step loop is fused.
+                        use crate::vm::proxy_regexp::{
+                            RegexpIterRec, ITFB_FUSED, ITFB_INDICES, ITFB_STICKY,
+                        };
+                        let mut extra_bits = 0u8;
+                        if global && s_val.is_heap() {
+                            self.heap.flatten(s_val.heap_index());
+                            if matches!(self.heap.get(s_val.heap_index()),
+                                        HeapObj::Str(js) if js.is_ascii())
+                            {
+                                extra_bits = ITFB_FUSED
+                                    | if flags.contains('y') { ITFB_STICKY } else { 0 }
+                                    | if flags.contains('d') { ITFB_INDICES } else { 0 };
+                            }
+                        }
+                        // A fused-eligible source with no twin yet gets it built
+                        // HERE, on the SOURCE, so every matcher clone carries
+                        // `Some` from creation: a regex only ever used via
+                        // matchAll is never `exec`'d, so nothing else ensures
+                        // its twin, and the slim step's cold build lands on the
+                        // per-call matcher — which dies with the iteration, so
+                        // every creation re-paid the full ensure (~136ns
+                        // measured: compile-cps vec builds, cache-key
+                        // materialisation, SipHash probe). `is_none()`
+                        // deliberately skips `Some(None)` (a recorded compile
+                        // failure): the clone carries the failure and the slim
+                        // step's base-program arm handles it, unchanged. The
+                        // ensure writes only engine-internal state — exactly
+                        // what the first pristine `exec` on an ASCII subject
+                        // does today — so nothing observable moves.
+                        let twin = if extra_bits & ITFB_FUSED != 0
+                            && twin.is_none()
+                            && crate::vm::proxy_regexp::twin_at_create_enabled()
+                        {
+                            self.ensure_regexp_ascii_twin(re_idx);
+                            match self.heap.get(re_idx) {
+                                HeapObj::RegExp { ascii_twin, .. } => ascii_twin.clone(),
+                                _ => twin,
+                            }
+                        } else {
+                            twin
+                        };
+                        // The matcher is a SEPARATE object: the iterator advances
+                        // its lastIndex independently of the source regex.
+                        // Carry the byte-optimized twin over. It is derived from
+                        // `source` + `flags`, which the clone copies verbatim, so
+                        // it is provably the same program — and dropping it made
+                        // the first `exec` on the matcher rebuild the pattern's
+                        // code-point vector and hash a two-String cache key. On a
+                        // 2,000-char pattern that cost 3.2us per matchAll, against
+                        // a flat 13ns for the same work on the ORIGINAL object,
+                        // whose twin caching already worked.
+                        let matcher_idx = self.heap.alloc(HeapObj::RegExp {
+                            regex,
+                            source,
+                            flags,
+                            last_index: Value::num(li as f64),
+                            ascii_twin: twin,
+                        });
+                        // A lone-surrogate pattern keeps its exact source bytes.
+                        // `regexp_exact_source` is a SipHash `HashMap` that only ever
+                        // holds lone-surrogate patterns, so for every ordinary regex
+                        // this probe is a guaranteed miss — paid once per
+                        // `matchAll()`. Gate it on `is_empty`, the idiom the other
+                        // rare-side-table reads in this file already use.
+                        if !self.regexp_exact_source.is_empty() {
+                            if let Some(b) = self.regexp_exact_source.get(&re_idx).cloned() {
+                                self.regexp_exact_source.insert(matcher_idx, b);
+                            }
+                        }
+                        self.proto_of
+                            .insert(matcher_idx, Value::heap(self.regexp_proto));
+                        let main_proto = self.regexp_string_iter_proto;
+                        let proto = self.native_home(main_proto);
+                        let it = self.heap.alloc(HeapObj::Iterator {
+                            items: Vec::new(),
+                            index: 0,
+                            proto,
+                            live: None,
+                        });
+                        if proto != main_proto {
+                            if let Some(r) = self.native_callee_realm {
+                                self.obj_realm.insert(it, r);
+                            }
+                        }
+                        let fbits = (global as u8) | ((full_unicode as u8) << 1) | extra_bits;
+                        // O(1): stored units on a Str, stored len on a Cons —
+                        // no flatten needed for the length alone.
+                        let subj_units = if s_val.is_heap() {
+                            self.heap.str_units(s_val.heap_index()).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        self.regexp_string_iters.insert(
+                            it,
+                            RegexpIterRec {
+                                matcher: matcher_idx,
+                                subject: s_val,
+                                subj_units,
+                                fbits,
+                                done: false,
+                                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                                scalar_pending: None,
+                            },
+                        );
+                        return Ok(Value::heap(it));
+                    }
+                }
+                // Step 4, C = SpeciesConstructor(R, %RegExp%), precedes step 5's
+                // Get(R, "flags"): the `constructor` read is observed first.
+                let default_ctor = Value::heap(self.regexp_ctor);
+                let c = {
+                    let ctor = self.get_prop(this, "constructor")?;
+                    if ctor == Value::UNDEFINED {
+                        default_ctor
+                    } else if !self.is_object_value(ctor) {
+                        return Err(Thrown::from_static(
+                            "TypeError: RegExp.prototype[Symbol.matchAll]: constructor is not an object",
+                        ));
+                    } else {
+                        let sp = self.get_prop(ctor, "@@species")?;
+                        if sp == Value::UNDEFINED || sp == Value::NULL {
+                            default_ctor
+                        } else if self.is_constructor(sp) {
+                            sp
+                        } else {
+                            return Err(Thrown::from_static(
+                                "TypeError: RegExp.prototype[Symbol.matchAll]: @@species is not a constructor",
+                            ));
+                        }
+                    }
+                };
+                let flags_v = self.get_prop(this, "flags")?;
+                let flags = self.to_js_string(flags_v)?;
+                let global = flags.contains('g');
+                // fullUnicode is captured HERE per CreateRegExpStringIterator —
+                // it drives the driver's AdvanceStringIndex on empty matches.
+                let full_unicode = flags.contains('u') || flags.contains('v');
+                // matcher = Construct(C, «R, flags») — `flags` is the ALREADY
+                // ToString'd string (a user flags.toString must not run twice).
+                let flags_str = self.alloc_str(flags.clone());
+                let matcher = self.construct(c, &[this, flags_str])?;
+                let matcher_idx = matcher.heap_index();
+                // lastIndex = ToLength(Get(R, "lastIndex")); Set(matcher, lastIndex).
+                let li_v = self.get_prop(this, "lastIndex")?;
+                let li_u64 = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+                // A value beyond the host's addressable string range is still
+                // just an out-of-range RegExp index; saturate instead of
+                // wrapping 2^32 to zero on wasm32.
+                let li = usize::try_from(li_u64).unwrap_or(usize::MAX);
+                self.set_regexp_last_index(matcher_idx, li);
+                // Build a LAZY %RegExpStringIterator%: an empty Iterator object whose
+                // `next()` runs one RegExpExec (honouring a user `exec`) at a time —
+                // exec/lastIndex side effects are observable per step, not up front.
+                let main_proto = self.regexp_string_iter_proto;
+                let proto = self.native_home(main_proto);
+                let it = self.heap.alloc(HeapObj::Iterator {
+                    items: Vec::new(),
+                    index: 0,
+                    proto,
+                    live: None,
+                });
+                if proto != main_proto {
+                    if let Some(r) = self.native_callee_realm {
+                        self.obj_realm.insert(it, r);
+                    }
+                }
+                let fbits = (global as u8) | ((full_unicode as u8) << 1);
+                // O(1) whatever the subject's shape (Str or Cons); the field
+                // is only load-bearing on the `ITFB_FUSED` path, which this
+                // arm never sets.
+                let subj_units = if s_val.is_heap() {
+                    self.heap.str_units(s_val.heap_index()).unwrap_or(0)
+                } else {
+                    0
+                };
+                self.regexp_string_iters.insert(
+                    it,
+                    crate::vm::proxy_regexp::RegexpIterRec {
+                        matcher: matcher_idx,
+                        subject: s_val,
+                        subj_units,
+                        fbits,
+                        done: false,
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        scalar_pending: None,
+                    },
+                );
+                Value::heap(it)
+            }
+            REGEXP_GET_GLOBAL
+            | REGEXP_GET_IGNORECASE
+            | REGEXP_GET_MULTILINE
+            | REGEXP_GET_DOTALL
+            | REGEXP_GET_UNICODE
+            | REGEXP_GET_UNICODESETS
+            | REGEXP_GET_STICKY
+            | REGEXP_GET_HASINDICES => {
+                let ch = match id {
+                    REGEXP_GET_GLOBAL => 'g',
+                    REGEXP_GET_IGNORECASE => 'i',
+                    REGEXP_GET_MULTILINE => 'm',
+                    REGEXP_GET_DOTALL => 's',
+                    REGEXP_GET_UNICODE => 'u',
+                    REGEXP_GET_UNICODESETS => 'v',
+                    REGEXP_GET_STICKY => 'y',
+                    _ => 'd', // REGEXP_GET_HASINDICES
+                };
+                if !this.is_heap() {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp flag getter called on a non-object",
+                    ));
+                }
+                let idx = this.heap_index();
+                // `this === %RegExp.prototype%` — the GETTER's own realm's
+                // prototype (a realm copy's home is the realm's image).
+                if idx == self.native_home(self.regexp_proto) {
+                    Value::UNDEFINED
+                } else if let HeapObj::RegExp { flags, .. } = self.heap.get(idx) {
+                    Value::bool(flags.contains(ch))
+                } else {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp flag getter called on a non-RegExp object",
+                    ));
+                }
+            }
+            FN_CALL => {
+                let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
+                self.call_value(this, a0, rest)?
+            }
+            FN_APPLY => {
+                // argArray null/undefined -> no args; otherwise CreateListFromArrayLike
+                // (an array-like, NOT necessarily an iterable).
+                let callargs = if a1.is_nullish() {
+                    Vec::new()
+                } else {
+                    self.create_list_from_array_like(a1)?
+                };
+                // The list is Rust-owned until the callee's frame copies it; an
+                // exotic callee (a native, a bound or wrapped function) can run
+                // guest code first.
+                self.with_host_roots(&callargs, |vm| vm.call_value(this, a0, &callargs))?
+            }
+            FN_BIND => {
+                if !self.is_callable(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Function.prototype.bind called on a non-callable",
+                    ));
+                }
+                // Spec 20.2.3.2 step 3 is BoundFunctionCreate, whose first step is
+                // `Target.[[GetPrototypeOf]]()` — a bound function INHERITS its
+                // target's prototype (`class D extends C` ⇒ `D.bind(null)`'s proto
+                // is C), not %Function.prototype%. It runs before the length/name
+                // reads below, so a Proxy target's getPrototypeOf trap fires first
+                // — and its result is then held un-rooted across those (re-entrant)
+                // reads, so GC has to stay suspended until it lands in `proto_of`.
+                let _gc = self.gc_lock_guard();
+                let bound_proto = self.object_get_prototype_of(this);
+                // Steps 4-6: HasOwnProperty(Target, "length") → Get(Target,
+                // "length"), then Get(Target, "name") — both OBSERVABLE (a
+                // throwing accessor propagates before the bound function exists).
+                // HasOwnProperty goes through the DYNAMIC variant so a Proxy
+                // target's getOwnPropertyDescriptor trap fires (the plain
+                // `has_own_property` is trap-blind).
+                let mut length_get = None;
+                if self.has_own_property_dyn(this, "length")? {
+                    length_get = Some(self.get_prop(this, "length")?);
+                }
+                let name_get = self.get_prop(this, "name")?;
+                let bound: Vec<Value> = if args.len() > 1 {
+                    args[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let idx = self.heap.alloc(HeapObj::Bound {
+                    target: this,
+                    this: a0,
+                    args: bound,
+                });
+                self.proto_of.insert(idx, bound_proto);
+                // Snapshot the spec values as EXPLICIT own properties —
+                // SetFunctionLength/Name's
+                // non-writable, non-enumerable, configurable pair — computed as
+                // "bound " + (String name, else "") and
+                // max(0, ToIntegerOrInfinity(length) − boundArgs)
+                // (bound-length-and-name.js).
+                let nbound = args.len().saturating_sub(1) as f64;
+                let len = match length_get {
+                    Some(v) if v.is_int() => (v.as_int() as f64 - nbound).max(0.0),
+                    Some(v) if v.is_double() => {
+                        let d = v.as_f64();
+                        if d.is_nan() {
+                            0.0
+                        } else {
+                            (d.trunc() - nbound).max(0.0)
+                        }
+                    }
+                    _ => 0.0,
+                };
+                let attr = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                // "bound " + the target's name. A short name is copied flat, as
+                // it always was; a long one is joined by ordinary string
+                // concatenation, which makes a rope node over the target's
+                // (possibly itself rope) name rather than a fresh flat copy, so
+                // a chain of n binds costs O(n), not O(n²) time and memory.
+                let name_units = if name_get.is_heap() {
+                    self.heap.str_units(name_get.heap_index())
+                } else {
+                    None
+                };
+                let nv = match name_units {
+                    Some(n) if n > 64 => {
+                        let prefix = self.alloc_str("bound ".to_string());
+                        self.add_values(prefix, name_get)?
+                    }
+                    _ => {
+                        let tname = if name_units.is_some() {
+                            self.to_js_string(name_get)?
+                        } else {
+                            String::new()
+                        };
+                        let mut bound_name = self.guest_string_with_capacity(tname.len() + 6)?;
+                        bound_name.push_str("bound ");
+                        bound_name.push_str(&tname);
+                        self.alloc_str(bound_name)
+                    }
+                };
+                let lv = if len.is_finite()
+                    && len >= 0.0
+                    && len <= i32::MAX as f64
+                    && len.fract() == 0.0
+                {
+                    Value::int(len as i32)
+                } else {
+                    Value::num(len)
+                };
+                let m = self
+                    .fn_props
+                    .entry(idx)
+                    .or_insert_with(ObjMap::new_side_table);
+                m.define("name", nv, attr);
+                m.define("length", lv, attr);
+                // The explicit pair IS the bound function's name/length —
+                // suppress the synthesized intrinsics so they cannot reappear
+                // if an explicit one is later deleted.
+                self.deleted_callable_intrinsics.insert((idx, 0));
+                self.deleted_callable_intrinsics.insert((idx, 1));
+                Value::heap(idx)
+            }
+            FN_TO_STRING => {
+                if !this.is_heap() {
+                    return Err(Thrown::from_static(
+                        "TypeError: Function.prototype.toString requires that 'this' be a Function",
+                    ));
+                }
+                // User functions carry their exact source slice; everything else
+                // (natives, bound, classes) renders in the `[native code]` form.
+                let stored: Option<String> = match self.heap.get(this.heap_index()) {
+                    HeapObj::Func(id) => {
+                        let s = &self.func(*id as usize).source;
+                        (!s.is_empty()).then(|| s.clone())
+                    }
+                    HeapObj::Closure { func, .. } => {
+                        let s = &self.func(*func as usize).source;
+                        (!s.is_empty()).then(|| s.clone())
+                    }
+                    // A class value renders as its whole `class … { … }` source.
+                    HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
+                    HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Wrapped { .. } => None,
+                    // A constructor global (Array, Date, Temporal.Instant, …) is stored
+                    // as an is_ctor Object — it is callable and `typeof` "function", so it
+                    // renders in the `[native code]` form rather than throwing. So does
+                    // %Function.prototype% itself (a built-in function).
+                    HeapObj::Object(m) if m.is_ctor => None,
+                    HeapObj::Object(_)
+                        if self.fn_proto != 0 && this.heap_index() == self.fn_proto =>
+                    {
+                        None
+                    }
+                    // A callable Proxy (its target is callable) is a function for
+                    // toString purposes — render the `[native code]` form, not throw.
+                    HeapObj::Proxy {
+                        target, revoked, ..
+                    } if !*revoked && self.is_callable(*target) => None,
+                    _ => return Err(Thrown::from_static(
+                        "TypeError: Function.prototype.toString requires that 'this' be a Function",
+                    )),
+                };
+                let out = match stored {
+                    Some(s) => {
+                        self.preflight_guest_string_size(s.len())?;
+                        s
+                    }
+                    None => {
+                        let name = self.callable_name(this);
+                        const OPEN: &str = "function ";
+                        const CLOSE: &str = "() { [native code] }";
+                        let total = OPEN
+                            .len()
+                            .checked_add(name.len())
+                            .and_then(|n| n.checked_add(CLOSE.len()))
+                            .ok_or_else(invalid_native_string_length)?;
+                        let mut source = self.guest_string_with_capacity(total)?;
+                        source.push_str(OPEN);
+                        source.push_str(&name);
+                        source.push_str(CLOSE);
+                        source
+                    }
+                };
+                self.alloc_str(out)
+            }
+            ARR_IS_ARRAY => Value::bool(self.value_is_array_throwing(a0)?),
+            ARR_FROM => self.array_from(
+                this,
+                a0,
+                a1,
+                args.get(2).copied().unwrap_or(Value::UNDEFINED),
+            )?,
+            ARR_FROM_ASYNC => {
+                // Delegate to a lazily-compiled JS polyfill (an async function),
+                // invoked with `this` = the receiver constructor C. It returns a
+                // Promise; the top-level microtask drain progresses it.
+                let f = self.from_async_polyfill()?;
+                self.call_value(f, this, args)?
+            }
+            ASYNC_ITER_DISPOSE => {
+                // %AsyncIteratorPrototype%[@@asyncDispose]: delegate to a lazily-
+                // compiled JS polyfill, invoked with `this` = the iterator. Returns
+                // a Promise that calls+awaits this.return() and resolves undefined.
+                let f = self.async_dispose_polyfill()?;
+                self.call_value(f, this, args)?
+            }
+            ARR_OF => {
+                // Array.of(...items): A = IsConstructor(this) ? Construct(this,«len»)
+                // : ArrayCreate(len); then CreateDataPropertyOrThrow each item. The
+                // plain `Array.of(...)` receiver is %Array% → fast dense array.
+                let items = args.to_vec();
+                let n = items.len();
+                let use_default = !self.is_constructor(this)
+                    || (this.is_heap()
+                        && self.array_ctor != 0
+                        && this.heap_index() == self.array_ctor);
+                if use_default {
+                    self.alloc_array_current_realm(items)
+                } else {
+                    let _gc = self.gc_lock_guard();
+                    let target = self.construct(this, &[Value::num(n as f64)])?;
+                    for (i, v) in items.into_iter().enumerate() {
+                        self.create_data_property_or_throw(target, i, v)?;
+                    }
+                    self.set_prop(target, "length", Value::num(n as f64), true)?;
+                    target
+                }
+            }
+            // `%TypedArray%.from(src, mapFn?)` / `.of(...items)` — `this` is the
+            // concrete kind constructor (Int8Array, …); collect the values into a
+            // plain Array, then materialize a typed array of that kind.
+            TA_FROM | TA_OF => {
+                let kind = self
+                    .ta_ctors
+                    .iter()
+                    .position(|&c| this.is_heap() && c == this.heap_index());
+                let kind = match kind {
+                    Some(k) => k as u8,
+                    None => {
+                        // The abstract %TypedArray% intrinsic IS a constructor for
+                        // from/of, so its source is evaluated first (any
+                        // IterableToList / array-like length+element error
+                        // propagates) BEFORE the abstract-construct TypeError fires
+                        // at the final TypedArrayCreate step.
+                        if this.is_heap()
+                            && self.ta_base_ctor != 0
+                            && this.heap_index() == self.ta_base_ctor
+                        {
+                            if id == TA_FROM {
+                                self.array_from(
+                                    Value::UNDEFINED,
+                                    a0,
+                                    a1,
+                                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                                )?;
+                            }
+                            return Err(Thrown::from_static(
+                                "TypeError: Abstract class TypedArray not directly constructable",
+                            ));
+                        }
+                        // A user-defined constructor as `this`: %TypedArray%.from/of
+                        // are generic — collect the source into a list, Construct(this,
+                        // «len»), then CreateDataPropertyOrThrow each element (mirrors
+                        // Array.of). Only a non-constructor `this` is a TypeError.
+                        if self.is_constructor(this) {
+                            // Spec order: mapfn validated BEFORE the source is
+                            // touched; the source collects WITHOUT mapping; the
+                            // target is constructed and write-validated; only then
+                            // does the mapper run, interleaved with per-element
+                            // [[Set]] writes (coercion throws propagate; writes to
+                            // a shrunk/detached target silently drop).
+                            let _gc = self.gc_lock_guard();
+                            let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
+                            if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
+                                return Err(Thrown::from_static(
+                                    "TypeError: TypedArray.from mapfn is not a function",
+                                ));
+                            }
+                            let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                            let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
+                                self.ta_from_source(a0)?
+                            } else {
+                                self.preflight_native_iteration_work(args.len() as u64)?;
+                                let mut list = Vec::new();
+                                list.try_reserve_exact(args.len()).map_err(|_| {
+                                    Thrown::from_static(
+                                        "RangeError: typed array source allocation failed",
+                                    )
+                                })?;
+                                list.extend_from_slice(args);
+                                (args.len(), Some(list))
+                            };
+                            self.preflight_native_iteration_work(n as u64)?;
+                            let target = self.construct(this, &[Value::num(n as f64)])?;
+                            // TypedArrayCreate: ValidateTypedArray in write mode —
+                            // a non-TypedArray, an immutable-backed result, or one
+                            // shorter than requested is a TypeError BEFORE any
+                            // element coercion or mapper call.
+                            let tidx = match target
+                                .is_heap()
+                                .then(|| self.heap.get(target.heap_index()))
+                            {
+                                Some(HeapObj::TypedArray { buffer, .. }) => {
+                                    let b = *buffer;
+                                    if self.immutable_buffers.contains(&b) {
+                                        return Err(Thrown::from_static(
+                                            "TypeError: TypedArray.from/of constructor returned a TypedArray backed by an immutable ArrayBuffer",
+                                        ));
+                                    }
+                                    target.heap_index()
+                                }
+                                _ => {
+                                    return Err(Thrown::from_static(
+                                        "TypeError: TypedArray.from/of constructor did not return a TypedArray",
+                                    ))
+                                }
+                            };
+                            if self.ta_effective_len(tidx).unwrap_or(0) < n {
+                                return Err(Thrown::from_static(
+                                    "TypeError: TypedArray.from/of constructor returned a TypedArray shorter than the requested length",
+                                ));
+                            }
+                            for i in 0..n {
+                                // Array-like sources Get their elements HERE,
+                                // after the target exists (spec step 12.b).
+                                let v = match &list {
+                                    Some(l) => l[i],
+                                    None => self.get_index(a0, Value::int(i as i32))?,
+                                };
+                                let mv = if mapfn != Value::UNDEFINED {
+                                    self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
+                                } else {
+                                    v
+                                };
+                                self.ta_element_set(tidx, i, mv)?;
+                            }
+                            return Ok(target);
+                        }
+                        return Err(Thrown::from_static(
+                            "TypeError: this is not a TypedArray constructor",
+                        ));
+                    }
+                };
+                // The built-in ctor path follows the same spec order: validate
+                // mapfn, collect the source unmapped, CREATE the target, then run
+                // the mapper interleaved with [[Set]] writes — the mapper can
+                // detach/shrink the (already-existing) result, whose later writes
+                // then silently drop.
+                let _gc = self.gc_lock_guard();
+                let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
+                if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
+                    return Err(Thrown::from_static(
+                        "TypeError: TypedArray.from mapfn is not a function",
+                    ));
+                }
+                let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
+                    self.ta_from_source(a0)?
+                } else {
+                    self.preflight_native_iteration_work(args.len() as u64)?;
+                    let mut list = Vec::new();
+                    list.try_reserve_exact(args.len()).map_err(|_| {
+                        Thrown::from_static("RangeError: typed array source allocation failed")
+                    })?;
+                    list.extend_from_slice(args);
+                    (args.len(), Some(list))
+                };
+                self.preflight_native_iteration_work(n as u64)?;
+                let size = native::TA_KINDS[kind as usize].1;
+                let buf = self.alloc_array_buffer(n * size)?;
+                let target = self.alloc_typed_array(buf, kind, 0, n);
+                let tidx = target.heap_index();
+                for i in 0..n {
+                    let v = match &list {
+                        Some(l) => l[i],
+                        None => self.get_index(a0, Value::int(i as i32))?,
+                    };
+                    let mv = if mapfn != Value::UNDEFINED {
+                        self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
+                    } else {
+                        v
+                    };
+                    self.ta_element_set(tidx, i, mv)?;
+                }
+                target
+            }
+            // %TypedArray%.prototype accessor getters. The data accessors throw on a
+            // non-TypedArray receiver; @@toStringTag returns undefined instead.
+            TA_GET_BUFFER | TA_GET_BYTELENGTH | TA_GET_BYTEOFFSET | TA_GET_LENGTH => {
+                let (buffer, kind, byte_offset, length) =
+                    match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                        Some(HeapObj::TypedArray {
+                            buffer,
+                            kind,
+                            byte_offset,
+                            length,
+                        }) => (*buffer, *kind, *byte_offset, *length),
+                        _ => {
+                            return Err(Thrown::from_static(
+                                "TypeError: TypedArray accessor called on a non-TypedArray",
+                            ))
+                        }
+                    };
+                let size = native::TA_KINDS[kind as usize].1;
+                let _ = length;
+                // Use the EFFECTIVE length, not the stored field: a
+                // length-tracking view over a resizable buffer re-derives its
+                // length from the buffer's current size, and a detached or
+                // shrunk-past view reports 0. The stored `length` is the value
+                // captured at construction, so reading it directly reported a
+                // stale length after `rab.resize(...)` — this getter must agree
+                // with the instance fast path in `props/member.rs`, which is
+                // what every `Array.prototype.*.call(ta, …)` goes through.
+                let eff = self.ta_effective_len(this.heap_index());
+                match id {
+                    TA_GET_BUFFER => Value::heap(buffer),
+                    TA_GET_BYTELENGTH => Value::num((eff.unwrap_or(0) * size) as f64),
+                    TA_GET_BYTEOFFSET => Value::num(if eff.is_none() {
+                        0.0
+                    } else {
+                        byte_offset as f64
+                    }),
+                    _ => Value::num(eff.unwrap_or(0) as f64), // TA_GET_LENGTH
+                }
+            }
+            // `get [Symbol.species]` — returns the receiver constructor unchanged.
+            SPECIES_GET => this,
+            // Async-module plumbing: `this` carries the deferred module's
+            // capability-promise index. OK decrements the pending-dependency
+            // count and runs the body on zero; FAIL rejects the capability.
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
+            MODULE_DEP_OK => {
+                let cap = this.as_f64() as u32;
+                if let Some(st) = self.deferred_mods.get_mut(&cap) {
+                    st.remaining = st.remaining.saturating_sub(1);
+                    if st.remaining == 0 {
+                        let st = self.deferred_mods.remove(&cap).unwrap();
+                        self.run_deferred_module(cap, st);
+                    }
+                }
+                Value::UNDEFINED
+            }
+            AGENT_MONOTONIC_NOW => {
+                Value::num(crate::vm::clock::now_mono_ms() - self.vm_start_mono_ms)
+            }
+            AGENT_SET_TIMEOUT => {
+                let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let ms = self
+                    .to_number_coerce(args.get(1).copied().unwrap_or(Value::UNDEFINED))?
+                    .max(0.0);
+                if self.is_callable(cb) {
+                    let next_len = self
+                        .timer_queue
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| Thrown::from_static("RangeError: timer queue is too large"))?;
+                    let delay = host_timeout_duration(ms)?;
+                    self.preflight_native_iteration_work(timer_queue_work_bound(next_len))?;
+                    self.timer_queue
+                        .try_reserve(1)
+                        .map_err(|_| Thrown::from_static("RangeError: timer queue allocation failed"))?;
+                    let due = crate::vm::clock::Instant::now() + delay;
+                    self.timer_queue.push((due, cb));
+                }
+                Value::UNDEFINED
+            }
+            DISPOSE_ASYNC_STEP => {
+                let cap = this.as_f64() as u32;
+                self.dispose_async_step(cap, None);
+                Value::UNDEFINED
+            }
+            DISPOSE_ASYNC_STEP_REJECT => {
+                let cap = this.as_f64() as u32;
+                let reason = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.dispose_async_step(cap, Some(reason));
+                Value::UNDEFINED
+            }
+            AGENT_GET_REPORT => match self.agent_pop_report() {
+                Some(s) => self.alloc_str(s),
+                None => Value::NULL,
+            },
+            AGENT_START => {
+                // Spawn a concurrent worker agent (its own thread + Vm/realm)
+                // and BLOCK until it signals it is running (INTERPRETING.md).
+                self.require_external_code_enabled()?;
+                let src = self.to_js_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                self.agent_start(src)?;
+                Value::UNDEFINED
+            }
+            AGENT_BROADCAST => {
+                // Blocks until every started agent has RETRIEVED the SAB
+                // (workers ack on receipt, before their callback runs).
+                let sab = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let id = match args.get(1).copied() {
+                    Some(v) if v != Value::UNDEFINED => self.to_number_coerce(v)?,
+                    _ => 0.0,
+                };
+                self.agent_broadcast(sab, id)?;
+                Value::UNDEFINED
+            }
+            #[cfg(not(feature = "wasm-single-agent"))]
+            AGENT_RECEIVE_BROADCAST => {
+                // Worker-side: register cb(sab, id) for the next broadcast.
+                // GC ROOT (gc.rs traces broadcast_cb).
+                self.broadcast_cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+                Value::UNDEFINED
+            }
+            #[cfg(feature = "wasm-single-agent")]
+            AGENT_RECEIVE_BROADCAST => Value::UNDEFINED,
+            AGENT_REPORT => {
+                // ToString(x) onto the shared FIFO the main agent's
+                // getReport() pops. Workers report; main pushing is harmless.
+                let v = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let s = self.to_js_string(v)?;
+                self.agent_push_report(s);
+                Value::UNDEFINED
+            }
+            // Marks the worker done; its thread may linger parked on the
+            // broadcast channel (process exit reaps it — one test per process).
+            AGENT_LEAVING => Value::UNDEFINED,
+            // The Annex-B call-assignment-target rewrite's deferred PutValue
+            // error (see lib.rs annexb_call_target_rewrite): always throws.
+            ANNEXB_REF_ERROR => {
+                return Err(Thrown::from_static(
+                    "ReferenceError: Invalid left-hand side in assignment",
+                ))
+            }
+            GLOBAL_PRINT => {
+                // Mirrors the Print instruction (console.log): inspect each
+                // argument into one bounded buffer, append one stdout line.
+                let line = self.inspect_line(args.len(), |i| args[i]);
+                #[cfg(feature = "instrument")]
+                self.instrument_output_line(&line)
+                    .map_err(|msg| Thrown(msg.into()))?;
+                self.push_console_line(line, false);
+                Value::UNDEFINED
+            }
+            CONSOLE_LOG | CONSOLE_INFO | CONSOLE_DEBUG => {
+                let line = self.inspect_line(args.len(), |i| args[i]);
+                #[cfg(feature = "instrument")]
+                self.instrument_output_line(&line)
+                    .map_err(|msg| Thrown(msg.into()))?;
+                self.push_console_line(line, false);
+                Value::UNDEFINED
+            }
+            CONSOLE_WARN | CONSOLE_ERROR => {
+                let line = self.inspect_line(args.len(), |i| args[i]);
+                #[cfg(feature = "instrument")]
+                self.instrument_output_line(&line)
+                    .map_err(|msg| Thrown(msg.into()))?;
+                self.push_console_line(line, true);
+                Value::UNDEFINED
+            }
+            AGENT_SLEEP => {
+                let ms = self
+                    .to_number_coerce(args.first().copied().unwrap_or(Value::UNDEFINED))?
+                    .max(0.0);
+                std::thread::sleep(host_timeout_duration(ms)?);
+                Value::UNDEFINED
+            }
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
+            MODULE_DEP_FAIL => {
+                let cap = this.as_f64() as u32;
+                if self.deferred_mods.remove(&cap).is_some() {
+                    let reason = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    self.reject(cap, reason);
+                }
+                Value::UNDEFINED
+            }
+            // The later job of a dynamic `import()` (the ImportCall op queued
+            // this microtask): `this` is the import() promise, args =
+            // [resolved path, type?]. Performs the load now and settles the
+            // promise (including chaining on a still-pending TLA body promise).
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
+            MODULE_DYN_IMPORT => {
+                let p = this.heap_index();
+                let spec = self.display(args.first().copied().unwrap_or(Value::UNDEFINED));
+                // Trailing slot: the reaction's settled value (always
+                // undefined here) follows the bound [specifier, type?] args —
+                // only a real string is a type attribute.
+                let mtype = args
+                    .get(1)
+                    .copied()
+                    .filter(|t| !t.is_undefined())
+                    .map(|t| self.display(t));
+                // The ImportCall op already resolved the specifier against
+                // its referrer (`dynamic_import_base_dir`): `spec` is the
+                // joined path, never re-resolved against the VM-wide base.
+                let path = std::path::PathBuf::from(spec);
+                let res: Result<Value, Value> = match self.import_module(&path, mtype.as_deref()) {
+                    Ok(ns) => Ok(ns),
+                    Err(Thrown(msg)) => Err(self
+                        .pending_throw
+                        .take()
+                        .unwrap_or_else(|| self.error_from_thrown(&msg))),
+                };
+                match res {
+                    Ok(ns) => {
+                        let body = self.pending_module_body.take();
+                        match body {
+                            Some(bp) if bp.is_heap() => {
+                                // Still-evaluating TLA module: settle FROM its
+                                // body promise (fulfill → the namespace).
+                                let _gc = self.gc_lock_guard();
+                                let ret_ns = Value::heap(
+                                    self.heap.alloc(HeapObj::Native(native::SPECIES_GET)),
+                                );
+                                let cb = Value::heap(self.heap.alloc(HeapObj::Bound {
+                                    target: ret_ns,
+                                    this: ns,
+                                    args: Vec::new(),
+                                }));
+                                self.then_internal(bp.heap_index(), cb, Value::UNDEFINED, Some(p));
+                            }
+                            _ => self.resolve(p, ns),
+                        }
+                    }
+                    Err(e) => self.reject(p, e),
+                }
+                Value::UNDEFINED
+            }
+            TA_GET_TOSTRINGTAG => match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                Some(HeapObj::TypedArray { kind, .. }) => {
+                    let name = native::TA_KINDS[*kind as usize].0.to_string();
+                    self.alloc_str(name)
+                }
+                _ => Value::UNDEFINED,
+            },
+            // `Array.prototype.{join,push}` as values: `this` is the receiver array.
+            // join is generic over array-likes (array_method materializes a
+            // non-array receiver); push mutates, so it still requires a real array.
+            ARR_JOIN => {
+                if this.is_heap() {
+                    self.array_method(this.heap_index(), "join", args)?
+                        .unwrap_or(Value::UNDEFINED)
+                } else {
+                    // Generic over a primitive `this`: ToObject (null/undefined throw),
+                    // then join the boxed array-like (a Boolean/Number wrapper has
+                    // length 0, so the result is "").
+                    self.require_object_coercible(this)?;
+                    let obj = self.to_object(this)?;
+                    self.array_method(obj.heap_index(), "join", args)?
+                        .unwrap_or(Value::UNDEFINED)
+                }
+            }
+            ARR_PUSH => {
+                if this.is_heap() && matches!(self.heap.get(this.heap_index()), HeapObj::Array(_)) {
+                    self.array_method(this.heap_index(), "push", args)?
+                        .unwrap_or(Value::UNDEFINED)
+                } else {
+                    // Generic over an array-like `this`
+                    // (`Array.prototype.push.call({length, 0:…}, …)`): ToObject then
+                    // the abstract Get/Set/ToLength protocol.
+                    self.require_object_coercible(this)?;
+                    let obj = self.to_object(this)?;
+                    self.array_like_mutate(obj, "push", args)?
+                        .unwrap_or(Value::UNDEFINED)
+                }
+            }
+            // More Object statics as values.
+            OBJ_IS => {
+                let a = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let b = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                Value::bool(self.same_value(a, b))
+            }
+            OBJ_HAS_OWN => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.require_object_coercible(o)?; // ToObject(O): null/undefined throw
+                let k = self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                Value::bool(self.has_own_property_dyn(o, &k)?)
+            }
+            OBJ_SET_PROTO_OF => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let proto = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // RequireObjectCoercible(O); proto must be Object or null.
+                self.require_object_coercible(o)?;
+                if proto != Value::NULL && !self.is_object_value(proto) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Object prototype may only be an Object or null",
+                    ));
+                }
+                // Object.setPrototypeOf returns O, but throws if [[SetPrototypeOf]]
+                // rejects the change (non-extensible / cycle / immutable prototype /
+                // a Proxy trap returning falsish).
+                if !self.ordinary_set_prototype_of(o, proto)? {
+                    return Err(Thrown::from_static(
+                        "TypeError: Object.setPrototypeOf failed (target is non-extensible, the change is cyclic, or it has an immutable prototype)",
+                    ));
+                }
+                o
+            }
+            OBJ_GET_OWN_SYMBOLS => {
+                let _a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.defer_check_all(_a0)?;
+                self.require_object_coercible(a0)?; // ToObject(O): null/undefined throw
+                                                    // Own symbol-keyed properties: the `@@`-prefixed own keys, mapped
+                                                    // back to their Symbol values via the prop_key registry.
+                let mut syms: Vec<Value> = Vec::new();
+                if a0.is_heap() && self.proxy_parts(a0.heap_index()).is_some() {
+                    // A Proxy: drive [[OwnPropertyKeys]] (the ownKeys trap and its
+                    // target-key invariant checks — a violation throws) via
+                    // object_own_keys, then keep only the Symbol keys.
+                    let all = self.object_own_keys(a0)?;
+                    for k in self.array_snapshot(all.heap_index()) {
+                        if k.is_heap()
+                            && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. })
+                        {
+                            syms.push(k);
+                        }
+                    }
+                } else if a0.is_heap() {
+                    if let HeapObj::Object(m) = self.heap.get(a0.heap_index()) {
+                        let keys: Vec<String> = m
+                            .keys
+                            .iter()
+                            .filter(|k| k.starts_with("@@"))
+                            .cloned()
+                            .collect();
+                        for k in keys {
+                            if let Some(&sym) = self.symbol_keys.get(&k) {
+                                syms.push(sym);
+                            }
+                        }
+                    } else if let HeapObj::Class(c) = self.heap.get(a0.heap_index()) {
+                        // A class constructor's symbol-keyed STATIC elements
+                        // (methods + accessors) live in the class's own member
+                        // stores, in definition order.
+                        let mut keys: Vec<String> = Vec::new();
+                        for k in c
+                            .statics
+                            .keys
+                            .iter()
+                            .chain(c.static_getters.iter().map(|(n, _)| n))
+                            .chain(c.static_setters.iter().map(|(n, _)| n))
+                        {
+                            if k.starts_with("@@") && !keys.iter().any(|e| e == k) {
+                                keys.push(k.clone());
+                            }
+                        }
+                        for k in keys {
+                            if let Some(&sym) = self.symbol_keys.get(&k) {
+                                syms.push(sym);
+                            }
+                        }
+                        // Symbol keys assigned directly onto the class value
+                        // (`C[sym] = v`) land in the arr_props side table.
+                        let extra: Vec<String> =
+                            self.arr_props
+                                .get(&a0.heap_index())
+                                .map_or(Vec::new(), |m| {
+                                    m.keys
+                                        .iter()
+                                        .filter(|k| k.starts_with("@@"))
+                                        .cloned()
+                                        .collect()
+                                });
+                        for k in extra {
+                            if let Some(&sym) = self.symbol_keys.get(&k) {
+                                syms.push(sym);
+                            }
+                        }
+                    } else {
+                        // Exotic heap kinds (TypedArray, DataView, Map, Date, ...)
+                        // keep their own props in the arr_props side table;
+                        // callables in fn_props.
+                        let table = if matches!(
+                            self.heap.get(a0.heap_index()),
+                            HeapObj::Func(_)
+                                | HeapObj::Closure { .. }
+                                | HeapObj::Bound { .. }
+                                | HeapObj::Native(_)
+                                | HeapObj::NativeClosure { .. }
+                        ) {
+                            self.fn_props.get(&a0.heap_index())
+                        } else {
+                            self.arr_props.get(&a0.heap_index())
+                        };
+                        let keys: Vec<String> = table.map_or(Vec::new(), |m| {
+                            m.keys
+                                .iter()
+                                .filter(|k| k.starts_with("@@"))
+                                .cloned()
+                                .collect()
+                        });
+                        for k in keys {
+                            if let Some(&sym) = self.symbol_keys.get(&k) {
+                                syms.push(sym);
+                            }
+                        }
+                    }
+                }
+                self.alloc_array_current_realm(syms)
+            }
+            OBJ_FROM_ENTRIES => {
+                let src = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.object_from_entries(src)?
+            }
+            OBJ_GET_OWN_DESCS => {
+                let a = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.require_object_coercible(a)?; // ToObject(O): null/undefined throw
+                let o = self.to_object(a)?;
+                // [[OwnPropertyKeys]] — STRING and SYMBOL keys (in spec order), not
+                // just strings: the result object mirrors every own key. `key_of`
+                // yields the internal key (the `@@`-key for a Symbol), so `map.set`
+                // recreates a symbol-keyed property.
+                let names = self.object_own_keys(o)?;
+                let keys: Vec<Value> = match self.heap.get(names.heap_index()) {
+                    HeapObj::Array(items) => items.clone(),
+                    _ => Vec::new(),
+                };
+                let mut map = ObjMap::new();
+                for kv in keys {
+                    let ks = self.key_of(kv);
+                    let desc = match self.proxy_gopd(o, &ks)? {
+                        Some(d) => d,
+                        None => self.object_get_own_property_descriptor(o, &ks),
+                    };
+                    // CreateDataProperty only for a DEFINED descriptor (a Proxy's gopd
+                    // trap may report undefined → that key is omitted from the result).
+                    if desc.is_undefined() {
+                        continue;
+                    }
+                    map.set(&ks, desc);
+                }
+                self.alloc_object_current_realm(map)
+            }
+            // Integrity traits. Non-object arguments pass through unchanged
+            // (freeze/seal/preventExtensions) or report as already-locked
+            // (isFrozen/isSealed -> true, isExtensible -> false), per ES2015+.
+            // Extensibility for an exotic (non-Object) heap value — array, function,
+            // Temporal instance, Map/Set/Date/… — is tracked in the `arr_props` side
+            // table (its ObjMap carries the `extensible` flag, default true). A fresh
+            // exotic is therefore extensible / not-frozen / not-sealed (per spec),
+            // and preventExtensions/seal/freeze record it consistently. Plain
+            // Objects keep their own `extensible` flag; primitives are immutable.
+            OBJ_FREEZE | OBJ_SEAL | OBJ_PREVENT_EXT => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                // SetIntegrityLevel (freeze/seal) AND Object.preventExtensions all
+                // call O.[[PreventExtensions]](): for a Proxy this fires the trap and
+                // a falsish result is a TypeError (the abrupt path these tests
+                // exercise). The full per-key integrity walk on a Proxy is not yet
+                // modeled, so on a successful trap freeze/seal fall through to the
+                // local flag-set; preventExtensions is then complete.
+                if let Some(ok) = self.proxy_prevent_extensions(o)? {
+                    if !ok {
+                        let m = match id {
+                            OBJ_FREEZE => "Object.freeze",
+                            OBJ_SEAL => "Object.seal",
+                            _ => "Object.preventExtensions",
+                        };
+                        return Err(Thrown(format!(
+                            "TypeError: {m} 'preventExtensions' trap returned falsish"
+                        )));
+                    }
+                    // preventExtensions succeeded. freeze/seal also run the per-key
+                    // integrity walk (ownKeys → getOwnPropertyDescriptor →
+                    // defineProperty traps) on the Proxy.
+                    if id != OBJ_PREVENT_EXT {
+                        self.proxy_set_integrity(o, id == OBJ_FREEZE)?;
+                    }
+                    return Ok(o);
+                }
+                if o.is_heap() {
+                    let idx = o.heap_index();
+                    self.materialize_regexp_result_props(idx);
+                    // SetIntegrityLevel on a module namespace: "frozen" first runs
+                    // the [[GetOwnProperty]] walk (an uninit export throws), then
+                    // defines {writable:false} per export — which the namespace
+                    // [[DefineOwnProperty]] rejects (TypeError). "sealed" defines
+                    // only {configurable:false}, which matches every export's
+                    // actual descriptor — a no-op that SUCCEEDS.
+                    if id == OBJ_FREEZE {
+                        if let Some(m) = self.module_namespaces.get(&idx) {
+                            let has_exports = !m.is_empty();
+                            self.ns_tdz_check_all(o)?;
+                            if has_exports {
+                                return Err(Thrown::from_static(
+                                    "TypeError: Cannot freeze a module namespace object with exports",
+                                ));
+                            }
+                        }
+                    }
+                    match self.heap.get(idx) {
+                        // Heap-but-primitive (string/symbol/bigint): a no-op.
+                        HeapObj::Str(_)
+                        | HeapObj::Cons { .. }
+                        | HeapObj::Symbol { .. }
+                        | HeapObj::BigInt(_)
+                        | HeapObj::BigIntBig(_) => {}
+                        HeapObj::Object(m) => {
+                            // Freezing a class's prototype makes its declared
+                            // members non-writable, which governs instance
+                            // writes: retire the class's member tables.
+                            if id == OBJ_FREEZE && m.class_proto {
+                                self.note_class_proto_mutation(idx, None);
+                            }
+                            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                                match id {
+                                    OBJ_FREEZE => m.freeze(),
+                                    OBJ_SEAL => m.seal(),
+                                    _ => m.extensible = false,
+                                }
+                            }
+                            // Attrs flipped IN PLACE: invalidate any JIT inline
+                            // cache holding a now-non-writable slot (the
+                            // interpreter IC re-reads attrs per hit; the native
+                            // IcEntry guards only on the version).
+                            self.heap.bump_version(idx);
+                        }
+                        // A TypedArray whose LENGTH CAN CHANGE can never lose
+                        // extensibility: [[PreventExtensions]] returns false
+                        // when IsTypedArrayFixedLength is false, so
+                        // preventExtensions/seal/freeze all throw. Keying that
+                        // on "the buffer is resizable" was too broad — a
+                        // fixed-length view onto a GROWABLE SharedArrayBuffer
+                        // can never shrink, and must succeed.
+                        HeapObj::TypedArray { buffer, .. }
+                            if !self.ta_is_fixed_length(idx, *buffer) =>
+                        {
+                            return Err(Thrown::from_static(
+                                "TypeError: Cannot prevent extensions on a TypedArray whose length can change",
+                            ));
+                        }
+                        // SetIntegrityLevel then redefines every index property
+                        // with configurable: false (and, for freeze, writable:
+                        // false), both of which an integer-indexed exotic
+                        // [[DefineOwnProperty]] rejects outright. So a NON-EMPTY
+                        // TypedArray can be preventExtensions'd but never sealed
+                        // or frozen; an empty one has no index property to
+                        // redefine and succeeds.
+                        HeapObj::TypedArray { .. }
+                            if id != OBJ_PREVENT_EXT
+                                && self.ta_effective_len(idx).unwrap_or(0) > 0 =>
+                        {
+                            // SetIntegrityLevel runs `? O.[[PreventExtensions]]()`
+                            // (step 3) BEFORE the per-key DefinePropertyOrThrow
+                            // walk that throws here, and that step SUCCEEDED — so
+                            // the array is left NON-EXTENSIBLE even though seal /
+                            // freeze threw. Throwing without it reported
+                            // `Object.isExtensible(ta) === true` after a failed
+                            // `Object.seal(ta)` (staging/sm/TypedArray/
+                            // test-integrity-level.js).
+                            self.arr_props
+                                .entry(idx)
+                                .or_insert_with(ObjMap::new_side_table)
+                                .extensible = false;
+                            let m = if id == OBJ_FREEZE { "freeze" } else { "seal" };
+                            return Err(Thrown(format!(
+                                "TypeError: Cannot {m} a TypedArray that has elements"
+                            )));
+                        }
+                        _ => {
+                            let m = self
+                                .arr_props
+                                .entry(idx)
+                                .or_insert_with(ObjMap::new_side_table);
+                            match id {
+                                OBJ_FREEZE => m.freeze(),
+                                OBJ_SEAL => m.seal(),
+                                _ => m.extensible = false,
+                            }
+                            // Freezing an Array also makes `length` non-writable (its
+                            // descriptor + assignment honour array_length_nonwritable).
+                            if id == OBJ_FREEZE && matches!(self.heap.get(idx), HeapObj::Array(_)) {
+                                self.array_length_nonwritable.insert(idx);
+                            }
+                            // The integrity level lives only in side tables, which
+                            // a compiled dense-Array store never reads: bump the
+                            // version (for an Array this also dirties the raw
+                            // snapshot epoch) so a pinned pre-freeze snapshot is
+                            // re-validated — `jit_ta_snapshot` declines an array
+                            // with an `arr_props` entry — before the next store.
+                            self.heap.bump_version(idx);
+                            // A callable's own properties live in the fn_props
+                            // side map — freeze/seal their ATTRIBUTES there too
+                            // (the extensible flag stays in arr_props).
+                            if matches!(
+                                self.heap.get(idx),
+                                HeapObj::Func(_)
+                                    | HeapObj::Closure { .. }
+                                    | HeapObj::Bound { .. }
+                                    | HeapObj::Wrapped { .. }
+                                    | HeapObj::Native(_)
+                                    | HeapObj::NativeClosure { .. }
+                            ) {
+                                if let Some(fm) = self.fn_props.get_mut(&idx) {
+                                    match id {
+                                        OBJ_FREEZE => fm.freeze(),
+                                        OBJ_SEAL => fm.seal(),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                o
+            }
+            OBJ_IS_FROZEN | OBJ_IS_SEALED | OBJ_IS_EXT => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if id == OBJ_IS_EXT {
+                    if let Some(b) = self.proxy_is_extensible(o)? {
+                        return Ok(Value::bool(b));
+                    }
+                } else if o.is_heap() && self.proxy_parts(o.heap_index()).is_some() {
+                    // isFrozen/isSealed on a Proxy: TestIntegrityLevel via the traps.
+                    return Ok(Value::bool(
+                        self.proxy_test_integrity(o, id == OBJ_IS_FROZEN)?,
+                    ));
+                }
+                // A non-object (primitive, incl. heap string/symbol/bigint) is
+                // non-extensible and vacuously frozen/sealed. An exotic object's
+                // flags live in `arr_props` (default: extensible, not frozen/sealed).
+                let (frozen, sealed, ext) = if o.is_heap() {
+                    match self.heap.get(o.heap_index()) {
+                        HeapObj::Object(m) => (m.is_frozen(), m.is_sealed(), m.extensible),
+                        HeapObj::Str(_)
+                        | HeapObj::Cons { .. }
+                        | HeapObj::Symbol { .. }
+                        | HeapObj::BigInt(_)
+                        | HeapObj::BigIntBig(_) => (true, true, false),
+                        // A TypedArray's integrity level is COMPUTED, not read off
+                        // the seal/freeze markers: 10.4.5.3 gives every valid
+                        // integer index a {writable, enumerable, configurable}
+                        // descriptor, so a non-empty one is never sealed or frozen,
+                        // while one with NO valid index (length 0, or DETACHED) has
+                        // only its named side-table properties left — making it
+                        // sealed AND frozen the moment it stops being extensible.
+                        // Reading `m.sealed`/`m.frozen` instead reported
+                        // `Object.isFrozen(new Int32Array(0))` as false right after
+                        // `Object.seal` of it, and both false after a bare
+                        // `Object.preventExtensions`
+                        // (staging/sm/TypedArray/test-integrity-level{,-detached}.js).
+                        HeapObj::TypedArray { .. } => {
+                            let has_elems = self.ta_effective_len(o.heap_index()).unwrap_or(0) > 0;
+                            self.arr_props
+                                .get(&o.heap_index())
+                                .map_or((false, false, true), |m| {
+                                    if has_elems {
+                                        (false, false, m.extensible)
+                                    } else {
+                                        (m.is_frozen(), m.is_sealed(), m.extensible)
+                                    }
+                                })
+                        }
+                        // An Array: TestIntegrityLevel over its real own
+                        // properties. The markers settle it when present. Else a
+                        // present dense element is configurable and writable
+                        // unless a defineProperty'd override (a side-table key)
+                        // says otherwise, so a non-extensible array is sealed
+                        // exactly when every present element has an override and
+                        // all side-table properties are non-configurable
+                        // (`length` itself never is), and frozen when, beyond
+                        // that, they are non-writable and so is `length`.
+                        HeapObj::Array(items) => match self.arr_props.get(&o.heap_index()) {
+                            None => (false, false, true),
+                            Some(m) if m.extensible => (false, false, true),
+                            Some(m) => {
+                                let elems_overridden = items
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(i, v)| v.is_hole() || m.element_pos(i).is_some());
+                                let sealed =
+                                    m.sealed || m.frozen || (elems_overridden && m.is_sealed());
+                                let len_ro = m.frozen
+                                    || self.array_length_nonwritable.contains(&o.heap_index());
+                                let frozen = m.frozen
+                                    || (sealed && elems_overridden && len_ro && m.is_frozen());
+                                (frozen, sealed, false)
+                            }
+                        },
+                        // An exotic object (Map / Set / …) whose own properties
+                        // live in arr_props: the explicit seal/freeze markers are
+                        // authoritative.
+                        _ => self
+                            .arr_props
+                            .get(&o.heap_index())
+                            .map_or((false, false, true), |m| (m.frozen, m.sealed, m.extensible)),
+                    }
+                } else {
+                    (true, true, false)
+                };
+                Value::bool(match id {
+                    OBJ_IS_FROZEN => frozen,
+                    OBJ_IS_SEALED => sealed,
+                    _ => ext,
+                })
+            }
+            // Object.groupBy(items, cb) -> null-proto object of arrays keyed by cb's
+            // (string) return; Map.groupBy -> a Map keyed by cb's value (SameValueZero).
+            OBJ_GROUP_BY | MAP_GROUP_BY => {
+                // The accumulating group arrays / keys live in Rust locals (not
+                // reachable from the GC roots) while the callback re-enters the
+                // interpreter — suspend GC for the scope.
+                let _gc = self.gc_lock_guard();
+                let src = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if !(cb.is_heap() && self.heap.as_callable(cb.heap_index()).is_some()) {
+                    return Err(Thrown::from_static("TypeError: groupBy callback is not callable"));
+                }
+                if !src.is_heap() {
+                    return Err(Thrown::from_static("TypeError: groupBy items is not iterable"));
+                }
+                // GroupBy steps one element at a time — IteratorStepValue, the
+                // callback, then (Object.groupBy) ToPropertyKey — and an abrupt
+                // callback or key coercion closes the iterator. An Array whose
+                // iteration is pristine is walked in place with the same live
+                // length/element reads its %ArrayIteratorPrototype%.next does
+                // (that iterator has no `return`, so closing it is a no-op).
+                let mut walker = GroupByWalk::new(self, src)?;
+                if id == OBJ_GROUP_BY {
+                    let mut map = ObjMap::new();
+                    let mut i = 0usize;
+                    while let Some(item) = walker.step(self, i)? {
+                        let key = walker.close_on_err(self, |vm| {
+                            vm.call_value(cb, Value::UNDEFINED, &[item, Value::num(i as f64)])
+                        })?;
+                        i += 1;
+                        // ToPropertyKey(key) — runs ToPrimitive, so a key whose
+                        // toString/@@toPrimitive throws propagates (and a Symbol key
+                        // groups under its symbol key), unlike the non-throwing display().
+                        let ks = walker.close_on_err(self, |vm| vm.to_property_key(key))?;
+                        match map.get(&ks) {
+                            Some(arr) => {
+                                self.heap.write_barrier_val(arr.heap_index(), item);
+                                if let HeapObj::Array(a) = self.heap.get_mut(arr.heap_index()) {
+                                    a.push(item);
+                                }
+                            }
+                            None => {
+                                let arr = self.alloc_array_current_realm(vec![item]);
+                                map.set(&ks, arr);
+                            }
+                        }
+                    }
+                    let result = self.heap.alloc(HeapObj::Object(Box::new(map)));
+                    self.proto_of.insert(result, Value::NULL); // null prototype per spec
+                    Value::heap(result)
+                } else {
+                    let mut keys: Vec<Value> = Vec::new();
+                    let mut vals: Vec<Value> = Vec::new();
+                    // Key lookup via the incremental SameValueZero finder
+                    // (linear for few groups, hash-indexed past the threshold).
+                    let mut finder = super::collections::LocalFinder::new();
+                    let mut i = 0usize;
+                    while let Some(item) = walker.step(self, i)? {
+                        let mut key = walker.close_on_err(self, |vm| {
+                            vm.call_value(cb, Value::UNDEFINED, &[item, Value::num(i as f64)])
+                        })?;
+                        i += 1;
+                        if key.is_number() && key.as_f64() == 0.0 {
+                            key = Value::int(0); // Map normalizes -0 to +0
+                        }
+                        if key.is_heap() {
+                            self.heap.flatten(key.heap_index()); // flat keys hash/compare cheaply
+                        }
+                        match finder.find(&self.heap, &keys, key) {
+                            Some(pos) => {
+                                // Nursery barrier: the callback runs user code
+                                // between iterations, so a group array built
+                                // earlier in THIS call can already be old.
+                                self.heap.write_barrier_val(vals[pos].heap_index(), item);
+                                if let HeapObj::Array(a) = self.heap.get_mut(vals[pos].heap_index())
+                                {
+                                    a.push(item);
+                                }
+                            }
+                            None => {
+                                finder.record_push(&self.heap, &keys, key);
+                                keys.push(key);
+                                vals.push(self.alloc_array_current_realm(vec![item]));
+                            }
+                        }
+                    }
+                    let result = self.heap.alloc(HeapObj::Map { keys, vals });
+                    self.adopt_native_result_realm(result, self.map_proto);
+                    Value::heap(result)
+                }
+            }
+            // Promise.withResolvers() -> { promise, resolve, reject }.
+            PROMISE_WITH_RESOLVERS => {
+                if !self.is_constructor(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Promise.withResolvers called on a non-constructor",
+                    ));
+                }
+                // NewPromiseCapability(C): the native Promise builds a native promise
+                // + its resolving functions directly; a subclass / custom C must run
+                // its executor so `resolve`/`reject` are ITS captured functions and
+                // `promise` is the object it produced.
+                let (promise, resolve, reject) = if this == self.promise_ctor_value() {
+                    let p = self.alloc_promise();
+                    let pair = self.new_resolver_pair();
+                    let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                        promise: p,
+                        is_reject: false,
+                        pair,
+                    }));
+                    let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                        promise: p,
+                        is_reject: true,
+                        pair,
+                    }));
+                    (Value::heap(p), res, rej)
+                } else {
+                    self.new_promise_capability(this)?
+                };
+                let mut map = ObjMap::new();
+                map.set("promise", promise);
+                map.set("resolve", resolve);
+                map.set("reject", reject);
+                self.alloc_object_current_realm(map)
+            }
+            PROMISE_TRY => {
+                if !self.is_constructor(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Promise.try called on a non-constructor",
+                    ));
+                }
+                let rest: Vec<Value> = if args.len() > 1 {
+                    args[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                if this == self.promise_ctor_value() {
+                    let p = self.alloc_promise();
+                    self.with_promise_resolution_root(p, |vm| {
+                        match vm.call_value(a0, Value::UNDEFINED, &rest) {
+                            Ok(v) => vm.resolve(p, v),
+                            Err(Thrown(msg)) => {
+                                // Preserve the actual thrown VALUE, not a reconstructed
+                                // error from its message string.
+                                let e = match vm.pending_throw.take() {
+                                    Some(v) => v,
+                                    None => vm.alloc_error_from_message(&msg),
+                                };
+                                vm.reject(p, e);
+                            }
+                        }
+                    });
+                    Value::heap(p)
+                } else {
+                    // NewPromiseCapability(C): settle through C's captured resolve/reject.
+                    let (promise, resolve, reject) = self.new_promise_capability(this)?;
+                    let roots = [promise, resolve, reject];
+                    self.with_promise_operation_roots(&roots, |vm| -> Result<(), Thrown> {
+                        match vm.call_value(a0, Value::UNDEFINED, &rest) {
+                            Ok(v) => {
+                                vm.call_value(resolve, Value::UNDEFINED, &[v])?;
+                            }
+                            Err(Thrown(msg)) => {
+                                let e = match vm.pending_throw.take() {
+                                    Some(v) => v,
+                                    None => vm.alloc_error_from_message(&msg),
+                                };
+                                vm.call_value(reject, Value::UNDEFINED, &[e])?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    promise
+                }
+            }
+            // Reflect namespace. apply/construct accept any callable target; the
+            // property-reflecting methods require Type(target) === Object (else TypeError).
+            REFLECT_APPLY => {
+                let target = a0;
+                let this_arg = a1;
+                let args_list = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                // 28.1.1: `IsCallable(target)` is step 1, BEFORE
+                // CreateListFromArrayLike. The order is observable — building the
+                // list reads `length` and the indices, so a throwing `length`
+                // getter on the argument object surfaced instead of the
+                // TypeError the non-callable target owes.
+                if !self.is_callable(target) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.apply target is not a function",
+                    ));
+                }
+                // Reflect.apply requires an array-like argumentsList (CreateListFromArrayLike).
+                let arg_vec = self.create_list_from_array_like(args_list)?;
+                self.with_host_roots(&arg_vec, |vm| vm.call_value(target, this_arg, &arg_vec))?
+            }
+            REFLECT_CONSTRUCT => {
+                let target = a0;
+                if !self.is_constructor(target) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.construct target is not a constructor",
+                    ));
+                }
+                // An explicit newTarget (3rd arg) must also be a constructor. We
+                // don't model newTarget-driven prototype selection, but the throw is
+                // what test262's isConstructor relies on.
+                if let Some(nt) = args.get(2) {
+                    if !self.is_constructor(*nt) {
+                        return Err(Thrown::from_static(
+                            "TypeError: Reflect.construct newTarget is not a constructor",
+                        ));
+                    }
+                }
+                // CreateListFromArrayLike(argumentsList): a non-object arglist (incl.
+                // a missing 2nd arg) is a TypeError; an array-LIKE is read via Get.
+                let arg_vec = self.create_list_from_array_like(a1)?;
+                // newTarget defaults to target when the 3rd arg is absent; thread it
+                // so a Proxy construct trap (and a trap-less forward) sees the real one.
+                let new_target = args.get(2).copied().unwrap_or(target);
+                // The argument list stays Rust-owned across newTarget.prototype
+                // reads and field initializers that run before the ctor frame.
+                self.with_host_roots(&arg_vec, |vm| {
+                    vm.construct_with_newtarget(target, &arg_vec, new_target)
+                })?
+            }
+            REFLECT_GET => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static("TypeError: Reflect.get called on non-object"));
+                }
+                // Reflect.get(target, key, receiver?): an explicit receiver is the
+                // `this` for an accessor getter (else the target). Use the index
+                // path when there's no distinct receiver (it also reads array
+                // elements for numeric keys).
+                let receiver = args.get(2).copied().unwrap_or(a0);
+                if receiver == a0 {
+                    self.get_index(a0, a1)?
+                } else {
+                    let key = self.to_property_key(a1)?;
+                    self.get_member(a0, &key, receiver)?
+                }
+            }
+            REFLECT_SET => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static("TypeError: Reflect.set called on non-object"));
+                }
+                let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                // ToPropertyKey once (an object key may have a side-effecting
+                // toString); reuse the coerced key Value for set_index so it isn't
+                // coerced a second time.
+                let receiver = args.get(3).copied().unwrap_or(a0);
+                let kv = self.coerce_index_key(a1)?;
+                Value::bool(self.ordinary_set_with_receiver(a0, kv, value, receiver)?)
+            }
+            REFLECT_HAS => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static("TypeError: Reflect.has called on non-object"));
+                }
+                let kv = self.coerce_index_key(a1)?;
+                Value::bool(self.has_property_dyn(a0, kv)?)
+            }
+            REFLECT_DELETE => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.deleteProperty called on non-object",
+                    ));
+                }
+                let key = self.to_property_key(a1)?;
+                // delete_property (not delete_prop) so a Proxy target's
+                // deleteProperty trap runs.
+                self.delete_property(a0, &key)?
+            }
+            REFLECT_OWN_KEYS => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.ownKeys called on non-object",
+                    ));
+                }
+                self.object_own_keys(a0)?
+            }
+            REFLECT_GET_PROTO => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.getPrototypeOf called on non-object",
+                    ));
+                }
+                self.get_prototype_of_checked(a0)?
+            }
+            REFLECT_SET_PROTO => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.setPrototypeOf called on non-object",
+                    ));
+                }
+                if a1 != Value::NULL && !self.is_object_value(a1) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.setPrototypeOf prototype must be an object or null",
+                    ));
+                }
+                Value::bool(self.ordinary_set_prototype_of(a0, a1)?)
+            }
+            REFLECT_DEFINE => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.defineProperty called on non-object",
+                    ));
+                }
+                // ToPropertyKey(propertyKey) is step 2 — BEFORE ToPropertyDescriptor
+                // (step 3) — so a throwing key coercion propagates ahead of the
+                // descriptor's "must be an object" check.
+                let key = self.to_property_key(a1)?;
+                let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_object_value(desc) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Property description must be an object",
+                    ));
+                }
+                // ToPropertyDescriptor(desc) is validated FIRST: an invalid
+                // descriptor (a non-callable get/set, or mixed accessor+data) is a
+                // THROW that propagates — only a rejected [[DefineOwnProperty]]
+                // (non-configurable redefine, non-extensible new key) returns false.
+                self.read_descriptor(desc)?;
+                // Whether a live defineProperty trap sits anywhere on a0's
+                // proxy chain (structural peek — no observable handler Get):
+                // a trap's ABRUPT completion (or an invariant violation) must
+                // PROPAGATE through Reflect.defineProperty
+                // (return-abrupt-from-result), while its falsish result — and
+                // any ordinary trap-less rejection — reads as false.
+                let mut define_trap = false;
+                let mut cur = a0;
+                while let Some((t, h, _)) = self.proxy_parts(cur.heap_index()) {
+                    if h.is_heap()
+                        && matches!(
+                            self.heap.get(h.heap_index()),
+                            HeapObj::Object(m) if m.get("defineProperty").is_some_and(|v| !v.is_nullish())
+                        )
+                    {
+                        define_trap = true;
+                        break;
+                    }
+                    cur = t;
+                }
+                match self.object_define_property(a0, &key, desc) {
+                    Ok(()) => Value::bool(true),
+                    Err(e)
+                        if e.0.starts_with("RangeError:")
+                            || (define_trap
+                                && !e.0.starts_with(
+                                    "TypeError: proxy 'defineProperty' trap returned falsish",
+                                )) =>
+                    {
+                        return Err(e);
+                    }
+                    Err(_) => Value::bool(false),
+                }
+            }
+            REFLECT_GET_OWN_DESC => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.getOwnPropertyDescriptor called on non-object",
+                    ));
+                }
+                let key = self.to_property_key(a1)?;
+                self.ns_tdz_check(a0, &key)?;
+                match self.proxy_gopd(a0, &key)? {
+                    Some(d) => d,
+                    None => self.object_get_own_property_descriptor(a0, &key),
+                }
+            }
+            REFLECT_IS_EXT => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.isExtensible called on non-object",
+                    ));
+                }
+                if let Some(b) = self.proxy_is_extensible(a0)? {
+                    return Ok(Value::bool(b));
+                }
+                let ext = match self.heap.get(a0.heap_index()) {
+                    HeapObj::Object(m) => m.extensible,
+                    _ => self
+                        .arr_props
+                        .get(&a0.heap_index())
+                        .map_or(true, |m| m.extensible),
+                };
+                Value::bool(ext)
+            }
+            REFLECT_PREVENT_EXT => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Reflect.preventExtensions called on non-object",
+                    ));
+                }
+                if let Some(b) = self.proxy_prevent_extensions(a0)? {
+                    return Ok(Value::bool(b));
+                }
+                let idx = a0.heap_index();
+                self.materialize_regexp_result_props(idx);
+                // An integer-indexed exotic [[PreventExtensions]] RETURNS false
+                // when IsTypedArrayFixedLength is false — it does not throw.
+                // Only `Object.preventExtensions` turns that false into a
+                // TypeError; `Reflect.preventExtensions` reports it.
+                if let HeapObj::TypedArray { buffer, .. } = self.heap.get(idx) {
+                    if !self.ta_is_fixed_length(idx, *buffer) {
+                        return Ok(Value::bool(false));
+                    }
+                }
+                if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                        m.extensible = false;
+                    }
+                    // In-place attrs change: invalidate JIT inline caches (the
+                    // native IcEntry guards only on the heap version).
+                    self.heap.bump_version(idx);
+                } else {
+                    self.arr_props
+                        .entry(idx)
+                        .or_insert_with(ObjMap::new_side_table)
+                        .extensible = false;
+                }
+                Value::bool(true)
+            }
+            // JSON namespace methods as values (`JSON.parse`/`JSON.stringify`).
+            // (The direct `JSON.parse(x)` call form is compile-lowered to a JSON op;
+            // these back the value form + reflection.)
+            JSON_PARSE => {
+                // EXACT input bytes for a string argument: JSON text may carry
+                // raw lone surrogates inside string literals (valid JSON text,
+                // preserved in the parsed value). Non-strings ToString-coerce
+                // (observable, may throw).
+                let s: Vec<u8> = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
+                    self.heap
+                        .str_wtf8_cow(a0.heap_index())
+                        .unwrap()
+                        .into_owned()
+                } else {
+                    self.to_js_string(a0)?.into_bytes()
+                };
+                let reviver = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if self.is_callable(reviver) {
+                    let _gc = self.gc_lock_guard();
+                    let (parsed, srctree) = self.json_parse_with_src(&s)?;
+                    let mut m = crate::heap::ObjMap::new();
+                    m.set("", parsed);
+                    let wrapper = self.alloc_object_current_realm(m);
+                    self.internalize_json(wrapper, "", reviver, Some(&srctree))?
+                } else {
+                    self.json_parse(&s)?
+                }
+            }
+            JSON_STRINGIFY => {
+                // The `json-stringify` phase tag was declared in `prof.rs` and
+                // never applied, which is worse than not declaring it: the dump
+                // filters zero-count phases, so a reader would see `json-parse`
+                // listed, no `json-stringify`, and conclude serialisation costs
+                // nothing. It is 6 of `json-large`'s 12 rounds.
+                let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonStringify);
+                let space = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let space = self.json_coerce_space(space)?;
+                let indent = self.json_indent(space);
+                let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let (replacer_fn, allowlist) = self.json_resolve_replacer(replacer)?;
+                // Hold un-rooted Values across toJSON/replacer re-entry; suspend GC.
+                let _gc = self.gc_lock_guard();
+                if indent.is_empty() && replacer_fn.is_undefined() && allowlist.is_none() {
+                    if let Some(s) = self.json_plain_stringify(a0) {
+                        return Ok(self.alloc_str(s));
+                    }
+                }
+                let mut m = crate::heap::ObjMap::new();
+                m.set("", a0);
+                let wrapper = self.alloc_object_current_realm(m);
+                let mut visited = Vec::new();
+                match self.json_value(
+                    wrapper,
+                    "",
+                    a0,
+                    &indent,
+                    0,
+                    &mut visited,
+                    replacer_fn,
+                    allowlist.as_deref(),
+                )? {
+                    Some(s) => self.json_stringify_result(s, &indent),
+                    None => Value::UNDEFINED,
+                }
+            }
+            JSON_RAW_JSON => {
+                // JSON.rawJSON(text): ToString (throws TypeError for a Symbol),
+                // then validate the text is a single non-empty JSON value with no
+                // leading/trailing JSON whitespace. The result is a frozen,
+                // null-prototype object whose sole own property "rawJSON" holds the
+                // text, tagged [[IsRawJSON]] so stringify emits it verbatim.
+                let s = self.to_js_string(a0)?;
+                let bytes = s.as_bytes();
+                let ws = |c: u8| matches!(c, b'\t' | b'\n' | b'\r' | b' ');
+                if s.is_empty() || ws(bytes[0]) || ws(bytes[bytes.len() - 1]) {
+                    return Err(Thrown::from_static(
+                        "SyntaxError: JSON.rawJSON text must be non-empty without leading/trailing whitespace",
+                    ));
+                }
+                // Validate it parses as one complete JSON value (checks trailing)
+                // — and a PRIMITIVE one: object and array text is a SyntaxError.
+                // (Valid JSON with no leading whitespace is an object/array
+                // exactly when it starts with `{`/`[`.)
+                self.json_parse(s.as_bytes())?;
+                if matches!(bytes[0], b'{' | b'[') {
+                    return Err(Thrown::from_static(
+                        "SyntaxError: JSON.rawJSON text must be a primitive JSON value",
+                    ));
+                }
+                let _gc = self.gc_lock_guard();
+                let sval = self.alloc_str(s);
+                let mut m = crate::heap::ObjMap::new();
+                m.is_raw_json = true;
+                m.extensible = false;
+                m.define(
+                    "rawJSON",
+                    sval,
+                    crate::heap::PropAttr {
+                        writable: false,
+                        enumerable: true,
+                        configurable: false,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    },
+                );
+                let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
+                self.proto_of.insert(idx, Value::NULL); // OrdinaryObjectCreate(null)
+                Value::heap(idx)
+            }
+            JSON_IS_RAW_JSON => {
+                let v = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let is = v.is_heap()
+                    && matches!(self.heap.get(v.heap_index()), HeapObj::Object(m) if m.is_raw_json);
+                Value::bool(is)
+            }
+            // `Math.random` as a first-class namespace method. Direct calls use
+            // ordinary dynamic property dispatch too, so replacing this own
+            // property is observable exactly like any other Math method.
+            MATH_RANDOM => {
+                let mut x = self.rng_state;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.rng_state = x;
+                let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                Value::num((r >> 11) as f64 / (1u64 << 53) as f64)
+            }
+            // `Math.sumPrecise(iterable)`: correctly-rounded sum. Every element must
+            // already BE a Number (no coercion) — else a TypeError (the iterator is
+            // closed). Spec 2024 proposal.
+            MATH_SUM_PRECISE => {
+                let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                // Iterate STEP-BY-STEP (the iterable may be infinite) and validate
+                // each element is a Number with NO coercion; on a non-number, close
+                // the iterator and throw a TypeError.
+                let iter = self.get_iterator_direct(a0)?;
+                let next = self.get_prop(iter, "next")?;
+                let mut nums: Vec<f64> = Vec::new();
+                loop {
+                    let res = self.call_value(next, iter, &[])?;
+                    if !self.is_object_value(res) {
+                        return Err(Thrown::from_static(
+                            "TypeError: Math.sumPrecise: iterator result is not an object",
+                        ));
+                    }
+                    let done = self.get_prop(res, "done")?;
+                    if self.truthy(done) {
+                        break;
+                    }
+                    let next_count = nums.len().saturating_add(1);
+                    if let Err(error) = self.preflight_native_iteration_work(next_count as u64) {
+                        self.iterator_close_quiet(iter);
+                        return Err(error);
+                    }
+                    let v = self.get_prop(res, "value")?;
+                    if !(v.is_int() || v.is_double()) {
+                        let _ = self.iterator_close(iter);
+                        return Err(Thrown::from_static(
+                            "TypeError: Math.sumPrecise: each element must be a Number",
+                        ));
+                    }
+                    if nums.try_reserve(1).is_err() {
+                        self.iterator_close_quiet(iter);
+                        return Err(Thrown::from_static("RangeError: precise sum allocation failed"));
+                    }
+                    nums.push(v.as_f64());
+                }
+                Value::num(super::helpers_num2::sum_precise(&nums))
+            }
+            // `Math.f16round(x)`: round ToNumber(x) to the nearest binary16 value.
+            MATH_F16ROUND => {
+                let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let x = self.to_number_strict(a0)?;
+                Value::num(super::helpers_num2::f16_round(x))
+            }
+            // WeakMap/WeakSet methods (brand-checked + object-key validated inside).
+            WM_GET => self.weakmap_method(this, "get", args)?,
+            WM_SET => self.weakmap_method(this, "set", args)?,
+            WM_HAS => self.weakmap_method(this, "has", args)?,
+            WM_DELETE => self.weakmap_method(this, "delete", args)?,
+            WM_GET_OR_INSERT => self.weakmap_method(this, "getOrInsert", args)?,
+            WM_GET_OR_INSERT_COMPUTED => self.weakmap_method(this, "getOrInsertComputed", args)?,
+            SET_SIZE_GET => match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                // Deleted entries are TOMBSTONED in place (a hole) so live
+                // iterators keep their cursor, so the count is the non-hole
+                // count — which the property fast path in `props/member.rs`
+                // already did and this, the extracted-getter path, did not.
+                Some(HeapObj::Set(_)) => Value::num(self.coll_live_len(this.heap_index()) as f64),
+                _ => {
+                    return Err(Thrown::from_static(
+                        "TypeError: get Set.prototype.size called on incompatible receiver",
+                    ))
+                }
+            },
+            MAP_SIZE_GET => match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                Some(HeapObj::Map { .. }) => {
+                    Value::num(self.coll_live_len(this.heap_index()) as f64)
+                }
+                _ => {
+                    return Err(Thrown::from_static(
+                        "TypeError: get Map.prototype.size called on incompatible receiver",
+                    ))
+                }
+            },
+            // GetCapabilitiesExecutor: capture (resolve, reject); a second call
+            // (capability.[[Resolve]] already set) is a TypeError.
+            CAP_EXECUTOR => {
+                let resolve = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let reject = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // GetCapabilitiesExecutor: throw ONLY if a prior invocation already
+                // captured a non-undefined resolve/reject (capability.[[Resolve]] /
+                // [[Reject]] is not undefined). An initial executor(undefined,
+                // undefined) leaves them undefined, so a later call may still
+                // (re)capture, per spec.
+                if let Some((r, j)) = self.cap_capture {
+                    if r != Value::UNDEFINED || j != Value::UNDEFINED {
+                        return Err(Thrown::from_static(
+                            "TypeError: Promise capability executor already invoked",
+                        ));
+                    }
+                }
+                self.cap_capture = Some((resolve, reject));
+                Value::UNDEFINED
+            }
+            WS_ADD => self.weakset_method(this, "add", args)?,
+            WS_HAS => self.weakset_method(this, "has", args)?,
+            WS_DELETE => self.weakset_method(this, "delete", args)?,
+            WR_DEREF => {
+                let target =
+                    match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                        Some(HeapObj::WeakRef(t)) => *t,
+                        _ => return Err(Thrown::from_static(
+                            "TypeError: WeakRef.prototype.deref called on incompatible receiver",
+                        )),
+                    };
+                if target != Value::UNDEFINED {
+                    self.keep_during_job(target);
+                }
+                target
+            }
+            FR_REGISTER => self.finreg_method(this, "register", args)?,
+            FR_UNREGISTER => self.finreg_method(this, "unregister", args)?,
+            ITER_NEXT => {
+                // A non-heap `this` (a primitive) is refused below; its bits
+                // name no heap slot.
+                let it_idx = if this.is_heap() { this.heap_index() } else { 0 };
+                let (live, mut index) =
+                    match this.is_heap().then(|| self.heap.get(it_idx)) {
+                        Some(HeapObj::Iterator { live, index, .. }) => (*live, *index),
+                        _ => return Err(Thrown::from_static(
+                            "TypeError: Iterator.prototype.next called on incompatible receiver",
+                        )),
+                    };
+                // A lazy %RegExpStringIterator%: one RegExpExec per next().
+                if let Some(step) = self.regexp_string_iter_step(it_idx) {
+                    let (value, ret_done) = step?;
+                    let mut m = ObjMap::new();
+                    m.set("value", value);
+                    m.set("done", Value::bool(ret_done));
+                    return Ok(self.alloc_object_current_realm(m));
+                }
+                // A live TypedArray iterator (keys/values/entries) re-reads the view's
+                // current length each step, so a resizable buffer's grow yields new
+                // elements; an out-of-bounds view (detached, or a fixed-length view on
+                // a shrunk buffer) throws TypeError per the spec's per-step check.
+                if let Some((coll, kind)) = live {
+                    if matches!(self.heap.get(coll), HeapObj::TypedArray { .. }) {
+                        // An already-exhausted iterator (latched usize::MAX) is
+                        // permanently done — the spec's "iterating is finished" check
+                        // precedes the out-of-bounds check, so a buffer that became OOB
+                        // AFTER exhaustion does NOT throw.
+                        let result = if index == usize::MAX {
+                            (Value::UNDEFINED, true)
+                        } else {
+                            match self.ta_effective_len(coll) {
+                            None => {
+                                return Err(Thrown::from_static(
+                                    "TypeError: TypedArray iterator: the viewed buffer is out of bounds",
+                                ))
+                            }
+                            Some(n) if index >= n => (Value::UNDEFINED, true),
+                            Some(_) => {
+                                let v = match kind {
+                                    0 => Value::num(index as f64),
+                                    1 => self.ta_element_get(coll, index),
+                                    _ => {
+                                        let e = self.ta_element_get(coll, index);
+                                        self.alloc_array_current_realm(vec![
+                                            Value::num(index as f64),
+                                            e,
+                                        ])
+                                    }
+                                };
+                                index += 1;
+                                (v, false)
+                            }
+                            }
+                        };
+                        let store = if result.1 { usize::MAX } else { index };
+                        if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                            *i = store;
+                        }
+                        let mut m = ObjMap::new();
+                        m.set("value", result.0);
+                        m.set("done", Value::bool(result.1));
+                        return Ok(self.alloc_object_current_realm(m));
+                    }
+                }
+                // A live ARRAY-LIKE iterator. The step is shared with the
+                // `IterNext` opcode, which takes the pair directly and never
+                // builds the result object — see `array_iter_step`.
+                if let Some(r) = self.array_iter_step(it_idx) {
+                    let (v, done) = r?;
+                    let mut m = ObjMap::new();
+                    m.set("value", v);
+                    m.set("done", Value::bool(done));
+                    return Ok(self.alloc_object_current_realm(m));
+                }
+                // Live Map/Set, or a snapshot iterator. Shared with the
+                // `IterNext` opcode, which takes the pair and never builds the
+                // result object — see `collection_iter_step`.
+                let (val, done) = match self.collection_iter_step(it_idx)? {
+                    Some(p) => p,
+                    // Unreachable from here: the TypedArray-backed case is
+                    // handled above and is the only thing that answers `None`.
+                    None => (Value::UNDEFINED, true),
+                };
+                let mut m = ObjMap::new();
+                m.set("value", val);
+                m.set("done", Value::bool(done));
+                self.alloc_object_current_realm(m)
+            }
+            ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
+            ITER_DISPOSE => {
+                // %IteratorPrototype% [ @@dispose ](): GetMethod(O, "return"); if present
+                // Call it; return undefined. A non-callable, non-nullish `return` throws.
+                let ret = self.get_prop(this, "return")?;
+                if !ret.is_nullish() {
+                    if !self.is_callable(ret) {
+                        return Err(Thrown::from_static(
+                            "TypeError: iterator return is not a function",
+                        ));
+                    }
+                    self.call_value(ret, this, &[])?;
+                }
+                Value::UNDEFINED
+            }
+            // ES2025 Iterator Helpers (%Iterator.prototype%).
+            ITER_MAP | ITER_FILTER | ITER_TAKE | ITER_DROP | ITER_FLATMAP | ITER_REDUCE
+            | ITER_TOARRAY | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND | ITER_JOIN => {
+                self.iter_helper_method(id, this, args)?
+            }
+            ITER_HELPER_NEXT => {
+                let kind =
+                    match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                        Some(HeapObj::IterHelper { kind, .. }) => *kind,
+                        _ => return Err(Thrown::from_static(
+                            "TypeError: Iterator Helper next called on an incompatible receiver",
+                        )),
+                    };
+                // kind 7 = a zip/zipKeyed helper (multi-iterator, lockstep).
+                if kind == 7 {
+                    self.iter_zip_next(this.heap_index())?
+                } else {
+                    self.iter_helper_next(this.heap_index())?
+                }
+            }
+            ITER_HELPER_RETURN => {
+                {
+                    let (kind, source, inner, was_done, started) = match this
+                        .is_heap()
+                        .then(|| self.heap.get(this.heap_index()))
+                    {
+                        Some(HeapObj::IterHelper {
+                            kind,
+                            source,
+                            inner,
+                            done,
+                            running,
+                            idx,
+                            ..
+                        }) => {
+                            // Re-entrant return() while a step is executing is a TypeError
+                            // (GeneratorValidate), the same as a re-entrant next().
+                            if *running {
+                                return Err(Thrown::from_static(
+                                    "TypeError: Iterator is already running",
+                                ));
+                            }
+                            // `idx > 0` ⇒ the helper has yielded (suspended at a yield),
+                            // so its return() resumes it in the "executing" state. A
+                            // suspended-START return completes WITHOUT that brand, so a
+                            // re-entrant next()/return() during its close does not throw.
+                            (*kind, *source, *inner, *done, *idx > 0)
+                        }
+                        _ => return Err(Thrown::from_static(
+                            "TypeError: Iterator Helper return called on an incompatible receiver",
+                        )),
+                    };
+                    // kind 5 = the WrapForValidIterator (Iterator.from): its return()
+                    // DELEGATES — GetMethod(iterator, "return") and, if present, returns
+                    // that method's result verbatim; otherwise CreateIterResultObject(
+                    // undefined, true). (It does not close-and-return-done like a helper.)
+                    if kind == 5 {
+                        let ret = self.get_prop(source, "return")?;
+                        if ret.is_nullish() {
+                            return Ok(self.iter_result(Value::UNDEFINED, true));
+                        }
+                        if !self.is_callable(ret) {
+                            return Err(Thrown::from_static(
+                                "TypeError: iterator return is not a function",
+                            ));
+                        }
+                        return self.call_value(ret, source, &[]);
+                    }
+                    // Mark done first (a re-entrant return is then a no-op), then
+                    // close the underlying iterator — `inner` for concat (its
+                    // `source` is the pair-array), else `source`. Skip if already
+                    // done or not yet started (no live underlying iterator). The
+                    // `running` brand is held across the close so that a source's
+                    // return() re-entering this helper's return()/next() is a TypeError
+                    // (the spec models the close as the closure resuming "executing").
+                    if let HeapObj::IterHelper { done, .. } = self.heap.get_mut(this.heap_index()) {
+                        *done = true;
+                    }
+                    if !was_done {
+                        // Only a suspended-YIELD return resumes "executing".
+                        if started {
+                            self.ih_set_running(this.heap_index(), true);
+                        }
+                        let r = if kind == 7 {
+                            // zip: close every still-open input iterator (reverse,
+                            // first close error propagates).
+                            match self.iz_close_all(this.heap_index()) {
+                                Some(e) => Err(e),
+                                None => Ok(()),
+                            }
+                        } else {
+                            // flatMap (kind 4) with a LIVE inner iterator (the
+                            // current mapper result): close the inner first —
+                            // its return() must be observed, and an inner
+                            // close error skips the source close (sequential
+                            // finally semantics).
+                            let inner_first = if kind == 4 && self.is_object_value(inner) {
+                                self.iterator_close(inner)
+                            } else {
+                                Ok(())
+                            };
+                            if inner_first.is_err() {
+                                inner_first
+                            } else {
+                                let target = if kind == 6 { inner } else { source };
+                                if self.is_object_value(target) {
+                                    self.iterator_close(target)
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        };
+                        if started {
+                            self.ih_set_running(this.heap_index(), false);
+                        }
+                        r?;
+                    }
+                }
+                self.iter_result(Value::UNDEFINED, true)
+            }
+            ITER_FROM => self.iterator_from(a0)?,
+            ITER_CONCAT => self.iterator_concat(args)?,
+            ITER_ZIP => self.iterator_zip(a0, a1, false)?,
+            ITER_ZIPKEYED => self.iterator_zip(a0, a1, true)?,
+            // test262 `$262.detachArrayBuffer(ab)` / `$262.gc()`.
+            DOLLAR262_DETACH => {
+                if let Some(buf) = self.as_array_buffer(a0) {
+                    self.require_buffer_unpinned(buf, "detach")?;
+                    if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buf) {
+                        *detached = true;
+                        // resize_bytes(0) == clear for a Local Vec; a (harness-
+                        // detached) Shared store drops its visible length to 0.
+                        data.resize_bytes(0);
+                    }
+                }
+                Value::NULL
+            }
+            DOLLAR262_GC => Value::UNDEFINED,
+            DOLLAR262_EVAL_SCRIPT => {
+                self.require_external_code_enabled()?;
+                let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let code = self.to_js_string(a0)?;
+                self.eval_script(&code)?
+            }
+            UNWRAP_ITER_RESULT => {
+                // Async-from-Sync unwrap reaction: `this` carries the bound
+                // `done` flag; the argument is the awaited element value.
+                let v = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let done = this == Value::bool(true);
+                self.iter_result(v, done)
+            }
+            AFS_CLOSE_REJECT => {
+                // Async-from-Sync close-on-rejection reaction (bound args =
+                // [syncIterator], the call arg is the rejection reason):
+                // IteratorClose(syncIterator, ThrowCompletion(reason)) — close
+                // errors are swallowed (the throw completion wins) and the
+                // original reason re-throws; run_microtask's Err arm then
+                // rejects the capability promise with it.
+                let iter = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let reason = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let _gc = self.gc_lock_guard();
+                let _ = self.iterator_close(iter);
+                self.pending_throw = Some(reason);
+                return Err(Thrown(self.throw_message(reason)));
+            }
+            DOLLAR262_CREATE_REALM => self.create_realm(),
+            // Object.prototype Annex-B accessor helpers.
+            OBJPROTO_DEFINE_GETTER | OBJPROTO_DEFINE_SETTER => {
+                // Spec order: ToObject(this) [step 1], THEN IsCallable(getter) [step 2],
+                // THEN ToPropertyKey(P) [step 4]. A null/undefined receiver therefore
+                // throws before the getter is type-checked or the key is coerced.
+                self.require_object_coercible(this)?;
+                if !self.is_callable(a1) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Object.prototype.__define[GS]etter__: expecting a function",
+                    ));
+                }
+                let key = self.to_property_key(a0)?;
+                let mut d = ObjMap::new();
+                d.set(
+                    if id == OBJPROTO_DEFINE_GETTER {
+                        "get"
+                    } else {
+                        "set"
+                    },
+                    a1,
+                );
+                d.set("enumerable", Value::bool(true));
+                d.set("configurable", Value::bool(true));
+                let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(d))));
+                self.object_define_property(this, &key, desc)?;
+                Value::UNDEFINED
+            }
+            OBJPROTO_LOOKUP_GETTER | OBJPROTO_LOOKUP_SETTER => {
+                // ToObject(this) is step 1 — BEFORE ToPropertyKey(P) — so a non-coercible
+                // receiver throws without ever coercing the key.
+                self.require_object_coercible(this)?;
+                let key = self.to_property_key(a0)?;
+                // The chain walk uses Proxy-trap-aware [[GetOwnProperty]] /
+                // [[GetPrototypeOf]] so a throwing trap propagates.
+                self.lookup_accessor_checked(this, &key, id == OBJPROTO_LOOKUP_SETTER)?
+            }
+            OBJPROTO_PROTO_GET => {
+                // `get __proto__` (B.2.2.1.1) is `? ToObject(this).[[GetPrototypeOf]]()`.
+                // Passing a PRIMITIVE straight to [[GetPrototypeOf]] answered null
+                // (`(42).__proto__`, `"s".__proto__` — and so `{__proto__: t} = 42`,
+                // which is an ordinary Get of that key, not the literal's proto-setter).
+                self.require_object_coercible(this)?;
+                let o = self.to_object(this)?;
+                self.get_prototype_of_checked(o)?
+            }
+            OBJPROTO_PROTO_SET => {
+                // `set __proto__`: RequireObjectCoercible(this) first; a non-object/
+                // non-null value, or a non-object receiver, is a silent no-op;
+                // otherwise [[SetPrototypeOf]] runs and a rejected change throws (the
+                // shared guards: non-extensible / cycle / immutable prototype / a
+                // Proxy trap returning falsish).
+                self.require_object_coercible(this)?;
+                if (self.is_object_value(a0) || a0 == Value::NULL)
+                    && self.is_object_value(this)
+                    && !self.ordinary_set_prototype_of(this, a0)?
+                {
+                    return Err(Thrown::from_static(
+                        "TypeError: cannot set prototype (target is non-extensible, the change is cyclic, or it has an immutable prototype)",
+                    ));
+                }
+                Value::UNDEFINED
+            }
+            ERROR_IS_ERROR => {
+                // Error.isError(arg) (ES2024): true iff arg is an object carrying
+                // the [[ErrorData]] internal slot (a genuine Error instance — NOT a
+                // fake with Error.prototype but no slot, nor a primitive).
+                Value::bool(a0.is_heap() && self.error_data.contains(&a0.heap_index()))
+            }
+            ERROR_STACK_GET => {
+                // get stack: a non-Object receiver throws; an object without
+                // [[ErrorData]] yields undefined; an Error instance yields an
+                // implementation-defined stack string.
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Error.prototype.stack getter called on a non-object",
+                    ));
+                }
+                if this.is_heap() && self.error_data.contains(&this.heap_index()) {
+                    self.alloc_str(String::new())
+                } else {
+                    Value::UNDEFINED
+                }
+            }
+            ERROR_STACK_SET => {
+                // set stack(v): SetterThatIgnoresPrototypeProperties(this,
+                // %Error.prototype%, "stack", v). A non-Object receiver, a
+                // non-String value, or a write whose receiver IS the home
+                // object throws TypeError; otherwise create an own data
+                // property (none yet) or ordinary-Set the existing own one.
+                if !self.is_object_value(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Error.prototype.stack setter called on a non-object",
+                    ));
+                }
+                if !self.is_string_value(a0) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Error.prototype.stack setter requires a string value",
+                    ));
+                }
+                // A createRealm child's `Error.prototype` is that realm's HOME
+                // object for its copied setter (which would otherwise re-enter
+                // itself through the own accessor): the SameValue(home) check
+                // applies there too, throwing the CHILD's TypeError.
+                if this.is_heap() && !self.realm_global_objs.is_empty() {
+                    let ti = this.heap_index();
+                    if let Some(&r) = self.obj_realm.get(&ti) {
+                        if self
+                            .realms
+                            .get(r as usize)
+                            .and_then(|m| m.get(&self.error_protos[0]))
+                            == Some(&ti)
+                        {
+                            let msg = "TypeError: Cannot assign to read only property 'stack'";
+                            let e = self.alloc_error_from_message(msg);
+                            self.realm_adopt_error_to(e, r);
+                            self.pending_throw = Some(e);
+                            return Err(Thrown(msg.into()));
+                        }
+                    }
+                }
+                self.setter_ignoring_proto_props(this, self.error_protos[0], "stack", a0)?;
+                Value::UNDEFINED
+            }
+            REGEXP_LEGACY_SET => {
+                // SetLegacyRegExpStaticProperty (RegExp.input/$_ — the only
+                // writable legacy statics): same %RegExp%-constructor brand
+                // check; the assigned value becomes the statics' input slot.
+                if !(this.is_heap() && this.heap_index() == self.regexp_ctor) {
+                    return Err(Thrown::from_static(
+                        "TypeError: RegExp legacy static setter called on a non-%RegExp% receiver",
+                    ));
+                }
+                #[cfg(feature = "safe-sandbox")]
+                if self.regexp_last.is_empty() {
+                    // Safe VMs create and audit the fixed 14-value record in
+                    // `Vm::new`; fail closed if that internal invariant is ever
+                    // broken instead of taking an infallible allocation path.
+                    return Err(Thrown(self.instrument_regex_memory_exhausted().into()));
+                }
+                #[cfg(not(feature = "safe-sandbox"))]
+                if self.regexp_last.is_empty() {
+                    self.regexp_last = vec![Value::UNDEFINED; 14];
+                }
+                self.regexp_last[0] = a0;
+                Value::UNDEFINED
+            }
+            // get %AbstractModuleSource%.prototype[@@toStringTag]: undefined for
+            // any receiver without a [[ModuleSourceClassName]] slot — i.e. every
+            // value today (never throws, even on primitives).
+            ABSTRACT_MODULE_SOURCE_TAG_GET => Value::UNDEFINED,
+            // PromiseReactionJob against an EXOTIC capability promise: run the
+            // handler (Identity/Thrower when non-callable) and settle through the
+            // capability's captured resolve/reject functions IN THE SAME JOB.
+            CAP_REACTION => {
+                let handler = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let cap_resolve = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let cap_reject = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let is_reject = args.get(3).copied().unwrap_or(Value::FALSE) == Value::TRUE;
+                let arg = args.get(4).copied().unwrap_or(Value::UNDEFINED);
+                // Un-rooted capability functions held across the JS re-entries.
+                let _gc = self.gc_lock_guard();
+                if !self.is_callable(handler) {
+                    // Identity → capResolve(arg); Thrower → capReject(reason).
+                    let f = if is_reject { cap_reject } else { cap_resolve };
+                    self.call_value(f, Value::UNDEFINED, &[arg])?;
+                    return Ok(Value::UNDEFINED);
+                }
+                match self.call_value(handler, Value::UNDEFINED, &[arg]) {
+                    Ok(v) => self.call_value(cap_resolve, Value::UNDEFINED, &[v])?,
+                    Err(Thrown(msg)) => {
+                        let e = match self.pending_throw.take() {
+                            Some(v) => v,
+                            None => self.alloc_error_from_message(&msg),
+                        };
+                        self.call_value(cap_reject, Value::UNDEFINED, &[e])?
+                    }
+                };
+                Value::UNDEFINED
+            }
+            ITER_TAG_GET => self.alloc_str("Iterator".to_string()),
+            ITER_TAG_SET => {
+                self.setter_ignoring_proto_props(
+                    this,
+                    self.iterator_proto_root,
+                    "@@toStringTag",
+                    a0,
+                )?;
+                Value::UNDEFINED
+            }
+            ITER_CTOR_GET => {
+                if self.iterator_ctor != 0 {
+                    Value::heap(self.iterator_ctor)
+                } else {
+                    Value::UNDEFINED
+                }
+            }
+            ITER_CTOR_SET => {
+                self.setter_ignoring_proto_props(
+                    this,
+                    self.iterator_proto_root,
+                    "constructor",
+                    a0,
+                )?;
+                Value::UNDEFINED
+            }
+            // Number static methods as values (no coercion, per spec).
+            NUM_IS_INTEGER => Value::bool(num_is_integer(a0)),
+            NUM_IS_NAN => Value::bool(a0.is_double() && a0.as_f64().is_nan()),
+            NUM_IS_FINITE => Value::bool(num_is_finite(a0)),
+            NUM_IS_SAFE_INTEGER => Value::bool(num_is_safe_integer(a0)),
+            // Embedder trampoline. `__zippHostCall(kind, ...args)`: every argument
+            // is ToString'd (so the host contract is plain strings both ways —
+            // structured data crosses as JSON, which both sides already have), the
+            // host closure runs, and its reply comes back as a JS string. A host
+            // `Err` becomes an ordinary JS throw the script can `try`/`catch`.
+            //
+            // The closure is MOVED OUT of `self` for the duration of the call and
+            // put back after: a host that re-enters the VM (evaluating JS, reading
+            // a global) needs `&mut Vm`, which it cannot have while the closure is
+            // still borrowed from it. Re-entrant `__zippHostCall` therefore sees
+            // `host == None` and throws rather than aliasing — the honest failure.
+            // The Python runtime's native tensor loops; `true` when the
+            // kernel ran, `false` when the caller must run its own loop.
+            #[cfg(feature = "python")]
+            PY_TENSOR => self.py_tensor(args)?,
+            // A library module's code object, compiled on first import.
+            #[cfg(feature = "python")]
+            PY_COMPILE => self.py_compile_module(a0)?,
+            #[cfg(feature = "python")]
+            PY_VFS_READ => self.py_vfs_read(a0)?,
+            #[cfg(feature = "python")]
+            PY_BIND => self.py_bind(args),
+            #[cfg(feature = "python")]
+            PY_STR => self.py_str_has_surrogate(a0),
+            #[cfg(feature = "python")]
+            PY_ORD => self.py_ord(args)?,
+            #[cfg(feature = "python")]
+            PY_GEN => self.py_gen_next(this)?,
+            #[cfg(feature = "python")]
+            PY_JSON => self.py_json(args)?,
+            #[cfg(feature = "python")]
+            PY_PCT => self.py_pct(args)?,
+            #[cfg(feature = "python")]
+            PY_STRM => self.py_str_method(this, args)?,
+            #[cfg(feature = "python")]
+            PY_ITER => self.py_iter_next(this)?,
+            // `makeExc(cls, args)` natively (`undefined`: the runtime's own
+            // literal builds it).
+            #[cfg(feature = "python")]
+            PY_EXC => {
+                let (c, a, r) = (
+                    a0,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                );
+                self.py_make_exc(c, a, r).unwrap_or(Value::UNDEFINED)
+            }
+            // `contains(container, needle)` natively (`undefined`: the
+            // runtime's own test answers).
+            #[cfg(feature = "python")]
+            PY_IN => {
+                let c = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                self.py_in(a0, c, this)
+            }
+            // `smfind`'s cached hit natively (`undefined`: the runtime's own
+            // `smfind` answers).
+            #[cfg(feature = "python")]
+            PY_SMFIND => {
+                let (s, n) = (
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                );
+                self.py_smfind(a0, s, n, this)
+            }
+            // The runtime's dict and set storage (`vm::py_table`).
+            #[cfg(feature = "python")]
+            PY_TABLE => self.py_table(args)?,
+            HOST_CALL => {
+                let kind = self.to_js_string(a0)?;
+                self.preflight_native_iteration_work(args.len().saturating_sub(1) as u64)?;
+                let mut aggregate = kind.len();
+                self.preflight_guest_string_size(aggregate)?;
+                let rest_len = args.len().saturating_sub(1);
+                let mut rest: Vec<String> = Vec::new();
+                rest.try_reserve_exact(rest_len)
+                    .map_err(|_| Thrown::from_static("RangeError: host argument allocation failed"))?;
+                for &a in args.iter().skip(1) {
+                    let value = self.to_js_string(a)?;
+                    aggregate = checked_native_output_add(aggregate, value.len())?;
+                    self.preflight_guest_string_size(aggregate)?;
+                    rest.push(value);
+                }
+                // The context-taking hook first: it receives the VM, so the
+                // host may resolve typed arrays and call guest functions while
+                // it runs (`crate::vm::host_api::HostCtx`).
+                let reply = if let Some(mut host) = self.host_ctx.take() {
+                    let reply = host(self, &kind, &rest);
+                    self.host_ctx = Some(host);
+                    reply
+                } else {
+                    let Some(mut host) = self.host.take() else {
+                        return Err(Thrown(format!(
+                            "TypeError: {HOST_CALL_NAME}(\"{kind}\") with no host installed \
+                             (or called re-entrantly from within a host call)"
+                        )));
+                    };
+                    let reply = host(&kind, &rest);
+                    self.host = Some(host);
+                    reply
+                };
+                match reply {
+                    Ok(s) => {
+                        self.preflight_guest_string_size(s.len())?;
+                        self.alloc_str(s)
+                    }
+                    Err(e) => {
+                        self.preflight_guest_string_size(e.len())?;
+                        return Err(Thrown(e));
+                    }
+                }
+            }
+            // Global functions as values.
+            GLOBAL_PARSE_INT => {
+                // ToString(string) — observable (calls toString, not valueOf) and
+                // abrupt; then radix = ToInt32(ToNumber(radix)) (NaN/±Infinity → 0,
+                // i.e. the default base). ToString runs BEFORE the radix coercion.
+                let s = self.to_js_string(a0)?;
+                // R is `ToInt32(radix)` — a MODULO 2^32 wrap. Rust's `as i32`
+                // on a float SATURATES instead, so `parseInt("0x10", 1e308)`
+                // became radix -1 (an out-of-range NaN) where ToInt32 gives 0,
+                // i.e. the default base.
+                let radix = if args.len() >= 2 {
+                    let r = self.to_number_strict(a1)?;
+                    crate::vm::helpers_num2::to_int32(r)
+                } else {
+                    0
+                };
+                Value::num(parse_int(&s, radix))
+            }
+            GLOBAL_PARSE_FLOAT => {
+                let s = self.to_js_string(a0)?;
+                Value::num(parse_float(&s))
+            }
+            // URI codecs. The `extra`/`reserved` byte sets are the ASCII chars
+            // kept verbatim beyond uriUnescaped (encode) / left percent-escaped
+            // (decode). Malformed input → URIError.
+            GLOBAL_ENCODE_URI => {
+                let s = self.to_js_string(a0)?;
+                // Encode 6.2.c: a LONE surrogate is a URIError. The lossy
+                // coercion above hides it (U+FFFD) — check the exact bytes.
+                self.uri_check_wellformed(a0)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let out_len = uri_encode_output_len(&s, b"#;/?:@&=+$,")?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                uri_encode_into(&s, b"#;/?:@&=+$,", &mut out);
+                debug_assert_eq!(out.len(), out_len);
+                self.alloc_str(out)
+            }
+            GLOBAL_ENCODE_URI_COMPONENT => {
+                let s = self.to_js_string(a0)?;
+                self.uri_check_wellformed(a0)?; // lone surrogate -> URIError
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let out_len = uri_encode_output_len(&s, b"")?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                uri_encode_into(&s, b"", &mut out);
+                debug_assert_eq!(out.len(), out_len);
+                self.alloc_str(out)
+            }
+            GLOBAL_DECODE_URI => {
+                // The input must be read EXACTLY (a raw lone surrogate is a
+                // non-'%' code unit the Decode algorithm copies verbatim).
+                let sv = self.to_str_value(a0)?;
+                let r = {
+                    let bytes = self.heap.str_wtf8_cow(sv.heap_index()).unwrap_or_default();
+                    self.preflight_native_iteration_work(bytes.len() as u64)?;
+                    uri_decode(&bytes, b";/?:@&=+$,#")?
+                };
+                Value::heap(self.heap.alloc_js(r))
+            }
+            GLOBAL_DECODE_URI_COMPONENT => {
+                let sv = self.to_str_value(a0)?;
+                let r = {
+                    let bytes = self.heap.str_wtf8_cow(sv.heap_index()).unwrap_or_default();
+                    self.preflight_native_iteration_work(bytes.len() as u64)?;
+                    uri_decode(&bytes, b"")?
+                };
+                Value::heap(self.heap.alloc_js(r))
+            }
+            GLOBAL_ESCAPE => {
+                // The argument's code units, lone surrogates included (a Rust
+                // `String` turned each one into `%uFFFD`).
+                let s = self.to_wtf8_string(a0)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let out_len = escape_output_len(&s)?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                escape_str_into(&s, &mut out);
+                debug_assert_eq!(out.len(), out_len);
+                self.alloc_str(out)
+            }
+            GLOBAL_UNESCAPE => {
+                let s = self.to_js_string(a0)?;
+                self.preflight_native_iteration_work(s.len() as u64)?;
+                self.preflight_guest_string_size(s.len())?;
+                let r = unescape_str(&s)?;
+                Value::heap(self.heap.alloc_js(r))
+            }
+            U8_TO_BASE64 => {
+                let idx = self.u8_brand(this)?;
+                let opts = args.first().copied().unwrap_or(Value::UNDEFINED);
+                // GetOptionsObject + read alphabet/omitPadding BEFORE the bytes (a
+                // getter on the options object may observably mutate the array).
+                let (url, omit) = if opts == Value::UNDEFINED {
+                    (false, false)
+                } else if self.is_object_value(opts) {
+                    let a = self.get_prop(opts, "alphabet")?;
+                    let url = if a == Value::UNDEFINED {
+                        false
+                    } else if self.is_string_value(a) {
+                        match self.to_js_string(a)?.as_str() {
+                            "base64" => false,
+                            "base64url" => true,
+                            _ => return Err(Thrown::from_static(
+                                "TypeError: toBase64 alphabet must be \"base64\" or \"base64url\"",
+                            )),
+                        }
+                    } else {
+                        return Err(Thrown::from_static(
+                            "TypeError: toBase64 alphabet must be a string",
+                        ));
+                    };
+                    let op = self.get_prop(opts, "omitPadding")?;
+                    (url, self.truthy(op))
+                } else {
+                    return Err(Thrown::from_static(
+                        "TypeError: toBase64 options must be an object",
+                    ));
+                };
+                let bytes = self
+                    .u8_bytes(idx)
+                    .ok_or_else(|| Thrown::from_static("TypeError: Uint8Array buffer is detached"))?;
+                self.preflight_native_iteration_work(bytes.len() as u64)?;
+                let out_len = base64_output_len(bytes.len(), omit)?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                to_base64_into(&bytes, url, omit, &mut out);
+                debug_assert_eq!(out.len(), out_len);
+                self.alloc_str(out)
+            }
+            U8_FROM_BASE64 => {
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_string_value(arg) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Uint8Array.fromBase64 argument must be a string",
+                    ));
+                }
+                let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let (url, lch) = self.read_b64_decode_opts(opts)?;
+                let s = self.to_js_string(arg)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let (_, b, err) = from_base64(&s, url, lch, usize::MAX);
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                let buf = self.alloc_array_buffer(b.len())?;
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
+                    data.copy_from_slice(&b);
+                }
+                self.alloc_typed_array(buf, 1, 0, b.len())
+            }
+            U8_SET_FROM_BASE64 => {
+                let idx = self.u8_brand(this)?;
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_string_value(arg) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Uint8Array.prototype.setFromBase64 argument must be a string",
+                    ));
+                }
+                // Writing into an immutable-backed view is a TypeError — verified
+                // BEFORE reading the options object (its getters must not run).
+                if let HeapObj::TypedArray { buffer, .. } = self.heap.get(idx) {
+                    let buffer = *buffer;
+                    if self.immutable_buffers.contains(&buffer) {
+                        return Err(Thrown::from_static(
+                            "TypeError: Cannot setFromBase64 into a TypedArray backed by an immutable ArrayBuffer",
+                        ));
+                    }
+                }
+                let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let (url, lch) = self.read_b64_decode_opts(opts)?;
+                let s = self.to_js_string(arg)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let max = self
+                    .ta_effective_len(idx)
+                    .ok_or_else(|| Thrown::from_static("TypeError: Uint8Array buffer is detached"))?;
+                let (read, b, err) = from_base64(&s, url, lch, max);
+                let written = b.len();
+                self.u8_write(idx, &b);
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                let mut m = crate::heap::ObjMap::new();
+                let attr = crate::heap::PropAttr {
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                m.define("read", Value::num(read as f64), attr);
+                m.define("written", Value::num(written as f64), attr);
+                let obj = self.heap.alloc(HeapObj::Object(Box::new(m)));
+                if self.obj_proto != 0 {
+                    self.proto_of.insert(obj, Value::heap(self.obj_proto));
+                }
+                Value::heap(obj)
+            }
+            U8_TO_HEX => {
+                let idx = self.u8_brand(this)?;
+                let bytes = self
+                    .u8_bytes(idx)
+                    .ok_or_else(|| Thrown::from_static("TypeError: Uint8Array buffer is detached"))?;
+                self.preflight_native_iteration_work(bytes.len() as u64)?;
+                let out_len = bytes
+                    .len()
+                    .checked_mul(2)
+                    .ok_or_else(invalid_native_string_length)?;
+                let mut s = self.guest_string_with_capacity(out_len)?;
+                for b in bytes {
+                    let h = hex_lower(b);
+                    s.push(h[0] as char);
+                    s.push(h[1] as char);
+                }
+                self.alloc_str(s)
+            }
+            U8_SET_FROM_HEX => {
+                let idx = self.u8_brand(this)?;
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_string_value(arg) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Uint8Array.prototype.setFromHex argument must be a string",
+                    ));
+                }
+                // Writing into a TypedArray backed by an immutable ArrayBuffer is a
+                // TypeError (checked before any decode/write, so contents are never
+                // mutated — even for an empty input).
+                if let HeapObj::TypedArray { buffer, .. } = self.heap.get(idx) {
+                    let buffer = *buffer;
+                    if self.immutable_buffers.contains(&buffer) {
+                        return Err(Thrown::from_static(
+                            "TypeError: Cannot setFromHex into a TypedArray backed by an immutable ArrayBuffer",
+                        ));
+                    }
+                }
+                let s = self.to_js_string(arg)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let max = self
+                    .ta_effective_len(idx)
+                    .ok_or_else(|| Thrown::from_static("TypeError: Uint8Array buffer is detached"))?;
+                let (read, bytes, err) = from_hex(&s, max);
+                let written = bytes.len();
+                self.u8_write(idx, &bytes);
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                // The { read, written } result (an ordinary object).
+                let mut m = crate::heap::ObjMap::new();
+                let attr = crate::heap::PropAttr {
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                m.define("read", Value::num(read as f64), attr);
+                m.define("written", Value::num(written as f64), attr);
+                let obj = self.heap.alloc(HeapObj::Object(Box::new(m)));
+                if self.obj_proto != 0 {
+                    self.proto_of.insert(obj, Value::heap(self.obj_proto));
+                }
+                Value::heap(obj)
+            }
+            U8_FROM_HEX => {
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_string_value(arg) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Uint8Array.fromHex argument must be a string",
+                    ));
+                }
+                let s = self.to_js_string(arg)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let (_, bytes, err) = from_hex(&s, usize::MAX);
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                let buf = self.alloc_array_buffer(bytes.len())?;
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
+                    data.copy_from_slice(&bytes);
+                }
+                self.alloc_typed_array(buf, 1, 0, bytes.len())
+            }
+            // ? ToNumber(x): coerce objects (@@toPrimitive/valueOf/toString) and
+            // propagate abrupt completions (throwing valueOf, Symbol → TypeError).
+            GLOBAL_IS_NAN => Value::bool(self.to_number_strict(a0)?.is_nan()),
+            GLOBAL_IS_FINITE => Value::bool(self.to_number_strict(a0)?.is_finite()),
+            GLOBAL_EVAL => {
+                // eval(x): if x is not a String, return it unchanged (spec 19.2.1).
+                let is_str = a0.is_heap()
+                    && matches!(
+                        self.heap.get(a0.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. }
+                    );
+                if !is_str {
+                    a0
+                } else {
+                    let code = self.display(a0);
+                    // EXACT WTF-8 bytes when the code string holds lone
+                    // surrogates: the lossy `code` aligns with them
+                    // byte-for-byte (U+FFFD and a WTF-8 surrogate are both
+                    // 3 bytes), letting regex literals recover their exact
+                    // pattern text. None (O(1)) for well-formed sources.
+                    let exact = self.heap.str_exact_if_not_wellformed(a0.heap_index());
+                    return self.do_eval(
+                        &code,
+                        false,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Value::UNDEFINED,
+                        None,
+                        true,
+                        None,
+                        Vec::new(),
+                        None,
+                        None,
+                        exact.as_deref(),
+                    );
+                }
+            }
+            // String static methods.
+            STR_FROM_CHAR_CODE => {
+                // ToUint16 per arg; adjacent surrogate halves combine, a lone
+                // half stays a real lone surrogate — see `string_from_char_codes`.
+                let js = self.string_from_char_codes(args)?;
+                Value::heap(self.heap.alloc_js(js))
+            }
+            STR_FROM_CODE_POINT => {
+                // WTF-8 build: a surrogate code point passes through as a real
+                // lone surrogate (and a high+low argument pair canonicalizes
+                // into the astral scalar, matching the UTF-16 join semantics).
+                self.preflight_native_iteration_work(args.len() as u64)?;
+                let capacity = args
+                    .len()
+                    .checked_mul(4)
+                    .filter(|&n| n <= MAX_STRING_BYTES)
+                    .ok_or_else(invalid_native_string_length)?;
+                self.preflight_guest_string_size(capacity)?;
+                let mut out: Vec<u8> = Vec::new();
+                out.try_reserve_exact(capacity)
+                    .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
+                for &v in args {
+                    let n = self.to_number_strict(v)?;
+                    if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
+                        return Err(Thrown(format!("RangeError: Invalid code point {n}")));
+                    }
+                    crate::heap::wtf8_push_cp(&mut out, n as u32);
+                }
+                let js = crate::heap::JsStr::from_wtf8(out);
+                Value::heap(self.heap.alloc_js(js))
+            }
+            // Date static methods as values.
+            DATE_NOW => Value::num(crate::vm::clock::now_epoch_ms()),
+            DATE_PARSE => {
+                let source = self.to_js_string(a0)?;
+                Value::num(parse_date(&source))
+            }
+            DATE_UTC => Value::num(self.date_utc_ms(args)?),
+            STR_RAW => {
+                // String.raw(template, ...subs): ToObject(template.raw), then
+                // interleave ToString(raw[i]) with ToString(subs[i]). ToObject of a
+                // nullish `raw` throws TypeError, and ToString throws on a Symbol —
+                // both must propagate (display() would have swallowed them).
+                self.require_object_coercible(a0)?; // ToObject(template)
+                let raw0 = self.get_prop(a0, "raw")?;
+                self.require_object_coercible(raw0)?; // ToObject(template.raw)
+                let raw = self.to_object(raw0)?;
+                let len_v = self.get_prop(raw, "length")?;
+                let n = self.to_number_strict(len_v)?;
+                let raw_len = if n.is_finite() && n > 0.0 {
+                    n as usize
+                } else {
+                    0
+                };
+                self.preflight_native_iteration_work(raw_len as u64)?;
+                let subs = args.get(1..).unwrap_or(&[]);
+                // Every segment and substitution is appended EXACTLY: the lossy
+                // `String` form turned a lone surrogate in a raw segment or a
+                // substitution into U+FFFD, so `String.raw` could not round-trip
+                // text the template literal itself holds. The parts join as `+`
+                // joins them: a high half ending one part pairs with a low half
+                // starting the next.
+                let mut out: Vec<u8> = Vec::new();
+                for i in 0..raw_len {
+                    let seg = self.get_index(raw, Value::num(i as f64))?;
+                    self.append_guest_tostring(&mut out, seg)?;
+                    if i + 1 == raw_len {
+                        break;
+                    }
+                    if let Some(sub) = subs.get(i) {
+                        self.append_guest_tostring(&mut out, *sub)?;
+                    }
+                }
+                self.alloc_wtf8(out)
+            }
+            // Object.prototype.toLocaleString() → this.toString().
+            PROTO_TO_LOCALE_STRING => {
+                let ts = self.get_prop(this, "toString")?;
+                if self.is_callable(ts) {
+                    self.call_value(ts, this, &[])?
+                } else {
+                    return Err(Thrown::from_static("TypeError: toString is not callable"));
+                }
+            }
+            // `Math.<op>` as a value (`Math.abs`, `Math.max`, …). The direct call
+            // form is compile-lowered to MathOp; these back the value form.
+            _ if native::math_method(id).is_some() => {
+                let (_, op, _) = native::math_method(id).unwrap();
+                Value::num(self.eval_math_args(op, args)?)
+            }
+            // Promise static methods invoked as values (`Promise.resolve`, …).
+            PROMISE_RESOLVE
+            | PROMISE_REJECT
+            | PROMISE_ALL
+            | PROMISE_ALLSETTLED
+            | PROMISE_RACE
+            | PROMISE_ANY
+            | PROMISE_ALLKEYED
+            | PROMISE_ALLSETTLEDKEYED => {
+                // These static methods read `this` as the constructor C (for the
+                // result's NewPromiseCapability); a non-constructor `this` is a
+                // TypeError. (The single-offset model still builds a native Promise.)
+                if !self.is_constructor(this) {
+                    return Err(Thrown::from_static(
+                        "TypeError: Promise static method called on a non-constructor",
+                    ));
+                }
+                let a = args.first().copied().unwrap_or(Value::UNDEFINED);
+                match id {
+                    PROMISE_RESOLVE => {
+                        // Promise.resolve(x): the native Promise ctor takes the fast
+                        // path; a custom `this` runs NewPromiseCapability(this) and
+                        // observably Calls its resolve — returning x unchanged when x
+                        // is already a promise whose .constructor === this.
+                        if this == self.promise_ctor_value() {
+                            // PromiseResolve step 2: x is returned AS-IS only when
+                            // Get(x, "constructor") is C — a promise whose
+                            // constructor was changed gets a fresh adopting promise.
+                            let is_native_promise = a.is_heap()
+                                && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. });
+                            if is_native_promise && self.get_prop(a, "constructor")? != this {
+                                let p = self.alloc_promise();
+                                self.resolve_fresh_promise(p, a);
+                                Value::heap(p)
+                            } else {
+                                Value::heap(self.to_promise(a))
+                            }
+                        } else {
+                            let already = a.is_heap()
+                                && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. })
+                                && self.get_prop(a, "constructor")? == this;
+                            if already {
+                                a
+                            } else {
+                                let (promise, resolve, _) = self.new_promise_capability(this)?;
+                                self.with_promise_operation_roots(&[promise, resolve], |vm| {
+                                    vm.call_value(resolve, Value::UNDEFINED, &[a])
+                                })?;
+                                promise
+                            }
+                        }
+                    }
+                    PROMISE_REJECT => {
+                        // As PROMISE_RESOLVE: a custom `this` settles through its own
+                        // capability's reject function.
+                        if this == self.promise_ctor_value() {
+                            let p = self.alloc_promise();
+                            self.reject(p, a);
+                            Value::heap(p)
+                        } else {
+                            let (promise, _, reject) = self.new_promise_capability(this)?;
+                            self.with_promise_operation_roots(&[promise, reject], |vm| {
+                                vm.call_value(reject, Value::UNDEFINED, &[a])
+                            })?;
+                            promise
+                        }
+                    }
+                    PROMISE_ALL => self.promise_combine(crate::heap::CombKind::All, a, this)?,
+                    PROMISE_ALLSETTLED => {
+                        self.promise_combine(crate::heap::CombKind::AllSettled, a, this)?
+                    }
+                    PROMISE_RACE => self.promise_combine(crate::heap::CombKind::Race, a, this)?,
+                    PROMISE_ALLKEYED => {
+                        self.promise_combine(crate::heap::CombKind::AllKeyed, a, this)?
+                    }
+                    PROMISE_ALLSETTLEDKEYED => {
+                        self.promise_combine(crate::heap::CombKind::AllSettledKeyed, a, this)?
+                    }
+                    _ => self.promise_combine(crate::heap::CombKind::Any, a, this)?, // PROMISE_ANY
+                }
+            }
+            // `%TypedArray%.prototype.<m>` invoked as a value (`.map.call(ta, …)`).
+            _ if (TA_METHOD_BASE..TA_METHOD_BASE + TA_PROTO_METHODS.len() as u16).contains(&id) => {
+                let m = TA_PROTO_METHODS[(id - TA_METHOD_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::TypedArray { .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: TypedArray.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.typed_array_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            _ if (DV_METHOD_BASE..DV_METHOD_BASE + DV_PROTO_METHODS.len() as u16).contains(&id) => {
+                let m = DV_PROTO_METHODS[(id - DV_METHOD_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::DataView { .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: DataView.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.dataview_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            ARRAYBUFFER_SLICE => {
+                // slice requires a non-shared ArrayBuffer receiver.
+                let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
+                if shared
+                    || !matches!(
+                        this.is_heap().then(|| self.heap.get(this.heap_index())),
+                        Some(HeapObj::ArrayBuffer { .. })
+                    )
+                {
+                    return Err(Thrown::from_static(
+                        "TypeError: ArrayBuffer.prototype.slice called on incompatible receiver",
+                    ));
+                }
+                self.arraybuffer_method(this.heap_index(), "slice", args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            ARRAYBUFFER_RESIZE => {
+                let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
+                if shared
+                    || !matches!(
+                        this.is_heap().then(|| self.heap.get(this.heap_index())),
+                        Some(HeapObj::ArrayBuffer { .. })
+                    )
+                {
+                    return Err(Thrown::from_static(
+                        "TypeError: ArrayBuffer.prototype.resize called on incompatible receiver",
+                    ));
+                }
+                self.arraybuffer_method(this.heap_index(), "resize", args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            ARRAYBUFFER_TRANSFER_IMMUTABLE
+            | ARRAYBUFFER_SLICE_IMMUTABLE
+            | ARRAYBUFFER_TRANSFER
+            | ARRAYBUFFER_TRANSFER_FIXED => {
+                let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
+                if shared
+                    || !matches!(
+                        this.is_heap().then(|| self.heap.get(this.heap_index())),
+                        Some(HeapObj::ArrayBuffer { .. })
+                    )
+                {
+                    return Err(Thrown::from_static(
+                        "TypeError: ArrayBuffer transfer method called on incompatible receiver",
+                    ));
+                }
+                let name = match id {
+                    ARRAYBUFFER_TRANSFER_IMMUTABLE => "transferToImmutable",
+                    ARRAYBUFFER_SLICE_IMMUTABLE => "sliceToImmutable",
+                    ARRAYBUFFER_TRANSFER => "transfer",
+                    _ => "transferToFixedLength",
+                };
+                self.arraybuffer_method(this.heap_index(), name, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            ARRAYBUFFER_ISVIEW => Value::bool(
+                a0.is_heap()
+                    && matches!(
+                        self.heap.get(a0.heap_index()),
+                        HeapObj::TypedArray { .. } | HeapObj::DataView { .. }
+                    ),
+            ),
+            _ if (BUFFER_GETTER_BASE..BUFFER_GETTER_BASE + BUFFER_GETTERS.len() as u16)
+                .contains(&id) =>
+            {
+                let (name, kind) = BUFFER_GETTERS[(id - BUFFER_GETTER_BASE) as usize];
+                // The ArrayBuffer getters (kind 0: byteLength/maxByteLength/resizable/
+                // detached) require IsSharedArrayBuffer(this) to be false — a
+                // SharedArrayBuffer is the same HeapObj internally but must be rejected.
+                let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
+                let ok = this.is_heap()
+                    && matches!(
+                        (kind, self.heap.get(this.heap_index())),
+                        (0, HeapObj::ArrayBuffer { .. })
+                            | (1, HeapObj::TypedArray { .. })
+                            | (2, HeapObj::DataView { .. })
+                    )
+                    && !(kind == 0 && shared);
+                if !ok {
+                    return Err(Thrown(format!(
+                        "TypeError: get {name} called on an incompatible receiver"
+                    )));
+                }
+                // The instance arm of get_member computes the value directly (it
+                // never consults this proto accessor, so there's no recursion).
+                self.get_member(this, name, this)?
+            }
+            SAB_GROW => {
+                let ok = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
+                if !ok {
+                    return Err(Thrown::from_static(
+                        "TypeError: SharedArrayBuffer.prototype.grow called on incompatible receiver",
+                    ));
+                }
+                self.arraybuffer_method(this.heap_index(), "grow", args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            SAB_SLICE => {
+                // Brand check: a SharedArrayBuffer receiver only (a plain
+                // ArrayBuffer must NOT pass through SAB's slice).
+                if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {
+                    return Err(Thrown::from_static(
+                        "TypeError: SharedArrayBuffer.prototype.slice called on incompatible receiver",
+                    ));
+                }
+                self.arraybuffer_method(this.heap_index(), "slice", args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            _ if (ATOMICS_BASE..ATOMICS_BASE + ATOMICS_METHODS.len() as u16).contains(&id) => {
+                let (name, _) = ATOMICS_METHODS[(id - ATOMICS_BASE) as usize];
+                self.atomics_op(name, args)?
+            }
+            DISPOSABLE_USE
+            | DISPOSABLE_ADOPT
+            | DISPOSABLE_DEFER
+            | DISPOSABLE_DISPOSE
+            | DISPOSABLE_DISPOSE_ASYNC
+            | DISPOSABLE_MOVE
+            | DISPOSABLE_DISPOSED_GET
+            | ASYNC_DISPOSABLE_USE
+            | ASYNC_DISPOSABLE_ADOPT
+            | ASYNC_DISPOSABLE_DEFER
+            | ASYNC_DISPOSABLE_MOVE => self.disposable_op(id, this, args)?,
+            GEN_NEXT | GEN_RETURN | GEN_THROW => {
+                let name = match id {
+                    GEN_NEXT => "next",
+                    GEN_RETURN => "return",
+                    _ => "throw",
+                };
+                if !this.is_heap()
+                    || !matches!(self.heap.get(this.heap_index()), HeapObj::Generator { .. })
+                {
+                    return Err(Thrown(format!(
+                        "TypeError: {name} called on a non-generator object"
+                    )));
+                }
+                self.generator_method(this.heap_index(), name, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            ASYNCGEN_NEXT | ASYNCGEN_RETURN | ASYNCGEN_THROW => {
+                let name = match id {
+                    ASYNCGEN_NEXT => "next",
+                    ASYNCGEN_RETURN => "return",
+                    _ => "throw",
+                };
+                if !this.is_heap()
+                    || !matches!(self.heap.get(this.heap_index()), HeapObj::AsyncGenerator(_))
+                {
+                    // AsyncGeneratorEnqueue: a non-async-generator `this` REJECTS the
+                    // returned promise with a TypeError, not a synchronous throw.
+                    let err = self.alloc_error_from_message(&format!(
+                        "TypeError: {name} called on a non-async-generator object"
+                    ));
+                    let p = self.alloc_promise();
+                    self.reject(p, err);
+                    Value::heap(p)
+                } else {
+                    self.async_generator_method(this.heap_index(), name, args)
+                        .unwrap_or(Value::UNDEFINED)
+                }
+            }
+            SHADOWREALM_EVALUATE | SHADOWREALM_IMPORTVALUE => {
+                self.shadowrealm_op(id, this, args)?
+            }
+            _ if (SAB_GETTER_BASE..SAB_GETTER_BASE + SAB_GETTERS.len() as u16).contains(&id) => {
+                let name = SAB_GETTERS[(id - SAB_GETTER_BASE) as usize];
+                if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {
+                    return Err(Thrown(format!(
+                        "TypeError: get SharedArrayBuffer.prototype.{name} called on incompatible receiver"
+                    )));
+                }
+                // The shared-buffer arm of get_member computes the value directly.
+                self.get_member(this, name, this)?
+            }
+            PROXY_REVOCABLE => {
+                // Proxy.revocable(target, handler) → { proxy, revoke }.
+                let p = self.make_proxy(a0, a1)?;
+                let revoke_fn = self.heap.alloc(HeapObj::Native(PROXY_REVOKE));
+                self.adopt_native_result_realm(revoke_fn, self.fn_proto);
+                let revoke = self.heap.alloc(HeapObj::Bound {
+                    target: Value::heap(revoke_fn),
+                    this: p,
+                    args: Vec::new(),
+                });
+                self.adopt_native_result_realm(revoke, self.fn_proto);
+                let revoke = Value::heap(revoke);
+                let mut m = ObjMap::new();
+                m.set("proxy", p);
+                m.set("revoke", revoke);
+                self.alloc_object_current_realm(m)
+            }
+            PROXY_REVOKE => {
+                if this.is_heap() {
+                    if let HeapObj::Proxy { revoked, .. } = self.heap.get_mut(this.heap_index()) {
+                        *revoked = true;
+                    }
+                }
+                Value::UNDEFINED
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (TEMPORAL_M_BASE..TEMPORAL_M_BASE + TEMPORAL_DURATION_METHODS.len() as u16)
+                .contains(&id) =>
+            {
+                let m = TEMPORAL_DURATION_METHODS[(id - TEMPORAL_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 0, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.Duration.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            TEMPORAL_DURATION_FROM => {
+                // The EXACT f64 record: from() must store ℝ(𝔽(field)) untouched
+                // by i64 saturation (a 4.5e21-microseconds field survives).
+                let f = self.to_duration_f64(a0)?;
+                self.make_duration(f)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            TEMPORAL_DURATION_COMPARE => {
+                let fa = self.to_duration_f64(a0)?;
+                let fb = self.to_duration_f64(a1)?;
+                let opts = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                Value::num(self.duration_compare(fa, fb, opts)?)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (PD_M_BASE..PD_M_BASE + PLAINDATE_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINDATE_METHODS[(id - PD_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 1, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainDate.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PLAINDATE_FROM => {
+                // Per ToTemporalDate, the item is validated before the overflow
+                // option's VALUE is observed: an object reads overflow then resolves
+                // its fields, but a string/primitive must parse/reject FIRST (a
+                // non-string primitive → TypeError, an invalid ISO string → RangeError),
+                // so overflow is read only once the item is known-processable.
+                let ((y, m, d), cal) = if self.is_object_value(a0) {
+                    // Object: read the bag fields, THEN options.overflow (order-of-ops).
+                    self.to_plain_date_cal(a0, Some(a1))?
+                } else {
+                    let r = self.to_plain_date_cal(a0, None)?;
+                    self.read_overflow(a1)?;
+                    r
+                };
+                let r = self.make_plain_date(y, m, d)?;
+                self.tag_cal(r, cal)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PLAINDATE_COMPARE => {
+                let a = self.to_plain_date(a0)?;
+                let b = self.to_plain_date(a1)?;
+                let ea = iso_to_epoch_days(a.0, a.1, a.2);
+                let eb = iso_to_epoch_days(b.0, b.1, b.2);
+                Value::num(if ea < eb {
+                    -1.0
+                } else if ea > eb {
+                    1.0
+                } else {
+                    0.0
+                })
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (PT_M_BASE..PT_M_BASE + PLAINTIME_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINTIME_METHODS[(id - PT_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 2, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainTime.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PLAINTIME_FROM => {
+                // Validate the item before observing overflow (see PLAINDATE_FROM).
+                let f = if self.is_object_value(a0) {
+                    // Object: read the bag fields, THEN options.overflow (order-of-ops).
+                    self.to_plain_time_overflow(a0, Some(a1))?
+                } else {
+                    let r = self.to_plain_time(a0)?;
+                    self.read_overflow(a1)?;
+                    r
+                };
+                self.make_plain_time(f)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PLAINTIME_COMPARE => {
+                let a = self.to_plain_time(a0)?;
+                let b = self.to_plain_time(a1)?;
+                let (ta, tb) = (time_to_ns(&a), time_to_ns(&b));
+                Value::num(if ta < tb {
+                    -1.0
+                } else if ta > tb {
+                    1.0
+                } else {
+                    0.0
+                })
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (PDT_M_BASE..PDT_M_BASE + PLAINDATETIME_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINDATETIME_METHODS[(id - PDT_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 3, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainDateTime.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PLAINDATETIME_FROM => {
+                // Validate the item before observing overflow (see PLAINDATE_FROM).
+                let f = if self.is_object_value(a0)
+                    && !matches!(self.heap.get(a0.heap_index()), HeapObj::Temporal { .. })
+                {
+                    // Plain bag: one PrepareTemporalFields pass (field gets, then
+                    // the required-y/m/d TypeError), THEN options.overflow, THEN
+                    // the deferred monthCode/range validation (order-of-ops).
+                    let bag = self.read_pdt_bag(a0, false)?;
+                    let reject = self.read_overflow(a1)?;
+                    (self.finish_pdt_fields(&bag, reject)?, bag.cal)
+                } else {
+                    let r = self.to_plain_date_time_cal(a0)?;
+                    self.read_overflow(a1)?;
+                    r
+                };
+                let r = self.make_plain_date_time(f.0)?;
+                self.tag_cal(r, f.1)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PLAINDATETIME_COMPARE => {
+                let a = self.to_plain_date_time_limited(a0)?;
+                let b = self.to_plain_date_time_limited(a1)?;
+                let an = iso_to_epoch_days(a[0], a[1], a[2]) as i128 * 86_400_000_000_000
+                    + time_to_ns(&[a[3], a[4], a[5], a[6], a[7], a[8]]);
+                let bn = iso_to_epoch_days(b[0], b[1], b[2]) as i128 * 86_400_000_000_000
+                    + time_to_ns(&[b[3], b[4], b[5], b[6], b[7], b[8]]);
+                Value::num(if an < bn {
+                    -1.0
+                } else if an > bn {
+                    1.0
+                } else {
+                    0.0
+                })
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (INST_M_BASE..INST_M_BASE + INSTANT_METHODS.len() as u16).contains(&id) => {
+                let m = INSTANT_METHODS[(id - INST_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 4, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.Instant.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INST_FROM => {
+                let ns = self.to_instant_ns(a0)?;
+                self.make_instant(ns)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INST_FROM_EPOCH_MS => {
+                // ToNumber (BigInt/Symbol → TypeError) then NumberToBigInt (a
+                // non-integral / non-finite Number → RangeError).
+                let n = self.to_number_strict(a0)?;
+                if !n.is_finite() || n.fract() != 0.0 {
+                    return Err(Thrown::from_static(
+                        "RangeError: epochMilliseconds must be an integer",
+                    ));
+                }
+                self.make_instant((n as i128) * 1_000_000)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INST_FROM_EPOCH_SEC => {
+                let n = self.to_number_strict(a0)?;
+                if !n.is_finite() || n.fract() != 0.0 {
+                    return Err(Thrown::from_static("RangeError: epochSeconds must be an integer"));
+                }
+                self.make_instant((n as i128) * 1_000_000_000)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INST_FROM_EPOCH_NS => {
+                // Beyond-i128 saturates (sign preserved) — certainly outside the
+                // Instant range, which make_instant validates.
+                let ns = self.to_bigint(a0)?.to_i128_sat();
+                self.make_instant(ns)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INST_FROM_EPOCH_US => {
+                let ns = self.to_bigint(a0)?.to_i128_sat().saturating_mul(1_000);
+                self.make_instant(ns)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INST_COMPARE => {
+                let a = self.to_instant_ns(a0)?;
+                let b = self.to_instant_ns(a1)?;
+                Value::num(if a < b {
+                    -1.0
+                } else if a > b {
+                    1.0
+                } else {
+                    0.0
+                })
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (PYM_M_BASE..PYM_M_BASE + PLAINYEARMONTH_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINYEARMONTH_METHODS[(id - PYM_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 5, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainYearMonth.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PLAINYEARMONTH_FROM => {
+                // Validate the item before observing overflow (see PLAINDATE_FROM).
+                let ((y, m, rd), cal) = if self.is_object_value(a0) {
+                    // Object: read the bag fields, THEN options.overflow (order-of-ops).
+                    self.to_plain_year_month_overflow(a0, Some(a1))?
+                } else {
+                    let r = self.to_plain_year_month_overflow(a0, None)?;
+                    self.read_overflow(a1)?;
+                    r
+                };
+                let r = self.make_plain_year_month(y, m, rd)?;
+                self.tag_cal(r, cal)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PLAINYEARMONTH_COMPARE => {
+                let a = self.to_plain_year_month(a0)?;
+                let b = self.to_plain_year_month(a1)?;
+                // Compare the full ISO reference date (year, month, then reference day).
+                let ka = (a.0, a.1, a.2);
+                let kb = (b.0, b.1, b.2);
+                Value::num(if ka < kb {
+                    -1.0
+                } else if ka > kb {
+                    1.0
+                } else {
+                    0.0
+                })
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (PMD_M_BASE..PMD_M_BASE + PLAINMONTHDAY_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINMONTHDAY_METHODS[(id - PMD_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 6, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainMonthDay.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (ZDT_M_BASE..ZDT_M_BASE + ZONEDDATETIME_METHODS.len() as u16).contains(&id) => {
+                let m = ZONEDDATETIME_METHODS[(id - ZDT_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 7, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.ZonedDateTime.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                match self.temporal_method(this.heap_index(), m, args)? {
+                    Some(v) => v,
+                    None => {
+                        return Err(Thrown(format!(
+                            "TypeError: Temporal.ZonedDateTime.prototype.{m} is not yet supported"
+                        )))
+                    }
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            ZDT_FROM => self.zoned_date_time_from(a0, a1)?,
+            #[cfg(not(feature = "wasm-lite"))]
+            ZDT_COMPARE => {
+                let za = self.zoned_date_time_from(a0, Value::UNDEFINED)?;
+                let zb = self.zoned_date_time_from(a1, Value::UNDEFINED)?;
+                let na = self.zdt_epoch_ns(za.heap_index()).unwrap_or(0);
+                let nb = self.zdt_epoch_ns(zb.heap_index()).unwrap_or(0);
+                Value::num(match na.cmp(&nb) {
+                    std::cmp::Ordering::Less => -1.0,
+                    std::cmp::Ordering::Equal => 0.0,
+                    std::cmp::Ordering::Greater => 1.0,
+                })
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PLAINMONTHDAY_FROM => {
+                // Validate the item before observing overflow (see PLAINDATE_FROM).
+                let ((ry, m, d), cal) = if self.is_object_value(a0) {
+                    // Object: read the bag fields, THEN options.overflow (order-of-ops).
+                    self.to_plain_month_day_overflow(a0, Some(a1))?
+                } else {
+                    let r = self.to_plain_month_day_overflow(a0, None)?;
+                    self.read_overflow(a1)?;
+                    r
+                };
+                let r = self.make_plain_month_day(m, d, ry)?;
+                self.tag_cal(r, cal)
+            }
+            // Temporal.Now — no timezone DB, so a named zone reports UTC, but a
+            // numeric-offset zone shifts the wall-clock. The time-zone arg is
+            // still validated (invalid string -> RangeError, wrong type -> TypeError).
+            #[cfg(not(feature = "wasm-lite"))]
+            NOW_INSTANT => {
+                let ns = Self::now_epoch_ns();
+                self.make_instant(ns)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            NOW_PLAINDATETIME_ISO => {
+                let (_, offset) = self.now_tz_id(a0)?;
+                let ns = Self::now_epoch_ns() + offset as i128;
+                let days = ns.div_euclid(DAY_NS);
+                let t = ns_to_time(ns.rem_euclid(DAY_NS));
+                let (y, mo, d) = epoch_days_to_iso(days as i64);
+                self.make_plain_date_time([y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]])?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            NOW_PLAINDATE_ISO => {
+                let (_, offset) = self.now_tz_id(a0)?;
+                let ns = Self::now_epoch_ns() + offset as i128;
+                let (y, mo, d) = epoch_days_to_iso(ns.div_euclid(DAY_NS) as i64);
+                self.make_plain_date(y, mo, d)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            NOW_PLAINTIME_ISO => {
+                let (_, offset) = self.now_tz_id(a0)?;
+                let ns = Self::now_epoch_ns() + offset as i128;
+                self.make_plain_time(ns_to_time(ns.rem_euclid(DAY_NS)))?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            NOW_ZONEDDATETIME_ISO => {
+                let (id, offset) = self.now_tz_id(a0)?;
+                let ns = Self::now_epoch_ns();
+                self.alloc_zdt(ns, offset, id)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            NOW_TIMEZONE_ID => self.alloc_str("UTC".to_string()),
+            // Shared Temporal toLocaleString. ECMA-402 replaces every one of
+            // these with `CreateDateTimeFormat(%Intl.DateTimeFormat%, locales,
+            // options, <required>, <defaults>)` followed by FormatDateTime — the
+            // receiver's own kind supplies the required/defaults pair, so ONE
+            // implementation covers all eight prototypes.
+            #[cfg(not(feature = "wasm-lite"))]
+            TEMPORAL_TO_LOCALE_STRING => {
+                let kind = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Temporal { kind, .. }) => *kind,
+                    _ => {
+                        return Err(Thrown::from_static(
+                            "TypeError: toLocaleString called on a non-Temporal object",
+                        ))
+                    }
+                };
+                self.temporal_to_locale_string(this, kind, a0, a1)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            ZDT_GET_TZ_TRANSITION => {
+                if !this.is_heap()
+                    || !matches!(
+                        self.heap.get(this.heap_index()),
+                        HeapObj::Temporal { kind: 7, .. }
+                    )
+                {
+                    return Err(Thrown::from_static(
+                        "TypeError: getTimeZoneTransition called on a non-ZonedDateTime",
+                    ));
+                }
+                let dir = self.read_direction_option(a0)?;
+                let idx = this.heap_index();
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                let ns = self.zdt_epoch_ns(idx).unwrap_or(0);
+                // An offset zone has no transitions at all; a named one is asked
+                // the database. The search is in whole seconds, so "next" from a
+                // sub-second instant must not re-find the transition it is in.
+                match crate::vm::temporal::tz_transition(&id, ns, dir == "next") {
+                    Some(t) => self.make_zoned_date_time_raw(t, 0, idx)?,
+                    None => Value::NULL,
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            PDT_WITH_PLAIN_TIME => {
+                if !this.is_heap()
+                    || !matches!(
+                        self.heap.get(this.heap_index()),
+                        HeapObj::Temporal { kind: 3, .. }
+                    )
+                {
+                    return Err(Thrown::from_static(
+                        "TypeError: withPlainTime called on a non-PlainDateTime",
+                    ));
+                }
+                self.temporal_method(this.heap_index(), "withPlainTime", args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
+            // ── Intl ──
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_GET_CANONICAL_LOCALES => {
+                let list = self.canonicalize_locale_list(a0)?;
+                let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
+                self.alloc_array_current_realm(items)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_SUPPORTED_VALUES_OF => {
+                let key = self.to_js_string(a0)?;
+                self.preflight_native_iteration_work(key.len() as u64)?;
+                let mut zones: Vec<String> = Vec::new();
+                let vals: &[&str] = match key.as_str() {
+                    // Shared with the DateTimeFormat/NumberFormat option
+                    // resolution so the two agree: a value listed here is
+                    // exactly one that resolvedOptions will echo back.
+                    "calendar" => crate::vm::intl::AVAILABLE_CALENDARS,
+                    "collation" => &["default"],
+                    // AvailableCurrencies is the codes for which the engine
+                    // provides BOTH Intl.NumberFormat and Intl.DisplayNames
+                    // functionality. There are no currency display names here
+                    // (no CLDR), so the intersection is empty — listing codes
+                    // NumberFormat alone handles would claim display names that
+                    // do not exist.
+                    "currency" => &[],
+                    "numberingSystem" => crate::vm::intl::AVAILABLE_NUMBERING_SYSTEMS,
+                    "timeZone" => {
+                        zones = crate::vm::intl::available_time_zones();
+                        &[]
+                    }
+                    // AvailableUnits is every simple sanctioned identifier of
+                    // ECMA-402 Table 2 — exactly the set `style: "unit"` accepts
+                    // and echoes back — not the three that happen to have a
+                    // hand-written label.
+                    "unit" => crate::vm::intl::SANCTIONED_UNITS,
+                    _ => {
+                        return Err(Thrown(format!(
+                            "RangeError: invalid key for supportedValuesOf: {key}"
+                        )))
+                    }
+                };
+                // Every AvailableX list is specified as sorted (as %Array.prototype.sort%
+                // with no comparefn would leave it), and the enumeration tests compare
+                // the result against its own `.sort()`.
+                let mut sorted: Vec<String> =
+                    vals.iter().map(|s| s.to_string()).chain(zones).collect();
+                sorted.sort_unstable();
+                let items: Vec<Value> = sorted.into_iter().map(|s| self.alloc_str(s)).collect();
+                self.alloc_array_current_realm(items)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_SUPPORTED_LOCALES_OF | INTL_DTF_SUPPORTED_LOCALES_OF => {
+                let list = self.canonicalize_locale_list(a0)?;
+                // SupportedLocales step 1 is `? ToObject(options)`, NOT
+                // GetOptionsObject: `supportedLocalesOf([], 7)` wraps the number
+                // and still reads `localeMatcher` off Object.prototype. Only
+                // null/undefined are special (undefined skips, null throws).
+                let options = if a1 == Value::UNDEFINED {
+                    a1
+                } else {
+                    self.require_object_coercible(a1)?;
+                    self.to_object(a1)?
+                };
+                self.opt_string(
+                    options,
+                    "localeMatcher",
+                    "best fit",
+                    &["lookup", "best fit"],
+                )?;
+                // LookupSupportedLocales: keep a requested tag only when
+                // BestAvailableLocale finds a match for its no-extension form.
+                // Returning the whole list unfiltered claimed support for every
+                // well-formed tag on earth, `zxx` ("no linguistic content")
+                // included — which is what every service's
+                // `supportedLocalesOf/basic.js` checks.
+                let list: Vec<String> = list
+                    .into_iter()
+                    .filter(|tag| {
+                        crate::vm::intl::best_available_locale_in(
+                            &crate::vm::intl::strip_extensions(tag),
+                            if id == INTL_DTF_SUPPORTED_LOCALES_OF {
+                                crate::vm::intl::DTF_AVAILABLE_LOCALES
+                            } else {
+                                crate::vm::intl::AVAILABLE_LOCALES
+                            },
+                        )
+                        .is_some()
+                    })
+                    .collect();
+                let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
+                Value::heap(self.heap.alloc(HeapObj::Array(items)))
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            n if n >= native::INTL_RESOLVED_OPTIONS_BASE
+                && n < native::INTL_RESOLVED_OPTIONS_BASE + 10 =>
+            {
+                let want = (n - native::INTL_RESOLVED_OPTIONS_BASE) as u8;
+                // UnwrapNumberFormat / UnwrapDateTimeFormat run BEFORE the brand
+                // check: a receiver produced by the legacy
+                // `Intl.DateTimeFormat.call(obj)` chaining carries the real
+                // service under %Intl%.[[FallbackSymbol]]. Only those two
+                // services have the legacy chaining, and only their own
+                // resolvedOptions unwraps.
+                let mut this = this;
+                if want == INTL_NUMBERFORMAT || want == INTL_DATETIMEFORMAT {
+                    this = self.intl_unwrap_legacy(this, want)?;
+                }
+                // RequireInternalSlot names ONE slot: the receiver must be an
+                // instance of THIS service, not of any Intl service.
+                let resolved = self.intl_this(this, want, "resolvedOptions")?;
+                self.clone_plain_object(resolved)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_NF_FORMAT => {
+                let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "format")?;
+                self.intl_number_format(resolved, a0)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_NF_FORMAT_TO_PARTS => {
+                let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "formatToParts")?;
+                // ToIntlMathematicalValue observes an object's
+                // valueOf/@@toPrimitive and keeps a BigInt/string exact.
+                let n = self.to_intl_mv(a0)?;
+                let parts = self.nf_parts(resolved, &n)?;
+                let parts: Vec<(String, String, &str)> =
+                    parts.into_iter().map(|(t, v)| (t, v, "")).collect();
+                self.intl_parts_array(&parts)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_NF_FORMAT_RANGE | INTL_NF_FORMAT_RANGE_TO_PARTS => {
+                let name = if id == INTL_NF_FORMAT_RANGE {
+                    "formatRange"
+                } else {
+                    "formatRangeToParts"
+                };
+                let resolved = self.intl_this(this, INTL_NUMBERFORMAT, name)?;
+                // FormatNumericRange step 3: an undefined endpoint is a TypeError
+                // BEFORE either is coerced; a NaN endpoint is a RangeError after.
+                if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
+                    return Err(Thrown(format!("TypeError: {name} requires two values")));
+                }
+                let x = self.to_intl_mv(a0)?;
+                let y = self.to_intl_mv(a1)?;
+                if x.is_nan() || y.is_nan() {
+                    return Err(Thrown(format!("RangeError: {name} values must not be NaN")));
+                }
+                let parts = self.nf_range_parts(resolved, &x, &y)?;
+                if id == INTL_NF_FORMAT_RANGE {
+                    let s: String = parts.iter().map(|(_, v, _)| v.as_str()).collect();
+                    self.alloc_str(s)
+                } else {
+                    self.intl_parts_array(&parts)
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_DTF_FORMAT => {
+                let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "format")?;
+                let mut fields = self.dtf_requested_fields(resolved);
+                let mut absolute = true;
+                let ms = if a0 == Value::UNDEFINED {
+                    (Self::now_epoch_ns() / 1_000_000) as f64
+                } else {
+                    self.dtf_check_calendar(resolved, a0, "format")?;
+                    let (f, abs) = self.dtf_fields_for(resolved, a0, "format")?;
+                    fields = f;
+                    absolute = abs;
+                    self.dtf_time_value(a0)?
+                };
+                let s = self.dtf_format(resolved, ms, fields, absolute);
+                self.alloc_str(s)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_DTF_FORMAT_TO_PARTS => {
+                let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "formatToParts")?;
+                let mut fields = self.dtf_requested_fields(resolved);
+                let mut absolute = true;
+                let ms = if a0 == Value::UNDEFINED {
+                    (Self::now_epoch_ns() / 1_000_000) as f64
+                } else {
+                    self.dtf_check_calendar(resolved, a0, "formatToParts")?;
+                    let (f, abs) = self.dtf_fields_for(resolved, a0, "formatToParts")?;
+                    fields = f;
+                    absolute = abs;
+                    self.dtf_time_value(a0)?
+                };
+                let parts: Vec<(String, String, &str)> = self
+                    .dtf_parts(resolved, ms, fields, absolute)
+                    .into_iter()
+                    .map(|(t, v)| (t.to_string(), v, ""))
+                    .collect();
+                self.intl_parts_array(&parts)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_DTF_FORMAT_RANGE | INTL_DTF_FORMAT_RANGE_TO_PARTS => {
+                let name = if id == INTL_DTF_FORMAT_RANGE {
+                    "formatRange"
+                } else {
+                    "formatRangeToParts"
+                };
+                let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, name)?;
+                if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
+                    return Err(Thrown(format!("TypeError: {name} requires two dates")));
+                }
+                // ToDateTimeFormattable on BOTH endpoints (steps 4-5) before
+                // PartitionDateTimeRangePattern's SameTemporalType check (step
+                // 5a): a non-Temporal argument's valueOf runs even when the
+                // pairing is going to be rejected, and it runs for the second
+                // argument too
+                // (formatRange/to-datetime-formattable-with-different-arg-kinds.js
+                // counts the calls). A Temporal object passes through untouched.
+                let mut a0 = a0;
+                let mut a1 = a1;
+                for v in [&mut a0, &mut a1] {
+                    if self.dt_arg_kind(*v).is_none() {
+                        *v = Value::num(self.to_number_strict(*v)?);
+                    }
+                }
+                // The endpoints must be the same kind of value: a Date/number
+                // range or a range of the SAME Temporal type, never a mix.
+                if self.dt_arg_kind(a0) != self.dt_arg_kind(a1) {
+                    return Err(Thrown(format!(
+                        "TypeError: {name} endpoints must be of the same type"
+                    )));
+                }
+                self.dtf_check_calendar(resolved, a0, name)?;
+                self.dtf_check_calendar(resolved, a1, name)?;
+                let (fields, absolute) = self.dtf_fields_for(resolved, a0, name)?;
+                let x = self.dtf_time_value(a0)?;
+                let y = self.dtf_time_value(a1)?;
+                let parts = self.dtf_range_parts(resolved, x, y, fields, absolute);
+                if id == INTL_DTF_FORMAT_RANGE {
+                    let s: String = parts.iter().map(|(_, v, _)| v.as_str()).collect();
+                    self.alloc_str(s)
+                } else {
+                    self.intl_parts_array(&parts)
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_COLLATOR_COMPARE => {
+                let resolved = self.intl_this(this, INTL_COLLATOR, "compare")?;
+                // The exact strings, seen as `localeCompare` sees them, so the
+                // two still agree when a lone surrogate is involved.
+                let (a, b) = (self.to_js_str_owned(a0)?, self.to_js_str_owned(a1)?);
+                let (a, b) = (
+                    super::string_ops::collation_view(&a),
+                    super::string_ops::collation_view(&b),
+                );
+                Value::num(self.collator_compare(resolved, &a, &b)?)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_PLURAL_SELECT => {
+                let resolved = self.intl_this(this, INTL_PLURALRULES, "select")?;
+                let n = self.to_number_strict(a0)?;
+                let cat = self.intl_plural_category(resolved, n);
+                self.alloc_str(cat.to_string())
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_PLURAL_SELECT_RANGE => {
+                let _ = self.intl_this(this, INTL_PLURALRULES, "selectRange")?;
+                // ResolvePluralRange steps 3-5: an absent endpoint is a
+                // TypeError and a NaN one a RangeError, both BEFORE any
+                // formatting (neither was checked at all).
+                if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
+                    return Err(Thrown::from_static(
+                        "TypeError: selectRange requires both a start and an end",
+                    ));
+                }
+                let x = self.to_number_strict(a0)?;
+                let y = self.to_number_strict(a1)?;
+                if x.is_nan() || y.is_nan() {
+                    return Err(Thrown::from_static(
+                        "RangeError: selectRange endpoints must not be NaN",
+                    ));
+                }
+                self.alloc_str("other".to_string())
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_LIST_FORMAT | INTL_LIST_FORMAT_TO_PARTS => {
+                let to_parts = id == INTL_LIST_FORMAT_TO_PARTS;
+                let name = if to_parts { "formatToParts" } else { "format" };
+                let resolved = self.intl_this(this, INTL_LISTFORMAT, name)?;
+                let strs = self.string_list_from_iterable(a0)?;
+                let t = self.display(self.intl_slot(resolved, "type"));
+                let st = self.display(self.intl_slot(resolved, "style"));
+                // CreatePartsFromList: the element/literal decomposition IS the
+                // format string, so both entry points derive from one splitter.
+                let parts = list_parts_en(&strs, &t, &st)?;
+                self.preflight_native_iteration_work(parts.len() as u64)?;
+                if to_parts {
+                    let mut ps: Vec<(String, String, &str)> = Vec::new();
+                    ps.try_reserve_exact(parts.len())
+                        .map_err(|_| Thrown::from_static("RangeError: list allocation failed"))?;
+                    for (ty, value) in parts {
+                        ps.push((ty.to_string(), value, ""));
+                    }
+                    self.intl_parts_array(&ps)
+                } else {
+                    let total = parts.iter().try_fold(0usize, |total, (_, value)| {
+                        total
+                            .checked_add(value.len())
+                            .filter(|&n| n <= MAX_STRING_BYTES)
+                            .ok_or_else(invalid_native_string_length)
+                    })?;
+                    let mut s = self.guest_string_with_capacity(total)?;
+                    for (_, value) in parts {
+                        s.push_str(&value);
+                    }
+                    self.alloc_str(s)
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_RTF_FORMAT | INTL_RTF_FORMAT_TO_PARTS => {
+                let to_parts = id == INTL_RTF_FORMAT_TO_PARTS;
+                let name = if to_parts { "formatToParts" } else { "format" };
+                let rtf_resolved = self.intl_this(this, INTL_RELATIVETIMEFORMAT, name)?;
+                let v = self.to_number_strict(a0)?;
+                // PartitionRelativeTimePattern step 2: a non-finite value is a
+                // RangeError (it was formatted as "in NaN days" before).
+                if !v.is_finite() {
+                    return Err(Thrown::from_static(
+                        "RangeError: relative time value must be finite",
+                    ));
+                }
+                // SingularRelativeTimeUnit: ToString first (so a Symbol is a
+                // TypeError), then the eight allowed units in either number —
+                // anything else, including "decade" and "millisecond", is a
+                // RangeError.
+                let unit_raw = self.to_js_string(a1)?;
+                self.preflight_native_iteration_work(unit_raw.len() as u64)?;
+                let unit = unit_raw.strip_suffix('s').unwrap_or(&unit_raw).to_string();
+                if ![
+                    "second", "minute", "hour", "day", "week", "month", "quarter", "year",
+                ]
+                .contains(&unit.as_str())
+                {
+                    return Err(Thrown(format!("RangeError: invalid unit: {unit_raw}")));
+                }
+                let style = self.display(self.intl_slot(rtf_resolved, "style"));
+                let numeric = self.display(self.intl_slot(rtf_resolved, "numeric"));
+                // PartitionRelativeTimePattern step 5 selects "past" when
+                // value < 0 **or value is -0** — the sign bit, not the ordering,
+                // so `format(-0, "second")` is "0 seconds ago", not "in 0 seconds".
+                let past = v.is_sign_negative();
+                let n = v.abs();
+                let mut parts: Vec<(String, String, &str)> = vec![];
+                // Step 4: with numeric "auto", an exact integer that CLDR gives an
+                // idiomatic name ("yesterday", "now", "next quarter") replaces the
+                // whole pattern with one literal part. `-0` and `+0` share the
+                // key "0", which is why `format(-0, "day")` is "today".
+                let auto_lit = if numeric == "auto" && v.fract() == 0.0 && v.abs() < 2.0e9 {
+                    let key = v as i32;
+                    crate::vm::cldr_en::RELATIVE_LITERALS
+                        .iter()
+                        .find(|(u, s, o, _)| *u == unit && *s == style && *o == key)
+                        .map(|(.., t)| (*t).to_string())
+                } else {
+                    None
+                };
+                if let Some(lit) = auto_lit {
+                    parts.push(("literal".into(), lit, ""));
+                    if to_parts {
+                        return Ok(self.intl_parts_array_keyed(&parts, "unit"));
+                    }
+                    let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
+                    return Ok(self.alloc_str(s));
+                }
+                // Otherwise the CLDR `relativeTimePattern` for (unit, style,
+                // tense, plural category) wraps the number. `en`'s cardinal rule
+                // is `i = 1 and v = 0`, so only an integral 1 takes "one"
+                // ("in 1 second" vs "in 1.5 seconds").
+                let one = n == 1.0;
+                let row = crate::vm::cldr_en::RELATIVE_PATTERNS
+                    .iter()
+                    .find(|(u, s, ..)| *u == unit && *s == style);
+                let pattern = match (row, past, one) {
+                    (Some((.., f1, _, _, _)), false, true) => *f1,
+                    (Some((.., _, fo, _, _)), false, false) => *fo,
+                    (Some((.., _, _, p1, _)), true, true) => *p1,
+                    (Some((.., _, _, _, po)), true, false) => *po,
+                    (None, false, _) => "in {0}",
+                    (None, true, _) => "{0} ago",
+                };
+                let (prefix, suffix) = pattern.split_once("{0}").unwrap_or((pattern, ""));
+                if !prefix.is_empty() {
+                    parts.push(("literal".into(), prefix.to_string(), ""));
+                }
+                // The interpolated number is decomposed like NumberFormat's, and
+                // every one of ITS parts (but none of the surrounding literals)
+                // carries the singular `unit` field. It goes through the service's
+                // resolved numbering system, exactly as PartitionNumberPattern
+                // would (`en-us-numbering-systems.js` compares it against
+                // `Intl.NumberFormat(locale).format(value)`).
+                let rtf_ns = self.display(self.intl_slot(rtf_resolved, "numberingSystem"));
+                let rtf_seps = crate::vm::intl::numbering_separators(&rtf_ns);
+                for (t, val) in grouped_decimal_parts(n) {
+                    // Digits AND separators, or this would print "١,٢٣٤" where
+                    // NumberFormat — the oracle the test compares against —
+                    // prints "١٬٢٣٤" for `-u-nu-arab`.
+                    let val = match (t, rtf_seps) {
+                        ("group", Some((_, g))) => g.to_string(),
+                        ("decimal", Some((d, _))) => d.to_string(),
+                        _ => crate::vm::intl::translate_digits(&val, &rtf_ns),
+                    };
+                    parts.push((t.to_string(), val, unit.as_str()));
+                }
+                if !suffix.is_empty() {
+                    parts.push(("literal".into(), suffix.to_string(), ""));
+                }
+                if to_parts {
+                    self.intl_parts_array_keyed(&parts, "unit")
+                } else {
+                    let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
+                    self.alloc_str(s)
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_DISPLAYNAMES_OF => {
+                let resolved = self.intl_this(this, INTL_DISPLAYNAMES, "of")?;
+                let code = self.to_js_string(a0)?;
+                self.preflight_native_iteration_work(code.len() as u64)?;
+                let ty = self.display(self.intl_slot(resolved, "type"));
+                // Step 5: IsValidDisplayNamesCode — a malformed code is a
+                // RangeError before any lookup. None of these were checked, so
+                // `of("00")`/`of("seconds")` silently echoed the code back.
+                let code = crate::vm::intl::canonical_display_names_code(&ty, &code)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid {ty} code: {code}")))?;
+                // The `en` calendar names are real CLDR (`localeDisplayNames`);
+                // every other display-name type is data this engine does not
+                // ship, so those codes still take the [[Fallback]] path.
+                let named = (ty == "calendar")
+                    .then(|| {
+                        crate::vm::cldr_en::CALENDAR_NAMES
+                            .iter()
+                            .find(|(k, _)| *k == code)
+                            .map(|(_, v)| (*v).to_string())
+                    })
+                    .flatten();
+                match named {
+                    Some(name) => self.alloc_str(name),
+                    None => {
+                        let fb = self.display(self.intl_slot(resolved, "fallback"));
+                        if fb == "none" {
+                            Value::UNDEFINED
+                        } else {
+                            self.alloc_str(code)
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_LOCALE_TOSTRING => {
+                // [[Locale]] — the FULL canonical tag, extensions included.
+                let resolved = self.intl_this(this, INTL_LOCALE, "toString")?;
+                self.intl_slot(resolved, "@@tag")
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_LOCALE_MAXIMIZE | INTL_LOCALE_MINIMIZE => {
+                // Add/RemoveLikelySubtags (UTS #35 §4.3). A tag no likely-subtags
+                // row covers is its own maximum AND its own minimum — `xtg`
+                // must not expand to the root's `en-Latn-US`
+                // (Locale/likely-subtags-grandfathered.js).
+                let name = if id == INTL_LOCALE_MAXIMIZE {
+                    "maximize"
+                } else {
+                    "minimize"
+                };
+                let resolved = self.intl_this(this, INTL_LOCALE, name)?;
+                let tag = self.display(self.intl_slot(resolved, "@@tag"));
+                match crate::vm::locale_tag::parse_lang_tag(&tag) {
+                    Some(t) => {
+                        let out = if id == INTL_LOCALE_MAXIMIZE {
+                            crate::vm::cldr_alias::add_likely_subtags(&t)
+                        } else {
+                            crate::vm::cldr_alias::remove_likely_subtags(&t)
+                        };
+                        self.alloc_locale(&out.unwrap_or(t))
+                    }
+                    None => this,
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_LOCALE_GET_VARIANTS => {
+                let resolved = self.intl_this(this, INTL_LOCALE, "variants")?;
+                self.intl_slot(resolved, "variants")
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_LOCALE_GET_FIRSTDAY => {
+                let resolved = self.intl_this(this, INTL_LOCALE, "firstDayOfWeek")?;
+                self.intl_slot(resolved, "firstDayOfWeek")
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (INTL_LOCALE_INFO_BASE
+                ..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16)
+                .contains(&id) =>
+            {
+                let which = LOCALE_INFO_METHODS[(id - INTL_LOCALE_INFO_BASE) as usize];
+                let resolved = self.intl_this(this, INTL_LOCALE, which)?;
+                self.locale_info(resolved, which)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_SEGMENTER_SEGMENT => {
+                let seg = self.intl_this(this, INTL_SEGMENTER, "segment")?;
+                // CreateSegmentsObject: the Segments carries the segmenter and the
+                // ToString'd input, and nothing else — every boundary is recomputed
+                // on demand, which is what makes `containing` and a live iterator
+                // independent (next-mix-with-containing.js).
+                let g = self.display(self.intl_slot(seg, "granularity"));
+                self.make_segments(native::INTL_SEGMENTS, a0, &g, 0)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_SEGMENTS_ITERATOR => {
+                let s = self.intl_this(this, native::INTL_SEGMENTS, "[Symbol.iterator]")?;
+                // CreateSegmentIterator: a FRESH cursor each time, so nested
+                // `for…of` over the same Segments do not share a position
+                // (nested-next.js, next-inside-next.js).
+                let g = self.display(self.intl_slot(s, "granularity"));
+                let input = self.intl_slot(s, "input");
+                self.make_segments(native::INTL_SEGMENT_ITERATOR, input, &g, 0)?
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_SEGMENTS_CONTAINING => {
+                let s = self.intl_this(this, native::INTL_SEGMENTS, "containing")?;
+                let g = self.display(self.intl_slot(s, "granularity"));
+                let input = self.intl_slot(s, "input");
+                // Step 6 is ToIntegerOrInfinity, whose coercion can run user code,
+                // so it happens before the bounds test — and ±Infinity/NaN are
+                // handled by the same clamp (containing/out-of-bound-index.js).
+                // ToNumber is the STRICT one: a Symbol or BigInt index is a
+                // TypeError, not a silent 0 (containing/index-throws.js).
+                let n = self.to_number_strict(a0)?;
+                let n = if n.is_nan() {
+                    0
+                } else {
+                    n.trunc().clamp(-(i32::MAX as f64), i32::MAX as f64) as i64
+                };
+                let text = self.display(input);
+                self.preflight_native_iteration_work(crate::vm::segmenter::segment_work_bound(
+                    text.len(),
+                ))?;
+                match crate::vm::segmenter::segment_at(&text, &g, n) {
+                    Some((start, end)) => self.segment_data_object(input, &g, start, end),
+                    None => Value::UNDEFINED,
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_SEGMENT_ITER_NEXT => {
+                let it = self.intl_this(this, native::INTL_SEGMENT_ITERATOR, "next")?;
+                let g = self.display(self.intl_slot(it, "granularity"));
+                let input = self.intl_slot(it, "input");
+                let start = self.intl_slot(it, "index").as_f64() as usize;
+                // One step is O(segment): the boundary search streams forward
+                // from `start`'s byte offset, which the string's position memo
+                // finds from the previous step. Copying the whole input and
+                // re-segmenting it from 0 on every step made a `for…of` over
+                // the segments quadratic.
+                let step = match self.heap.get(input.heap_index()) {
+                    HeapObj::Str(js) if start < js.units() => Some((
+                        js.unit_byte_bounds(start).0,
+                        js.as_bytes().len(),
+                        js.units(),
+                    )),
+                    _ => None,
+                };
+                let (value, done) = if let Some((at, bytes, len)) = step {
+                    self.preflight_native_iteration_work(
+                        crate::vm::segmenter::segment_work_bound(bytes - at),
+                    )?;
+                    let end = match self.heap.get(input.heap_index()) {
+                        HeapObj::Str(js) => {
+                            crate::vm::segmenter::next_boundary(js.as_bytes(), &g, start, at, len)
+                        }
+                        _ => len,
+                    };
+                    let v = self.segment_data_object(input, &g, start, end);
+                    // [[IteratedStringNextSegmentCodeUnitIndex]] advances only
+                    // after the data object is built.
+                    if let HeapObj::Object(m) = self.heap.get_mut(it) {
+                        m.set("index", Value::num(end as f64));
+                    }
+                    (v, false)
+                } else {
+                    (Value::UNDEFINED, true)
+                };
+                self.iter_result(value, done)
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_DURATION_FORMAT | INTL_DURATION_FORMAT_TO_PARTS => {
+                let to_parts = id == INTL_DURATION_FORMAT_TO_PARTS;
+                let name = if to_parts { "formatToParts" } else { "format" };
+                let resolved = self.intl_this(this, INTL_DURATIONFORMAT, name)?;
+                // The record is read as f64 rather than the i64 view: a duration
+                // may legally hold 4503599627370495000000 microseconds, which
+                // saturates i64, and PartitionDurationFormatPattern sums the
+                // sub-second fields exactly.
+                let dur = self.to_duration_f64(a0)?;
+                let parts = self.duration_format_parts(resolved, &dur)?;
+                if to_parts {
+                    // The third tuple slot is the `unit` field here, not `source`.
+                    self.intl_parts_array_keyed(&parts, "unit")
+                } else {
+                    let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
+                    self.alloc_str(s)
+                }
+            }
+            #[cfg(not(feature = "wasm-lite"))]
+            _ if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16)
+                .contains(&id) =>
+            {
+                let field = LOCALE_ACCESSORS[(id - INTL_LOCALE_GET_BASE) as usize];
+                let resolved = self.intl_this(this, INTL_LOCALE, field)?;
+                self.intl_slot(resolved, field)
+            }
+            // The format/compare bound-function getters: return (and cache) a
+            // function bound to the instance, so `nf.format === nf.format`.
+            #[cfg(not(feature = "wasm-lite"))]
+            INTL_NF_FORMAT_GET | INTL_DTF_FORMAT_GET | INTL_COLLATOR_COMPARE_GET => {
+                let (kind, target_id, svc) = match id {
+                    INTL_NF_FORMAT_GET => (INTL_NUMBERFORMAT, INTL_NF_FORMAT, "format"),
+                    INTL_DTF_FORMAT_GET => (INTL_DATETIMEFORMAT, INTL_DTF_FORMAT, "format"),
+                    _ => (INTL_COLLATOR, INTL_COLLATOR_COMPARE, "compare"),
+                };
+                let resolved = self.intl_this(this, kind, svc)?;
+                let cached = self.intl_slot(resolved, "@@boundfn");
+                if cached != Value::UNDEFINED {
+                    cached
+                } else {
+                    let nat = Value::heap(self.heap.alloc(HeapObj::Native(target_id)));
+                    let b = Value::heap(self.heap.alloc(HeapObj::Bound {
+                        target: nat,
+                        this,
+                        args: vec![],
+                    }));
+                    if let HeapObj::Object(m) = self.heap.get_mut(resolved) {
+                        m.set("@@boundfn", b);
+                    }
+                    b
+                }
+            }
+            // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
+            // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
+            _ if native::proto_method(id).is_some() => {
+                let (m, kind, _len) = native::proto_method(id).unwrap();
+                // The raw receiver BEFORE any boxed-primitive unwrap — the
+                // symbol-consulting String methods pass it (e.g. a `new String`
+                // wrapper) to the argument's @@-method, not the unwrapped primitive.
+                let raw_this = this;
+                // A boxed primitive receiver unwraps to its [[PrimitiveValue]] so the
+                // method runs on the primitive (`new Number(5).toFixed(2)`). The generic
+                // Array methods (kind 0) are the exception: a `new Boolean/Number/String`
+                // wrapper must stay intact so its own array-like props (length + indexed
+                // elements) remain visible and the callback's receiver argument is the
+                // original wrapper (`obj instanceof Boolean`, `toString.call(obj)`).
+                let this = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Boxed { value, .. }) if kind != 0 => *value,
+                    _ => this,
+                };
+                // TypedArray.prototype.toString IS Array.prototype.toString (one
+                // function object), but a TypedArray receiver goes through
+                // this.join = %TypedArray%.prototype.join, whose ValidateTypedArray
+                // rejects a detached/out-of-bounds view — route it to the TA
+                // implementation rather than the generic array-like materialize.
+                if kind == 0
+                    && m == "toString"
+                    && matches!(
+                        this.is_heap().then(|| self.heap.get(this.heap_index())),
+                        Some(HeapObj::TypedArray { .. })
+                    )
+                {
+                    return Ok(self
+                        .typed_array_method(this.heap_index(), m, args)?
+                        .unwrap_or(Value::UNDEFINED));
+                }
+                // Promise.prototype.then is brand-checked (IsPromise); catch and
+                // finally are generic (they Invoke `this.then`, so an overridden /
+                // non-callable / throwing `this.then`, a thenable receiver, and a
+                // custom species constructor are observed), not direct internal-slot
+                // operations.
+                if kind == 7 {
+                    if m == "catch" {
+                        let on_r = args.first().copied().unwrap_or(Value::UNDEFINED);
+                        let then_fn = self.get_prop(this, "then")?;
+                        return Ok(self.call_value(then_fn, this, &[Value::UNDEFINED, on_r])?);
+                    }
+                    if m == "finally" {
+                        let on_finally = args.first().copied().unwrap_or(Value::UNDEFINED);
+                        return Ok(self.promise_finally(this, on_finally)?);
+                    }
+                    if m == "then"
+                        && !matches!(
+                            this.is_heap().then(|| self.heap.get(this.heap_index())),
+                            Some(HeapObj::Promise { .. })
+                        )
+                    {
+                        return Err(Thrown::from_static(
+                            "TypeError: Promise.prototype.then called on a non-Promise",
+                        ));
+                    }
+                }
+                // Array.prototype.toString: func = Get(array, "join"), Call it
+                // when callable, else the %Object.prototype.toString% intrinsic
+                // (NOT a Get of "toString" — the test deletes it) — 23.1.3.36.
+                if kind == 0 && m == "toString" {
+                    self.require_object_coercible(this)?;
+                    let recv = self.to_object(this)?;
+                    let f = self.get_prop(recv, "join")?;
+                    return Ok(if self.is_callable(f) {
+                        self.call_value(f, recv, &[])?
+                    } else {
+                        let tag = self.object_to_string_tag(recv)?;
+                        let total = tag
+                            .len()
+                            .checked_add(9)
+                            .ok_or_else(invalid_native_string_length)?;
+                        let mut out = self.guest_string_with_capacity(total)?;
+                        out.push_str("[object ");
+                        out.push_str(&tag);
+                        out.push(']');
+                        self.alloc_str(out)
+                    });
+                }
+                // Number/Boolean receivers are primitive values; the rest are heap.
+                if kind == 2 {
+                    self.number_method(this, m, args)?
+                        .unwrap_or(Value::UNDEFINED)
+                } else if kind == 5 {
+                    self.boolean_method(this, m)?
+                } else if kind == 1 && matches!(m, "toString" | "valueOf") {
+                    // String.prototype.toString/valueOf are NOT generic: thisStringValue
+                    // requires `this` to be a String (primitive or wrapper, already
+                    // unwrapped above), else TypeError — unlike the coercing methods below.
+                    if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
+                        this
+                    } else if this.is_heap()
+                        && self.str_proto != 0
+                        && this.heap_index() == self.str_proto
+                    {
+                        // %String.prototype% is itself a String exotic whose
+                        // [[StringData]] is the empty string.
+                        self.alloc_str(String::new())
+                    } else {
+                        return Err(Thrown(format!(
+                            "TypeError: String.prototype.{m} requires that 'this' be a String"
+                        )));
+                    }
+                } else if kind == 1
+                    && matches!(
+                        m,
+                        "replace" | "replaceAll" | "split" | "match" | "search" | "matchAll"
+                    )
+                {
+                    // These methods must observe the ARGUMENT's well-known Symbol
+                    // method (IsRegExp/flags + GetMethod(@@replace/@@split/@@match/…))
+                    // with the RAW receiver BEFORE ToString(this) — a poison `this`
+                    // (toString throws) must not be coerced first, and an @@-method
+                    // receives the raw receiver. ToString happens only on the
+                    // fall-through plain path (inside string_symbol_method).
+                    self.string_symbol_method(raw_this, m, args)?
+                } else if kind == 1 {
+                    // String methods are generic: RequireObjectCoercible(this) then
+                    // ToString(this), so `String.prototype.slice.call(123, …)` works.
+                    let s_idx = if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
+                        this.heap_index()
+                    } else if this == Value::UNDEFINED || this == Value::NULL {
+                        return Err(Thrown(format!(
+                            "TypeError: String.prototype.{m} called on null or undefined"
+                        )));
+                    } else {
+                        let s = self.to_js_string(this)?;
+                        self.alloc_str(s).heap_index()
+                    };
+                    self.string_method(s_idx, m, args)?
+                        .unwrap_or(Value::UNDEFINED)
+                } else if !this.is_heap() {
+                    // Array.prototype methods are generic: a primitive `this` is
+                    // ToObject-coerced (a Number/Boolean wrapper has length 0, so
+                    // the method runs trivially). null/undefined still throw, as do
+                    // primitive receivers for the non-generic kinds.
+                    if kind == 0 && this != Value::NULL && this != Value::UNDEFINED {
+                        let boxed = self.to_object(this)?;
+                        self.array_method(boxed.heap_index(), m, args)?
+                            .unwrap_or(Value::UNDEFINED)
+                    } else {
+                        return Err(Thrown(format!(
+                            "TypeError: prototype method {m} called on {}",
+                            self.display(this)
+                        )));
+                    }
+                } else {
+                    let r = match kind {
+                        // ToObject(this): a heap-allocated PRIMITIVE receiver
+                        // (string/symbol/bigint) boxes to its wrapper — generic
+                        // methods that return `this` (sort) must return the
+                        // wrapper, never the bare primitive. Real objects pass
+                        // through to_object unchanged.
+                        0 => {
+                            let recv = self.to_object(this)?;
+                            self.array_method(recv.heap_index(), m, args)?
+                        }
+                        1 => self.string_method(this.heap_index(), m, args)?,
+                        3 => self.set_method(this.heap_index(), m, args)?,
+                        4 => self.map_method(this.heap_index(), m, args)?,
+                        6 => self.date_method(this.heap_index(), m, args)?,
+                        _ => self.promise_method(this.heap_index(), m, args)?, // kind 7
+                    };
+                    r.unwrap_or(Value::UNDEFINED)
+                }
+            }
+            _ => Value::UNDEFINED,
+        })
+    }
+}
+
+/// The always-unescaped set for the Encode operation: uriAlpha + DecimalDigit +
+impl<'p> Vm<'p> {
+    /// URIError when `v` is a string VALUE containing a lone surrogate
+    /// (Encode step 6.2.c) — the exact WTF-8 check behind the lossy `&str`
+    /// view the URI codecs operate on.
+    fn uri_check_wellformed(&self, v: Value) -> Result<(), Thrown> {
+        if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
+            let b = self.heap.str_wtf8_cow(v.heap_index()).unwrap();
+            if !crate::heap::wtf8_is_wellformed(&b) {
+                return Err(Thrown::from_static("URIError: URI malformed"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// uriMark. (encodeURI additionally keeps uriReserved + "#"; those extra chars
+/// are passed in by the caller.)
+const URI_UNESCAPED: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
+
+fn hex_upper(b: u8) -> [u8; 2] {
+    const H: &[u8; 16] = b"0123456789ABCDEF";
+    [H[(b >> 4) as usize], H[(b & 0xF) as usize]]
+}
+
+fn hex_val(b: u8) -> Result<u8, ()> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(()),
+    }
+}
+
+/// Encode (ECMA-262 19.2.6.5): every char not in uriUnescaped ∪ `extra` is
+/// replaced by the percent-encoded uppercase hex of its UTF-8 bytes. Rust `str`
+/// holds only Unicode scalar values, so the lone-surrogate URIError branch is
+/// unreachable here.
+/// A byte → its two lowercase hex ASCII digits.
+fn hex_lower(b: u8) -> [u8; 2] {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    [D[(b >> 4) as usize], D[(b & 0xf) as usize]]
+}
+
+fn invalid_native_string_length() -> Thrown {
+    Thrown::from_static("RangeError: Invalid string length")
+}
+
+fn checked_native_output_add(current: usize, additional: usize) -> Result<usize, Thrown> {
+    current
+        .checked_add(additional)
+        .filter(|&total| total <= MAX_STRING_BYTES)
+        .ok_or_else(invalid_native_string_length)
+}
+
+fn regexp_escape_other(u: u32) -> bool {
+    matches!(
+        u,
+        // ,-=<>#&!%:;@~'`"
+        0x2c | 0x2d | 0x3d | 0x3c | 0x3e | 0x23 | 0x26 | 0x21 | 0x25 | 0x3a
+            | 0x3b | 0x40 | 0x7e | 0x27 | 0x60 | 0x22
+        // WhiteSpace (minus tab/VT/FF) + ZWNBSP
+            | 0x20 | 0xA0 | 0x1680 | 0x202F | 0x205F | 0x3000 | 0xFEFF
+        // LineTerminator (minus LF/CR)
+            | 0x2028 | 0x2029
+    ) || (0x2000..=0x200A).contains(&u)
+        || (0xD800..=0xDFFF).contains(&u)
+}
+
+fn regexp_escape_output_len(bytes: &[u8]) -> Result<usize, Thrown> {
+    let mut total = 0usize;
+    for (index, u) in crate::heap::wtf8_code_points(bytes).enumerate() {
+        let additional = match char::from_u32(u) {
+            None => 6, // lone surrogate -> \uNNNN
+            Some(c) if index == 0 && (c.is_ascii_digit() || c.is_ascii_alphabetic()) => 4,
+            Some(
+                '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                | '/',
+            ) => 2,
+            Some('\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r') => 2,
+            Some(c) if regexp_escape_other(u) => {
+                if u <= 0xFF {
+                    4
+                } else {
+                    let mut units = [0u16; 2];
+                    c.encode_utf16(&mut units)
+                        .len()
+                        .checked_mul(6)
+                        .ok_or_else(invalid_native_string_length)?
+                }
+            }
+            Some(c) => c.len_utf8(),
+        };
+        total = checked_native_output_add(total, additional)?;
+    }
+    Ok(total)
+}
+
+fn push_regexp_unicode_escape(out: &mut String, unit: u16) {
+    let hi = hex_lower((unit >> 8) as u8);
+    let lo = hex_lower(unit as u8);
+    out.push_str("\\u");
+    out.push(hi[0] as char);
+    out.push(hi[1] as char);
+    out.push(lo[0] as char);
+    out.push(lo[1] as char);
+}
+
+fn push_regexp_byte_escape(out: &mut String, byte: u8) {
+    let h = hex_lower(byte);
+    out.push_str("\\x");
+    out.push(h[0] as char);
+    out.push(h[1] as char);
+}
+
+fn regexp_escape_into(bytes: &[u8], out: &mut String) {
+    for (index, u) in crate::heap::wtf8_code_points(bytes).enumerate() {
+        let c = match char::from_u32(u) {
+            Some(c) => c,
+            None => {
+                push_regexp_unicode_escape(out, u as u16);
+                continue;
+            }
+        };
+        if index == 0 && (c.is_ascii_digit() || c.is_ascii_alphabetic()) {
+            push_regexp_byte_escape(out, u as u8);
+            continue;
+        }
+        match c {
+            '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+            | '/' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0b}' => out.push_str("\\v"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            _ if regexp_escape_other(u) => {
+                if u <= 0xFF {
+                    push_regexp_byte_escape(out, u as u8);
+                } else {
+                    let mut units = [0u16; 2];
+                    for unit in c.encode_utf16(&mut units) {
+                        push_regexp_unicode_escape(out, *unit);
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+}
+
+/// FromHex(string, maxLength) (Uint8Array base64/hex proposal): decode hex into
+/// at most `maxLength` bytes. Returns (chars read, decoded bytes, optional
+/// SyntaxError). An odd-length string decodes NOTHING; an illegal hexit pair
+/// decodes the valid prefix then errors; reaching `maxLength` stops without error.
+fn from_hex(s: &str, max_len: usize) -> (usize, Vec<u8>, Option<Thrown>) {
+    let chars: Vec<char> = s.chars().collect();
+    let length = chars.len();
+    let err = || Some(Thrown::from_static("SyntaxError: invalid hexadecimal string"));
+    if length % 2 != 0 {
+        return (0, Vec::new(), err());
+    }
+    let hexv = |c: char| -> Option<u8> {
+        if c.is_ascii() {
+            hex_val(c as u8).ok()
+        } else {
+            None
+        }
+    };
+    let mut bytes = Vec::new();
+    let mut read = 0;
+    while read < length && bytes.len() < max_len {
+        match (hexv(chars[read]), hexv(chars[read + 1])) {
+            (Some(h), Some(l)) => {
+                bytes.push((h << 4) | l);
+                read += 2;
+            }
+            _ => return (read, bytes, err()),
+        }
+    }
+    (read, bytes, None)
+}
+
+/// ASCII whitespace skipped between base64 characters: tab, LF, FF, CR, space.
+fn is_b64_ws(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
+/// A base64 character → its 6-bit value, honouring the alphabet (`url` ⇒ `-_`).
+fn b64_val(c: char, url: bool) -> Option<u8> {
+    match c {
+        'A'..='Z' => Some(c as u8 - b'A'),
+        'a'..='z' => Some(c as u8 - b'a' + 26),
+        '0'..='9' => Some(c as u8 - b'0' + 52),
+        '+' if !url => Some(62),
+        '/' if !url => Some(63),
+        '-' if url => Some(62),
+        '_' if url => Some(63),
+        _ => None,
+    }
+}
+
+/// Decode a base64 chunk of 2/3/4 sextets into 1/2/3 bytes. When
+/// `throw_on_extra` (strict mode), the unused trailing bits of a 2- or
+/// 3-sextet final chunk must be zero (else `None`).
+fn decode_chunk(chunk: &[u8], throw_on_extra: bool) -> Option<Vec<u8>> {
+    match chunk.len() {
+        2 => {
+            if throw_on_extra && (chunk[1] & 0x0f) != 0 {
+                return None;
+            }
+            Some(vec![(chunk[0] << 2) | (chunk[1] >> 4)])
+        }
+        3 => {
+            if throw_on_extra && (chunk[2] & 0x03) != 0 {
+                return None;
+            }
+            Some(vec![
+                (chunk[0] << 2) | (chunk[1] >> 4),
+                ((chunk[1] & 0x0f) << 4) | (chunk[2] >> 2),
+            ])
+        }
+        4 => Some(vec![
+            (chunk[0] << 2) | (chunk[1] >> 4),
+            ((chunk[1] & 0x0f) << 4) | (chunk[2] >> 2),
+            ((chunk[2] & 0x03) << 6) | chunk[3],
+        ]),
+        _ => None,
+    }
+}
+
+/// FromBase64(string, alphabet, lastChunkHandling, maxLength) (Uint8Array
+/// base64/hex proposal). `lch`: 0=loose, 1=strict, 2=stop-before-partial.
+/// Returns (chars read, decoded bytes (≤ maxLength), optional SyntaxError).
+/// Chunks are atomic: a chunk whose full output would exceed `max_len` is not
+/// decoded (the decode stops before it, without error).
+fn from_base64(s: &str, url: bool, lch: u8, max_len: usize) -> (usize, Vec<u8>, Option<Thrown>) {
+    let chars: Vec<char> = s.chars().collect();
+    let length = chars.len();
+    let synerr = || Some(Thrown::from_static("SyntaxError: invalid base64 string"));
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk: Vec<u8> = Vec::new();
+    let mut read = 0usize; // committed position (after the last full chunk)
+    let mut index = 0usize;
+    if max_len == 0 {
+        return (0, bytes, None); // no room — read nothing (trailing garbage ignored)
+    }
+    loop {
+        while index < length && is_b64_ws(chars[index]) {
+            index += 1;
+        }
+        if index == length {
+            if chunk.is_empty() {
+                return (length, bytes, None);
+            }
+            // Partial chunk at end (no padding).
+            match lch {
+                2 => return (read, bytes, None),     // stop-before-partial
+                1 => return (read, bytes, synerr()), // strict
+                _ => {
+                    // loose
+                    if chunk.len() == 1 {
+                        return (read, bytes, synerr());
+                    }
+                    let nb = chunk.len() - 1;
+                    if bytes.len() + nb > max_len {
+                        return (read, bytes, None);
+                    }
+                    match decode_chunk(&chunk, false) {
+                        Some(d) => {
+                            bytes.extend(d);
+                            return (length, bytes, None);
+                        }
+                        None => return (read, bytes, synerr()),
+                    }
+                }
+            }
+        }
+        let c = chars[index];
+        if c == '=' {
+            // Padding: the pending chunk must be 2 or 3 sextets.
+            if chunk.len() < 2 {
+                return (read, bytes, synerr());
+            }
+            let need_eq = 4 - chunk.len(); // 2 sextets→"==", 3 sextets→"="
+            let mut got = 0;
+            let mut j = index;
+            while got < need_eq {
+                while j < length && is_b64_ws(chars[j]) {
+                    j += 1;
+                }
+                if j < length && chars[j] == '=' {
+                    got += 1;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if got < need_eq {
+                // Incomplete padding: stop-before-partial stops here; else error.
+                if lch == 2 {
+                    return (read, bytes, None);
+                }
+                return (read, bytes, synerr());
+            }
+            // Only whitespace may follow the padding.
+            let mut k = j;
+            while k < length && is_b64_ws(chars[k]) {
+                k += 1;
+            }
+            if k != length {
+                return (read, bytes, synerr());
+            }
+            let nb = chunk.len() - 1;
+            if bytes.len() + nb > max_len {
+                return (read, bytes, None);
+            }
+            match decode_chunk(&chunk, lch == 1) {
+                Some(d) => {
+                    bytes.extend(d);
+                    return (length, bytes, None);
+                }
+                None => return (read, bytes, synerr()),
+            }
+        }
+        match b64_val(c, url) {
+            Some(v) => {
+                chunk.push(v);
+                index += 1;
+                if chunk.len() == 4 {
+                    if bytes.len() + 3 > max_len {
+                        return (read, bytes, None);
+                    }
+                    if let Some(d) = decode_chunk(&chunk, false) {
+                        bytes.extend(d);
+                    }
+                    chunk.clear();
+                    read = index;
+                    // Output full: stop here, ignoring any trailing characters.
+                    if bytes.len() == max_len {
+                        return (read, bytes, None);
+                    }
+                }
+            }
+            None => return (read, bytes, synerr()),
+        }
+    }
+}
+
+/// Encode bytes as base64 (Uint8Array.prototype.toBase64). `url` selects the
+/// base64url alphabet (`-_` for `+/`); `omit_padding` drops trailing `=`.
+fn base64_output_len(bytes: usize, omit_padding: bool) -> Result<usize, Thrown> {
+    let full = (bytes / 3)
+        .checked_mul(4)
+        .ok_or_else(invalid_native_string_length)?;
+    let tail = match (bytes % 3, omit_padding) {
+        (0, _) => 0,
+        (1, true) => 2,
+        (2, true) => 3,
+        (_, false) => 4,
+        _ => unreachable!(),
+    };
+    checked_native_output_add(full, tail)
+}
+
+fn to_base64_into(bytes: &[u8], url: bool, omit_padding: bool, out: &mut String) {
+    const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let t = if url { URL } else { STD };
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let (b0, b1, b2) = (bytes[i], bytes[i + 1], bytes[i + 2]);
+        out.push(t[(b0 >> 2) as usize] as char);
+        out.push(t[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(t[(((b1 & 0xf) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(t[(b2 & 0x3f) as usize] as char);
+        i += 3;
+    }
+    match bytes.len() - i {
+        1 => {
+            let b0 = bytes[i];
+            out.push(t[(b0 >> 2) as usize] as char);
+            out.push(t[((b0 & 3) << 4) as usize] as char);
+            if !omit_padding {
+                out.push('=');
+                out.push('=');
+            }
+        }
+        2 => {
+            let (b0, b1) = (bytes[i], bytes[i + 1]);
+            out.push(t[(b0 >> 2) as usize] as char);
+            out.push(t[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+            out.push(t[((b1 & 0xf) << 2) as usize] as char);
+            if !omit_padding {
+                out.push('=');
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `escape(string)` (Annex B B.2.1.1): keep `A-Za-z0-9@*_+-./`, encode any
+/// other UTF-16 code unit as `%XX` (unit < 256) or `%uXXXX`. Iterates the
+/// WTF-8 string's code units (not chars) so an astral char yields its two
+/// surrogate `%uXXXX`s and a lone surrogate its own.
+fn escape_output_len(s: &[u8]) -> Result<usize, Thrown> {
+    const KEEP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+    let mut total = 0usize;
+    for u in crate::heap::wtf8_units_iter(s) {
+        let additional = if u < 0x80 && KEEP.contains(&(u as u8)) {
+            1
+        } else if u < 0x100 {
+            3
+        } else {
+            6
+        };
+        total = checked_native_output_add(total, additional)?;
+    }
+    Ok(total)
+}
+
+fn escape_str_into(s: &[u8], out: &mut String) {
+    // A-Za-z0-9 and @ * _ + - . /
+    const KEEP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+    for u in crate::heap::wtf8_units_iter(s) {
+        if u < 0x80 && KEEP.contains(&(u as u8)) {
+            out.push(u as u8 as char);
+        } else if u < 0x100 {
+            let h = hex_upper(u as u8);
+            out.push('%');
+            out.push(h[0] as char);
+            out.push(h[1] as char);
+        } else {
+            let hi = hex_upper((u >> 8) as u8);
+            let lo = hex_upper((u & 0xff) as u8);
+            out.push('%');
+            out.push('u');
+            out.push(hi[0] as char);
+            out.push(hi[1] as char);
+            out.push(lo[0] as char);
+            out.push(lo[1] as char);
+        }
+    }
+}
+
+/// `unescape(string)` (Annex B B.2.1.2): decode `%uXXXX` (one UTF-16 unit) and
+/// `%XX` (a unit < 256); any other character passes through unchanged. Building
+/// directly as WTF-8 avoids the former pair of input-sized `Vec<u16>`
+/// temporaries and preserves decoded lone surrogates instead of replacing them.
+fn unescape_str(s: &str) -> Result<crate::heap::JsStr, Thrown> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 5 < bytes.len() && bytes[i + 1] == b'u' {
+                if let (Ok(a), Ok(b), Ok(c), Ok(d)) = (
+                    hex_val(bytes[i + 2]),
+                    hex_val(bytes[i + 3]),
+                    hex_val(bytes[i + 4]),
+                    hex_val(bytes[i + 5]),
+                ) {
+                    let unit = (u16::from(a) << 12)
+                        | (u16::from(b) << 8)
+                        | (u16::from(c) << 4)
+                        | u16::from(d);
+                    crate::heap::wtf8_push_cp(&mut out, u32::from(unit));
+                    i += 6;
+                    continue;
+                }
+            }
+            if i + 2 < bytes.len() {
+                if let (Ok(a), Ok(b)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    crate::heap::wtf8_push_cp(
+                        &mut out,
+                        u32::from((u16::from(a) << 4) | u16::from(b)),
+                    );
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        let c = s[i..]
+            .chars()
+            .next()
+            .expect("byte index remains a char boundary");
+        crate::heap::wtf8_push_cp(&mut out, u32::from(c));
+        i += c.len_utf8();
+    }
+    debug_assert!(out.len() <= bytes.len());
+    Ok(crate::heap::JsStr::from_wtf8(out))
+}
+
+fn uri_encode_output_len(s: &str, extra: &[u8]) -> Result<usize, Thrown> {
+    let mut total = 0usize;
+    for c in s.chars() {
+        let additional =
+            if c.is_ascii() && (URI_UNESCAPED.contains(&(c as u8)) || extra.contains(&(c as u8))) {
+                1
+            } else {
+                c.len_utf8()
+                    .checked_mul(3)
+                    .ok_or_else(invalid_native_string_length)?
+            };
+        total = checked_native_output_add(total, additional)?;
+    }
+    Ok(total)
+}
+
+fn uri_encode_into(s: &str, extra: &[u8], out: &mut String) {
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        if c.is_ascii() && (URI_UNESCAPED.contains(&(c as u8)) || extra.contains(&(c as u8))) {
+            out.push(c);
+        } else {
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                let h = hex_upper(b);
+                out.push('%');
+                out.push(h[0] as char);
+                out.push(h[1] as char);
+            }
+        }
+    }
+}
+
+/// Decode (ECMA-262 19.2.6.4): each `%XX` escape is decoded; a decoded
+/// single-byte char that lies in the `reserved` set is left as its original
+/// `%XX` text (decodeURI keeps uriReserved + "#"; decodeURIComponent keeps
+/// nothing). Multi-byte sequences are validated as UTF-8. Malformed → Err.
+fn uri_decode(bytes: &[u8], reserved: &[u8]) -> Result<crate::heap::JsStr, Thrown> {
+    use crate::heap::{wtf8_push, wtf8_push_cp, JsStr};
+    let malformed = || Thrown::from_static("URIError: URI malformed");
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
+    let read = |at: usize| -> Result<u8, Thrown> {
+        if at + 2 >= bytes.len() || bytes[at] != b'%' {
+            return Err(malformed());
+        }
+        let high = hex_val(bytes[at + 1]).map_err(|_| malformed())?;
+        let low = hex_val(bytes[at + 2]).map_err(|_| malformed())?;
+        Ok((high << 4) | low)
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            let b = bytes[i];
+            if b < 0x80 {
+                out.push(b);
+                i += 1;
+            } else {
+                // Copy the whole encoded char through the seam-canonicalizing
+                // append (a raw low surrogate after a %-decoded high merges).
+                let n = if b >> 5 == 0b110 {
+                    2
+                } else if b >> 4 == 0b1110 {
+                    3
+                } else {
+                    4
+                };
+                let end = (i + n).min(bytes.len());
+                wtf8_push(&mut out, &bytes[i..end]);
+                i = end;
+            }
+            continue;
+        }
+        let b0 = read(i)?;
+        if b0 & 0x80 == 0 {
+            if reserved.contains(&b0) {
+                out.extend_from_slice(&bytes[i..i + 3]); // keep original %XX
+            } else {
+                out.push(b0);
+            }
+            i += 3;
+        } else {
+            // UTF-8 lead byte: 2/3/4 total octets. The spec Decode algorithm
+            // accepts SURROGATE-range 3-byte sequences (each yields its code
+            // UNIT — '%ED%A0%80' decodes to the lone surrogate \uD800, and a
+            // CESU-8 high+low pair canonicalizes into the astral scalar), so
+            // decode manually instead of from_utf8; overlong forms and
+            // beyond-U+10FFFF still reject (URIError).
+            let (n, mut cp) = if b0 >> 5 == 0b110 {
+                (2, (b0 & 0x1F) as u32)
+            } else if b0 >> 4 == 0b1110 {
+                (3, (b0 & 0x0F) as u32)
+            } else if b0 >> 3 == 0b11110 {
+                (4, (b0 & 0x07) as u32)
+            } else {
+                return Err(malformed());
+            };
+            i += 3;
+            for _ in 1..n {
+                let cb = read(i)?;
+                if cb & 0xC0 != 0x80 {
+                    return Err(malformed());
+                }
+                cp = (cp << 6) | (cb & 0x3F) as u32;
+                i += 3;
+            }
+            let overlong =
+                (n == 2 && cp < 0x80) || (n == 3 && cp < 0x800) || (n == 4 && cp < 0x10000);
+            // %-escaped sequences are STRICT UTF-8: a surrogate-range escape
+            // ('%ED%BF%BF') is a URIError — only RAW lone-surrogate code
+            // units (the non-'%' copy path above) pass through verbatim.
+            if overlong || cp > 0x10FFFF || (0xD800..=0xDFFF).contains(&cp) {
+                return Err(malformed());
+            }
+            wtf8_push_cp(&mut out, cp);
+        }
+    }
+    Ok(JsStr::from_wtf8(out))
+}

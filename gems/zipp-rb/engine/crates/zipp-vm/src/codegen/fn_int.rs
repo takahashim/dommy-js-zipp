@@ -1,0 +1,1232 @@
+// Split out of the former monolithic parent file by tools/split_rs.py.
+// Pure code move: `use super::*` keeps the parent module's imports in
+// scope, and items are widened to pub(crate) so the pieces still see
+// each other. No logic changed.
+#![allow(unused_imports)]
+use super::*;
+
+/// Whether the value written to `reg` at `def_ip` can be observed before every
+/// control-flow path overwrites it.
+///
+/// This is deliberately a whole-function CFG walk rather than a textual scan:
+/// compiler temporaries are routinely recycled after a dominating overwrite.
+/// Reads happen before the overwrite check so read-modify-write instructions
+/// remain observable. Exception-handler control flow carries hidden state that
+/// this small proof does not model, so functions containing it fail closed.
+pub(crate) fn reg_value_is_observable_after_def(
+    code: &[Instr],
+    reg: u16,
+    def_ip: usize,
+    allowed_use_ips: &[usize],
+) -> bool {
+    if def_ip >= code.len()
+        || code.iter().any(|ins| {
+            matches!(
+                ins,
+                Instr::PushHandler { .. }
+                    | Instr::PopHandler
+                    | Instr::PushFinally { .. }
+                    | Instr::PopFinally
+                    | Instr::EndFinally { .. }
+                    | Instr::JumpFinally { .. }
+            )
+        })
+    {
+        return true;
+    }
+
+    let mut work = vec![def_ip + 1];
+    let mut seen = vec![false; code.len()];
+    while let Some(ip) = work.pop() {
+        if ip >= code.len() || seen[ip] {
+            continue;
+        }
+        seen[ip] = true;
+        let ins = &code[ip];
+        if instr_uses(ins).contains(&reg) && !allowed_use_ips.contains(&ip) {
+            return true;
+        }
+        if writes_reg(ins) == Some(reg) {
+            continue;
+        }
+
+        let mut add = |next: usize| {
+            if next >= code.len() {
+                return false;
+            }
+            work.push(next);
+            true
+        };
+        match *ins {
+            Instr::Jump { target } => {
+                if !add(target as usize) {
+                    return true;
+                }
+            }
+            Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => {
+                if !add(target as usize) {
+                    return true;
+                }
+                if ip + 1 < code.len() {
+                    work.push(ip + 1);
+                }
+            }
+            Instr::Return { .. } | Instr::ReturnUndefined | Instr::Throw { .. } => {}
+            _ if ip + 1 < code.len() => work.push(ip + 1),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Can this function be JIT-compiled in the current (leaf-int) subset? Rejects
+/// any op outside the integer subset and any call/heap/closure/throw op.
+///
+/// `self_slot` is this function's own `name_global` (if it is a hoisted
+/// top-level function). When present, the SELF-CALL pattern is allowed:
+/// `LoadGlobal(self_slot) -> r` immediately followed by `Call{callee=r}`. That
+/// lets a self-recursive integer function (fib) be compiled — the `LoadGlobal`
+/// of the own slot is a no-op marker (its value is only the call target, which
+/// the helper resolves), and the `Call` becomes a depth-guarded native recurse.
+pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
+    if proto.code.is_empty() || proto.reg_count == 0 || proto.param_count >= proto.reg_count {
+        return false;
+    }
+    // An async or generator body's completion is a Promise / generator object
+    // built by the interpreter's call path. Ordinary calls never enter a compiled
+    // body for these, but `native_cb_entry` (array-builtin callbacks, sort
+    // comparators) does: `a.sort(async (x, y) => x - y)` sorted the array.
+    if proto.is_async || proto.is_generator {
+        return false;
+    }
+    // Rest and `arguments` are materialized by the interpreter's call setup,
+    // not by the native self-call window. Stay interpreted when either can be
+    // observed by the body.
+    if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
+        return false;
+    }
+    let code = &proto.code;
+    // A bare call to a sloppy function substitutes the callee realm's global
+    // object for `this`; the Tier-A self-call window deliberately seeds reg 0
+    // with undefined. That shortcut is exact only when the body never reads
+    // reg 0 (strict functions already receive undefined for a bare call).
+    if !proto.is_strict && code.iter().any(|instr| tier_a_reads_reg(instr, 0)) {
+        return false;
+    }
+    for (ip, instr) in code.iter().enumerate() {
+        // The compiler normally guarantees every operand is inside the
+        // function's register window and every branch names an instruction.
+        // Keep that invariant at the unsafe native-code boundary too: a
+        // malformed internal FuncProto must decline rather than emit an
+        // unchecked [rbx + reg*8] access or index the label table out of range.
+        if !tier_a_operands_in_bounds(instr, proto.reg_count, code.len()) {
+            return false;
+        }
+        match instr {
+            Instr::LoadInt { .. }
+            | Instr::Move { .. }
+            | Instr::AddInt { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Mod { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::Return { .. }
+            | Instr::ReturnUndefined => {}
+            // `LoadGlobal(self_slot)` is allowed only as the immediately-
+            // preceding callee load of a self `Call` (checked at the Call).
+            Instr::LoadGlobal { idx, .. } if Some(*idx) == self_slot => {}
+            // A self-call: callee must be loaded from self_slot by the prior op.
+            Instr::Call { callee, argc, .. } => {
+                // The native window copies only actual arguments. Missing
+                // formal slots in a reused high-water window would otherwise
+                // retain values written by an earlier activation.
+                if *argc < proto.param_count || !is_self_call(code, ip, *callee, self_slot) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Validate every operand used by Tier A before it becomes a native memory
+/// displacement or label-table index. This duplicates the compiler's ordinary
+/// FuncProto invariant deliberately: code generation is the last safe place to
+/// reject malformed bytecode before its register indices become raw accesses.
+fn tier_a_operands_in_bounds(instr: &Instr, reg_count: u16, code_len: usize) -> bool {
+    let reg = |r: u16| r < reg_count;
+    let target = |ip: u32| (ip as usize) < code_len;
+    let args = |base: u16, count: u16| base.checked_add(count).is_some_and(|end| end <= reg_count);
+    match *instr {
+        Instr::LoadInt { dst, .. } | Instr::LoadGlobal { dst, .. } => reg(dst),
+        Instr::Move { dst, src } => reg(dst) && reg(src),
+        Instr::AddInt { dst, a, .. } => reg(dst) && reg(a),
+        Instr::Add { dst, a, b }
+        | Instr::Sub { dst, a, b }
+        | Instr::Mul { dst, a, b }
+        | Instr::Mod { dst, a, b }
+        | Instr::Lt { dst, a, b }
+        | Instr::Le { dst, a, b }
+        | Instr::Gt { dst, a, b }
+        | Instr::Ge { dst, a, b }
+        | Instr::Eq { dst, a, b }
+        | Instr::Ne { dst, a, b } => reg(dst) && reg(a) && reg(b),
+        Instr::Jump { target: ip } => target(ip),
+        Instr::JumpIfFalse { cond, target: ip } | Instr::JumpIfTrue { cond, target: ip } => {
+            reg(cond) && target(ip)
+        }
+        Instr::JumpIfNotLt { a, b, target: ip } | Instr::JumpIfNotLe { a, b, target: ip } => {
+            reg(a) && reg(b) && target(ip)
+        }
+        Instr::Call {
+            dst,
+            callee,
+            arg_base,
+            argc,
+        } => reg(dst) && reg(callee) && args(arg_base, argc),
+        Instr::Return { src } => reg(src),
+        Instr::ReturnUndefined => true,
+        _ => false,
+    }
+}
+
+/// Does an instruction accepted by Tier A read `reg`? This is intentionally
+/// local to the small whole-function subset: it is the admission proof that a
+/// sloppy function cannot observe Tier A's undefined reg-0 shortcut.
+fn tier_a_reads_reg(instr: &Instr, reg: u16) -> bool {
+    match *instr {
+        Instr::Move { src, .. } | Instr::Return { src } => src == reg,
+        Instr::AddInt { a, .. } => a == reg,
+        Instr::Add { a, b, .. }
+        | Instr::Sub { a, b, .. }
+        | Instr::Mul { a, b, .. }
+        | Instr::Mod { a, b, .. }
+        | Instr::Lt { a, b, .. }
+        | Instr::Le { a, b, .. }
+        | Instr::Gt { a, b, .. }
+        | Instr::Ge { a, b, .. }
+        | Instr::Eq { a, b, .. }
+        | Instr::Ne { a, b, .. }
+        | Instr::JumpIfNotLt { a, b, .. }
+        | Instr::JumpIfNotLe { a, b, .. } => a == reg || b == reg,
+        Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => cond == reg,
+        Instr::Call {
+            callee,
+            arg_base,
+            argc,
+            ..
+        } => {
+            let r = reg as u32;
+            callee == reg || (r >= arg_base as u32 && r < arg_base as u32 + argc as u32)
+        }
+        _ => false,
+    }
+}
+
+/// Is the `Call` at `ip` (with callee register `callee`) a self-call — i.e. was
+/// `callee` produced by a `LoadGlobal(self_slot)` earlier with no intervening
+/// write to that register? Conservative: scans backward for the nearest writer.
+pub(crate) fn is_self_call(code: &[Instr], ip: usize, callee: u16, self_slot: Option<u32>) -> bool {
+    let self_slot = match self_slot {
+        Some(s) => s,
+        None => return false,
+    };
+    for j in (0..ip).rev() {
+        if let Some(w) = writes_reg(&code[j]) {
+            if w == callee {
+                return matches!(&code[j], Instr::LoadGlobal { idx, .. } if *idx == self_slot);
+            }
+        }
+    }
+    false
+}
+
+/// Is `reg`'s value at `ip` known to be an Int from a preceding int-producing op?
+/// Finds the nearest backward writer of `reg`; it must be one of
+/// `LoadInt`/`AddInt`/`Add`/`Sub`/`Mul`/`Mod` (each yields a boxed Int natively,
+/// guarding its operands and bailing otherwise — so reaching `ip` natively proves
+/// the value is an Int). SOUNDNESS: the writer must also DOMINATE the use along
+/// the only entry path — i.e. no jump may land in `(writer_ip, ip]`, which would
+/// let control reach `ip` bypassing the writer (possibly with a non-int value).
+/// Conservative: returns false on any doubt. Lets the base-case-inline decision
+/// skip a redundant int guard on `fib`'s `n-1` / `n-2` arguments.
+pub(crate) fn arg_is_known_int(code: &[Instr], ip: usize, reg: u16) -> bool {
+    let mut writer = None;
+    for j in (0..ip).rev() {
+        if let Some(w) = writes_reg(&code[j]) {
+            if w == reg {
+                writer = Some(j);
+                break;
+            }
+        }
+    }
+    let w = match writer {
+        Some(w) => w,
+        None => return false,
+    };
+    let int_producing = matches!(
+        &code[w],
+        Instr::LoadInt { .. }
+            | Instr::AddInt { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Mod { .. }
+    );
+    if !int_producing {
+        return false;
+    }
+    // No branch may jump into (w, ip]: such an edge could reach `ip` without
+    // executing the writer at `w`.
+    for instr in code {
+        let target = match *instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => target as usize,
+            _ => continue,
+        };
+        if target > w && target <= ip {
+            return false;
+        }
+    }
+    true
+}
+
+/// The destination register an instruction writes, if it writes exactly one.
+pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
+    match *i {
+        Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::Move { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Add { dst, .. }
+        | Instr::Sub { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Div { dst, .. }
+        | Instr::Mod { dst, .. }
+        | Instr::Neg { dst, .. }
+        | Instr::Lt { dst, .. }
+        | Instr::Le { dst, .. }
+        | Instr::Gt { dst, .. }
+        | Instr::Ge { dst, .. }
+        | Instr::Eq { dst, .. }
+        | Instr::Ne { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::GetProp { dst, .. }
+        // GetIndex defines `dst`: needed so the regalloc path's dead/hoist passes
+        // treat a pinned-TypedArray element load as a normal def (unboxed-region
+        // epic). Inert elsewhere — the int path never sees GetIndex (region_is_int
+        // rejects it) and an SROA region with a GetIndex isn't field-promotable.
+        | Instr::GetIndex { dst, .. }
+        | Instr::GetIndexConcat { dst, .. }
+        | Instr::DeleteIndexConcat { dst, .. }
+        | Instr::StrConcat { dst, .. }
+        | Instr::StrAppendInPlace { dst, .. }
+        | Instr::StrAppendIndex { dst, .. }
+        | Instr::AddRightPair { dst, .. }
+        | Instr::Pad2Concat { dst, .. }
+        | Instr::Pad2Conditional { dst, .. }
+        | Instr::StrConcatChain { dst, .. }
+        | Instr::Bitwise { dst, .. }
+        | Instr::Call { dst, .. }
+        | Instr::CallWithThis { dst, .. }
+        | Instr::RegExpMethod { dst, .. }
+        // MathOp and CallMethod DEFINE their dst. They used to fall through the
+        // `_` arm below and report "writes nothing", so a register defined by
+        // `Math.imul(..)` or a pinned-string `charCodeAt(..)` looked
+        // never-defined to the home-unification passes and got coalesced onto an
+        // unrelated global's home — in practice the loop counter's. That
+        // produced a dropped store, a loop counter that took the accumulator's
+        // value (`i` ending at 61 instead of 20), an infinite loop when the
+        // aliased counter could never reach its bound, and an `xh` panic when
+        // the register had no home at all.
+        | Instr::MathOp { dst, .. }
+        | Instr::CallMethod { dst, .. }
+        | Instr::CallMethodComputed { dst, .. } => Some(dst),
+        // ToPropKey DEFINES its dst (for a numeric key it is the identity — the
+        // regalloc tier emits it as a register copy). Absent from this list, the
+        // dst looked never-defined, landed in `ro_live_in`, and one `x[i] *= v`
+        // declined its whole loop to the boxed MEM tier — the only site in the
+        // suite where "read-only live-in used where a number isn't required"
+        // fired (typedarray-math's normalize phase).
+        | Instr::ToPropKey { dst, .. } => Some(dst),
+        // W20 M4: `Not` DEFINES its dst too, and the omission is the same one
+        // the note above records for `MathOp`/`CallMethod` -- a register the
+        // def model cannot see gets its live range from its USES alone, so the
+        // linear-scan allocator is free to hand its home out across the def.
+        // That was inert while `Instr::Not` declined every register tier; the
+        // INT tier admits it as of this wave, so the cover has to be real.
+        // Behind the package latch so `ZIPP_NO_INT_PUSH=1` restores the exact
+        // pre-wave def model for every tier, not just this one.
+        Instr::Not { dst, .. } if crate::codegen::int_push_enabled() => Some(dst),
+        // The one-step literal DEFINES its dst. No register tier admits it, so
+        // this is def-model exactness rather than an enabling change.
+        Instr::FinalizeObject { dst, .. } => Some(dst),
+        _ => None,
+    }
+}
+
+/// The destination carried by every bytecode control-flow edge.
+///
+/// Keep structural recognisers on this common, fail-closed list: handler and
+/// finally edges can enter a captured/replayed prefix just as an ordinary
+/// branch can, even though most numeric regions decline those opcodes later.
+pub(crate) fn bytecode_control_target(i: &Instr) -> Option<u32> {
+    match *i {
+        Instr::Jump { target }
+        | Instr::JumpIfFalse { target, .. }
+        | Instr::JumpIfTrue { target, .. }
+        | Instr::JumpIfNotLt { target, .. }
+        | Instr::JumpIfNotLe { target, .. }
+        | Instr::PushFinally { target, .. }
+        | Instr::JumpFinally { target, .. } => Some(target),
+        Instr::PushHandler { catch_target, .. } => Some(catch_target),
+        _ => None,
+    }
+}
+
+/// Exact compiler shape for a reference-captured `Math.imul` call.  The
+/// receiver global and property Get remain distinct bytecodes so argument
+/// evaluation observes the specified order; register tiers use this proof to
+/// treat those two boxed values as guarded control inputs rather than numeric
+/// homes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CapturedMathSite {
+    pub load_ip: usize,
+    pub get_ip: usize,
+    pub call_ip: usize,
+    pub receiver: u16,
+    pub callee: u16,
+    pub global: u32,
+}
+
+pub(crate) fn captured_math_site(
+    proto: &FuncProto,
+    start: usize,
+    end: usize,
+    call_ip: usize,
+) -> Option<CapturedMathSite> {
+    if !(start..=end).contains(&call_ip) {
+        return None;
+    }
+    let (callee, receiver) = match proto.code.get(call_ip)? {
+        Instr::MathOp {
+            op: crate::bytecode::MathFn::Imul,
+            callee,
+            this_v,
+            argc: 2,
+            ..
+        } => (*callee, *this_v),
+        _ => return None,
+    };
+    let get_ip = (start..call_ip)
+        .rev()
+        .find(|&ip| writes_reg(&proto.code[ip]) == Some(callee))?;
+    let name = match proto.code.get(get_ip)? {
+        Instr::GetProp { dst, obj, name } if *dst == callee && *obj == receiver => *name,
+        _ => return None,
+    };
+    if proto
+        .string_constants
+        .get(name as usize)
+        .map(String::as_str)
+        != Some("imul")
+    {
+        return None;
+    }
+    let load_ip = (start..get_ip)
+        .rev()
+        .find(|&ip| writes_reg(&proto.code[ip]) == Some(receiver))?;
+    let global = match proto.code.get(load_ip)? {
+        Instr::LoadGlobal { dst, idx } if *dst == receiver => *idx,
+        _ => return None,
+    };
+    // Both reference components must remain the captured values until MathOp.
+    if proto.code[get_ip + 1..call_ip]
+        .iter()
+        .any(|ins| writes_reg(ins).is_some_and(|r| r == callee || r == receiver))
+    {
+        return None;
+    }
+    // Folding the member lookup uses one exact intrinsic guard at native
+    // entry.  Keep that proof invariant for the whole region: no bytecode may
+    // replace the source global, and no control-flow edge may enter after its
+    // LoadGlobal (which would otherwise consume stale receiver/callee slots).
+    if proto.code[start..=end].iter().any(|ins| {
+        matches!(*ins,
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } if idx == global)
+    }) {
+        return None;
+    }
+    for ins in &proto.code {
+        let Some(target) = bytecode_control_target(ins).map(|target| target as usize) else {
+            continue;
+        };
+        if target > load_ip && target <= call_ip {
+            return None;
+        }
+    }
+    Some(CapturedMathSite {
+        load_ip,
+        get_ip,
+        call_ip,
+        receiver,
+        callee,
+        global,
+    })
+}
+
+pub(crate) fn captured_math_sites(
+    proto: &FuncProto,
+    start: usize,
+    end: usize,
+) -> Vec<CapturedMathSite> {
+    (start..=end)
+        .filter_map(|ip| captured_math_site(proto, start, end, ip))
+        .collect()
+}
+
+/// The `Math` global indices read by the BARE `Math.imul` ops in `[start,
+/// end]` (sorted, deduplicated): each needs the same entry validation a
+/// captured site's prefix gets (`jit_math_imul_prefix_is_intrinsic`), after
+/// which the call-free region's imul arm runs guard-free.
+pub(crate) fn bare_math_globals(proto: &FuncProto, start: usize, end: usize) -> Vec<u32> {
+    let mut v: Vec<u32> = proto.code[start..=end.min(proto.code.len() - 1)]
+        .iter()
+        .filter_map(|ins| match *ins {
+            Instr::MathOp {
+                op: crate::bytecode::MathFn::Imul,
+                callee: crate::bytecode::NO_REG,
+                this_v,
+                argc: 2,
+                ..
+            } => Some(this_v as u32),
+            _ => None,
+        })
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// If this single-parameter function opens with a base case of the shape
+/// `if (param <cmp> K) return param;` — i.e. it returns its argument UNCHANGED
+/// for small inputs — report `(cmp, K)`. A self-call to such a function can then
+/// inline the base case at the call site (`arg <cmp> K ? arg : recurse`),
+/// eliminating the call + prologue/epilogue for every LEAF invocation (about
+/// half of `fib`'s calls). The recognised shape is exactly what `fib` compiles
+/// to (LoadInt K; compare param,K; JumpIfFalse; Move/Jump…; Return param); any
+/// deviation returns `None`, so the optimization is opt-in and never wrong.
+pub(crate) fn base_case_returns_arg(proto: &FuncProto) -> Option<(Cmp, i32)> {
+    if proto.param_count != 1 {
+        return None;
+    }
+    let code = &proto.code;
+    if code.len() < 3 {
+        return None;
+    }
+    // ip0: LoadInt{c, K}
+    let (c, k) = match code[0] {
+        Instr::LoadInt { dst, val } => (dst, val),
+        _ => return None,
+    };
+    // ip1: compare param (reg 1) against c. Either the unfused pair (compare
+    // → t, then `JumpIfFalse t` at ip2) or the fused `JumpIfNotLt/Le` — both
+    // leave for the recursive body when (param<cmp>K) is FALSE, so the base
+    // case is the FALL-THROUGH either way and they report the same `(cmp, K)`.
+    // The reported Cmp is the one whose TRUE branch selects the base case.
+    let (cmp, t, base_ip) = match code[1] {
+        Instr::Lt { dst, a: 1, b } if b == c => (Cmp::Lt, Some(dst), 3usize),
+        Instr::Le { dst, a: 1, b } if b == c => (Cmp::Le, Some(dst), 3),
+        Instr::Gt { dst, a: 1, b } if b == c => (Cmp::Gt, Some(dst), 3),
+        Instr::Ge { dst, a: 1, b } if b == c => (Cmp::Ge, Some(dst), 3),
+        Instr::JumpIfNotLt { a: 1, b, .. } if b == c => (Cmp::Lt, None, 2),
+        Instr::JumpIfNotLe { a: 1, b, .. } if b == c => (Cmp::Le, None, 2),
+        _ => return None,
+    };
+    // ip2 (unfused shape only): JumpIfFalse{t, _}.
+    if let Some(t) = t {
+        match code[2] {
+            Instr::JumpIfFalse { cond, .. } if cond == t => {}
+            _ => return None,
+        }
+    }
+    // Base path: follow Move/Jump to a Return whose source traces back
+    // to the param (reg 1). Bounded walk; any other op disqualifies.
+    let mut ip = base_ip;
+    let mut ret_reg: u16 = 1; // register currently holding the (copied) param
+    for _ in 0..8 {
+        match code.get(ip)? {
+            Instr::Move { dst, src } => {
+                if *src == ret_reg {
+                    ret_reg = *dst;
+                } else if *dst == ret_reg {
+                    return None; // our tracked value was overwritten
+                }
+                ip += 1;
+            }
+            Instr::Jump { target } => ip = *target as usize,
+            Instr::Return { src } => {
+                return if *src == ret_reg {
+                    Some((cmp, k))
+                } else {
+                    None
+                };
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Win64 register plan (integer subset):
+/// * `rcx` = regs base pointer (preserved across the body; we never clobber it
+///   because we issue no calls).
+/// * `rdx` = bail_ip out-pointer (preserved likewise).
+/// * `rax`, `r8`, `r9`, `r10`, `r11` = scratch (all volatile under win64, and
+///   we make no calls, so no save needed).
+///
+/// Because a self-call invokes a Rust helper (which clobbers the volatile
+/// argument registers), the prologue moves the three inputs into NON-VOLATILE
+/// (callee-saved) registers that survive any helper call:
+/// * `rbx` = regs base pointer   (was rcx)
+/// * `rsi` = bail_ip out-pointer (was rdx)
+/// * `rdi` = vm pointer          (was r8)
+/// A register `Value` lives at `[rbx + reg*8]`. We push/pop rbx/rsi/rdi and keep
+/// the stack 16-byte aligned, reserving 32 bytes of shadow space for any helper
+/// call (win64 requires the caller to provide it).
+pub(crate) fn compile_proto(
+    proto: &FuncProto,
+    self_func_id: u32,
+    self_call_helper: usize,
+    self_val_bits: u64,
+    meter: Option<crate::codegen::meter::Meter>,
+) -> Option<JitFn> {
+    let self_slot = proto.name_global;
+    if !can_compile(proto, self_slot) {
+        return None;
+    }
+    // If the callee (== self for our self-calls) returns its argument unchanged
+    // for small inputs (`fib`: `n<2 ? n`), inline that base case at each call
+    // site so leaf invocations skip the call + prologue/epilogue entirely.
+    let base_case = base_case_returns_arg(proto);
+    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+
+    // A label per bytecode index so jumps resolve to the right native offset.
+    // `labels[n]` is the fall-off-the-end label (treated as ReturnUndefined).
+    let n = proto.code.len();
+    let labels: Vec<_> = (0..=n).map(|_| ops.new_dynamic_label()).collect();
+    // Shared epilogue: every Return/bail sets rax + [rsi] then jumps here, which
+    // restores the stack frame and callee-saved regs before `ret`.
+    let epilogue = ops.new_dynamic_label();
+    // The function's own entry (offset 0). A self-recursive `Call` issues a
+    // DIRECT native call here (same win64 ABI as `JitFn::run`), skipping the Rust
+    // trampoline on the clean hot path. The recursion runs on the native stack,
+    // bounded by an inline depth guard (see `emit_self_call`).
+    let self_entry = ops.new_dynamic_label();
+    // Step metering (a metered VM only). A whole-function body can contain a
+    // loop — `can_compile` whitelists every branch with no direction
+    // restriction — so without this a JIT'd function is an unbounded native
+    // path. Charges land out of line, next to the epilogue.
+    let blocks = crate::codegen::meter::block_map(meter, &proto.code, 0, n - 1);
+    let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
+    // Whether any `emit_self_call` ran — i.e. whether this body baked in "the global
+    // `self_slot` still holds me". Recorded on the `JitFn` so `try_run_jit` re-checks.
+    let mut emitted_self_call = false;
+
+    // ── prologue ── save callee-saved regs, stash the 3 inputs, reserve shadow.
+    // 3 pushes (24B) + sub 48 = 72B; +8 (return addr) = 80 ⇒ 16-aligned. The 48
+    // gives 32B shadow for helper calls PLUS a 4B callee bail slot (at [rsp+32])
+    // for the inline self-call.
+    dynasm!(ops
+        ; => self_entry
+        ; push rbx
+        ; push rsi
+        ; push rdi
+        ; sub rsp, 48
+        ; mov rbx, rcx        // regs base
+        ; mov rsi, rdx        // bail_ip ptr
+        ; mov rdi, r8         // vm ptr
+    );
+
+    for (ip, instr) in proto.code.iter().enumerate() {
+        let ipl = labels[ip];
+        dynasm!(ops ; => ipl);
+        // Each op that can bail gets its OWN dedicated bail label (records this
+        // ip). Threading it explicitly — rather than dynasm `>bail` local labels
+        // — guarantees a guard jumps to THIS op's bail, never a neighbour's
+        // (which would resume the interpreter at the wrong ip: a silent bug).
+        let bail = ops.new_dynamic_label();
+        if let Some((m, bl)) = blocks.as_ref() {
+            if let Some(&len) = bl.get(&ip) {
+                let stub = ops.new_dynamic_label();
+                crate::codegen::meter::emit_charge(&mut ops, m, len, stub);
+                meter_stubs.push((stub, ip));
+            }
+        }
+        match *instr {
+            Instr::LoadInt { dst, val } => {
+                let boxed = INT_TAG | (val as u32 as u64);
+                dynasm!(ops
+                    ; mov rax, QWORD boxed as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::Move { dst, src } => {
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::AddInt { dst, a, imm, .. } => {
+                guard_int(&mut ops, a, bail);
+                dynasm!(ops
+                    ; mov eax, [rbx + dreg(a)]    // low 32 bits = i32 payload
+                    ; add eax, imm
+                    ; jo => bail
+                );
+                box_eax(&mut ops, dst);
+                emit_bail(&mut ops, ip, bail);
+            }
+            Instr::Add { dst, a, b } => int_binop(&mut ops, ip, bail, dst, a, b, BinOp::Add),
+            Instr::Sub { dst, a, b } => int_binop(&mut ops, ip, bail, dst, a, b, BinOp::Sub),
+            Instr::Mul { dst, a, b } => int_binop(&mut ops, ip, bail, dst, a, b, BinOp::Mul),
+            Instr::Mod { dst, a, b } => int_binop(&mut ops, ip, bail, dst, a, b, BinOp::Mod),
+            Instr::Lt { dst, a, b } => int_cmp(&mut ops, ip, bail, dst, a, b, Cmp::Lt),
+            Instr::Le { dst, a, b } => int_cmp(&mut ops, ip, bail, dst, a, b, Cmp::Le),
+            Instr::Gt { dst, a, b } => int_cmp(&mut ops, ip, bail, dst, a, b, Cmp::Gt),
+            Instr::Ge { dst, a, b } => int_cmp(&mut ops, ip, bail, dst, a, b, Cmp::Ge),
+            Instr::Eq { dst, a, b } => int_cmp(&mut ops, ip, bail, dst, a, b, Cmp::Eq),
+            Instr::Ne { dst, a, b } => int_cmp(&mut ops, ip, bail, dst, a, b, Cmp::Ne),
+            Instr::Jump { target } => {
+                dynasm!(ops ; jmp => labels[target as usize]);
+            }
+            Instr::JumpIfFalse { cond, target } => {
+                // The condition is a Bool (from a compare) or an Int. Falsy ⇔
+                // payload low-32 == 0 (Int 0 or Bool false). Guard Int|Bool else
+                // bail (e.g. a double/heap cond needs the interpreter's truthy).
+                guard_int_or_bool(&mut ops, cond, bail);
+                dynasm!(ops
+                    ; mov eax, [rbx + dreg(cond)]
+                    ; test eax, eax
+                    ; jz => labels[target as usize]
+                );
+                emit_bail(&mut ops, ip, bail);
+            }
+            Instr::JumpIfTrue { cond, target } => {
+                guard_int_or_bool(&mut ops, cond, bail);
+                dynasm!(ops
+                    ; mov eax, [rbx + dreg(cond)]
+                    ; test eax, eax
+                    ; jnz => labels[target as usize]
+                );
+                emit_bail(&mut ops, ip, bail);
+            }
+            Instr::JumpIfNotLt { a, b, target } => {
+                jump_if_not_cmp(&mut ops, ip, bail, a, b, Cmp::Lt, labels[target as usize]);
+            }
+            Instr::JumpIfNotLe { a, b, target } => {
+                jump_if_not_cmp(&mut ops, ip, bail, a, b, Cmp::Le, labels[target as usize]);
+            }
+            Instr::LoadGlobal { .. } => {
+                // `LoadGlobal(self_slot)` (can_compile gated) — only ever the
+                // callee load of a self-`Call`. The native fast path calls the
+                // entry DIRECTLY and never reads this register, so materialising
+                // the self-Value here is dead work on every call (2 instr × ~96M
+                // for fib(37)). SKIP it; `emit_self_call` lazily writes the callee
+                // register on its cold (interpreter-bound) paths, where the
+                // interpreter resume actually reads it. No-op here.
+            }
+            Instr::Call {
+                dst,
+                callee,
+                arg_base,
+                argc,
+            } => {
+                // Self-recursive call (can_compile verified callee == self_slot).
+                // Fast path: a DIRECT native call to this function's own entry
+                // with an inline depth guard — no Rust trampoline. Cold paths
+                // (depth limit, or the callee bailed mid-body) route to the Rust
+                // helper / interpreter, which read `regs[callee]` — so they
+                // restore it from `self_val_bits` first (the skipped LoadGlobal).
+                //
+                // BASE-CASE INLINING: when the callee returns its argument
+                // unchanged for small inputs (`base_case`), test the guard here
+                // and produce the result inline for the leaf case — no call. Only
+                // for argc==1 (the recognised shape). A non-int arg or the
+                // recursive case routes to the real call.
+                match base_case {
+                    Some((cmp, k)) if argc == 1 => {
+                        let do_call = ops.new_dynamic_label();
+                        let inline_base = ops.new_dynamic_label();
+                        let after = ops.new_dynamic_label();
+                        // Non-int arg → real call (which guards + bails correctly).
+                        // Skip the guard when the arg provably came from an
+                        // int-producing op (`fib`'s `n-1`/`n-2` from AddInt).
+                        if !arg_is_known_int(&proto.code, ip, arg_base) {
+                            guard_int(&mut ops, arg_base, do_call);
+                        }
+                        dynasm!(ops
+                            ; mov eax, [rbx + dreg(arg_base)]   // arg payload (i32)
+                            ; cmp eax, k
+                        );
+                        // Jump to the inline base case when `arg <cmp> k` is TRUE.
+                        match cmp {
+                            Cmp::Lt => dynasm!(ops ; jl => inline_base),
+                            Cmp::Le => dynasm!(ops ; jle => inline_base),
+                            Cmp::Gt => dynasm!(ops ; jg => inline_base),
+                            Cmp::Ge => dynasm!(ops ; jge => inline_base),
+                            Cmp::Eq | Cmp::Ne => unreachable!("base_case yields only Lt/Le/Gt/Ge"),
+                        }
+                        dynasm!(ops ; => do_call);
+                        emitted_self_call = true;
+                        emit_self_call(
+                            &mut ops,
+                            ip,
+                            bail,
+                            self_entry,
+                            self_func_id,
+                            self_call_helper,
+                            dst,
+                            callee,
+                            arg_base,
+                            argc,
+                            proto.reg_count,
+                            self_val_bits,
+                        );
+                        dynasm!(ops
+                            ; jmp => after
+                            ; => inline_base
+                            ; mov rax, [rbx + dreg(arg_base)]   // result = arg (base returns it)
+                            ; mov [rbx + dreg(dst)], rax
+                            ; => after
+                        );
+                    }
+                    _ => {
+                        emitted_self_call = true;
+                        emit_self_call(
+                            &mut ops,
+                            ip,
+                            bail,
+                            self_entry,
+                            self_func_id,
+                            self_call_helper,
+                            dst,
+                            callee,
+                            arg_base,
+                            argc,
+                            proto.reg_count,
+                            self_val_bits,
+                        );
+                    }
+                }
+            }
+            Instr::Return { src } => {
+                dynasm!(ops
+                    ; mov DWORD [rsi], NO_BAIL as i32   // bail_ip = NO_BAIL
+                    ; mov rax, [rbx + dreg(src)]        // result = regs[src]
+                    ; jmp => epilogue
+                );
+            }
+            Instr::ReturnUndefined => {
+                let undef = Value::UNDEFINED.bits();
+                dynasm!(ops
+                    ; mov DWORD [rsi], NO_BAIL as i32
+                    ; mov rax, QWORD undef as i64
+                    ; jmp => epilogue
+                );
+            }
+            _ => return None, // can_compile already filtered; defensive
+        }
+    }
+    // Falling off the end behaves like ReturnUndefined (jumps to epilogue).
+    dynasm!(ops
+        ; => labels[n]
+        ; mov DWORD [rsi], NO_BAIL as i32
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; jmp => epilogue
+    );
+
+    // ── metering exits ── out of line so the hot path is just `sub` + a
+    // not-taken `jle`. Resuming at this ip is exactly an ordinary guard bail:
+    // the interpreter re-runs the block, charging it as it goes.
+    for (stub, ip) in meter_stubs {
+        dynasm!(ops
+            ; => stub
+            ; mov DWORD [rsi], ip as i32
+            ; xor rax, rax
+            ; jmp => epilogue
+        );
+    }
+
+    // ── epilogue ── undo the prologue and return (rax already holds the result
+    // or 0-for-bail; [rsi] already holds NO_BAIL or the bail ip).
+    dynasm!(ops
+        ; => epilogue
+        ; add rsp, 48
+        ; pop rdi
+        ; pop rsi
+        ; pop rbx
+        ; ret
+    );
+
+    let buf = ops.finalize().ok()?;
+    let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
+    // Record the self-binding this body assumed, for `try_run_jit` to re-check at
+    // every entry. Only when a self-call was actually emitted — a Tier A body with
+    // no recursion must not be declined merely because its own global name was
+    // reassigned (`function f(){…}; var g = f; f = 1;` keeps `g` fast).
+    let self_binding = if emitted_self_call {
+        self_slot.map(|s| (s, self_val_bits))
+    } else {
+        None
+    };
+    Some(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding,
+        int_tier: true,
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Mod,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// Byte displacement of register `r` within the window (`[rcx + r*8]`).
+#[inline]
+pub(crate) fn dreg(r: u16) -> i32 {
+    (r as i32) * 8
+}
+
+/// Emit this op's bail block at `bail`: the success path skips it; the block
+/// records `ip` into `[rsi]` (bail_ip), then performs the FULL epilogue
+/// (restore stack + callee-saved regs) and returns — a bare `ret` would leave
+/// the prologue's pushes/`sub rsp` on the stack and corrupt the caller.
+pub(crate) fn emit_bail(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+) {
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; jmp => done            // success path skips the bail block
+        ; => bail
+        ; mov DWORD [rsi], ip as i32
+        ; xor rax, rax
+        ; add rsp, 48
+        ; pop rdi
+        ; pop rsi
+        ; pop rbx
+        ; ret
+        ; => done
+    );
+}
+
+/// Guard that `regs[r]` is tagged `Int`; on mismatch jump to `bail`. Reads the
+/// high 16 bits and compares to `INT_TAG_HI`.
+pub(crate) fn guard_int(ops: &mut dynasmrt::x64::Assembler, r: u16, bail: dynasmrt::DynamicLabel) {
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(r)]
+        ; shr rax, 48
+        ; cmp eax, INT_TAG_HI as i32
+        ; jne => bail
+    );
+}
+
+/// Guard that `regs[r]` is Int OR Bool (both used as conditions). Int hi =
+/// 0x7FF9, Bool hi = 0x7FFA. Accept either; else jump to `bail`.
+pub(crate) fn guard_int_or_bool(
+    ops: &mut dynasmrt::x64::Assembler,
+    r: u16,
+    bail: dynasmrt::DynamicLabel,
+) {
+    let ok = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(r)]
+        ; shr rax, 48
+        ; cmp eax, INT_TAG_HI as i32
+        ; je => ok
+        ; cmp eax, (INT_TAG_HI + 1) as i32   // Bool tag
+        ; jne => bail
+        ; => ok
+    );
+}
+
+/// Box the i32 in `eax` into `regs[dst]` as an Int Value.
+pub(crate) fn box_eax(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+    dynasm!(ops
+        ; mov r8, QWORD INT_TAG as i64
+        ; mov eax, eax            // zero-extend i32 payload into rax
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+    );
+}
+
+pub(crate) fn int_binop(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    dst: u16,
+    a: u16,
+    b: u16,
+    op: BinOp,
+) {
+    guard_int(ops, a, bail);
+    guard_int(ops, b, bail);
+    dynasm!(ops
+        ; mov eax, [rbx + dreg(a)]
+        ; mov r9d, [rbx + dreg(b)]
+    );
+    match op {
+        BinOp::Add => dynasm!(ops ; add eax, r9d ; jo => bail),
+        BinOp::Sub => dynasm!(ops ; sub eax, r9d ; jo => bail),
+        // A zero product with a negative operand is -0 in JS (`0 * -5`),
+        // which is not an Int — bail and let the interpreter make the double.
+        // One operand is 0, so the other's sign is the sign of `a | b`; the
+        // test sits behind the (rare) zero result, off the hot path.
+        BinOp::Mul => {
+            let nonzero = ops.new_dynamic_label();
+            dynasm!(ops
+                ; imul eax, r9d
+                ; jo => bail
+                ; test eax, eax
+                ; jnz => nonzero
+                ; mov r10d, [rbx + dreg(a)]
+                ; or r10d, r9d
+                ; js => bail
+                ; => nonzero
+            )
+        }
+        // Signed integer remainder (JS `%` on integers; truncated, sign of the
+        // dividend = idiv's remainder). `% 0` is NaN (not an Int) → bail; bail on
+        // divisor -1 too, which sidesteps the INT_MIN/-1 idiv #DE (and `% -1` is
+        // always 0, so the interpreter handles that rare case correctly).
+        // `cdq` sign-extends eax into edx:eax; `idiv r9d` puts the remainder in
+        // edx, which we move into eax for `box_eax`. (Division `/` is NOT done
+        // here — JS `/` is float division, e.g. 7/2 == 3.5, not an integer.)
+        // A zero remainder from a NEGATIVE dividend is -0 in JS (`-20 % 5`),
+        // which is not an Int — bail and let the interpreter make the double.
+        BinOp::Mod => dynasm!(ops
+            ; test r9d, r9d
+            ; jz => bail
+            ; cmp r9d, -1
+            ; je => bail
+            ; test eax, eax
+            ; js => bail
+            ; cdq
+            ; idiv r9d
+            ; mov eax, edx
+        ),
+    }
+    box_eax(ops, dst);
+    emit_bail(ops, ip, bail);
+}
+
+/// `regs[dst] = (regs[a] <cmp> regs[b]) as Bool`. Guards both Int; bails else.
+pub(crate) fn int_cmp(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    dst: u16,
+    a: u16,
+    b: u16,
+    cmp: Cmp,
+) {
+    guard_int(ops, a, bail);
+    guard_int(ops, b, bail);
+    let bool_tag = INT_TAG + (1u64 << 48); // 0x7FFA…
+    dynasm!(ops
+        ; mov eax, [rbx + dreg(a)]
+        ; mov r9d, [rbx + dreg(b)]
+        ; cmp eax, r9d
+    );
+    match cmp {
+        Cmp::Lt => dynasm!(ops ; setl al),
+        Cmp::Le => dynasm!(ops ; setle al),
+        Cmp::Gt => dynasm!(ops ; setg al),
+        Cmp::Ge => dynasm!(ops ; setge al),
+        Cmp::Eq => dynasm!(ops ; sete al),
+        Cmp::Ne => dynasm!(ops ; setne al),
+    }
+    dynasm!(ops
+        ; movzx rax, al
+        ; mov r8, QWORD bool_tag as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+    );
+    emit_bail(ops, ip, bail);
+}
+
+/// Fused `if !(regs[a] <cmp> regs[b]) goto target`. Guards both Int; bails else.
+pub(crate) fn jump_if_not_cmp(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    a: u16,
+    b: u16,
+    cmp: Cmp,
+    target: dynasmrt::DynamicLabel,
+) {
+    guard_int(ops, a, bail);
+    guard_int(ops, b, bail);
+    dynasm!(ops
+        ; mov eax, [rbx + dreg(a)]
+        ; mov r9d, [rbx + dreg(b)]
+        ; cmp eax, r9d
+    );
+    // Jump to target when the comparison is FALSE.
+    match cmp {
+        Cmp::Lt => dynasm!(ops ; jge => target), // !(a<b) ⇔ a>=b
+        Cmp::Le => dynasm!(ops ; jg => target),  // !(a<=b) ⇔ a>b
+        _ => {}
+    }
+    emit_bail(ops, ip, bail);
+}
+
+#[cfg(test)]
+mod control_target_tests {
+    use super::*;
+
+    fn tier_a_proto() -> FuncProto {
+        let source = r#"
+            function fib(n) {
+                if (n < 2) return n;
+                return fib(n - 1) + fib(n - 2);
+            }
+            fib(6);
+        "#;
+        let ast = crate::front::parse_script(source).expect("parse tier-a fixture");
+        crate::compile::compile_program(&ast, source)
+            .expect("compile tier-a fixture")
+            .functions
+            .into_iter()
+            .find(|proto| proto.name == "fib")
+            .expect("fib proto")
+    }
+
+    #[test]
+    fn includes_exceptional_handler_and_finally_edges() {
+        assert_eq!(
+            bytecode_control_target(&Instr::PushHandler {
+                catch_target: 11,
+                catch_reg: 2,
+            }),
+            Some(11)
+        );
+        assert_eq!(
+            bytecode_control_target(&Instr::PushFinally {
+                target: 12,
+                kind_reg: 3,
+                val_reg: 4,
+            }),
+            Some(12)
+        );
+        assert_eq!(
+            bytecode_control_target(&Instr::JumpFinally {
+                target: 13,
+                floor: 1,
+            }),
+            Some(13)
+        );
+        assert_eq!(bytecode_control_target(&Instr::PopFinally), None);
+    }
+
+    #[test]
+    fn audit_20260912_malformed_tier_a_registers_decline() {
+        let proto = tier_a_proto();
+        assert!(can_compile(&proto, proto.name_global));
+
+        let mut zero_window = proto.clone();
+        zero_window.reg_count = 0;
+        assert!(!can_compile(&zero_window, zero_window.name_global));
+
+        let mut bad_dst = proto.clone();
+        let out = bad_dst.reg_count;
+        let load = bad_dst
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::LoadInt { .. }))
+            .expect("fixture load");
+        let Instr::LoadInt { dst, .. } = load else {
+            unreachable!()
+        };
+        *dst = out;
+        assert!(!can_compile(&bad_dst, bad_dst.name_global));
+
+        let mut bad_args = proto.clone();
+        let out = bad_args.reg_count;
+        let call = bad_args
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::Call { .. }))
+            .expect("fixture recursive call");
+        let Instr::Call { arg_base, .. } = call else {
+            unreachable!()
+        };
+        *arg_base = out;
+        assert!(!can_compile(&bad_args, bad_args.name_global));
+    }
+
+    #[test]
+    fn audit_20260912_malformed_tier_a_target_declines() {
+        let mut proto = tier_a_proto();
+        assert!(can_compile(&proto, proto.name_global));
+        let out = proto.code.len() as u32;
+        let branch = proto
+            .code
+            .iter_mut()
+            .find(|instr| {
+                matches!(
+                    instr,
+                    Instr::Jump { .. }
+                        | Instr::JumpIfFalse { .. }
+                        | Instr::JumpIfTrue { .. }
+                        | Instr::JumpIfNotLt { .. }
+                        | Instr::JumpIfNotLe { .. }
+                )
+            })
+            .expect("fixture branch");
+        match branch {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => *target = out,
+            _ => unreachable!(),
+        };
+        assert!(!can_compile(&proto, proto.name_global));
+    }
+}

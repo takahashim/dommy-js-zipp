@@ -1,0 +1,4054 @@
+#![allow(unused_imports)]
+use super::*;
+use crate::bytecode::{Instr, Program, UpvalSource};
+use crate::heap::{
+    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
+    PromiseState, PropAttr, ReactionPair, Reactions,
+};
+use crate::value::Value;
+
+/// How a SYNC generator is being resumed (`gen_resume`). Kept separate from the
+/// async `Resume` enum so the async drive paths are entirely unaffected.
+enum GenResumeMode {
+    /// `gen.next(v)` — deliver `v` at the yield point.
+    Next(Value),
+    /// `gen.throw(e)` — throw `e` at the yield point (into try/catch/finally).
+    Throw(Value),
+    /// `gen.return(v)` — return `v`, running any `finally` on the way out.
+    Return(Value),
+}
+
+/// One step of a sync generator before it becomes an iterator result
+/// (`gen_resume_step`): `gen_resume` wraps `Yield`/`Done` in a fresh
+/// `{value, done}` and passes `Raw` through; a raw consumer reads them as is.
+pub(crate) enum GenStep {
+    /// Suspended at a plain `yield` of this value (`done: false`).
+    Yield(Value),
+    /// Completed with this value (`done: true`).
+    Done(Value),
+    /// A `yield*` step: the inner iterator's result object, verbatim.
+    Raw(Value),
+}
+
+/// `ZIPP_ASYNCSTATS=1` -- how many activation re-parks reused the buffer the
+/// resume detached, and how many had to grow it. Exists because "the allocation
+/// is gone" is not a performance result on its own and this file's standing rule
+/// is that a mechanism must be shown to have fired.
+///
+/// Off, this costs one relaxed atomic load per suspension (against ~400ns of
+/// await round-trip), so it is left compiled in rather than behind a feature.
+mod asyncstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static REPARKS: AtomicU64 = AtomicU64::new(0);
+    static REUSED: AtomicU64 = AtomicU64::new(0);
+    static GREW: AtomicU64 = AtomicU64::new(0);
+    static VALUES: AtomicU64 = AtomicU64::new(0);
+    static INLINE_AWAITS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_ASYNCSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    /// `had` is the recycled buffer's capacity BEFORE the copy, `want` the window
+    /// length being parked. `had >= want` is the reuse we are buying.
+    #[inline]
+    pub(super) fn repark(had: usize, want: usize) {
+        if !enabled() {
+            return;
+        }
+        REPARKS.fetch_add(1, Ordering::Relaxed);
+        if had >= want {
+            REUSED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            GREW.fetch_add(1, Ordering::Relaxed);
+        }
+        VALUES.fetch_add(want as u64, Ordering::Relaxed);
+    }
+
+    static SUB_INLINE: AtomicU64 = AtomicU64::new(0);
+    static SUB_SPILLED: AtomicU64 = AtomicU64::new(0);
+
+    /// One promise SUBSCRIPTION. `inline` means it became `Reactions::One` and
+    /// allocated nothing; the old two-`Vec` layout allocated TWICE here
+    /// regardless. Counted at the two registration sites rather than inside
+    /// `Reactions::push` so `heap.rs` stays free of instrumentation.
+    #[inline]
+    pub(super) fn subscribe(inline: bool) {
+        if !enabled() {
+            return;
+        }
+        if inline {
+            SUB_INLINE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SUB_SPILLED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn inline_await() {
+        if enabled() {
+            INLINE_AWAITS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    static REUSE_ON: AtomicU8 = AtomicU8::new(2);
+
+    /// `ZIPP_NO_BUF_REUSE=1` restores `Vec::split_off` at every suspension --
+    /// the rollback switch, and the two sides of the one-binary A/B (fat LTO
+    /// makes a two-binary comparison a layout confound; see B77).
+    #[inline]
+    pub(super) fn reuse_enabled() -> bool {
+        match REUSE_ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_NO_BUF_REUSE").is_none() as u8;
+                REUSE_ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    /// `(reparks, reused, grew, values_copied, subs_inline, subs_spilled)`
+    pub fn dump() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            REPARKS.load(Ordering::Relaxed),
+            REUSED.load(Ordering::Relaxed),
+            GREW.load(Ordering::Relaxed),
+            VALUES.load(Ordering::Relaxed),
+            SUB_INLINE.load(Ordering::Relaxed),
+            SUB_SPILLED.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn dump_inline_awaits() -> u64 {
+        INLINE_AWAITS.load(Ordering::Relaxed)
+    }
+}
+
+pub use asyncstats::dump as async_stats;
+pub use asyncstats::dump_inline_awaits as async_inline_await_stats;
+
+/// Collapse the next already-settled await job into the current AsyncResume job
+/// when no older microtask is waiting. A bounded trampoline preserves FIFO job
+/// ordering while avoiding register-window parking and heap-state churn.
+#[inline]
+fn async_settled_trampoline_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ASYNC_SETTLED_TRAMPOLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_PROMISE_ALL_DIRECT=1` restores the heap-allocated
+/// `CombinatorResolver` callback for every intrinsic `Promise.all` element.
+/// Keeping a one-binary switch makes the allocation and wall-time result
+/// independently measurable without a fat-LTO layout comparison.
+#[inline]
+/// B218: run the intrinsic `Promise.all` resolve-element job EAGERLY at
+/// subscription when the microtask queue is EMPTY and the element is already
+/// fulfilled, instead of queueing one job per element.
+///
+/// WHY THIS IS ORDER-PRESERVING, which is the whole question (job ordering is
+/// observable): an EMPTY queue means the job being collapsed would have been
+/// the very next one to run anyway, and the job itself runs NO user code — it
+/// records a value into the result array and decrements `remaining`, both of
+/// them combinator-internal. So running it now rather than at the head of the
+/// drain is unobservable. The one event that IS observable — the result
+/// promise settling — is not run eagerly: it is re-queued as a single
+/// `CombinatorFinish` standing where the FIRST element job would have been,
+/// and since the spec's settle happens at the LAST element job (which queues
+/// the result's own reactions behind everything already queued), both
+/// arrangements put those reactions in the same place. `microtasks.is_empty()`
+/// is what carries the argument; the moment anything else is queued (a
+/// thenable's `then` getter, a pending element, an enclosing job) the lane
+/// switches itself off and the ordinary one-job-per-element FIFO runs.
+///
+/// `ZIPP_NO_EAGER_COMB=1` restores that FIFO (the pricing comparator).
+fn eager_combinator_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_EAGER_COMB").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+fn promise_all_direct_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PROMISE_ALL_DIRECT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_PROMISE_RESOLVE_DIRECT=1` restores the historical
+/// allocate-pending-then-settle sequence. The direct form is valid only for a
+/// fresh intrinsic promise wrapping a non-heap primitive: no thenable lookup,
+/// adoption, user code, reaction, or old-to-young edge can exist in that gap.
+#[inline]
+pub(super) fn promise_resolve_direct_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PROMISE_RESOLVE_DIRECT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// The pristine-%Promise.prototype% proof, resolved to SLOT INDICES. The full
+/// proof (`promise_proto_pristine_uncached`) re-found `then`/`constructor`/
+/// `@@species` with 2-4 linear `pos()` scans plus 3-4 `heap.get`s on EVERY
+/// `.then` / `await` / `Promise.all` element; the slots cannot move without a
+/// version bump, so once resolved the warm re-proof is version compares plus
+/// direct slot reads.
+///
+/// Guarded by the heap's index-parallel `versions` array — the same
+/// invalidation the JIT inline cache rides: a key add/delete, any
+/// `defineProperty`, a whole-object `Heap::replace`, and GC slot reuse all
+/// bump the owning object's version. What a version does NOT guard (B110's
+/// audit: a plain in-place `vals[i] = v` data write bumps nothing) is never
+/// trusted from the cache — the accessor bit and the value identity at each
+/// slot are re-read on every call. On any guard mismatch the full proof
+/// re-runs and re-resolves the slots: conservative fallback, never a wrong
+/// answer.
+#[derive(Clone, Copy)]
+pub(crate) struct PromisePristineSlots {
+    /// `heap.versions[promise_proto]` when the slots were resolved.
+    proto_version: u32,
+    /// `heap.versions[promise_ctor_intrinsic]` when the slots were resolved.
+    ctor_version: u32,
+    /// Slots of `then` / `constructor` in %Promise.prototype%'s `ObjMap`.
+    then_slot: u32,
+    ctor_slot: u32,
+    /// `@@species` on %Promise%: `(slot, getter heap index, getter slot
+    /// version)` — the getter was proven `Native(SPECIES_GET)` at fill time,
+    /// and its slot version pins that identity (only `Heap::replace`/GC reuse
+    /// can change a `Native`, and both bump). `None` when the key was absent
+    /// at fill time (also pristine; adding it would bump the ctor version).
+    species: Option<(u32, u32, u32)>,
+    /// The exact value BITS the proof read at `then_slot` / `ctor_slot` /
+    /// the `@@species` slot (`UNDEFINED` when `species` is `None`). The lean
+    /// warm re-check (`promise_pristine_bit_identical`) compares a slot's
+    /// live `Value` against these in one `u64` compare instead of unpacking
+    /// `is_heap()`/`heap_index()`; stored rather than rebuilt from the index
+    /// so the compare is "unchanged since the proof" regardless of how a heap
+    /// `Value`'s payload is encoded.
+    then_val: Value,
+    ctor_val: Value,
+    species_val: Value,
+}
+
+/// `ZIPP_NO_PROMISE_SLOT_CACHE=1` makes `promise_proto_pristine` run the
+/// original full scan on every call, bypassing the slot cache entirely — the
+/// rollback switch and the two sides of a one-binary A/B (`tools/bench.py
+/// --ab-env`, no fat-LTO layout confound). Same idiom as
+/// `ZIPP_NO_PROMISE_PRISTINE` / `ZIPP_NO_ENUM_HOIST`.
+#[inline]
+fn promise_slot_cache_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PROMISE_SLOT_CACHE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_PRISTINE_LEAN=1` makes the warm pristine re-check run the
+/// original `promise_pristine_from_slots` on every call — the key-string
+/// compares, the `PropAttrs::at` calls and the `is_heap()`/`heap_index()`
+/// unpacking — instead of the bit-identity prefix
+/// (`promise_pristine_bit_identical`). Read once; the two sides of a
+/// one-binary A/B (`tools/bench.py --ab-env`). Same idiom as
+/// `ZIPP_NO_PROMISE_SLOT_CACHE`.
+#[inline]
+fn pristine_lean_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PRISTINE_LEAN").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// The most entries a combinator reserves ahead of stepping a dense array
+/// (see `promise_combine_rooted`): 4,096 results and flags are 36 KiB.
+const COMBINATOR_PRESIZE_MAX: usize = 4096;
+
+impl<'p> Vm<'p> {
+    /// Park the live register window `[new_base..]` back onto a suspended
+    /// activation, REUSING `buf` -- the buffer this resume detached from that
+    /// same activation with `mem::take`.
+    ///
+    /// The obvious spelling is `self.regs.split_off(new_base)`, and that is what
+    /// every suspension point used to do. `split_off` allocates a fresh Vec sized
+    /// to the tail and memcpys into it; the detached buffer then went out of scope
+    /// and was freed. Since the two are the same size in steady state -- an
+    /// activation's window length is fixed by its `reg_count` -- the pair was a
+    /// malloc and a free per await for no reason. `clear` + `extend_from_slice`
+    /// keeps the capacity and does the identical memcpy.
+    ///
+    /// The length is taken from the live file rather than from `buf`, because a
+    /// `finally` that runs between two suspension points can leave the window at
+    /// a different height than the one that was restored.
+    #[inline]
+    fn repark_window(&mut self, mut buf: Vec<Value>, new_base: usize) -> Vec<Value> {
+        if !asyncstats::reuse_enabled() {
+            return self.regs.split_off(new_base);
+        }
+        let want = self.regs.len() - new_base;
+        asyncstats::repark(buf.capacity(), want);
+        buf.clear();
+        buf.extend_from_slice(&self.regs[new_base..]);
+        self.regs.truncate(new_base);
+        buf
+    }
+
+    /// Calling a `function*` does NOT run its body — it allocates a suspended
+    /// Generator whose DETACHED register window holds `this` + the bound args
+    /// (incl. a rest array). Resumed later by `generator_method`.
+    pub(crate) fn alloc_generator(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        let gen_callee = std::mem::replace(&mut self.pending_gen_callee, Value::UNDEFINED);
+        let proto = self.func(func_id as usize);
+        let reg_count = (proto.reg_count as usize).max(1);
+        let param_count = proto.param_count as usize;
+        let rest_reg = proto.rest_reg;
+        let arguments_reg = proto.arguments_reg;
+        // OrdinaryCallBindThis: a SLOPPY (non-arrow) generator/async invoked
+        // with a nullish `this` binds the global object; a primitive boxes.
+        let this = if !proto.lexical_this
+            && !proto.is_strict
+            && this.is_nullish()
+            && self.global_this != 0
+        {
+            Value::heap(self.global_this)
+        } else if !proto.lexical_this
+            && !proto.is_strict
+            && !self.is_object_value(this)
+            && self.global_this != 0
+        {
+            self.to_object(this).unwrap_or(this)
+        } else {
+            this
+        };
+        let mut regs = vec![Value::UNDEFINED; reg_count];
+        regs[0] = this;
+        let n = args.len().min(param_count);
+        regs[1..1 + n].copy_from_slice(&args[..n]);
+        if let Some(rr) = rest_reg {
+            let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
+            regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+        }
+        // `arguments` (a generator that references it) — the spec-shaped object,
+        // MAPPED for a sloppy callee with simple params (aliases the formal
+        // registers; re-linked to the live window on every resume).
+        let (is_strict, simple) = {
+            let p = self.func(func_id as usize);
+            (p.is_strict, p.simple_params)
+        };
+        let new_base = self.regs.len();
+        let mut args_obj = u32::MAX;
+        if let Some(areg) = arguments_reg {
+            let mapinfo =
+                (!is_strict && simple).then(|| (self.frames.len(), new_base, param_count));
+            let arr = self.build_arguments_object(args.to_vec(), gen_callee, is_strict, mapinfo);
+            regs[areg as usize] = arr;
+            if mapinfo.is_some() {
+                args_obj = arr.heap_index();
+            }
+        }
+        // FunctionDeclarationInstantiation runs eagerly at CALL time: splice the
+        // window onto the live register file and run the parameter prologue
+        // (defaults + destructuring) up to the `GenStart` body-entry marker. A
+        // destructuring throw or a default's side effect therefore happens at the
+        // call, per spec — not at the first `.next()`. The generator is then parked
+        // AT the marker; the first `.next()` resumes just past it to run the body.
+        if self.regs_would_overflow(new_base + reg_count) {
+            return Err(Thrown::from_static(
+                "RangeError: Maximum call stack size exceeded",
+            ));
+        }
+        self.regs.extend_from_slice(&regs);
+        self.bump_regs_hw(new_base + reg_count);
+        let stop = self.frames.len();
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: 0,
+            closure,
+            handlers: Vec::new(),
+            new_target: Value::UNDEFINED,
+            callee: gen_callee,
+        });
+        let outcome = self.run_loop(stop);
+        if let Some((_v, genstart_ip)) = self.pending_yield.take() {
+            // Suspended at `GenStart`: the post-prologue window is live at the top.
+            let back = self.regs.split_off(new_base);
+            let handlers = std::mem::take(&mut self.pending_yield_handlers);
+            let esc = std::mem::replace(&mut self.pending_yield_eval_scope, u32::MAX);
+            let g = self.heap.alloc(HeapObj::Generator {
+                func: func_id,
+                closure,
+                state: GenState::Suspended(genstart_ip),
+                regs: back,
+                handlers,
+            });
+            // OrdinaryCreateFromConstructor: the instance's [[Prototype]] is
+            // the callee's `prototype` object (a replaced g.prototype flows
+            // through); the HeapObj::Generator fallback stays %GeneratorProto%.
+            // A REALM-BORN generator function with a NON-OBJECT `prototype`
+            // falls back to GetFunctionRealm's %GeneratorPrototype% image
+            // instead (the main realm keeps the dynamic fallback).
+            if let Some(p) = self.prototype_of(gen_callee) {
+                self.proto_of.insert(g, p);
+            } else if !self.realm_global_objs.is_empty() {
+                if let Some(rp) = self.realm_proto_fallback(gen_callee, self.gen_proto) {
+                    self.proto_of.insert(g, Value::heap(rp));
+                }
+            }
+            if gen_callee != Value::UNDEFINED {
+                // Resumes re-bind this as Frame.callee (LoadCallee identity).
+                self.gen_callee.insert(g, gen_callee);
+            }
+            if args_obj != u32::MAX {
+                // Mapped arguments: each resume re-links the [[ParameterMap]]
+                // to the freshly spliced window.
+                self.gen_args_obj.insert(g, args_obj);
+            }
+            // A param-prologue direct eval created a dynamic EvalScope on the
+            // (now-parked) frame: keep it resolvable across suspensions.
+            if esc != u32::MAX {
+                self.closure_eval_scope.insert(g, esc);
+            }
+            return Ok(Value::heap(g));
+        }
+        // No marker was reached — either the prologue threw (propagate at the call
+        // site) or, defensively (a proto with no `GenStart`), the body ran to
+        // completion. Either way the window is reclaimed.
+        self.regs.truncate(new_base);
+        match outcome {
+            Ok(_) => Ok(Value::heap(self.heap.alloc(HeapObj::Generator {
+                func: func_id,
+                closure,
+                state: GenState::Completed,
+                regs: Vec::new(),
+                handlers: Vec::new(),
+            }))),
+            Err(t) => Err(t),
+        }
+    }
+
+    /// Resume / query a generator (`gen.next(v)` / `gen.return(v)` / `gen.throw(e)`).
+    /// Returns an iterator-result object `{value, done}` (or propagates a throw).
+    pub(crate) fn generator_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let (state, fid, closure) = match self.heap.get(idx) {
+            HeapObj::Generator {
+                state,
+                func,
+                closure,
+                ..
+            } => (*state, *func, *closure),
+            _ => return Ok(None),
+        };
+        match name {
+            "return" => match state {
+                // A completed generator just echoes {value, done:true}.
+                GenState::Completed => Ok(Some(self.iter_result(arg0, true))),
+                GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
+                // Resume the suspended body with a RETURN completion so any `finally`
+                // spanning the yield runs (and a `finally { yield }` can re-suspend).
+                GenState::Suspended(ip) => {
+                    self.gen_resume(idx, fid, closure, ip, GenResumeMode::Return(arg0))
+                }
+            },
+            "throw" => match state {
+                // Throwing into a completed generator re-throws the EXACT value at
+                // the call site (pending_throw preserves its identity — `iter.throw(
+                // new E())` must surface that E instance, not a synthesized Error).
+                GenState::Completed => {
+                    self.pending_throw = Some(arg0);
+                    Err(Thrown(self.throw_message(arg0)))
+                }
+                GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
+                // Resume the suspended body, injecting the throw at the yield point so
+                // an enclosing `try`/`catch` (whose handlers we parked) can catch it.
+                GenState::Suspended(ip) => {
+                    self.gen_resume(idx, fid, closure, ip, GenResumeMode::Throw(arg0))
+                }
+            },
+            "next" => match state {
+                GenState::Completed => Ok(Some(self.iter_result(Value::UNDEFINED, true))),
+                GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
+                GenState::Suspended(ip) => {
+                    self.gen_resume(idx, fid, closure, ip, GenResumeMode::Next(arg0))
+                }
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// `generator_method(idx, "next", [undefined])` as a [`GenStep`], without
+    /// the iterator-result object (`None`: `idx` is not a sync generator).
+    pub(crate) fn generator_next_step(&mut self, idx: u32) -> Result<Option<GenStep>, Thrown> {
+        let (state, fid, closure) = match self.heap.get(idx) {
+            HeapObj::Generator {
+                state,
+                func,
+                closure,
+                ..
+            } => (*state, *func, *closure),
+            _ => return Ok(None),
+        };
+        match state {
+            GenState::Completed => Ok(Some(GenStep::Done(Value::UNDEFINED))),
+            GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
+            GenState::Suspended(ip) => {
+                self.gen_resume_step(idx, fid, closure, ip, GenResumeMode::Next(Value::UNDEFINED))
+            }
+        }
+    }
+
+    /// [`Self::gen_resume_step`] with its step as the iterator result
+    /// `generator_method` returns.
+    fn gen_resume(
+        &mut self,
+        idx: u32,
+        fid: u32,
+        closure: u32,
+        resume_ip: usize,
+        input: GenResumeMode,
+    ) -> Result<Option<Value>, Thrown> {
+        Ok(match self.gen_resume_step(idx, fid, closure, resume_ip, input)? {
+            None => None,
+            Some(GenStep::Yield(y)) => Some(self.iter_result(y, false)),
+            Some(GenStep::Done(v)) => Some(self.iter_result(v, true)),
+            Some(GenStep::Raw(r)) => Some(r),
+        })
+    }
+
+    /// Splice a suspended generator's saved register window back onto the live
+    /// register file, RESTORE its parked `try` handlers, and resume it with one of
+    /// three completions at the yield point: `Next(v)` delivers a sent value (from
+    /// `gen.next(v)`); `Throw(e)` throws a value in there (`gen.throw(e)`), which
+    /// unwinds through the body's try/catch/finally; `Return(v)` injects a return
+    /// completion (`gen.return(v)`), running any `finally` on the way out. On a
+    /// further yield it re-parks the window + handlers; on completion or an
+    /// uncaught throw it clears them. Returns the step (see [`GenStep`]).
+    fn gen_resume_step(
+        &mut self,
+        idx: u32,
+        fid: u32,
+        closure: u32,
+        resume_ip: usize,
+        input: GenResumeMode,
+    ) -> Result<Option<GenStep>, Thrown> {
+        let (saved, saved_handlers) = match self.heap.get_mut(idx) {
+            HeapObj::Generator {
+                state,
+                regs,
+                handlers,
+                ..
+            } => {
+                *state = GenState::Running;
+                (std::mem::take(regs), std::mem::take(handlers))
+            }
+            _ => return Ok(None),
+        };
+        let reg_count = saved.len();
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            if let HeapObj::Generator {
+                state,
+                regs,
+                handlers,
+                ..
+            } = self.heap.get_mut(idx)
+            {
+                *state = GenState::Suspended(resume_ip);
+                *regs = saved;
+                *handlers = saved_handlers;
+            }
+            return Err(Thrown::from_static(
+                "RangeError: Maximum call stack size exceeded",
+            ));
+        }
+        self.regs.extend_from_slice(&saved);
+        self.bump_regs_hw(new_base + reg_count);
+        let stop = self.frames.len();
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
+            func: fid,
+            base: new_base,
+            ip: 0, // set below per resume kind
+            ret_dst: 0,
+            closure,
+            handlers: saved_handlers,
+            new_target: Value::UNDEFINED,
+            // The creating call's function value (named fn-expression
+            // self-name identity survives suspension).
+            callee: self
+                .gen_callee
+                .get(&idx)
+                .copied()
+                .unwrap_or(Value::UNDEFINED),
+        });
+        // Restore the activation's dynamic EvalScope (created by a direct eval
+        // in the param prologue or an earlier resume), parked on the generator.
+        if let Some(&sc) = self.closure_eval_scope.get(&idx) {
+            self.frames[stop].eval_scope = sc;
+        }
+        // A mapped `arguments` object aliases this resumption's register window.
+        self.relink_mapped_args(idx, stop, new_base);
+        // A `yield*` suspension point (YieldDelegate) consumes ALL three resume
+        // modes by DELIVERING (mode-code, value) into the loop's registers — the
+        // loop then forwards next/throw/return to the inner iterator. This must NOT
+        // inject a body throw/finally (that's a plain Yield's behaviour).
+        let resumes_delegate = matches!(
+            self.func(fid as usize).code.get(resume_ip),
+            Some(Instr::YieldDelegate { .. })
+        );
+        let outcome = if resumes_delegate {
+            if let Instr::YieldDelegate {
+                mode_dst, val_dst, ..
+            } = self.func(fid as usize).code[resume_ip]
+            {
+                let (m, v) = match input {
+                    GenResumeMode::Next(v) => (0, v),
+                    GenResumeMode::Throw(v) => (1, v),
+                    GenResumeMode::Return(v) => (2, v),
+                };
+                self.regs[new_base + mode_dst as usize] = Value::int(m);
+                self.regs[new_base + val_dst as usize] = v;
+            }
+            self.frames[stop].ip = resume_ip + 1;
+            self.run_loop(stop)
+        } else {
+            match input {
+                GenResumeMode::Next(v) => {
+                    // First next() runs from ip 0 (legacy proto with no marker); a later
+                    // one resumes just past the Yield/GenStart, delivering the sent value
+                    // into a Yield's dst (GenStart delivers nothing).
+                    let ip = if resume_ip == usize::MAX {
+                        0
+                    } else {
+                        if let Instr::Yield { dst, .. } = self.func(fid as usize).code[resume_ip] {
+                            self.regs[new_base + dst as usize] = v;
+                        }
+                        resume_ip + 1
+                    };
+                    self.frames[stop].ip = ip;
+                    self.run_loop(stop)
+                }
+                GenResumeMode::Throw(e) => {
+                    // Throw at the suspension point: unwind into the body's handlers.
+                    // The frame is at the suspension point for an unwinder
+                    // that reads it (a Python frame's line, `vm::py_rt`).
+                    #[cfg(feature = "python")]
+                    if resume_ip != usize::MAX {
+                        self.frames[stop].ip = resume_ip;
+                    }
+                    self.pending_throw = Some(e);
+                    if self.unwind_to_handler(e, stop) {
+                        self.pending_throw = None;
+                        self.run_loop(stop)
+                    } else {
+                        // Uncaught in the body: unwind_to_handler already popped the frame
+                        // and truncated its window. Complete the generator and surface the
+                        // throw at the `gen.throw(e)` call site (value via pending_throw).
+                        if let HeapObj::Generator {
+                            state,
+                            regs,
+                            handlers,
+                            ..
+                        } = self.heap.get_mut(idx)
+                        {
+                            *state = GenState::Completed;
+                            regs.clear();
+                            handlers.clear();
+                        }
+                        return Err(Thrown(self.throw_message(e)));
+                    }
+                }
+                GenResumeMode::Return(v) => {
+                    // Return completion at the suspension point: run any `finally` that
+                    // spans the yield (route_through_finally, kind 1=return), exactly as
+                    // a `return` statement in the body would. EndFinally then completes
+                    // the return (or an outer finally), and a `finally { yield }` makes
+                    // the generator re-suspend below.
+                    if let Some(target) = self.route_through_finally(1, v) {
+                        self.frames[stop].ip = target as usize;
+                        self.run_loop(stop)
+                    } else {
+                        // No `finally` pending: discard the spliced window/frame and
+                        // complete the generator with the return value.
+                        self.frames.pop();
+                        self.regs.truncate(new_base);
+                        if let HeapObj::Generator {
+                            state,
+                            regs,
+                            handlers,
+                            ..
+                        } = self.heap.get_mut(idx)
+                        {
+                            *state = GenState::Completed;
+                            regs.clear();
+                            handlers.clear();
+                        }
+                        return Ok(Some(GenStep::Done(v)));
+                    }
+                }
+            }
+        };
+        if let Some((y, yield_ip)) = self.pending_yield.take() {
+            // Re-suspended at another yield: park the window AND the live handlers.
+            let raw = std::mem::replace(&mut self.pending_yield_raw, false);
+            let back = self.repark_window(saved, new_base);
+            let parked = std::mem::take(&mut self.pending_yield_handlers);
+            let esc = std::mem::replace(&mut self.pending_yield_eval_scope, u32::MAX);
+            if esc != u32::MAX {
+                self.closure_eval_scope.insert(idx, esc);
+            }
+            // Nursery barrier: the re-parked window may hold young values and
+            // the generator may be old (holder-grain — the window is a batch).
+            self.heap.write_barrier(idx);
+            if let HeapObj::Generator {
+                state,
+                regs,
+                handlers,
+                ..
+            } = self.heap.get_mut(idx)
+            {
+                *state = GenState::Suspended(yield_ip);
+                *regs = back;
+                *handlers = parked;
+            }
+            // A `yield*` delegation step forwards the inner iterator's result
+            // object VERBATIM (spec GeneratorYield(innerResult)); a plain yield
+            // wraps the value in a fresh `{value, done: false}`.
+            if raw {
+                return Ok(Some(GenStep::Raw(y)));
+            }
+            return Ok(Some(GenStep::Yield(y)));
+        }
+        match outcome {
+            Ok(ret) => {
+                if let HeapObj::Generator {
+                    state,
+                    regs,
+                    handlers,
+                    ..
+                } = self.heap.get_mut(idx)
+                {
+                    *state = GenState::Completed;
+                    regs.clear();
+                    handlers.clear();
+                }
+                Ok(Some(GenStep::Done(ret)))
+            }
+            Err(t) => {
+                self.regs.truncate(new_base);
+                if let HeapObj::Generator {
+                    state,
+                    regs,
+                    handlers,
+                    ..
+                } = self.heap.get_mut(idx)
+                {
+                    *state = GenState::Completed;
+                    regs.clear();
+                    handlers.clear();
+                }
+                Err(t)
+            }
+        }
+    }
+
+    /// Build an iterator-result object `{ value, done }` (insertion order matches
+    /// the spec / node).
+    /// Read `(value, done)` straight out of a result object that is EXACTLY the
+    /// one `iter_result` builds — two own data properties, `value` then `done`,
+    /// no accessors, no prototype involvement.
+    ///
+    /// `None` for anything else, and the caller falls back to two `get_prop`s.
+    /// The check is against the map, not an assumption about the caller: `yield*`
+    /// returns the inner iterator's result VERBATIM (spec GeneratorYield), so a
+    /// generator's `next` can hand back an arbitrary user object whose `value`
+    /// and `done` may be accessors, inherited, or in the other order.
+    pub(crate) fn iter_result_unwrap(&self, res: Value) -> Option<(Value, Value)> {
+        if !res.is_heap() {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(res.heap_index()) else {
+            return None;
+        };
+        if m.len() != 2
+            || m.key_at(0) != "value"
+            || m.key_at(1) != "done"
+            || m.attr_at(0).accessor
+            || m.attr_at(1).accessor
+        {
+            return None;
+        }
+        Some((m.val_at(0), m.val_at(1)))
+    }
+
+    /// CreateIterResultObject: `{value, done}`, an ordinary object with two
+    /// data properties in that order.
+    ///
+    /// Built from one key plan the VM keeps (`iter_result_plan`, with the
+    /// shape the two appends reach), as an object literal is: each result
+    /// used to own its two key strings and take two shape transitions, three
+    /// allocations and two table walks for every `next()` of every iterator.
+    pub(crate) fn iter_result(&mut self, value: Value, done: bool) -> Value {
+        if !crate::bytecode::static_key_plans_enabled() {
+            let mut map = ObjMap::new();
+            map.set("value", value);
+            map.set("done", Value::bool(done));
+            return self.alloc_object_current_realm(map);
+        }
+        let (plan, shape) = match &self.iter_result_plan {
+            Some((plan, shape)) => (plan.clone(), *shape),
+            None => {
+                let plan = crate::bytecode::StaticKeyPlan::new(vec!["value".into(), "done".into()]);
+                let data = crate::shape::attr_bits(true, true, true, false);
+                let shape = crate::shape::add(crate::shape::add(crate::shape::EMPTY, "value", data), "done", data);
+                self.iter_result_plan = Some((plan.clone(), shape));
+                (plan, shape)
+            }
+        };
+        let map = ObjMap::finalized_from_plan(plan, vec![value, Value::bool(done)], shape);
+        self.alloc_object_current_realm(map)
+    }
+
+    // ── promises / microtasks ──
+
+    pub(crate) fn alloc_promise(&mut self) -> u32 {
+        let promise = self.heap.alloc(HeapObj::Promise {
+            state: PromiseState::Pending,
+            result: Value::UNDEFINED,
+            reactions: Reactions::None,
+            handled: false,
+        });
+        self.realm_born(promise, self.promise_proto);
+        promise
+    }
+
+    /// Try to allocate the result of intrinsic `Promise.resolve(primitive)`
+    /// directly in its final state. The release-mode heap check lives here—not
+    /// only at JIT/interpreter call sites—so a future caller cannot accidentally
+    /// bypass thenable lookup/adoption or omit a write barrier for a heap Value.
+    /// There is no observable pending interval for an accepted input: the
+    /// promise is fresh, the value cannot be a thenable, and no reaction can
+    /// exist until after this call returns.
+    #[inline]
+    pub(crate) fn try_alloc_fulfilled_primitive_promise(&mut self, value: Value) -> Option<u32> {
+        if value.is_heap() || !promise_resolve_direct_enabled() {
+            return None;
+        }
+        let promise = self.heap.alloc(HeapObj::Promise {
+            state: PromiseState::Fulfilled,
+            result: value,
+            reactions: Reactions::None,
+            handled: false,
+        });
+        self.realm_born(promise, self.promise_proto);
+        Some(promise)
+    }
+
+    /// Settle a pending promise (no-op if already settled — the one-shot guard
+    /// covers double-resolve / resolve-then-reject / race losers), scheduling its
+    /// matching reactions as microtasks.
+    pub(crate) fn settle(&mut self, p: u32, state: PromiseState, val: Value) {
+        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 —
+        // resolving an old promise with a young value.
+        self.store_barrier(crate::heap::gcoracle::PROMISE_SETTLE, p, val);
+        let (reactions, unhandled) = match self.heap.get_mut(p) {
+            HeapObj::Promise {
+                state: s,
+                result,
+                reactions,
+                handled,
+            } => {
+                if *s != PromiseState::Pending {
+                    return;
+                }
+                *s = state;
+                *result = val;
+                if state == PromiseState::Pending {
+                    return;
+                }
+                // Both handlers of every subscription leave together. The two
+                // parallel Vecs used to drain only the MATCHING one, so a settled
+                // promise kept its opposite-kind reactions -- and the GC kept
+                // tracing their callbacks and dependents -- for the rest of its
+                // life. One list cannot express that, so it also goes away.
+                (
+                    std::mem::take(reactions),
+                    state == PromiseState::Rejected && !*handled,
+                )
+            }
+            _ => return,
+        };
+        // HostPromiseRejectionTracker(promise, "reject"), narrowed to the
+        // rejections a running job THREW and kept only for the Test262 host
+        // report (see `reject_thrown_job` and `report_unhandled_errors`).
+        if unhandled && self.report_unhandled && self.rejecting_thrown_job {
+            self.unhandled_rejections.push(p);
+        }
+        let kind = if state == PromiseState::Fulfilled {
+            ReactionKind::Fulfill
+        } else {
+            ReactionKind::Reject
+        };
+        for r in reactions {
+            if r.is_combinator_all {
+                debug_assert!(r.on_fulfilled.is_int() && r.on_fulfilled.as_int() >= 0);
+                debug_assert!(matches!(self.heap.get(r.dependent), HeapObj::Combinator(_)));
+                match kind {
+                    ReactionKind::Fulfill => {
+                        self.microtasks.push_back(Microtask::CombinatorStep {
+                            combinator: r.dependent,
+                            index: r.on_fulfilled.as_int() as u32,
+                            kind,
+                            arg: val,
+                        });
+                    }
+                    ReactionKind::Reject => {
+                        // Admission proves `on_rejected` is the intrinsic
+                        // capability resolver. Keep the ordinary Reaction job
+                        // shape and result-promise dependent for exact ordering.
+                        let dependent = match self.heap.get(r.dependent) {
+                            HeapObj::Combinator(c) => c.result,
+                            _ => r.dependent,
+                        };
+                        self.microtasks.push_back(Microtask::Reaction {
+                            callback: r.on_rejected,
+                            arg: val,
+                            dependent,
+                            kind,
+                            finally: false,
+                        });
+                    }
+                }
+            } else if r.is_async {
+                // `dependent` is a suspended async activation; resume it with the
+                // value (fulfill) or by throwing the reason in (reject).
+                let input = match kind {
+                    ReactionKind::Fulfill => Resume::Value(val),
+                    ReactionKind::Reject => Resume::Throw(val),
+                };
+                self.microtasks.push_back(Microtask::AsyncResume {
+                    activation: r.dependent,
+                    input,
+                });
+            } else {
+                self.microtasks.push_back(Microtask::Reaction {
+                    callback: match kind {
+                        ReactionKind::Fulfill => r.on_fulfilled,
+                        ReactionKind::Reject => r.on_rejected,
+                    },
+                    arg: val,
+                    dependent: r.dependent,
+                    kind,
+                    finally: r.finally,
+                });
+            }
+        }
+    }
+
+    /// Hand out a fresh CreateResolvingFunctions [[AlreadyResolved]] record id
+    /// (shared by the resolve+reject `BoundResolver`s of one pair).
+    pub(crate) fn new_resolver_pair(&mut self) -> u32 {
+        let id = self.resolver_pair_next;
+        self.resolver_pair_next += 1;
+        id
+    }
+
+    /// Consume a pair's [[AlreadyResolved]] record: true the FIRST time either
+    /// function of the pair fires, false (spec no-op) for every later call.
+    /// `pair == 0` (untracked internal resolvers) always fires.
+    pub(crate) fn resolver_pair_fire(&mut self, pair: u32) -> bool {
+        pair == 0 || self.resolved_pairs.insert(pair)
+    }
+
+    /// True when adopting `value` (a native promise) into a resolution can skip
+    /// the observable Get("then") + PromiseResolveThenableJob + `then` call: the
+    /// instance is a PLAIN promise (its [[Prototype]] is exactly
+    /// %Promise.prototype%, no own `then`/`constructor`) and the prototype's
+    /// `then`/`constructor` are still the intrinsic data properties. Anything
+    /// else (a subclass instance, a patched `Promise.prototype.then`, a shadowed
+    /// `constructor`) takes the spec path — the thenable job's `then` call and
+    /// its SpeciesConstructor lookups are observable (finally/species tests).
+    fn promise_adoption_unobservable(&mut self, value: Value) -> bool {
+        if self.promise_proto == 0
+            || self.prototype_of(value) != Some(Value::heap(self.promise_proto))
+            || self.has_own_property(value, "then")
+            || self.has_own_property(value, "constructor")
+        {
+            return false;
+        }
+        // %Promise.prototype%: own `then` must still be the intrinsic native
+        // data prop, own `constructor` the intrinsic %Promise% data prop.
+        let (then_ok, ctor_ok) = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => {
+                let check = |key: &str, pred: &dyn Fn(Value) -> bool| {
+                    m.keys
+                        .iter()
+                        .position(|k| k == key)
+                        .is_some_and(|i| !m.attr_at(i).accessor && pred(m.val_at(i)))
+                };
+                (
+                    check("then", &|v: Value| {
+                        v.is_heap() && v.heap_index() == self.promise_then_intrinsic
+                    }),
+                    check("constructor", &|v: Value| {
+                        v.is_heap() && v.heap_index() == self.promise_ctor_intrinsic
+                    }),
+                )
+            }
+            _ => (false, false),
+        };
+        if !(then_ok && ctor_ok) {
+            return false;
+        }
+        // %Promise%[@@species] must still be the intrinsic getter (the species
+        // lookup inside `then` would observably call a replacement).
+        match self.heap.get(self.promise_ctor_intrinsic) {
+            HeapObj::Object(m) => match m.pos("@@species") {
+                None => true,
+                Some(i) => {
+                    let v = m.val_at(i);
+                    m.attr_at(i).accessor
+                        && v.is_heap()
+                        && matches!(self.heap.get(v.heap_index()),
+                                    HeapObj::Native(id) if *id == native::SPECIES_GET)
+                }
+            },
+            _ => false,
+        }
+    }
+
+    /// %Promise.prototype%'s `then`/`constructor` are still the pristine
+    /// intrinsic data properties, and %Promise%[@@species] is still the
+    /// intrinsic getter — the shared half of the plain-promise fast-lane
+    /// gates (instance-independent).
+    ///
+    /// Answered from the resolved slots when they are warm (version compares
+    /// + slot reads — see [`PromisePristineSlots`]); a cold or invalidated
+    /// cache re-runs the full scan once and re-resolves. Single-realm by
+    /// construction: both the cache and the full proof only ever describe the
+    /// MAIN realm's `promise_proto`/`promise_ctor_intrinsic` anchors — a
+    /// createRealm/ShadowRealm child's promise carries the child's prototype
+    /// and already fails the callers' instance checks before reaching here.
+    pub(crate) fn promise_proto_pristine(&mut self) -> bool {
+        if self.promise_proto == 0 || self.promise_ctor_intrinsic == 0 {
+            return false;
+        }
+        if !promise_slot_cache_enabled() {
+            return self.promise_proto_pristine_uncached();
+        }
+        // Warm path. The lean prefix answers `Some(true)` when every guarded
+        // word is bit-identical to the fill-time proof and otherwise defers
+        // to the original slot re-check, which alone decides every other
+        // outcome (fast `false`, or `None` to re-prove).
+        let known = if pristine_lean_enabled() && self.promise_pristine_bit_identical() {
+            Some(true)
+        } else {
+            self.promise_pristine_from_slots()
+        };
+        if let Some(known) = known {
+            return known;
+        }
+        // Cold cache, or a guarded version moved: run the full proof and
+        // capture the slots for the next call. `None` (not pristine) leaves
+        // every call on the full proof — exactly the pre-cache behavior, and
+        // those calls take the generic promise paths anyway.
+        let slots = self.promise_pristine_resolve_slots();
+        self.promise_pristine_slots = slots;
+        slots.is_some()
+    }
+
+    /// The original linear proof, kept verbatim: the whole path under
+    /// `ZIPP_NO_PROMISE_SLOT_CACHE=1`, and the re-proof a cold or invalidated
+    /// slot cache falls back to (via `promise_pristine_resolve_slots`, which
+    /// mirrors it read-for-read).
+    fn promise_proto_pristine_uncached(&self) -> bool {
+        let proto_ok = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => {
+                let intrinsic = |key: &str, target: u32| {
+                    m.pos(key).is_some_and(|i| {
+                        !m.attr_at(i).accessor
+                            && m.val_at(i).is_heap()
+                            && m.val_at(i).heap_index() == target
+                    })
+                };
+                intrinsic("then", self.promise_then_intrinsic)
+                    && intrinsic("constructor", self.promise_ctor_intrinsic)
+            }
+            _ => false,
+        };
+        if !proto_ok {
+            return false;
+        }
+        match self.heap.get(self.promise_ctor_intrinsic) {
+            HeapObj::Object(m) => match m.pos("@@species") {
+                None => true,
+                Some(i) => {
+                    let v = m.val_at(i);
+                    m.attr_at(i).accessor
+                        && v.is_heap()
+                        && matches!(self.heap.get(v.heap_index()),
+                                    HeapObj::Native(id) if *id == native::SPECIES_GET)
+                }
+            },
+            _ => false,
+        }
+    }
+
+    /// Answer the pristine question from the resolved slots: `Some(answer)`
+    /// when the guards hold, `None` when the cache is cold or a guarded
+    /// object's version moved (the caller then re-runs the full proof).
+    ///
+    /// A matching version proves the slot INDICES still name their keys (all
+    /// structural mutation bumps — key add/delete, defineProperty, replace,
+    /// GC reuse). What versions do NOT guard is re-read on every call: an
+    /// in-place `vals[i] = v` data write deliberately bumps nothing
+    /// (access.rs: "no shape change, so no version bump"), so the accessor
+    /// bit and the value identity at each slot are always read fresh —
+    /// `Promise.prototype.then = f` is observed on the very next call.
+    #[inline]
+    fn promise_pristine_from_slots(&self) -> Option<bool> {
+        let c = self.promise_pristine_slots?;
+        if self.heap.version_of(self.promise_proto) != c.proto_version
+            || self.heap.version_of(self.promise_ctor_intrinsic) != c.ctor_version
+        {
+            return None;
+        }
+        let m = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => m,
+            // Unreachable under a matching version (`Heap::replace` bumps) —
+            // decline to the full proof rather than reason about it.
+            _ => return None,
+        };
+        let (ts, cs) = (c.then_slot as usize, c.ctor_slot as usize);
+        // Belt-and-braces: the versions say the layout is unchanged; verify
+        // the slots still name their keys anyway, so an un-bumped structural
+        // change could only ever cost a re-proof, never a wrong answer.
+        if m.keys.get(ts).map_or(true, |k| k != "then")
+            || m.keys.get(cs).map_or(true, |k| k != "constructor")
+        {
+            return None;
+        }
+        if m.attr_at(ts).accessor
+            || !m.val_at(ts).is_heap()
+            || m.val_at(ts).heap_index() != self.promise_then_intrinsic
+            || m.attr_at(cs).accessor
+            || !m.val_at(cs).is_heap()
+            || m.val_at(cs).heap_index() != self.promise_ctor_intrinsic
+        {
+            // The slots provably still name `then`/`constructor`, so this IS
+            // the full proof's answer: an in-place overwrite (or an attr
+            // flip) made the prototype non-pristine. The cache stays — a
+            // later in-place RESTORE of the intrinsic re-answers true.
+            return Some(false);
+        }
+        let mc = match self.heap.get(self.promise_ctor_intrinsic) {
+            HeapObj::Object(mc) => mc,
+            _ => return None,
+        };
+        match c.species {
+            // No `@@species` key at fill time; adding one (assignment can't —
+            // there is no setter to hit — so a define/key-add) bumps the ctor
+            // version, which already mismatched above if it happened.
+            None => Some(true),
+            Some((slot, getter, getter_version)) => {
+                let s = slot as usize;
+                if mc.keys.get(s).map_or(true, |k| k != "@@species") {
+                    return None;
+                }
+                if mc.attr_at(s).accessor
+                    && mc.val_at(s).is_heap()
+                    && mc.val_at(s).heap_index() == getter
+                    && self.heap.version_of(getter) == getter_version
+                {
+                    // The same getter object, un-replaced since fill proved
+                    // it `Native(SPECIES_GET)` — no `heap.get` needed.
+                    Some(true)
+                } else {
+                    // A DIFFERENT value here could still be pristine (any
+                    // other `Native(SPECIES_GET)` identity answers the same
+                    // question), so a mismatch is never a fast `false` —
+                    // re-prove in full and re-resolve.
+                    None
+                }
+            }
+        }
+    }
+
+    /// The lean warm re-check: true only when EVERY word the fill-time proof
+    /// read is bit-identical now — %Promise.prototype%'s and %Promise%'s
+    /// versions, the value bits at the `then`/`constructor` slots, their
+    /// accessor bits, and for `@@species` the slot's value bits, accessor bit
+    /// and the getter's version. A `false` here decides nothing: the caller
+    /// runs [`Self::promise_pristine_from_slots`] unchanged, so the fast
+    /// `false` for an in-place patch, the `None` that re-proves, and the
+    /// provenance of every answer are exactly what they were. This is a pure
+    /// prefix on the `true` side.
+    ///
+    /// What the original re-check spent per call that this does not: three
+    /// key-string compares (`keys[i] != "then"`, …), three `PropAttrs::at`
+    /// calls (an `assert!` + `match` the compiler keeps out of line — 3.5% of
+    /// `async-promise-chain`'s await part on their own), and `is_heap()` +
+    /// `heap_index()` unpacking before each identity compare. Here a slot's
+    /// value is one `u64` compare against the bits the proof saw (`Value:
+    /// PartialEq` is by bits), and an accessor bit is one direct read
+    /// (`ObjMap::is_accessor_at`).
+    ///
+    /// Why the key compares can go: a matching version proves the slot
+    /// indices still name their keys — every key add/delete/redefine,
+    /// `Heap::replace` and GC slot reuse bumps the owner — and compiled code
+    /// already relies on exactly that for MEMORY safety (a baked
+    /// `vals_ptr[slot]` under a version guard). The original re-check kept
+    /// them as belt-and-braces; this one trusts what the JIT trusts, and no
+    /// more. What a version does NOT guard — an in-place `vals[i] = v` from
+    /// the interpreter's `set_prop`, the JIT's `SetProp` own-data hit,
+    /// `Reflect.set`, `Object.assign`, … — is caught by the value compare
+    /// itself: any such write changes the bits. An accessor flip
+    /// (`defineProperty` with `get`) bumps, and the bit is re-read anyway.
+    ///
+    /// GC safety: nothing raw is held. Every read is a bounds-checked index
+    /// (`heap.get`, `version_of`, `val_at`) taken fresh on this call; the
+    /// bounds checks against `vals_len()` are belt-and-braces for a slot the
+    /// version already proves in range.
+    #[inline]
+    fn promise_pristine_bit_identical(&self) -> bool {
+        let Some(c) = self.promise_pristine_slots else {
+            return false;
+        };
+        if self.heap.version_of(self.promise_proto) != c.proto_version
+            || self.heap.version_of(self.promise_ctor_intrinsic) != c.ctor_version
+        {
+            return false;
+        }
+        let m = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => m,
+            _ => return false,
+        };
+        let (ts, cs) = (c.then_slot as usize, c.ctor_slot as usize);
+        if ts >= m.vals_len()
+            || cs >= m.vals_len()
+            || m.val_at(ts) != c.then_val
+            || m.val_at(cs) != c.ctor_val
+            || m.is_accessor_at(ts)
+            || m.is_accessor_at(cs)
+        {
+            return false;
+        }
+        match c.species {
+            // No `@@species` key at fill time: adding one bumps the ctor
+            // version, which already matched above.
+            None => true,
+            Some((slot, getter, getter_version)) => {
+                let mc = match self.heap.get(self.promise_ctor_intrinsic) {
+                    HeapObj::Object(mc) => mc,
+                    _ => return false,
+                };
+                let s = slot as usize;
+                s < mc.vals_len()
+                    && mc.val_at(s) == c.species_val
+                    && mc.is_accessor_at(s)
+                    && self.heap.version_of(getter) == getter_version
+            }
+        }
+    }
+
+    /// Run the FULL pristine proof — read-for-read the same checks as
+    /// `promise_proto_pristine_uncached` — and, when it holds, capture the
+    /// slot indices plus the version of every heap object the proof read:
+    /// %Promise.prototype%, %Promise%, and the @@species getter. `Some` is
+    /// "pristine, and how to re-check it warm"; `None` is "not pristine".
+    fn promise_pristine_resolve_slots(&self) -> Option<PromisePristineSlots> {
+        let m = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => m,
+            _ => return None,
+        };
+        let intrinsic_slot = |key: &str, target: u32| {
+            m.pos(key).filter(|&i| {
+                !m.attr_at(i).accessor
+                    && m.val_at(i).is_heap()
+                    && m.val_at(i).heap_index() == target
+            })
+        };
+        let then_slot = intrinsic_slot("then", self.promise_then_intrinsic)?;
+        let ctor_slot = intrinsic_slot("constructor", self.promise_ctor_intrinsic)?;
+        let mc = match self.heap.get(self.promise_ctor_intrinsic) {
+            HeapObj::Object(mc) => mc,
+            _ => return None,
+        };
+        let mut species_val = Value::UNDEFINED;
+        let species = match mc.pos("@@species") {
+            None => None,
+            Some(i) => {
+                let v = mc.val_at(i);
+                let pristine = mc.attr_at(i).accessor
+                    && v.is_heap()
+                    && matches!(self.heap.get(v.heap_index()),
+                                HeapObj::Native(id) if *id == native::SPECIES_GET);
+                if !pristine {
+                    return None;
+                }
+                species_val = v;
+                Some((
+                    i as u32,
+                    v.heap_index(),
+                    self.heap.version_of(v.heap_index()),
+                ))
+            }
+        };
+        Some(PromisePristineSlots {
+            proto_version: self.heap.version_of(self.promise_proto),
+            ctor_version: self.heap.version_of(self.promise_ctor_intrinsic),
+            then_slot: then_slot as u32,
+            ctor_slot: ctor_slot as u32,
+            species,
+            then_val: m.val_at(then_slot),
+            ctor_val: m.val_at(ctor_slot),
+            species_val,
+        })
+    }
+
+    /// True when promise `idx` is PLAIN for the TICK-NEUTRAL fast lanes
+    /// (PerformPromiseThen's SpeciesConstructor skip, Await's PromiseResolve
+    /// pass-through, the Promise.all element lane): a native HeapObj::Promise
+    /// whose [[Prototype]] is exactly %Promise.prototype% (the heap default,
+    /// or an explicit proto_of entry pointing there), with no own
+    /// `then`/`constructor`, on a pristine prototype/constructor
+    /// (`promise_proto_pristine`). Every Get those paths would perform is
+    /// then unobservable and yields the intrinsic. NOTE: unlike the (defunct)
+    /// resolve-adoption skip, the fast lanes gated on THIS predicate perform
+    /// the same number of ticks as the generic paths.
+    pub(crate) fn promise_plain_unobservable(&mut self, idx: u32) -> bool {
+        self.promise_instance_plain(idx) && self.promise_proto_pristine()
+    }
+
+    /// The instance half of [`Vm::promise_plain_unobservable`]: a native
+    /// promise whose [[Prototype]] is %Promise.prototype% and that has no own
+    /// `then` or `constructor`. A caller that already holds
+    /// `promise_proto_pristine()` for a stretch in which no user code runs
+    /// needs only this for each promise of the stretch.
+    pub(crate) fn promise_instance_plain(&self, idx: u32) -> bool {
+        if !matches!(self.heap.get(idx), HeapObj::Promise { .. }) {
+            return false;
+        }
+        match self.proto_of.get(&idx) {
+            // Absent ⇒ the HeapObj::Promise default, %Promise.prototype%.
+            None => {}
+            Some(p) if p.is_heap() && p.heap_index() == self.promise_proto => {}
+            _ => return false,
+        }
+        !self
+            .arr_props
+            .get(&idx)
+            .is_some_and(|m| m.pos("then").is_some() || m.pos("constructor").is_some())
+    }
+
+    /// JS `[[Resolve]]`: a thenable/Promise value is ADOPTED (p forwards when it
+    /// settles); a self-resolution rejects with a TypeError; else fulfill.
+    pub(crate) fn resolve(&mut self, p: u32, value: Value) {
+        if value.is_heap() {
+            if value.heap_index() == p {
+                let e =
+                    self.alloc_error_from_message("TypeError: Chaining cycle detected for promise");
+                self.reject(p, e);
+                return;
+            }
+            if matches!(self.heap.get(value.heap_index()), HeapObj::Promise { .. })
+                && self.promise_adoption_unobservable(value)
+            {
+                // A PLAIN native promise reached through the INTRINSIC `then`
+                // adopts state directly (a valid optimisation of the resolve
+                // procedure — no observable Get/call differs). A subclass
+                // instance or patched `then`/`constructor` must be OBSERVED
+                // instead — the spec does Get(resolution,"then") and enqueues
+                // PromiseResolveThenableJob, whose `then` call runs
+                // SpeciesConstructor — so those fall through to the generic
+                // thenable adoption below.
+                let inner = value.heap_index();
+                self.then_internal(inner, Value::UNDEFINED, Value::UNDEFINED, Some(p));
+                return;
+            }
+            // Thenable adoption (the Promise resolve function, steps 8-12): an
+            // object with a callable `then` is adopted — defer
+            // `then.call(value, resolveFn, rejectFn)` to a microtask (spec ordering).
+            // A throwing `then` GETTER rejects the promise.
+            if self.is_object_value(value) {
+                let then = match self.get_prop(value, "then") {
+                    Ok(t) => t,
+                    Err(Thrown(msg)) => {
+                        let e = match self.pending_throw.take() {
+                            Some(v) => v,
+                            None => self.alloc_error_from_message(&msg),
+                        };
+                        self.reject(p, e);
+                        return;
+                    }
+                };
+                if self.is_callable(then) {
+                    self.microtasks.push_back(Microtask::ThenableJob {
+                        thenable: value,
+                        then,
+                        promise: p,
+                        resolve: Value::UNDEFINED,
+                        reject: Value::UNDEFINED,
+                    });
+                    return;
+                }
+            }
+        }
+        self.settle(p, PromiseState::Fulfilled, value);
+    }
+
+    pub(crate) fn reject(&mut self, p: u32, reason: Value) {
+        self.settle(p, PromiseState::Rejected, reason);
+    }
+
+    /// Reject `p` because the JOB that was running threw: a reaction or
+    /// `finally` callback, a `then` called by PromiseResolveThenableJob, or an
+    /// async function/generator body reaching an uncaught exception.
+    ///
+    /// Only these rejections can be a guest assertion escaping into a later
+    /// job, so only these are recorded for the Test262 host report (see
+    /// `report_unhandled_errors`). A promise rejected by an explicit
+    /// `reject(value)` call is ordinary data flow that Test262 does not score:
+    /// built-ins/Promise/all/invoke-then-error-close.js and about fifteen
+    /// siblings reject with a `Test262Error` ON PURPOSE and never handle it.
+    fn reject_thrown_job(&mut self, p: u32, reason: Value) {
+        let previous = std::mem::replace(&mut self.rejecting_thrown_job, true);
+        self.reject(p, reason);
+        self.rejecting_thrown_job = previous;
+    }
+
+    /// Keep heap Values owned only by a Promise abstract operation's Rust locals
+    /// alive across re-entrant JavaScript. This is deliberately narrower than
+    /// `gc_lock_guard`: user code may run and the collector may reclaim everything
+    /// except these Values and the ordinary VM roots.
+    pub(crate) fn with_promise_operation_roots<R>(
+        &mut self,
+        roots: &[Value],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let base = self.promise_resolution_roots.len();
+        self.promise_resolution_roots.extend(
+            roots
+                .iter()
+                .filter(|value| value.is_heap())
+                .map(|value| value.heap_index()),
+        );
+        let result = f(self);
+        debug_assert!(self.promise_resolution_roots.len() >= base);
+        self.promise_resolution_roots.truncate(base);
+        result
+    }
+
+    /// Keep a promise target live while an abstract operation still owns it only
+    /// in a Rust local. The closure form also covers work which runs *before*
+    /// `resolve` (Promise executors / Promise.try callbacks).
+    pub(crate) fn with_promise_resolution_root<R>(
+        &mut self,
+        p: u32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_promise_operation_roots(&[Value::heap(p)], f)
+    }
+
+    /// Resolve a freshly allocated (or temporarily unpublished) promise.
+    /// `resolve` may invoke an arbitrary `then` getter before it queues the
+    /// ThenableJob; keep the target live without suppressing collection.
+    pub(crate) fn resolve_fresh_promise(&mut self, p: u32, value: Value) {
+        if value.is_heap() && self.is_object_value(value) {
+            self.with_promise_resolution_root(p, |vm| vm.resolve(p, value));
+        } else {
+            // Heap-backed strings/symbols/bigints are still primitives: no
+            // `then` lookup or callback can occur, so avoid charging them for
+            // a root-stack push just because their representation is a slot.
+            self.resolve(p, value);
+        }
+    }
+
+    /// Register reactions on `p` (creating/reusing the dependent promise `into`),
+    /// or schedule a microtask immediately if `p` is already settled. Returns the
+    /// dependent promise's heap index. The basis of `.then`/`.catch`/`.finally`
+    /// and of internal promise adoption.
+    pub(crate) fn then_internal(
+        &mut self,
+        p: u32,
+        on_f: Value,
+        on_r: Value,
+        into: Option<u32>,
+    ) -> u32 {
+        let dep = into.unwrap_or_else(|| self.alloc_promise());
+        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 — `.then`
+        // on an old promise with young callbacks / dependent.
+        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, on_f);
+        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, on_r);
+        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, Value::heap(dep));
+        let (state, result) = match self.heap.get(p) {
+            HeapObj::Promise { state, result, .. } => (*state, *result),
+            _ => return dep,
+        };
+        match state {
+            PromiseState::Pending => {
+                if let HeapObj::Promise {
+                    reactions, handled, ..
+                } = self.heap.get_mut(p)
+                {
+                    asyncstats::subscribe(reactions.is_empty());
+                    reactions.push(ReactionPair {
+                        on_fulfilled: on_f,
+                        on_rejected: on_r,
+                        dependent: dep,
+                        finally: false,
+                        is_async: false,
+                        is_combinator_all: false,
+                    });
+                    // PerformPromiseThen marks the promise handled with or
+                    // without an onRejected: a rejection then flows to the
+                    // dependent, and that is the promise that goes unhandled
+                    // (internal adoption passes no handlers at all).
+                    *handled = true;
+                }
+            }
+            PromiseState::Fulfilled => {
+                self.microtasks.push_back(Microtask::Reaction {
+                    callback: on_f,
+                    arg: result,
+                    dependent: dep,
+                    kind: ReactionKind::Fulfill,
+                    finally: false,
+                });
+            }
+            PromiseState::Rejected => {
+                if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p) {
+                    *handled = true;
+                }
+                self.microtasks.push_back(Microtask::Reaction {
+                    callback: on_r,
+                    arg: result,
+                    dependent: dep,
+                    kind: ReactionKind::Reject,
+                    finally: false,
+                });
+            }
+        }
+        dep
+    }
+
+    /// A warm proof for skipping unobservable method/species lookups. Be
+    /// conservative once another realm exists, and require an own species
+    /// getter: an absent own property could expose an inherited accessor.
+    #[cfg_attr(feature = "wasm-lite", inline)]
+    #[cfg_attr(not(feature = "wasm-lite"), inline(always))]
+    pub(crate) fn promise_inline_plain(&mut self, idx: u32) -> bool {
+        super::builtins::promise_pristine_enabled()
+            && self.promise_pristine_slots.is_some()
+            && self.realm_global_objs.is_empty()
+            && self.active_realm.is_none()
+            && self.promise_plain_unobservable(idx)
+            && self.promise_pristine_slots.is_some_and(|c| c.species.is_some())
+    }
+
+    /// Register handlers after `promise_plain_unobservable` has proved the
+    /// default species. Keep proof and registration adjacent: no guest code
+    /// may execute between them. Callable checks do not invoke proxy traps.
+    #[inline(always)]
+    pub(crate) fn perform_plain_promise_then(
+        &mut self,
+        idx: u32,
+        on_f: Value,
+        on_r: Value,
+    ) -> Value {
+        let on_f = if self.is_callable(on_f) { on_f } else { Value::UNDEFINED };
+        let on_r = if self.is_callable(on_r) { on_r } else { Value::UNDEFINED };
+        Value::heap(self.then_internal(idx, on_f, on_r, None))
+    }
+
+    /// `Promise.prototype.{then,catch}` PerformPromiseThen with SpeciesConstructor.
+    /// C = SpeciesConstructor(promise, %Promise%) — a throwing/poisoned/non-object
+    /// `constructor` or a throwing `@@species` propagates here (before any reaction
+    /// is queued). When C is the built-in %Promise% the native fast path is kept
+    /// (a plain dependent promise, no capability). Otherwise NewPromiseCapability(C)
+    /// builds the result; for a Promise subclass the capability promise is a native
+    /// HeapObj::Promise, so the reactions settle it directly (matching
+    /// `promise_combine`); the constructed promise is returned verbatim.
+    pub(crate) fn perform_promise_then(
+        &mut self,
+        idx: u32,
+        on_f: Value,
+        on_r: Value,
+    ) -> Result<Value, Thrown> {
+        // PLAIN promise fast lane: when the receiver's [[Prototype]] is
+        // exactly %Promise.prototype% with no own `constructor`, and the
+        // prototype's `constructor` / %Promise%[@@species] are the pristine
+        // intrinsics, SpeciesConstructor(promise, %Promise%) is %Promise%
+        // with every Get unobservable — skip the two Gets + the species
+        // getter call and build the plain native dependent directly
+        // (tick-identical to the generic path below).
+        if self.promise_plain_unobservable(idx) {
+            return Ok(self.perform_plain_promise_then(idx, on_f, on_r));
+        }
+        let c = self.promise_species_constructor(Value::heap(idx))?;
+        // PerformPromiseThen steps 3-4: a NON-CALLABLE handler is Identity /
+        // Thrower — `then_internal`'s undefined callback is exactly that
+        // pass-through (so `p.then(3, 5)` forwards instead of throwing).
+        let on_f = if self.is_callable(on_f) {
+            on_f
+        } else {
+            Value::UNDEFINED
+        };
+        let on_r = if self.is_callable(on_r) {
+            on_r
+        } else {
+            Value::UNDEFINED
+        };
+        if c == self.promise_ctor_value() {
+            let dep = self.then_internal(idx, on_f, on_r, None);
+            return Ok(Value::heap(dep));
+        }
+        let (cap_promise, cap_resolve, cap_reject) = self.new_promise_capability(c)?;
+        if cap_promise.is_heap()
+            && matches!(
+                self.heap.get(cap_promise.heap_index()),
+                HeapObj::Promise { .. }
+            )
+        {
+            self.then_internal(idx, on_f, on_r, Some(cap_promise.heap_index()));
+        } else {
+            // An EXOTIC capability promise (the constructor returned a plain
+            // object): reactions can't settle it as a native promise — route
+            // them through the CAPTURED resolve/reject functions via
+            // CAP_REACTION wrappers (called in the reaction job itself). The
+            // throwaway native dependent only receives the wrappers' undefined.
+            let _gc = self.gc_lock_guard(); // cap_* held across allocs
+            let f_native = Value::heap(self.heap.alloc(HeapObj::Native(native::CAP_REACTION)));
+            let r_native = Value::heap(self.heap.alloc(HeapObj::Native(native::CAP_REACTION)));
+            let f_cb = Value::heap(self.heap.alloc(HeapObj::Bound {
+                target: f_native,
+                this: Value::UNDEFINED,
+                args: vec![on_f, cap_resolve, cap_reject, Value::FALSE],
+            }));
+            let r_cb = Value::heap(self.heap.alloc(HeapObj::Bound {
+                target: r_native,
+                this: Value::UNDEFINED,
+                args: vec![on_r, cap_resolve, cap_reject, Value::TRUE],
+            }));
+            let dep = self.alloc_promise();
+            self.then_internal(idx, f_cb, r_cb, Some(dep));
+        }
+        Ok(cap_promise)
+    }
+
+    /// SpeciesConstructor(promise, %Promise%) for `finally`: the receiver's
+    /// `constructor`'s `@@species` (defaulting to %Promise% when either is absent),
+    /// throwing a TypeError for a non-object `constructor` or a non-constructor
+    /// `@@species`.
+    pub(crate) fn promise_species_constructor(&mut self, this: Value) -> Result<Value, Thrown> {
+        let c = self.get_prop(this, "constructor")?;
+        if c == Value::UNDEFINED {
+            return Ok(self.promise_ctor_value());
+        }
+        if !self.is_object_value(c) {
+            return Err(Thrown::from_static(
+                "TypeError: Promise.prototype.finally: constructor is not an object",
+            ));
+        }
+        let s = self.get_prop(c, "@@species")?;
+        if s == Value::UNDEFINED || s == Value::NULL {
+            return Ok(self.promise_ctor_value());
+        }
+        if !self.is_constructor(s) {
+            return Err(Thrown::from_static(
+                "TypeError: Promise.prototype.finally: @@species is not a constructor",
+            ));
+        }
+        Ok(s)
+    }
+
+    /// `Promise.prototype.finally(onFinally)` — the generic spec algorithm. Rather
+    /// than touching internal slots, it Invokes the receiver's OWN `then` with
+    /// ThenFinally/CatchFinally wrappers, so an overridden / non-callable / poisoned
+    /// `then`, a thenable receiver, and a custom species constructor are all
+    /// observed. When `onFinally` is not callable it is passed through as both
+    /// handlers (matching the spec). The wrappers are native FINALLY_THEN/CATCH
+    /// functions bound to `[onFinally, C]` (see `call_native`).
+    pub(crate) fn promise_finally(
+        &mut self,
+        this: Value,
+        on_finally: Value,
+    ) -> Result<Value, Thrown> {
+        if !self.is_object_value(this) {
+            return Err(Thrown::from_static(
+                "TypeError: Promise.prototype.finally called on a non-object",
+            ));
+        }
+        let plain = self.promise_inline_plain(this.heap_index());
+        let ctor = if plain { self.promise_ctor_value() } else { self.promise_species_constructor(this)? };
+        let (then_finally, catch_finally) = if !self.is_callable(on_finally) {
+            (on_finally, on_finally)
+        } else {
+            let then_native = Value::heap(self.heap.alloc(HeapObj::Native(native::FINALLY_THEN)));
+            let catch_native = Value::heap(self.heap.alloc(HeapObj::Native(native::FINALLY_CATCH)));
+            let tf = Value::heap(self.heap.alloc(HeapObj::Bound {
+                target: then_native,
+                this: Value::UNDEFINED,
+                args: vec![on_finally, ctor],
+            }));
+            let cf = Value::heap(self.heap.alloc(HeapObj::Bound {
+                target: catch_native,
+                this: Value::UNDEFINED,
+                args: vec![on_finally, ctor],
+            }));
+            (tf, cf)
+        };
+        // Hold the un-rooted wrapper Values across the `then` getter / invocation.
+        let _gc = self.gc_lock_guard();
+        if plain {
+            // Wrapper allocation cannot execute guest code, so the entry proof
+            // still holds. The wrappers themselves re-check later effects.
+            return Ok(self.perform_plain_promise_then(this.heap_index(), then_finally, catch_finally));
+        }
+        let then = self.get_prop(this, "then")?;
+        self.call_value(then, this, &[then_finally, catch_finally])
+    }
+
+    // ── async functions ──
+
+    /// Build a suspended `async function` activation and run it synchronously up
+    /// to its first `await` (or to completion / a throw). Returns the activation's
+    /// result Promise — the value an `async` call evaluates to.
+    pub(crate) fn alloc_async(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this: Value,
+        args: &[Value],
+    ) -> Value {
+        let gen_callee = std::mem::replace(&mut self.pending_gen_callee, Value::UNDEFINED);
+        // An async arrow captures `this` lexically (call sites pass UNDEFINED/recv).
+        let this = self.rebind_arrow_this(func_id, closure, this);
+        let proto = self.func(func_id as usize);
+        let reg_count = (proto.reg_count as usize).max(1);
+        let param_count = proto.param_count as usize;
+        let rest_reg = proto.rest_reg;
+        let arguments_reg = proto.arguments_reg;
+        // OrdinaryCallBindThis: a SLOPPY (non-arrow) generator/async invoked
+        // with a nullish `this` binds the global object; a primitive boxes.
+        let this = if !proto.lexical_this
+            && !proto.is_strict
+            && this.is_nullish()
+            && self.global_this != 0
+        {
+            Value::heap(self.global_this)
+        } else if !proto.lexical_this
+            && !proto.is_strict
+            && !self.is_object_value(this)
+            && self.global_this != 0
+        {
+            self.to_object(this).unwrap_or(this)
+        } else {
+            this
+        };
+        let mut regs = vec![Value::UNDEFINED; reg_count];
+        regs[0] = this;
+        let n = args.len().min(param_count);
+        regs[1..1 + n].copy_from_slice(&args[..n]);
+        if let Some(rr) = rest_reg {
+            let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
+            regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+        }
+        // `arguments` (an async function that references it) — the spec-shaped
+        // object, MAPPED for a sloppy callee with simple params. No frame exists
+        // yet (drive_async pushes one per resumption and re-links), so the map
+        // starts parked on a dead frame index.
+        let mut args_obj = u32::MAX;
+        if let Some(areg) = arguments_reg {
+            let (is_strict, simple) = {
+                let p = self.func(func_id as usize);
+                (p.is_strict, p.simple_params)
+            };
+            let mapinfo = (!is_strict && simple).then(|| (usize::MAX, 0usize, param_count));
+            let arr = self.build_arguments_object(args.to_vec(), gen_callee, is_strict, mapinfo);
+            regs[areg as usize] = arr;
+            if mapinfo.is_some() {
+                args_obj = arr.heap_index();
+            }
+        }
+        let result = self.alloc_promise();
+        // A MODULE BODY activation: its result promise settles with undefined
+        // (spec Evaluate() capability), never the body's completion value.
+        if std::mem::take(&mut self.pending_module_body_marker) {
+            self.module_body_results.insert(result);
+        }
+        let idx = self
+            .heap
+            .alloc(HeapObj::AsyncState(Box::new(AsyncStateData {
+                func: func_id,
+                closure,
+                callee: gen_callee,
+                // `usize::MAX` = not-yet-started — distinct from a genuine yield/await
+                // parked at ip 0 (which previously collided with this sentinel and made
+                // the resume re-run from the top).
+                state: GenState::Suspended(usize::MAX),
+                regs,
+                result,
+                handlers: Vec::new(),
+            })));
+        // GC roots suspended activations from this registry instead of scanning
+        // the whole heap every collection; see `Vm::async_activations`.
+        self.async_activations.push(idx);
+        if args_obj != u32::MAX {
+            // Mapped arguments: every drive re-links the [[ParameterMap]] to
+            // the freshly spliced window.
+            self.gen_args_obj.insert(idx, args_obj);
+        }
+        // Run from the top until the first await suspends it (or it finishes —
+        // settling `result` either way).
+        self.drive_async(idx, Resume::Value(Value::UNDEFINED));
+        Value::heap(result)
+    }
+
+    /// Calling an `async function*` builds a suspended AsyncGenerator (an async
+    /// iterator). Like a sync generator, its parameter prologue (defaults +
+    /// destructuring) runs EAGERLY here at call time — so a destructuring throw
+    /// surfaces synchronously from the call — and it is parked at the `GenStart`
+    /// body-entry marker; the body itself does NOT run until the first `.next()`.
+    pub(crate) fn alloc_async_generator(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        let gen_callee = std::mem::replace(&mut self.pending_gen_callee, Value::UNDEFINED);
+        let proto = self.func(func_id as usize);
+        let reg_count = (proto.reg_count as usize).max(1);
+        let param_count = proto.param_count as usize;
+        let rest_reg = proto.rest_reg;
+        let arguments_reg = proto.arguments_reg;
+        // OrdinaryCallBindThis: a SLOPPY (non-arrow) generator/async invoked
+        // with a nullish `this` binds the global object; a primitive boxes.
+        let this = if !proto.lexical_this
+            && !proto.is_strict
+            && this.is_nullish()
+            && self.global_this != 0
+        {
+            Value::heap(self.global_this)
+        } else if !proto.lexical_this
+            && !proto.is_strict
+            && !self.is_object_value(this)
+            && self.global_this != 0
+        {
+            self.to_object(this).unwrap_or(this)
+        } else {
+            this
+        };
+        let mut regs = vec![Value::UNDEFINED; reg_count];
+        regs[0] = this;
+        let n = args.len().min(param_count);
+        regs[1..1 + n].copy_from_slice(&args[..n]);
+        if let Some(rr) = rest_reg {
+            let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
+            regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+        }
+        // `arguments` (an async generator that references it).
+        if let Some(areg) = arguments_reg {
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+            regs[areg as usize] = arr;
+        }
+        // Run the parameter prologue up to `GenStart` (see `alloc_generator`).
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            return Err(Thrown::from_static(
+                "RangeError: Maximum call stack size exceeded",
+            ));
+        }
+        self.regs.extend_from_slice(&regs);
+        self.bump_regs_hw(new_base + reg_count);
+        let stop = self.frames.len();
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: 0,
+            closure,
+            handlers: Vec::new(),
+            new_target: Value::UNDEFINED,
+            callee: gen_callee,
+        });
+        let outcome = self.run_loop(stop);
+        self.pending_yield_eval_scope = u32::MAX;
+        let (state, regs) = if let Some((_v, genstart_ip)) = self.pending_yield.take() {
+            // Suspended at `GenStart`: park at the marker, body runs on first next().
+            (
+                GenState::Suspended(genstart_ip),
+                self.regs.split_off(new_base),
+            )
+        } else {
+            // The prologue threw (propagate at the call) or, defensively, the body
+            // ran to completion (a proto with no `GenStart`).
+            self.regs.truncate(new_base);
+            match outcome {
+                Ok(_) => (GenState::Completed, Vec::new()),
+                Err(t) => return Err(t),
+            }
+        };
+        let ag = self
+            .heap
+            .alloc(HeapObj::AsyncGenerator(Box::new(AsyncGenState {
+                func: func_id,
+                closure,
+                state,
+                regs,
+                handlers: Vec::new(),
+                queue: std::collections::VecDeque::new(),
+                awaiting_return: false,
+            })));
+        self.async_activations.push(ag);
+        // OrdinaryCreateFromConstructor: honor the callee's `prototype`
+        // object; the HeapObj::AsyncGenerator fallback stays %AsyncGenProto%.
+        // A REALM-BORN async generator function with a NON-OBJECT `prototype`
+        // falls back to GetFunctionRealm's %AsyncGeneratorPrototype% image.
+        if let Some(p) = self.prototype_of(gen_callee) {
+            self.proto_of.insert(ag, p);
+        } else if !self.realm_global_objs.is_empty() {
+            if let Some(rp) = self.realm_proto_fallback(gen_callee, self.asyncgen_proto) {
+                self.proto_of.insert(ag, Value::heap(rp));
+            }
+        }
+        if gen_callee != Value::UNDEFINED {
+            // Resumes re-bind this as Frame.callee (LoadCallee identity).
+            self.gen_callee.insert(ag, gen_callee);
+        }
+        Ok(Value::heap(ag))
+    }
+
+    /// `.next()`/`.return()`/`.throw()` on an async generator. Each returns a
+    /// Promise that settles when its request is serviced (AsyncGeneratorEnqueue:
+    /// EVERY request — including return/throw on a running or completed
+    /// generator — is appended to the FIFO queue; `async_gen_service_queue`
+    /// then makes progress unless a step is already in flight).
+    pub(crate) fn async_generator_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Option<Value> {
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let kind = match name {
+            "next" => 0u8,
+            "throw" => 1,
+            "return" => 2,
+            _ => return None,
+        };
+        let p = self.alloc_promise();
+        // Nursery barrier: the request (arg + fresh promise) enters an
+        // async generator that may have survived a collection. Holder-grain:
+        // `p` is always young here, so the card fires on any old holder.
+        self.heap.write_barrier(idx);
+        match self.heap.get_mut(idx) {
+            HeapObj::AsyncGenerator(g) => g.queue.push_back(crate::heap::AsyncGenRequest {
+                kind,
+                arg: arg0,
+                promise: p,
+            }),
+            _ => return None,
+        }
+        self.async_gen_service_queue(idx);
+        Some(Value::heap(p))
+    }
+
+    /// Service the request queue (AsyncGeneratorResumeNext + DrainQueue): settle
+    /// requests a COMPLETED generator answers directly (next → `{undefined,
+    /// done:true}`, throw → reject), and start at most ONE resumption when the
+    /// generator is idle at a suspension point — `next`/`throw` resume the body,
+    /// `return` first awaits its argument (`async_gen_await_return`). A generator
+    /// that is Running, parked at a body `await`, or already awaiting-return is
+    /// left alone: the in-flight step re-enters here when it settles.
+    pub(crate) fn async_gen_service_queue(&mut self, idx: u32) {
+        loop {
+            let (state, fid, awaiting, front) = match self.heap.get(idx) {
+                HeapObj::AsyncGenerator(g) => (
+                    g.state,
+                    g.func,
+                    g.awaiting_return,
+                    g.queue.front().map(|r| (r.kind, r.arg, r.promise)),
+                ),
+                _ => return,
+            };
+            if awaiting {
+                return;
+            }
+            let Some((kind, arg, p)) = front else { return };
+            match state {
+                GenState::Running => return,
+                GenState::Completed => match kind {
+                    0 => {
+                        self.async_gen_pop_front(idx);
+                        let r = self.iter_result(Value::UNDEFINED, true);
+                        self.resolve_fresh_promise(p, r);
+                    }
+                    1 => {
+                        self.async_gen_pop_front(idx);
+                        self.reject(p, arg);
+                    }
+                    _ => {
+                        // 'awaiting-return': even a completed generator awaits the
+                        // return value before resolving `{value, done:true}`.
+                        self.async_gen_await_return(idx, arg);
+                        return;
+                    }
+                },
+                GenState::Suspended(ip) => {
+                    let op = self.func(fid as usize).code.get(ip);
+                    let at_start = ip == 0 || matches!(op, Some(Instr::GenStart));
+                    let at_yield = matches!(
+                        op,
+                        Some(Instr::Yield { .. } | Instr::AsyncYieldDelegate { .. })
+                    );
+                    if at_start {
+                        match kind {
+                            0 => return self.drive_async_gen(idx, Resume::Value(arg)),
+                            1 => {
+                                // throw before the body starts: no handler can exist
+                                // yet — complete and reject (the body never runs).
+                                self.async_gen_complete(idx);
+                                self.async_gen_pop_front(idx);
+                                self.reject(p, arg);
+                            }
+                            _ => {
+                                self.async_gen_await_return(idx, arg);
+                                return;
+                            }
+                        }
+                    } else if at_yield {
+                        match kind {
+                            0 => return self.drive_async_gen(idx, Resume::Value(arg)),
+                            // throw into the suspended body: the parked handlers make
+                            // try/catch/finally spanning the yield run.
+                            1 => return self.drive_async_gen(idx, Resume::Throw(arg)),
+                            // AsyncGeneratorUnwrapYieldResumption: Await(arg) FIRST,
+                            // then deliver a return completion (or the rejection as a
+                            // throw) — drive_async_gen's awaiting-return entry.
+                            _ => {
+                                self.async_gen_await_return(idx, arg);
+                                return;
+                            }
+                        }
+                    } else {
+                        // Parked at a body `await`: a request is in flight; its
+                        // settlement resumes the body and re-services the queue.
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pop the front request (its promise is being settled by the caller).
+    fn async_gen_pop_front(&mut self, idx: u32) {
+        if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+            g.queue.pop_front();
+        }
+    }
+
+    /// Mark the generator completed, discarding its parked window + handlers.
+    fn async_gen_complete(&mut self, idx: u32) {
+        if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+            g.state = GenState::Completed;
+            g.regs.clear();
+            g.handlers.clear();
+        }
+    }
+
+    /// AsyncGeneratorAwaitReturn / the Await step of UnwrapYieldResumption: start
+    /// the one-tick await of the front `.return(value)` argument. Marks the
+    /// generator awaiting-return (requests arriving meanwhile only enqueue) and
+    /// subscribes it to PromiseResolve(value) — replicating the `Await` op's
+    /// OBSERVABLE constructor read for a native promise here, in the caller's
+    /// (native / microtask) context, never inside the drive completion path. The
+    /// settlement re-enters `drive_async_gen`, whose awaiting-return entry routes
+    /// it; an abrupt PromiseResolve delivers an immediate throw completion.
+    fn async_gen_await_return(&mut self, idx: u32, arg: Value) {
+        if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+            g.awaiting_return = true;
+        }
+        let is_promise =
+            arg.is_heap() && matches!(self.heap.get(arg.heap_index()), HeapObj::Promise { .. });
+        let p = if is_promise {
+            match self.get_prop(arg, "constructor") {
+                Ok(c) => {
+                    let intrinsic = self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                    if c == intrinsic {
+                        arg.heap_index()
+                    } else {
+                        let p = self.alloc_promise();
+                        self.resolve_fresh_promise(p, arg);
+                        p
+                    }
+                }
+                Err(Thrown(msg)) => {
+                    let e = self.take_thrown(&msg);
+                    self.drive_async_gen(idx, Resume::Throw(e));
+                    return;
+                }
+            }
+        } else {
+            self.to_promise(arg)
+        };
+        self.settle_subscribe(p, idx);
+    }
+
+    /// Advance an async generator: run its body until the next `yield` (resolve
+    /// the front queued promise with `{value, done:false}`), `await` (park +
+    /// subscribe, the promise stays pending), or return/throw (settle), then
+    /// service any remaining queued requests. `input` delivers the `.next()`
+    /// argument, a settled awaited value/throw, or a return completion
+    /// (`Resume::Return`, from `.return()` once its argument has been awaited).
+    pub(crate) fn drive_async_gen(&mut self, idx: u32, mut input: Resume) {
+        // An awaiting-return settlement (AsyncGeneratorAwaitReturn / the Await of
+        // UnwrapYieldResumption — `async_gen_await_return`): route per the parked
+        // state. Suspended at a yield ⇒ resume the body with a RETURN completion
+        // (or the rejection as a throw, into try/catch/finally); otherwise
+        // (suspendedStart / completed) settle the front `.return()` request
+        // directly with `{awaited, done: true}` / the rejection.
+        let awaiting = matches!(
+            self.heap.get(idx),
+            HeapObj::AsyncGenerator(g) if g.awaiting_return
+        );
+        if awaiting {
+            if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                g.awaiting_return = false;
+            }
+            let at_yield = match self.heap.get(idx) {
+                HeapObj::AsyncGenerator(g) => {
+                    let fid = g.func;
+                    matches!(g.state, GenState::Suspended(ip)
+                        if matches!(self.func(fid as usize).code.get(ip),
+                            Some(Instr::Yield { .. } | Instr::AsyncYieldDelegate { .. })))
+                }
+                _ => false,
+            };
+            if at_yield {
+                input = match input {
+                    Resume::Value(v) => Resume::Return(v),
+                    other => other, // a rejection throws in at the yield point
+                };
+                // fall through to the normal resume below
+            } else {
+                self.async_gen_complete(idx);
+                let front = match self.heap.get(idx) {
+                    HeapObj::AsyncGenerator(g) => g.queue.front().map(|r| r.promise),
+                    _ => None,
+                };
+                self.async_gen_pop_front(idx);
+                if let Some(p) = front {
+                    match input {
+                        Resume::Value(v) | Resume::Return(v) => {
+                            let r = self.iter_result(v, true);
+                            self.resolve_fresh_promise(p, r);
+                        }
+                        Resume::Throw(e) => self.reject(p, e),
+                    }
+                }
+                self.async_gen_service_queue(idx);
+                return;
+            }
+        }
+        let (state, fid, closure) = match self.heap.get(idx) {
+            HeapObj::AsyncGenerator(g) => (g.state, g.func, g.closure),
+            _ => return,
+        };
+        let resume_ip = match state {
+            GenState::Completed => return self.async_gen_service_queue(idx),
+            GenState::Running => return, // re-entrant; will resume when current settles
+            GenState::Suspended(ip) => ip,
+        };
+        // Nothing queued ⇒ idle until a `.next()` arrives.
+        if matches!(self.heap.get(idx), HeapObj::AsyncGenerator(g) if g.queue.is_empty()) {
+            return;
+        }
+        let (saved, saved_handlers) = match self.heap.get_mut(idx) {
+            HeapObj::AsyncGenerator(g) => {
+                g.state = GenState::Running;
+                (std::mem::take(&mut g.regs), std::mem::take(&mut g.handlers))
+            }
+            _ => return,
+        };
+        let reg_count = saved.len();
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                g.state = GenState::Completed;
+                g.regs.clear();
+            }
+            let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+            let front = match self.heap.get(idx) {
+                HeapObj::AsyncGenerator(g) => g.queue.front().map(|r| r.promise),
+                _ => None,
+            };
+            if let Some(p) = front {
+                self.async_gen_pop_front(idx);
+                self.reject_thrown_job(p, e);
+            }
+            self.async_gen_service_queue(idx);
+            return;
+        }
+        self.regs.extend_from_slice(&saved);
+        self.bump_regs_hw(new_base + reg_count);
+        let stop = self.frames.len();
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
+            func: fid,
+            base: new_base,
+            ip: 0,
+            ret_dst: 0,
+            closure,
+            handlers: saved_handlers,
+            new_target: Value::UNDEFINED,
+            // The creating call's function value (named fn-expression
+            // self-name identity survives suspension).
+            callee: self
+                .gen_callee
+                .get(&idx)
+                .copied()
+                .unwrap_or(Value::UNDEFINED),
+        });
+        // Resume after the suspending op, delivering the sent/awaited value. The
+        // op at `resume_ip` is a Yield (resumed by `.next(v)`) or Await (resumed
+        // by a settled promise) — both write the value into the op's `dst`.
+        // A `GenStart` marker means freshly constructed (the prologue already ran
+        // eagerly at the call): run the body from just past it with no value
+        // delivery. (The legacy `0` sentinel — a proto with no marker — runs from
+        // the top.)
+        let is_genstart = matches!(
+            self.func(fid as usize).code.get(resume_ip),
+            Some(Instr::GenStart)
+        );
+        let outcome = if is_genstart {
+            self.frames[stop].ip = resume_ip + 1;
+            self.run_loop(stop)
+        } else if resume_ip == 0 {
+            self.run_loop(stop)
+        } else {
+            match input {
+                Resume::Value(v) => {
+                    // A `.next(v)` resume: deliver v. At an AsyncYieldDelegate also set
+                    // its mode register to 0 (next) so the yield* loop continues.
+                    match self.func(fid as usize).code[resume_ip] {
+                        Instr::AsyncYieldDelegate {
+                            mode_dst, val_dst, ..
+                        } => {
+                            self.regs[new_base + mode_dst as usize] = Value::int(0);
+                            self.regs[new_base + val_dst as usize] = v;
+                        }
+                        Instr::Yield { dst, .. } | Instr::Await { dst, .. } => {
+                            self.regs[new_base + dst as usize] = v;
+                        }
+                        _ => {}
+                    }
+                    self.frames[stop].ip = resume_ip + 1;
+                    self.run_loop(stop)
+                }
+                Resume::Return(v) => {
+                    // A `.return(v)` resume (its value already awaited). At an async
+                    // yield* delegate: set mode 2 (return) + the value, so the loop
+                    // delegates to inner.return. At a plain Yield: inject a RETURN
+                    // completion — run any `finally` spanning the yield (the body
+                    // may re-suspend / override the completion there); with none,
+                    // the generator completes with `v` (the Ok arm below resolves
+                    // the front request `{v, done: true}`).
+                    if let Instr::AsyncYieldDelegate {
+                        mode_dst, val_dst, ..
+                    } = self.func(fid as usize).code[resume_ip]
+                    {
+                        self.regs[new_base + mode_dst as usize] = Value::int(2);
+                        self.regs[new_base + val_dst as usize] = v;
+                        self.frames[stop].ip = resume_ip + 1;
+                        self.run_loop(stop)
+                    } else if let Some(target) = self.route_through_finally(1, v) {
+                        self.frames[stop].ip = target as usize;
+                        self.run_loop(stop)
+                    } else {
+                        self.frames.pop();
+                        self.regs.truncate(new_base);
+                        Ok(v)
+                    }
+                }
+                Resume::Throw(e) => {
+                    self.pending_throw = Some(e);
+                    if self.unwind_to_handler(e, stop) {
+                        self.pending_throw = None;
+                        self.run_loop(stop)
+                    } else {
+                        Err(Thrown(String::new()))
+                    }
+                }
+            }
+        };
+        // Yielded a value → resolve the front queued promise with {value, done:false}.
+        if let Some((y, yield_ip)) = self.pending_yield.take() {
+            // Preserve the body's `try` handlers across the suspension so a later
+            // `.throw()`/`.return()` (or a yield* throw-delegation) can unwind into
+            // them on resume — the await path already does this; the yield path used
+            // to drop them.
+            let handlers = std::mem::take(&mut self.pending_yield_handlers);
+            self.pending_yield_eval_scope = u32::MAX;
+            let back = self.repark_window(saved, new_base);
+            // Nursery barrier: re-parked window into a possibly-old holder.
+            self.heap.write_barrier(idx);
+            let front = match self.heap.get_mut(idx) {
+                HeapObj::AsyncGenerator(g) => {
+                    g.state = GenState::Suspended(yield_ip);
+                    g.regs = back;
+                    g.handlers = handlers;
+                    g.queue.pop_front()
+                }
+                _ => None,
+            };
+            if let Some(req) = front {
+                let r = self.iter_result(y, false);
+                self.resolve_fresh_promise(req.promise, r);
+            }
+            // More requests already queued → service the next one now, honoring
+            // its kind (a queued `.next(v)` delivers ITS argument to this yield;
+            // a queued return/throw resumes with that completion).
+            self.async_gen_service_queue(idx);
+            return;
+        }
+        // Awaited → park and subscribe; the front promise stays pending.
+        if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
+            let back = self.repark_window(saved, new_base);
+            // Nursery barrier: re-parked window into a possibly-old holder.
+            self.heap.write_barrier(idx);
+            if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                g.state = GenState::Suspended(await_ip);
+                g.regs = back;
+                g.handlers = handlers;
+            }
+            let p = self.to_promise(awaited);
+            self.settle_subscribe(p, idx);
+            return;
+        }
+        // Returned / fell off the end, or threw.
+        match outcome {
+            Ok(ret) => {
+                let front = match self.heap.get_mut(idx) {
+                    HeapObj::AsyncGenerator(g) => {
+                        g.state = GenState::Completed;
+                        g.regs.clear();
+                        g.handlers.clear();
+                        g.queue.pop_front()
+                    }
+                    _ => None,
+                };
+                if let Some(req) = front {
+                    let r = self.iter_result(ret, true);
+                    self.resolve_fresh_promise(req.promise, r);
+                }
+                self.async_gen_service_queue(idx);
+            }
+            Err(t) => {
+                self.regs.truncate(new_base);
+                let reason = self
+                    .pending_throw
+                    .take()
+                    .unwrap_or_else(|| self.alloc_error_from_message(&t.0));
+                let front = match self.heap.get_mut(idx) {
+                    HeapObj::AsyncGenerator(g) => {
+                        g.state = GenState::Completed;
+                        g.regs.clear();
+                        g.handlers.clear();
+                        g.queue.pop_front()
+                    }
+                    _ => None,
+                };
+                if let Some(req) = front {
+                    self.reject_thrown_job(req.promise, reason);
+                }
+                self.async_gen_service_queue(idx);
+            }
+        }
+    }
+
+    /// `Promise.resolve` as an internal helper: a Promise passes through (identity
+    /// preserved); any other value is wrapped in a fulfilled promise. The basis of
+    /// awaiting a non-promise (`await 5` still yields a microtask tick).
+    pub(crate) fn to_promise(&mut self, v: Value) -> u32 {
+        if v.is_heap() {
+            if matches!(self.heap.get(v.heap_index()), HeapObj::Promise { .. }) {
+                return v.heap_index();
+            }
+            let p = self.alloc_promise();
+            self.resolve_fresh_promise(p, v);
+            return p;
+        }
+        if let Some(promise) = self.try_alloc_fulfilled_primitive_promise(v) {
+            return promise;
+        }
+        // The kill-switch comparator keeps the historical primitive path exact:
+        // a non-heap value cannot run a then getter or allocate while resolving,
+        // so the temporary root stack is neither needed nor charged to OFF.
+        let p = self.alloc_promise();
+        self.resolve(p, v);
+        p
+    }
+
+    /// Subscribe a suspended async `activation` to promise `p`: when `p` settles,
+    /// the activation resumes with the value, or has the reason thrown back in at
+    /// the await point. If `p` is already settled, schedule the resume as a
+    /// microtask (so `await` always yields to the queue, per spec).
+    pub(crate) fn settle_subscribe(&mut self, p: u32, activation: u32) {
+        // Nursery barrier + B6 oracle: §1 case 5's await form — an old promise
+        // gaining a young suspended activation as its reaction.
+        self.store_barrier(
+            crate::heap::gcoracle::PROMISE_REACT,
+            p,
+            Value::heap(activation),
+        );
+        let (state, result) = match self.heap.get(p) {
+            HeapObj::Promise { state, result, .. } => (*state, *result),
+            _ => {
+                self.microtasks.push_back(Microtask::AsyncResume {
+                    activation,
+                    input: Resume::Value(Value::UNDEFINED),
+                });
+                return;
+            }
+        };
+        match state {
+            PromiseState::Pending => {
+                if let HeapObj::Promise {
+                    reactions, handled, ..
+                } = self.heap.get_mut(p)
+                {
+                    asyncstats::subscribe(reactions.is_empty());
+                    reactions.push(ReactionPair {
+                        on_fulfilled: Value::UNDEFINED,
+                        on_rejected: Value::UNDEFINED,
+                        dependent: activation,
+                        finally: false,
+                        is_async: true,
+                        is_combinator_all: false,
+                    });
+                    *handled = true; // an `await` consumes the rejection
+                }
+            }
+            PromiseState::Fulfilled => self.microtasks.push_back(Microtask::AsyncResume {
+                activation,
+                input: Resume::Value(result),
+            }),
+            PromiseState::Rejected => {
+                if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p) {
+                    *handled = true;
+                }
+                self.microtasks.push_back(Microtask::AsyncResume {
+                    activation,
+                    input: Resume::Throw(result),
+                });
+            }
+        }
+    }
+
+    /// Register the resolve-element reaction for the already-proven intrinsic
+    /// `Promise.all` dense-Array lane without allocating a
+    /// `HeapObj::CombinatorResolver`. The admission proof lives in
+    /// `promise_combine`: constructor/resolve/prototype and iterator are
+    /// pristine, and `p` is a plain native promise. Pending and already-settled
+    /// inputs both retain the ordinary path's one-job-per-element FIFO shape.
+    /// Returns `true` when the element's resolve-element job ran EAGERLY at
+    /// subscription (already-fulfilled element, empty queue — see
+    /// `eager_combinator_enabled`); the caller then owes the result promise a
+    /// queued `CombinatorFinish` in place of a synchronous settle.
+    fn then_combinator_all_direct(
+        &mut self,
+        p: u32,
+        combinator: u32,
+        index: u32,
+        cap_reject: Value,
+        result: u32,
+    ) -> bool {
+        debug_assert!(index <= i32::MAX as u32);
+        let (state, value) = match self.heap.get(p) {
+            HeapObj::Promise { state, result, .. } => (*state, *result),
+            _ => return false,
+        };
+        match state {
+            PromiseState::Pending => {
+                // The one arm that stores the combinator and the reject
+                // capability into `p`; a settled promise is only read.
+                self.store_barrier(
+                    crate::heap::gcoracle::PROMISE_REACT,
+                    p,
+                    Value::heap(combinator),
+                );
+                self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, cap_reject);
+                if let HeapObj::Promise {
+                    reactions, handled, ..
+                } = self.heap.get_mut(p)
+                {
+                    asyncstats::subscribe(reactions.is_empty());
+                    reactions.push(ReactionPair {
+                        on_fulfilled: Value::int(index as i32),
+                        on_rejected: cap_reject,
+                        dependent: combinator,
+                        finally: false,
+                        is_async: false,
+                        is_combinator_all: true,
+                    });
+                    *handled = true;
+                }
+            }
+            PromiseState::Fulfilled => {
+                // EAGER lane: the job is a pure internal record (no user code,
+                // no allocation, no queue push — `remaining` stays >= 1 while
+                // the iteration holds its own count, so `combinator_finish`
+                // cannot fire in here). With the queue EMPTY nothing can
+                // observe the collapsed job boundaries; the observable settle
+                // is deferred to a queued CombinatorFinish by the caller.
+                if eager_combinator_enabled() && self.microtasks.is_empty() {
+                    self.combinator_step(combinator, index, ReactionKind::Fulfill, value);
+                    return true;
+                }
+                self.microtasks.push_back(Microtask::CombinatorStep {
+                    combinator,
+                    index,
+                    kind: ReactionKind::Fulfill,
+                    arg: value,
+                });
+            }
+            PromiseState::Rejected => {
+                if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p) {
+                    *handled = true;
+                }
+                self.microtasks.push_back(Microtask::Reaction {
+                    callback: cap_reject,
+                    arg: value,
+                    dependent: result,
+                    kind: ReactionKind::Reject,
+                    finally: false,
+                });
+            }
+        }
+        false
+    }
+
+    // ── Promise combinators ──
+
+    /// `Promise.all/allSettled/race/any(iterable)`. Coerces each input to a
+    /// promise and subscribes a native combinator reaction; the shared
+    /// `Combinator` state settles the returned promise per the combinator's rule.
+    /// NewPromiseCapability(C): construct `C` with a capturing executor and return
+    /// `(promise, resolve, reject)`. Works for the native Promise and any subclass
+    /// that chains through `super()` (the executor is invoked synchronously with
+    /// callable resolve/reject). Throws if C isn't a constructor, the executor
+    /// isn't called, or resolve/reject aren't callable.
+    pub(crate) fn new_promise_capability(
+        &mut self,
+        c: Value,
+    ) -> Result<(Value, Value, Value), Thrown> {
+        if !self.is_constructor(c) {
+            return Err(Thrown::from_static(
+                "TypeError: NewPromiseCapability requires a constructor",
+            ));
+        }
+        // Save/restore for a nested capability; clear so the executor's
+        // already-called check starts fresh.
+        let saved = self.cap_capture.take();
+        let executor = Value::heap(self.heap.alloc(HeapObj::Native(native::CAP_EXECUTOR)));
+        let constructed = self.construct(c, &[executor]);
+        let captured = self.cap_capture.take();
+        self.cap_capture = saved;
+        let promise = constructed?;
+        let (resolve, reject) = match captured {
+            Some(rr) => rr,
+            None => {
+                return Err(Thrown::from_static(
+                    "TypeError: Promise resolve/reject were not set by the executor",
+                ))
+            }
+        };
+        if !self.is_callable(resolve) || !self.is_callable(reject) {
+            return Err(Thrown::from_static(
+                "TypeError: Promise resolve or reject is not callable",
+            ));
+        }
+        Ok((promise, resolve, reject))
+    }
+
+    /// The `Promise` constructor value, for the lowered `Promise.all/race/...`
+    /// ops where the receiver `this` isn't threaded. Resolved via
+    /// `Promise.prototype.constructor` (so `Get(C, "resolve")` reaches an
+    /// overridden `Promise.resolve`).
+    pub(crate) fn promise_ctor_value(&mut self) -> Value {
+        // The RECORDED intrinsic, not `Get(%Promise.prototype%, "constructor")`.
+        //
+        // Every caller is asking "is this %Promise% itself" — as the C of
+        // PromiseResolve/NewPromiseCapability, or to decide whether a combinator
+        // may take its unobservable fast path. That is a question about the
+        // intrinsic, and reading it back out of a mutable property answered a
+        // different one.
+        //
+        // It is also a correctness fix, not only a speed one. `Promise.resolve(x)`
+        // returns x unchanged only when `Get(x, "constructor")` is C. With
+        // `Promise.prototype.constructor` patched to X, a plain promise reports X
+        // and the old code compared it against X too — so it passed x through even
+        // though C is still %Promise% and the spec requires a fresh adopting
+        // promise.
+        //
+        // Speed: this ran a full property lookup on %Promise.prototype% on EVERY
+        // `Promise.resolve`, `Promise.reject` and combinator entry.
+        if self.promise_ctor_intrinsic == 0 {
+            return Value::UNDEFINED;
+        }
+        Value::heap(self.promise_ctor_intrinsic)
+    }
+
+    pub(crate) fn promise_combine(
+        &mut self,
+        kind: crate::heap::CombKind,
+        iterable: Value,
+        ctor: Value,
+    ) -> Result<Value, Thrown> {
+        // The iterator, per-element value, capability functions and freshly
+        // returned Promise are held in Rust locals across re-entrant iterator
+        // getters/calls. B214's rule: ROOT them on `host_result_roots` (every
+        // exit releases the whole segment here) instead of suspending
+        // collection for the entire setup — `Promise.all(gen())` whose `next()`
+        // makes millions of temporaries otherwise never collects until the
+        // iteration ends.
+        let base = self.host_result_roots.len();
+        let r = self.promise_combine_rooted(kind, iterable, ctor);
+        self.host_result_roots.truncate(base);
+        r
+    }
+
+    fn promise_combine_rooted(
+        &mut self,
+        kind: crate::heap::CombKind,
+        iterable: Value,
+        ctor: Value,
+    ) -> Result<Value, Thrown> {
+        use crate::heap::CombKind;
+        self.host_result_roots.extend([iterable, ctor]);
+        // NewPromiseCapability(C) — the result is a C-typed promise (a subclass
+        // instance when `this` is a Promise subclass). A throwing/invalid capability
+        // (executor not called / called twice / non-callable resolve-reject) throws
+        // synchronously per ReturnIfAbrupt. A custom constructor may return any
+        // object, so settlement must call its captured capability functions.
+        let (cap_promise, cap_resolve, cap_reject) = self.new_promise_capability(ctor)?;
+        self.host_result_roots
+            .extend([cap_promise, cap_resolve, cap_reject]);
+        let result = cap_promise.heap_index();
+        // GetPromiseResolve(C): `promiseResolve = Get(C, "resolve")`, which must be
+        // callable. This is the spec-observable step the tests check (overriding
+        // `Promise.resolve` is visible, and a non-callable resolve rejects). When C
+        // isn't a usable object we fall back to internal coercion. An abrupt Get or
+        // a non-callable resolve rejects the result (IfAbruptRejectPromise).
+        let promise_resolve = if self.is_object_value(ctor) {
+            match self.get_prop(ctor, "resolve") {
+                Ok(r) => Some(r),
+                Err(Thrown(msg)) => {
+                    self.reject_capability_with_thrown(cap_reject, &msg)?;
+                    return Ok(Value::heap(result));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(pr) = promise_resolve {
+            self.host_result_roots.push(pr);
+            if !self.is_callable(pr) {
+                let err =
+                    self.alloc_error_from_message("TypeError: Promise.resolve is not a function");
+                self.reject_capability_with(cap_reject, err)?;
+                return Ok(Value::heap(result));
+            }
+        }
+        // Keyed combinators (allKeyed/allSettledKeyed) operate over an OBJECT's own
+        // enumerable keys (incl. Symbols): validate it's an object, snapshot the
+        // keys, and iterate the corresponding VALUES (reusing the array-iteration
+        // path below); the keys are stored on the Combinator (Symbols as their
+        // "@@…" form) to build the keyed result on settle.
+        let mut comb_keys: Vec<String> = Vec::new();
+        let iterable = if matches!(kind, CombKind::AllKeyed | CombKind::AllSettledKeyed) {
+            if !self.is_object_value(iterable) {
+                let e = self.alloc_error_from_message(
+                    "TypeError: Promise.allKeyed argument is not an object",
+                );
+                self.reject_capability_with(cap_reject, e)?;
+                return Ok(Value::heap(result));
+            }
+            // OwnPropertyKeys (incl. Symbols), filtered to enumerable own props —
+            // per PerformPromiseAllKeyed step "For each key of ? OwnPropertyKeys,
+            // if desc.[[Enumerable]]". A Symbol key round-trips via its internal
+            // "@@…" key string (key_of), so `map.set` in combinator_finish carries
+            // it back as a real Symbol on the keyed result object.
+            let karr = match self.object_own_keys(iterable) {
+                Ok(a) => a,
+                Err(Thrown(msg)) => {
+                    self.reject_capability_with_thrown(cap_reject, &msg)?;
+                    return Ok(Value::heap(result));
+                }
+            };
+            // The key array keeps `kvals`' key values alive across the traps
+            // and getters below; each value read joins it on the root stack.
+            self.host_result_roots.push(karr);
+            let kvals = self.array_snapshot(karr.heap_index());
+            if let Err(Thrown(msg)) = self.preflight_native_iteration_work(kvals.len() as u64) {
+                self.reject_capability_with_thrown(cap_reject, &msg)?;
+                return Ok(Value::heap(result));
+            }
+            let mut vals = Vec::with_capacity(kvals.len());
+            for kv in kvals {
+                let ks = self.key_of(kv);
+                // Step 6.a is `Let desc be ? promises.[[GetOwnProperty]](key)`,
+                // an internal method — so on a Proxy it fires the
+                // getOwnPropertyDescriptor trap and its throw REJECTS the
+                // result promise. Reading the enumerable flag off the ordinary
+                // slot skipped the trap entirely and the promise fulfilled.
+                match self.own_is_enumerable_dyn(iterable, &ks) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(Thrown(msg)) => {
+                        self.reject_capability_with_thrown(cap_reject, &msg)?;
+                        return Ok(Value::heap(result));
+                    }
+                }
+                let v = match self.get_member(iterable, &ks, iterable) {
+                    Ok(v) => v,
+                    Err(Thrown(msg)) => {
+                        self.reject_capability_with_thrown(cap_reject, &msg)?;
+                        return Ok(Value::heap(result));
+                    }
+                };
+                comb_keys.push(ks);
+                self.host_result_roots.push(v);
+                vals.push(v);
+            }
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(vals)));
+            self.host_result_roots.push(arr);
+            arr
+        } else {
+            iterable
+        };
+        // GetIterator(iterable): invoke @@iterator to obtain a REAL iterator object
+        // (not the array fast-path, which `get_iterator` returns un-stepped) so the
+        // lazy step + IteratorClose below work. A non-callable @@iterator / abrupt →
+        // reject (IfAbruptRejectPromise).
+        let iter_method = match self.get_prop(iterable, "@@iterator") {
+            Ok(m) if self.is_callable(m) => m,
+            Ok(_) => {
+                let disp = self.display(iterable);
+                let e =
+                    self.alloc_error_from_message(&format!("TypeError: {disp} is not iterable"));
+                self.reject_capability_with(cap_reject, e)?;
+                return Ok(Value::heap(result));
+            }
+            Err(Thrown(msg)) => {
+                self.reject_capability_with_thrown(cap_reject, &msg)?;
+                return Ok(Value::heap(result));
+            }
+        };
+        self.host_result_roots.push(iter_method);
+        // FAST ITERATION lane: a REAL Array whose @@iterator Get yielded the
+        // PRISTINE intrinsic (and %ArrayIteratorPrototype%.next is untouched)
+        // is stepped INLINE while dense, with the live length re-read per step.
+        // A hole demotes at its current index so inherited values/accessors and
+        // ordinary `undefined` holes remain observable. While inline, NO user
+        // code can run
+        // between steps (any per-element path that could call out DEMOTES to
+        // a real iterator object first), so these gates can't be invalidated
+        // mid-iteration. `fast_pos = None` ⇒ `iter` drives via the protocol.
+        let arr_fast = iterable.is_heap()
+            && matches!(self.heap.get(iterable.heap_index()), HeapObj::Array(_))
+            // `defineProperty` can leave the old dense slot in place while an
+            // arr_props data/accessor descriptor becomes authoritative. Sloppy
+            // mapped arguments likewise route indexed reads through the live
+            // formal cell rather than the Array snapshot. Both must use the
+            // ordinary iterator before ANY dense slot is read.
+            && !self.array_elements_overlaid(iterable.heap_index())
+            && !self.arguments_objs.contains_key(&iterable.heap_index())
+            // Very large/sparse Arrays keep their JS length in this side table
+            // while the dense Vec contains only a prefix (possibly nothing).
+            // Stepping that Vec would stop early instead of observing holes,
+            // inherited indexed accessors, and the full live Array length.
+            && !self.array_js_len.contains_key(&iterable.heap_index())
+            && iter_method.bits() == self.default_array_iter.bits()
+            && match self.heap.get(self.array_iter_proto) {
+                HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
+                _ => false,
+            };
+        let mut fast_pos: Option<usize> = if arr_fast { Some(0) } else { None };
+        let mut iter = Value::UNDEFINED;
+        if !arr_fast {
+            iter = match self.call_value(iter_method, iterable, &[]) {
+                Ok(it) => it,
+                Err(Thrown(msg)) => {
+                    self.reject_capability_with_thrown(cap_reject, &msg)?;
+                    return Ok(Value::heap(result));
+                }
+            };
+        }
+        // `iter` is reassigned when the inline lane demotes: it keeps one
+        // root slot, rewritten with it.
+        let iter_slot = self.host_result_roots.len();
+        self.host_result_roots.push(iter);
+        // Per-element intrinsic gates: Call(promiseResolve, C, val) and
+        // Invoke(nextPromise, "then") collapse to their intrinsic native
+        // behavior only when C IS the intrinsic %Promise%, `promiseResolve`
+        // IS the intrinsic Promise.resolve, and the prototype/constructor
+        // pair is pristine.
+        let intrinsic_resolve = ctor.is_heap()
+            && ctor.heap_index() == self.promise_ctor_intrinsic
+            && promise_resolve.is_some_and(|pr| {
+                pr.is_heap()
+                    && matches!(self.heap.get(pr.heap_index()),
+                                HeapObj::Native(n) if *n == native::PROMISE_RESOLVE)
+            })
+            && self.promise_proto_pristine();
+        // remainingElementsCount starts at 1 (the iteration itself); each element
+        // bumps it, each settling element decrements it, and completing the
+        // iteration decrements it — when it hits 0 the combinator resolves/rejects.
+        // results/settled grow as the iterator is stepped (LAZY, so an abrupt
+        // Call(promiseResolve)/Invoke(.then) can IteratorClose the live iterator).
+        //
+        // Their CAPACITY is the array's length when the inline lane is
+        // stepping a dense array: both otherwise start empty and reallocate
+        // eight times each on the way to a hundred elements, a tenth of a
+        // `Promise.all` of that width. The length is a hint and the entries
+        // are still pushed one step at a time; it is bounded, so a huge array
+        // does not reserve before the lane has looked at an element.
+        let expected = match (fast_pos, self.heap.get(iterable.heap_index())) {
+            (Some(_), HeapObj::Array(items)) => items.len().min(COMBINATOR_PRESIZE_MAX),
+            _ => 0,
+        };
+        let comb = self
+            .heap
+            .alloc(HeapObj::Combinator(Box::new(crate::heap::CombinatorData {
+                kind,
+                results: Vec::with_capacity(expected),
+                remaining: 1,
+                result,
+                settled: Vec::with_capacity(expected),
+                cap_resolve,
+                cap_reject,
+                keys: comb_keys,
+            })));
+        self.host_result_roots.push(Value::heap(comb));
+        // Per-element values (the step value, nextPromise, the element
+        // resolvers, `then`) are rooted above this mark for one element only:
+        // by the next step each is held by a reaction, a queued job, or the
+        // combinator itself.
+        let element_roots = self.host_result_roots.len();
+        let mut native_work = 0u64;
+        // Whether any resolve-element job ran eagerly at subscription (see
+        // `eager_combinator_enabled`): the result promise then owes its settle
+        // to a queued CombinatorFinish instead of the synchronous tail call.
+        let mut eager_used = false;
+        loop {
+            self.host_result_roots.truncate(element_roots);
+            // Array iteration does NOT skip holes: it performs Get(array,
+            // index), so an inherited numeric property or accessor may supply
+            // the value (and an otherwise-empty hole yields `undefined`). The
+            // dense inline lane cannot perform that observable lookup. Demote
+            // at the hole's CURRENT position so the ordinary live iterator
+            // handles it exactly once.
+            if let Some(pos) = fast_pos {
+                let hole = matches!(
+                    self.heap.get(iterable.heap_index()),
+                    HeapObj::Array(items) if pos < items.len() && items[pos].is_hole()
+                );
+                if hole {
+                    iter = Value::heap(self.heap.alloc(HeapObj::Iterator {
+                        items: Vec::new(),
+                        index: pos,
+                        proto: self.array_iter_proto,
+                        live: Some((iterable.heap_index(), 1)),
+                    }));
+                    self.host_result_roots[iter_slot] = iter;
+                    fast_pos = None;
+                }
+            }
+            // IteratorStep; a throwing next() leaves the iterator done → no close.
+            let val = if let Some(pos) = fast_pos {
+                // Inline intrinsic array-iterator step for the dense case.
+                let stepped = match self.heap.get(iterable.heap_index()) {
+                    HeapObj::Array(items) if pos < items.len() => Some(items[pos]),
+                    _ => None,
+                };
+                fast_pos = Some(pos + usize::from(stepped.is_some()));
+                match stepped {
+                    Some(v) => v,
+                    None => break,
+                }
+            } else {
+                match self.iterator_step(iter) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => break,
+                    Err(Thrown(msg)) => {
+                        self.reject_capability_with_thrown(cap_reject, &msg)?;
+                        return Ok(Value::heap(result));
+                    }
+                }
+            };
+            self.host_result_roots.push(val);
+            native_work = native_work.saturating_add(1);
+            if let Err(Thrown(msg)) = self.preflight_native_iteration_work(native_work) {
+                let err = self.alloc_error_from_message(&msg);
+                self.host_result_roots.push(err);
+                if fast_pos.is_none() {
+                    self.iterator_close_quiet(iter);
+                }
+                self.reject_capability_with(cap_reject, err)?;
+                return Ok(Value::heap(result));
+            }
+            // DEMOTE before any per-element path that could run user code: a
+            // non-intrinsic resolve/constructor, or a heap OBJECT value that
+            // is not a plain promise (its constructor Get / thenable `then`
+            // Get may invoke an accessor). The replacement is a real live
+            // array iterator parked at the current position, so any user
+            // code that patches the iterator protocol from here on is
+            // honoured by the generic loop.
+            if let Some(pos) = fast_pos {
+                // `intrinsic_resolve` holds the prototype-and-constructor
+                // proof, taken once above. Nothing between two elements of
+                // this lane can run user code (whatever could demotes first),
+                // so that half cannot have changed; what differs from element
+                // to element is the instance half.
+                let inert = !val.is_heap()
+                    || !self.is_object_value(val)
+                    || (matches!(self.heap.get(val.heap_index()), HeapObj::Promise { .. })
+                        && if intrinsic_resolve {
+                            self.promise_instance_plain(val.heap_index())
+                        } else {
+                            self.promise_plain_unobservable(val.heap_index())
+                        });
+                if !intrinsic_resolve || !inert {
+                    iter = Value::heap(self.heap.alloc(HeapObj::Iterator {
+                        items: Vec::new(),
+                        index: pos,
+                        proto: self.array_iter_proto,
+                        live: Some((iterable.heap_index(), 1)),
+                    }));
+                    self.host_result_roots[iter_slot] = iter;
+                    fast_pos = None;
+                }
+            }
+            let index = match self.heap.get_mut(comb) {
+                HeapObj::Combinator(__c) => {
+                    let crate::heap::CombinatorData {
+                        results,
+                        settled,
+                        remaining,
+                        ..
+                    } = &mut **__c;
+                    let i = results.len() as u32;
+                    results.push(Value::UNDEFINED);
+                    settled.push(false);
+                    *remaining += 1;
+                    i
+                }
+                _ => break,
+            };
+            // nextPromise = Call(promiseResolve, C, «val») — OBSERVABLE. An abrupt
+            // here closes the (still-open) iterator, then rejects with the ORIGINAL
+            // error (IteratorClose preserves the throw).
+            let next = if fast_pos.is_some() {
+                // Intrinsic PromiseResolve(%Promise%, val) with an INERT val
+                // (gates above): a PLAIN promise passes through (its
+                // constructor Get is unobservable and yields %Promise%); a
+                // non-object coerces to a fresh fulfilled native promise (a
+                // primitive can never be a thenable — no callout).
+                if val.is_heap()
+                    && matches!(self.heap.get(val.heap_index()), HeapObj::Promise { .. })
+                {
+                    val
+                } else {
+                    Value::heap(self.to_promise(val))
+                }
+            } else {
+                match promise_resolve {
+                    Some(pr) => match self.call_value(pr, ctor, &[val]) {
+                        Ok(v) => v,
+                        Err(Thrown(msg)) => {
+                            let err = self.take_thrown(&msg);
+                            self.host_result_roots.push(err);
+                            self.iterator_close_quiet(iter);
+                            // IfAbruptRejectPromise: settle through the capability's
+                            // observable [[Reject]] (a custom constructor's reject is
+                            // visibly invoked), not the internal reject.
+                            self.reject_capability_with(cap_reject, err)?;
+                            return Ok(Value::heap(result));
+                        }
+                    },
+                    // No usable constructor: coerce to a native promise for the Invoke.
+                    None => Value::heap(self.to_promise(val)),
+                }
+            };
+            self.host_result_roots.push(next);
+            if fast_pos.is_some()
+                && matches!(kind, CombKind::All)
+                && index <= i32::MAX as u32
+                && promise_all_direct_enabled()
+            {
+                eager_used |= self.then_combinator_all_direct(
+                    next.heap_index(),
+                    comb,
+                    index,
+                    cap_reject,
+                    result,
+                );
+                continue;
+            }
+            // onFulfilled / onRejected per PerformPromise{All,AllSettled,Race,Any}: a
+            // per-index "resolveElement"/"rejectElement" (CombinatorResolver) is used
+            // only where the algorithm collects a per-input outcome; otherwise the
+            // SHARED result-capability [[Resolve]]/[[Reject]] is passed directly. So
+            // every Promise.all element sees the SAME reject function, Promise.race
+            // uses the capability pair directly, and Promise.any shares the resolve.
+            let element_resolver = |vm: &mut Self, is_reject: bool| {
+                Value::heap(vm.heap.alloc(HeapObj::CombinatorResolver {
+                    combinator: comb,
+                    index,
+                    is_reject,
+                }))
+            };
+            let res_f = match kind {
+                CombKind::Race | CombKind::Any => cap_resolve,
+                CombKind::All
+                | CombKind::AllSettled
+                | CombKind::AllKeyed
+                | CombKind::AllSettledKeyed => element_resolver(self, false),
+            };
+            let res_r = match kind {
+                CombKind::All | CombKind::Race | CombKind::AllKeyed => cap_reject,
+                CombKind::Any | CombKind::AllSettled | CombKind::AllSettledKeyed => {
+                    element_resolver(self, true)
+                }
+            };
+            self.host_result_roots.extend([res_f, res_r]);
+            // Invoke(nextPromise, "then", «res_f, res_r») — OBSERVABLE; abrupt →
+            // close + reject with the original error.
+            let outcome = if fast_pos.is_some() {
+                // `next` is a PLAIN promise on a pristine prototype (gates
+                // above): Get(next,"then") is unobservable and yields the
+                // intrinsic, whose PerformPromiseThen takes the plain-
+                // dependent lane — infallible. Tick-identical: the reactions
+                // are registered synchronously either way. The dependent
+                // promise is unobservable AND unused — both handlers are
+                // native resolver objects (CombinatorResolver/BoundResolver),
+                // whose reaction dispatch never touches `dependent` — so the
+                // combinator's own result promise stands in as an inert
+                // placeholder rather than allocating a throwaway promise.
+                self.then_internal(next.heap_index(), res_f, res_r, Some(result));
+                Ok(Value::UNDEFINED)
+            } else {
+                match self.get_prop(next, "then") {
+                    Ok(then_fn) => {
+                        self.host_result_roots.push(then_fn);
+                        self.call_value(then_fn, next, &[res_f, res_r])
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            if let Err(Thrown(msg)) = outcome {
+                let err = self.take_thrown(&msg);
+                self.host_result_roots.push(err);
+                self.iterator_close_quiet(iter);
+                self.reject_capability_with(cap_reject, err)?;
+                return Ok(Value::heap(result));
+            }
+        }
+        // Iteration complete: drop the initial count. Race never uses the counter
+        // (it settles on the first element), so its empty form stays pending.
+        if !matches!(kind, CombKind::Race) {
+            let now_zero = if let HeapObj::Combinator(__c) = self.heap.get_mut(comb) {
+                let remaining = &mut __c.remaining;
+                *remaining -= 1;
+                *remaining == 0
+            } else {
+                false
+            };
+            // remaining==0 with eager steps used means EVERY element was
+            // recorded eagerly (an un-run queued step would still hold its
+            // count), and the queue is still empty — so the spec's settle
+            // moment is the first element job's queue position. Defer the
+            // observable settle there; a burst-queued job after this return
+            // lands behind it, exactly as it would land behind the spec's
+            // element jobs. Without eager steps (incl. the empty iterable,
+            // which the spec settles synchronously) the tail is unchanged.
+            if now_zero && eager_used {
+                debug_assert!(self.microtasks.is_empty());
+                self.microtasks
+                    .push_back(Microtask::CombinatorFinish { combinator: comb });
+            } else {
+                self.combinator_finish(comb);
+            }
+        }
+        Ok(Value::heap(result))
+    }
+
+    /// IfAbruptRejectPromise: consume the original thrown value, call the
+    /// observable capability's reject function, and propagate a throw from it.
+    fn reject_capability_with_thrown(&mut self, reject: Value, msg: &str) -> Result<(), Thrown> {
+        let e = self.take_thrown(msg);
+        self.reject_capability_with(reject, e)
+    }
+
+    /// Call a capability's `reject` with `err`, which is only a Rust local:
+    /// rooted across the call, since a custom capability's reject is guest code.
+    fn reject_capability_with(&mut self, reject: Value, err: Value) -> Result<(), Thrown> {
+        self.with_host_roots(&[err], |vm| vm.call_value(reject, Value::UNDEFINED, &[err]))?;
+        Ok(())
+    }
+
+    /// The live thrown value (`pending_throw`), or a fresh error from the message.
+    fn take_thrown(&mut self, msg: &str) -> Value {
+        match self.pending_throw.take() {
+            Some(v) => v,
+            None => self.alloc_error_from_message(msg),
+        }
+    }
+
+    /// When a combinator's remainingElementsCount reaches 0, settle its result:
+    /// All/AllSettled resolve with the collected array, Any rejects with an
+    /// AggregateError of the collected reasons. A no-op while count > 0 or for Race.
+    fn combinator_finish(&mut self, comb: u32) {
+        use crate::heap::CombKind;
+        let (ckind, remaining, cap_resolve, cap_reject) = match self.heap.get(comb) {
+            HeapObj::Combinator(__c) => {
+                let crate::heap::CombinatorData {
+                    kind,
+                    remaining,
+                    cap_resolve,
+                    cap_reject,
+                    ..
+                } = &**__c;
+                (*kind, *remaining, *cap_resolve, *cap_reject)
+            }
+            _ => return,
+        };
+        if remaining != 0 || ckind == CombKind::Race {
+            return;
+        }
+        let (collected, comb_keys) = match self.heap.get(comb) {
+            HeapObj::Combinator(__c) => (__c.results.clone(), __c.keys.clone()),
+            _ => return,
+        };
+        // Settle THROUGH the result capability (per spec): Any rejects with an
+        // AggregateError of the collected reasons; All/AllSettled resolve with the
+        // collected array. (On the native path the cap functions are BoundResolvers
+        // bound to `result`, so this is the same as self.resolve/reject(result, …).)
+        match ckind {
+            CombKind::Any => {
+                let e = self.alloc_aggregate_error(collected);
+                let _ = self.call_value(cap_reject, Value::UNDEFINED, &[e]);
+            }
+            CombKind::AllKeyed | CombKind::AllSettledKeyed => {
+                // Build a NULL-prototype object mapping each key to its value/record.
+                let mut map = ObjMap::new();
+                for (k, v) in comb_keys.iter().zip(collected.iter()) {
+                    map.set(k, *v);
+                }
+                let obj = self.heap.alloc(HeapObj::Object(Box::new(map)));
+                self.proto_of.insert(obj, Value::NULL);
+                if let Err(Thrown(msg)) =
+                    self.call_value(cap_resolve, Value::UNDEFINED, &[Value::heap(obj)])
+                {
+                    self.combinator_reject_on_resolve_throw(cap_reject, msg);
+                }
+            }
+            _ => {
+                let arr = Value::heap(self.heap.alloc(HeapObj::Array(collected)));
+                if let Err(Thrown(msg)) = self.call_value(cap_resolve, Value::UNDEFINED, &[arr]) {
+                    self.combinator_reject_on_resolve_throw(cap_reject, msg);
+                }
+            }
+        }
+    }
+
+    /// A combinator's result capability `resolve` threw (a custom subclass may
+    /// install a throwing resolve): per IfAbruptRejectPromise, reject the result
+    /// promise with the thrown VALUE (preserved via `pending_throw`, not a
+    /// reconstructed error).
+    fn combinator_reject_on_resolve_throw(&mut self, cap_reject: Value, msg: String) {
+        let e = match self.pending_throw.take() {
+            Some(v) => v,
+            None => self.alloc_error_from_message(&msg),
+        };
+        let _ = self.call_value(cap_reject, Value::UNDEFINED, &[e]);
+    }
+
+    /// Perform one combinator step: the input at `index` settled (`kind`) with
+    /// `value`. Updates the shared state and settles the combinator's promise
+    /// when its rule is met (the one-shot `settle` guard absorbs later inputs).
+    pub(crate) fn combinator_step(
+        &mut self,
+        comb: u32,
+        index: u32,
+        kind: ReactionKind,
+        value: Value,
+    ) {
+        use crate::heap::CombKind;
+        let (ckind, cap_resolve, cap_reject) = match self.heap.get(comb) {
+            HeapObj::Combinator(__c) => {
+                let crate::heap::CombinatorData {
+                    kind,
+                    cap_resolve,
+                    cap_reject,
+                    ..
+                } = &**__c;
+                (*kind, *cap_resolve, *cap_reject)
+            }
+            _ => return,
+        };
+        // [[AlreadyCalled]]: a custom thenable may invoke a resolve/reject element
+        // (or both) more than once for the same index — only the first counts.
+        let already = match self.heap.get_mut(comb) {
+            HeapObj::Combinator(__c) => {
+                let settled = &mut __c.settled;
+                let s = &mut settled[index as usize];
+                if *s {
+                    true
+                } else {
+                    *s = true;
+                    false
+                }
+            }
+            _ => return,
+        };
+        if already {
+            return;
+        }
+        // Each immediate settle goes THROUGH the result capability's
+        // [[Resolve]]/[[Reject]] (observable for a custom `this`-constructor; on the
+        // native path the cap functions resolve/reject `result` directly).
+        match (ckind, kind) {
+            (CombKind::Race, ReactionKind::Fulfill) => {
+                let _ = self.call_value(cap_resolve, Value::UNDEFINED, &[value]);
+            }
+            (CombKind::Race, ReactionKind::Reject) => {
+                let _ = self.call_value(cap_reject, Value::UNDEFINED, &[value]);
+            }
+            (CombKind::All | CombKind::AllKeyed, ReactionKind::Reject) => {
+                let _ = self.call_value(cap_reject, Value::UNDEFINED, &[value]);
+            }
+            (CombKind::Any, ReactionKind::Fulfill) => {
+                let _ = self.call_value(cap_resolve, Value::UNDEFINED, &[value]);
+            }
+            (CombKind::All | CombKind::AllKeyed, ReactionKind::Fulfill)
+            | (CombKind::Any, ReactionKind::Reject)
+            | (CombKind::AllSettled | CombKind::AllSettledKeyed, _) => {
+                // Record the per-input outcome and decrement the outstanding count;
+                // combinator_finish settles the result when it reaches 0.
+                let stored = if matches!(ckind, CombKind::AllSettled | CombKind::AllSettledKeyed) {
+                    self.make_settled_record(kind, value)
+                } else {
+                    value
+                };
+                // Nursery barrier: a combinator pending across a collection is
+                // old; the settled value / record it stores may be young.
+                self.heap.write_barrier_val(comb, stored);
+                if let HeapObj::Combinator(__c) = self.heap.get_mut(comb) {
+                    let crate::heap::CombinatorData {
+                        results, remaining, ..
+                    } = &mut **__c;
+                    results[index as usize] = stored;
+                    *remaining -= 1;
+                }
+                self.combinator_finish(comb);
+            }
+        }
+    }
+
+    /// Build a `Promise.allSettled` record: `{status:'fulfilled', value}` or
+    /// `{status:'rejected', reason}`.
+    pub(crate) fn make_settled_record(&mut self, kind: ReactionKind, value: Value) -> Value {
+        let mut map = ObjMap::new();
+        match kind {
+            ReactionKind::Fulfill => {
+                let s = self.alloc_str("fulfilled".to_string());
+                map.set("status", s);
+                map.set("value", value);
+            }
+            ReactionKind::Reject => {
+                let s = self.alloc_str("rejected".to_string());
+                map.set("status", s);
+                map.set("reason", value);
+            }
+        }
+        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))))
+    }
+
+    /// Build an `AggregateError`-like object `{name, message, errors}` for a
+    /// failed `Promise.any`.
+    pub(crate) fn alloc_aggregate_error(&mut self, errors: Vec<Value>) -> Value {
+        // name/message/errors are all non-enumerable own data properties.
+        let attr = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let mut map = ObjMap::new();
+        // (`name` is inherited from %AggregateError.prototype%, linked below.)
+        let msg = self.alloc_str("All promises were rejected".to_string());
+        map.define("message", msg, attr);
+        let errs = Value::heap(self.heap.alloc(HeapObj::Array(errors)));
+        map.define("errors", errs, attr);
+        let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
+        self.error_data.insert(idx); // [[ErrorData]] internal slot
+                                     // Link [[Prototype]] to %AggregateError.prototype% (error_protos[7]) so the
+                                     // internally-created error is a real AggregateError instance:
+                                     // getPrototypeOf === AggregateError.prototype and `.constructor` resolves to
+                                     // AggregateError (instanceof already held via the error-ctor name check).
+        if self.error_protos[7] != 0 {
+            self.proto_of.insert(idx, Value::heap(self.error_protos[7]));
+        }
+        Value::heap(idx)
+    }
+
+    /// Resume (or start) a suspended async activation `idx` with `input` — the
+    /// awaited value (fulfill) or the reason to throw in at the await point
+    /// (reject). Runs until the next `await` (re-parks the window + subscribes to
+    /// the awaited promise), a normal return (resolves the result Promise), or an
+    /// uncaught throw (rejects it). Mirrors `generator_method`'s resume path, but
+    /// restores the activation's `try` handlers so a rejection can be caught.
+    pub(crate) fn drive_async(&mut self, idx: u32, input: Resume) {
+        self.drive_async_inner(idx, input, false);
+    }
+
+    /// AsyncResume is already a microtask job. If it reaches another settled
+    /// promise while no older job is queued, the next resume job is known to be
+    /// next in FIFO order and can stay inside this bounded trampoline.
+    fn drive_async_resumed(&mut self, idx: u32, input: Resume) {
+        self.drive_async_inner(idx, input, true);
+    }
+
+    fn drive_async_inner(&mut self, idx: u32, input: Resume, allow_trampoline: bool) {
+        let (state, fid, closure, result, callee) = match self.heap.get(idx) {
+            HeapObj::AsyncState(a) => (a.state, a.func, a.closure, a.result, a.callee),
+            _ => return,
+        };
+        let mut resume_ip = match state {
+            GenState::Completed | GenState::Running => return,
+            GenState::Suspended(ip) => ip,
+        };
+        // Detach the saved window + handlers, then splice the window onto the top
+        // of the live register file.
+        let (saved, saved_handlers) = match self.heap.get_mut(idx) {
+            HeapObj::AsyncState(a) => {
+                a.state = GenState::Running;
+                (std::mem::take(&mut a.regs), std::mem::take(&mut a.handlers))
+            }
+            _ => return,
+        };
+        let reg_count = saved.len();
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            // Can't make progress — abandon the activation and reject its result.
+            if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                a.state = GenState::Completed;
+                a.regs.clear();
+                a.handlers.clear();
+            }
+            let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+            self.reject_thrown_job(result, e);
+            return;
+        }
+        self.regs.extend_from_slice(&saved);
+        self.bump_regs_hw(new_base + reg_count);
+        let stop = self.frames.len();
+        let mut resume_input = input;
+        let mut resume_handlers = saved_handlers;
+        // Periodically re-queue even when the queue stays empty. This restores a
+        // GC checkpoint for allocation-heavy loops without giving up the common
+        // settled-promise fast path.
+        let mut inline_budget = if allow_trampoline && async_settled_trampoline_enabled() {
+            1024usize
+        } else {
+            0
+        };
+        // The activation owns and traces its immutable callee. Reuse the
+        // captured identity for every resumed frame, without a side-table lookup.
+        let outcome = loop {
+            self.frames.push(Frame {
+                super_done: false,
+                args_obj: u32::MAX,
+                eval_scope: u32::MAX,
+                arg_win: u32::MAX,
+                argc: 0,
+                is_eval: false,
+                func: fid,
+                base: new_base,
+                ip: 0,
+                ret_dst: 0,
+                closure,
+                handlers: resume_handlers,
+                new_target: Value::UNDEFINED,
+                // The creating call's function value (named fn-expression
+                // self-name identity survives suspension).
+                callee,
+            });
+            // A mapped `arguments` object aliases every resumed frame window.
+            self.relink_mapped_args(idx, stop, new_base);
+            // Position the resume point and deliver the awaited value/rejection.
+            let outcome = if resume_ip == usize::MAX {
+                self.run_loop(stop)
+            } else {
+                match resume_input {
+                    Resume::Value(v) | Resume::Return(v) => {
+                        if let Instr::Await { dst, .. } = self.func(fid as usize).code[resume_ip] {
+                            self.regs[new_base + dst as usize] = v;
+                        }
+                        self.frames[stop].ip = resume_ip + 1;
+                        self.run_loop(stop)
+                    }
+                    Resume::Throw(e) => {
+                        // Throw the rejection in at the await point. A caught
+                        // rejection resumes at its parked handler; otherwise it
+                        // becomes the async function's rejected result.
+                        self.pending_throw = Some(e);
+                        if self.unwind_to_handler(e, stop) {
+                            self.pending_throw = None;
+                            self.run_loop(stop)
+                        } else {
+                            Err(Thrown(String::new()))
+                        }
+                    }
+                }
+            };
+            let Some((awaited, await_ip, handlers)) = self.pending_await.take() else {
+                break outcome;
+            };
+
+            let settled = if inline_budget != 0 && self.microtasks.is_empty() && awaited.is_heap() {
+                match self.heap.get(awaited.heap_index()) {
+                    HeapObj::Promise {
+                        state: PromiseState::Fulfilled,
+                        result,
+                        ..
+                    } => Some(Resume::Value(*result)),
+                    HeapObj::Promise {
+                        state: PromiseState::Rejected,
+                        result,
+                        ..
+                    } => Some(Resume::Throw(*result)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(next_input) = settled {
+                if matches!(next_input, Resume::Throw(_)) {
+                    if let HeapObj::Promise { handled, .. } =
+                        self.heap.get_mut(awaited.heap_index())
+                    {
+                        *handled = true;
+                    }
+                }
+                inline_budget -= 1;
+                asyncstats::inline_await();
+                resume_ip = await_ip;
+                resume_input = next_input;
+                resume_handlers = handlers;
+                continue;
+            }
+
+            let back = self.repark_window(saved, new_base);
+            // Nursery barrier: re-parked window into a possibly-old holder.
+            self.heap.write_barrier(idx);
+            if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                a.state = GenState::Suspended(await_ip);
+                a.regs = back;
+                a.handlers = handlers;
+            }
+            let p = self.to_promise(awaited);
+            self.settle_subscribe(p, idx);
+            return;
+        };
+        // Otherwise the activation finished — settle `result`.
+        match outcome {
+            Ok(ret) => {
+                if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                    a.state = GenState::Completed;
+                    a.regs.clear();
+                    a.handlers.clear();
+                }
+                if self.module_body_results.remove(&result) {
+                    // Module body: the capability resolves with undefined —
+                    // a thenable completion value must not be adopted
+                    // (adoption makes a completed module look suspended and
+                    // deadlocks its importers).
+                    self.resolve(result, Value::UNDEFINED);
+                } else {
+                    if ret.is_heap() {
+                        self.resolve_fresh_promise(result, ret);
+                    } else {
+                        self.resolve(result, ret);
+                    }
+                }
+            }
+            Err(_) => {
+                let e = match self.pending_throw.take() {
+                    Some(v) => v,
+                    None => self.alloc_error_from_message("Error"),
+                };
+                // The unwind already truncated the window; keep regs consistent.
+                self.regs.truncate(new_base);
+                if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                    a.state = GenState::Completed;
+                    a.regs.clear();
+                    a.handlers.clear();
+                }
+                self.reject_thrown_job(result, e);
+            }
+        }
+    }
+
+    /// Run one microtask. A reaction's callback may be a JS function (re-enters
+    /// the VM; a throw REJECTS the dependent, never unwinds the drain), a native
+    /// BoundResolver, or undefined (pass-through). `AsyncResume` resumes an async
+    /// activation (Stage 2).
+    pub(crate) fn run_microtask(&mut self, t: Microtask) {
+        match t {
+            Microtask::Reaction {
+                callback,
+                arg,
+                dependent,
+                kind,
+                finally,
+            } => {
+                if finally {
+                    // Run cb (no args) for its side effect, then forward the
+                    // original value/reason — unless cb itself throws.
+                    if !callback.is_undefined() {
+                        if let Err(_) = self.call_value(callback, Value::UNDEFINED, &[]) {
+                            let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                            self.reject_thrown_job(dependent, r);
+                            return;
+                        }
+                    }
+                    match kind {
+                        ReactionKind::Fulfill => self.resolve(dependent, arg),
+                        ReactionKind::Reject => self.reject(dependent, arg),
+                    }
+                    return;
+                }
+                if callback.is_undefined() {
+                    match kind {
+                        ReactionKind::Fulfill => self.resolve(dependent, arg),
+                        ReactionKind::Reject => self.reject(dependent, arg),
+                    }
+                    return;
+                }
+                if callback.is_heap() {
+                    if let HeapObj::BoundResolver {
+                        promise,
+                        is_reject,
+                        pair,
+                    } = self.heap.get(callback.heap_index())
+                    {
+                        let (pr, isr, pid) = (*promise, *is_reject, *pair);
+                        // [[AlreadyResolved]]: only the pair's FIRST call acts.
+                        if self.resolver_pair_fire(pid) {
+                            if isr {
+                                self.reject(pr, arg);
+                            } else {
+                                self.resolve(pr, arg);
+                            }
+                        }
+                        return;
+                    }
+                    // A combinator reaction (Promise.all/allSettled/race/any). The
+                    // kind comes from the reaction list (is_reject is for the
+                    // direct-call path only).
+                    if let HeapObj::CombinatorResolver {
+                        combinator, index, ..
+                    } = self.heap.get(callback.heap_index())
+                    {
+                        let (c, i) = (*combinator, *index);
+                        self.combinator_step(c, i, kind, arg);
+                        return;
+                    }
+                }
+                match self.call_value(callback, Value::UNDEFINED, &[arg]) {
+                    Ok(ret) => self.resolve(dependent, ret),
+                    Err(_) => {
+                        let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                        self.reject_thrown_job(dependent, r);
+                    }
+                }
+            }
+            // Resumes a suspended async activation with the settled value (or by
+            // throwing the rejection reason in at the await point). An async
+            // generator routes to its own driver.
+            Microtask::AsyncResume { activation, input } => {
+                if matches!(self.heap.get(activation), HeapObj::AsyncGenerator(_)) {
+                    self.drive_async_gen(activation, input);
+                } else {
+                    self.drive_async_resumed(activation, input);
+                }
+            }
+            Microtask::CombinatorStep {
+                combinator,
+                index,
+                kind,
+                arg,
+            } => self.combinator_step(combinator, index, kind, arg),
+            // The deferred finish of an eagerly-recorded Promise.all (see
+            // `eager_combinator_enabled`): all element jobs already ran at
+            // subscription; this job carries only the observable settle.
+            Microtask::CombinatorFinish { combinator } => self.combinator_finish(combinator),
+            Microtask::FinalizationCleanup { registry } => {
+                self.run_finalization_cleanup(registry)
+            }
+            // PromiseResolveThenableJob: run then.call(thenable, resolveFn, rejectFn).
+            // The resolving functions settle `promise` (one-shot via settle's Pending
+            // guard, so a thenable that calls both / twice is handled). A throwing
+            // `then` rejects the promise (a no-op if it already settled).
+            Microtask::ThenableJob {
+                thenable,
+                then,
+                promise,
+                ..
+            } => {
+                let pair = self.new_resolver_pair();
+                let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                    promise,
+                    is_reject: false,
+                    pair,
+                }));
+                // The running task is the traced owner of its freshly-created
+                // resolvers. Publish each one BEFORE the next allocation: under
+                // ZIPP_GC_STRESS an otherwise local-only resolver may be swept
+                // and its slot reused before `then` receives it.
+                if let Some(Microtask::ThenableJob { resolve, .. }) =
+                    self.current_microtask.as_mut()
+                {
+                    *resolve = res;
+                }
+                let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                    promise,
+                    is_reject: true,
+                    pair,
+                }));
+                if let Some(Microtask::ThenableJob { reject, .. }) = self.current_microtask.as_mut()
+                {
+                    *reject = rej;
+                }
+                if let Err(Thrown(msg)) = self.call_value(then, thenable, &[res, rej]) {
+                    let e = match self.pending_throw.take() {
+                        Some(v) => v,
+                        None => self.alloc_error_from_message(&msg),
+                    };
+                    // Spec: the job's catch calls resolvingFunctions.[[Reject]] —
+                    // a no-op when the pair already fired inside `then`.
+                    if self.resolver_pair_fire(pair) {
+                        self.reject_thrown_job(promise, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// CleanupFinalizationRegistry: consume cleared cells one at a time so a
+    /// callback can unregister other cleared cells or register new targets.
+    /// An abrupt callback is a job-level error; this embedding has no
+    /// HostReportErrors hook, so consume it and schedule the remaining cells as
+    /// a later cleanup job rather than poisoning the Promise queue.
+    fn run_finalization_cleanup(&mut self, registry: u32) {
+        loop {
+            let next = match self.heap.get_mut(registry) {
+                HeapObj::FinalizationRegistry {
+                    cleanup, cleared, ..
+                } => cleared.pop().map(|cell| (*cleanup, cell.held)),
+                _ => None,
+            };
+            let Some((cleanup, held)) = next else {
+                break;
+            };
+            let result = self.with_host_roots(&[cleanup, held], |vm| {
+                vm.call_value(cleanup, Value::UNDEFINED, &[held])
+            });
+            if result.is_err() {
+                self.pending_throw.take();
+                break;
+            }
+        }
+
+        let mut reschedule = false;
+        if let HeapObj::FinalizationRegistry {
+            cleared,
+            cleanup_queued,
+            ..
+        } = self.heap.get_mut(registry)
+        {
+            *cleanup_queued = false;
+            if !cleared.is_empty() {
+                *cleanup_queued = true;
+                reschedule = true;
+            }
+        }
+        if reschedule {
+            self.microtasks
+                .push_back(Microtask::FinalizationCleanup { registry });
+        }
+    }
+
+    /// Drain the microtask queue to empty (FIFO; tasks enqueued during the drain
+    /// run in the same drain). The whole event loop.
+    pub fn drain_microtasks(&mut self) {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Microtask);
+        // The embedding/main-script call that reached this checkpoint was one
+        // job. WeakRef targets kept during it may now be cleared before the
+        // first queued job starts.
+        self.finish_weak_job();
+        while let Some(t) = self.microtasks.pop_front() {
+            // B214: the popped task's Values are kept reachable by ROOTING a
+            // copy in `current_microtask` (traced by mark_roots) instead of
+            // suspending GC for the task's whole scope — a top-level-await
+            // module's entire body is one microtask, and the old whole-scope
+            // lock ran such programs with collection off (the npm-nanoid
+            // starvation; an unbounded-heap hole for long-lived TLA shapes).
+            // Save/restore handles a nested drain. run_microtask's internals
+            // need no more than any other native-to-interpreter path: frame
+            // registers root call arguments exactly as the lockless builtin
+            // callers (map/forEach) rely on.
+            if crate::vm::microtask_root_enabled() {
+                let prev = self.current_microtask.replace(t.clone());
+                self.run_microtask(t);
+                self.current_microtask = prev;
+            } else {
+                // The pre-B214 comparator: suspend GC for the task's scope.
+                let _gc = self.gc_lock_guard();
+                self.run_microtask(t);
+            }
+            // Between microtasks no un-rooted local survives, so reclaim now.
+            self.finish_weak_job();
+        }
+    }
+
+    /// Deliver cross-thread `Atomics.notify` wakes: drain this Vm's mailbox
+    /// and resolve each matching waitAsync promise "ok" (the notifier already
+    /// removed the global-registry entry; this removes the local bookkeeping).
+    /// An id with no surviving entry is dropped.
+    fn drain_mailbox(&mut self) {
+        let ids = std::mem::take(&mut *self.mailbox.wakes.lock().unwrap());
+        if ids.is_empty() {
+            return;
+        }
+        let mut to_wake: Vec<u32> = Vec::new();
+        self.async_waiters.retain(|&(_, _, p, _, id)| {
+            if id != 0 && ids.contains(&id) {
+                to_wake.push(p);
+                false
+            } else {
+                true
+            }
+        });
+        for p in to_wake {
+            let _gc = self.gc_lock_guard();
+            let v = self.alloc_str("ok".to_string());
+            self.resolve(p, v);
+        }
+    }
+
+    /// The Test262 host report (`ZIPP_REPORT_UNHANDLED=1`, set by
+    /// tools/run_test262.py). Once the program and its event loop have
+    /// finished, append an `errput` line for every exception that escaped a
+    /// promise job (see `reject_thrown_job`) and whose promise never gained a
+    /// handler, then one per exception a timer callback threw. Neither shows
+    /// up anywhere else — the process still exits 0 — so without these lines a
+    /// positive test whose assertion fails inside a promise job or a timer
+    /// scores PASS. A no-op when reporting is off.
+    pub(crate) fn report_unhandled_errors(&mut self) {
+        if !self.report_unhandled {
+            return;
+        }
+        for p in std::mem::take(&mut self.unhandled_rejections) {
+            let reason = match self.heap.get(p) {
+                HeapObj::Promise {
+                    state: PromiseState::Rejected,
+                    result,
+                    handled: false,
+                    ..
+                } => *result,
+                _ => continue,
+            };
+            let msg = if reason.is_heap()
+                && matches!(self.heap.get(reason.heap_index()), HeapObj::Object(_))
+            {
+                self.throw_message(reason)
+            } else {
+                self.display(reason)
+            };
+            self.errput
+                .push(format!("zipp: unhandled exception in promise job: {msg}"));
+        }
+        let timers = std::mem::take(&mut self.uncaught_timer_errors);
+        self.errput.extend(timers);
+    }
+
+    /// The full event loop: deliver cross-thread waitAsync wakes, drain
+    /// microtasks, then — while `$262.agent` timers or FINITE-deadline
+    /// waitAsync waiters remain — sleep until the earliest due time ON THE
+    /// MAILBOX CONDVAR (a remote `Atomics.notify` wakes the loop immediately
+    /// instead of after the full timeout), fire what is due, and go again.
+    /// Infinite-deadline waiters do not keep a Main loop alive; a WORKER
+    /// agent parks for them — the main agent's notify is what ends them.
+    pub(crate) fn run_event_loop(&mut self) {
+        loop {
+            // Cross-thread wakes FIRST: an "ok" resolution beats both the
+            // microtask drain and the deadline bookkeeping below.
+            self.drain_mailbox();
+            self.drain_microtasks();
+            let now = crate::vm::clock::Instant::now();
+            let next_timer = self.timer_queue.iter().map(|(d, _)| *d).min();
+            let next_wait = self
+                .async_waiters
+                .iter()
+                .filter_map(|(_, _, _, d, _)| *d)
+                .min();
+            let due = match (next_timer, next_wait) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let Some(due) = due else {
+                #[cfg(not(feature = "wasm-single-agent"))]
+                if self.agent_role == agents::AgentRole::Worker && !self.async_waiters.is_empty() {
+                    // Worker with only infinite-deadline waiters: park until a
+                    // notify lands in the mailbox (re-check under the lock —
+                    // a wake may have arrived since the drain above).
+                    let wakes = self.mailbox.wakes.lock().unwrap();
+                    if wakes.is_empty() {
+                        drop(self.mailbox.cv.wait(wakes).unwrap());
+                    }
+                    continue;
+                }
+                break;
+            };
+            if due > now {
+                // Interruptible sleep: notify pushes into the mailbox and
+                // signals this condvar (spurious wakeups just re-loop).
+                let wakes = self.mailbox.wakes.lock().unwrap();
+                if wakes.is_empty() {
+                    drop(self.mailbox.cv.wait_timeout(wakes, due - now).unwrap().0);
+                }
+            }
+            let now = crate::vm::clock::Instant::now();
+            // Fire due timers (FIFO among equal deadlines). `setTimeout`
+            // preflights the queue's worst-case scan+sort work before admitting
+            // each entry. Compact with `retain` so alternating due/future timers
+            // cannot turn repeated `Vec::remove` shifts into quadratic work.
+            // Attach the insertion index as a unique secondary key, allowing an
+            // allocation-free unstable sort without losing FIFO ties.
+            let mut fired: Vec<(crate::vm::clock::Instant, usize, Value)> = Vec::new();
+            if fired.try_reserve_exact(self.timer_queue.len()).is_err() {
+                // A host allocation failure must not panic/abort the sandbox.
+                // Drop the macrotasks: no guest callback is safer than running
+                // them out of order or looping forever on the same queue.
+                self.timer_queue.clear();
+                break;
+            }
+            let mut insertion_index = 0usize;
+            self.timer_queue.retain(|&(deadline, callback)| {
+                let index = insertion_index;
+                insertion_index = insertion_index.saturating_add(1);
+                if deadline <= now {
+                    fired.push((deadline, index, callback));
+                    false
+                } else {
+                    true
+                }
+            });
+            // The standard sort, not `cold_sort`, which allocates: this path
+            // reserves fallibly above so that a host allocation failure
+            // cannot abort the sandbox.
+            fired.sort_unstable_by_key(|&(deadline, index, _)| (deadline, index));
+            // B214's rule for timers: the fired callbacks just left
+            // `timer_queue` (a traced root), so ROOT the batch rather than
+            // suspending collection for each callback's whole run — a
+            // `setTimeout(main)` program otherwise never collects until main
+            // returns. Every timer is its own task: a microtask checkpoint (and
+            // its between-jobs collection) follows each callback, and an
+            // uncaught throw ends the loop as the program's error, as in Node.
+            if self.host_result_roots.try_reserve(fired.len()).is_err() {
+                self.timer_queue.clear();
+                break;
+            }
+            let roots_base = self.host_result_roots.len();
+            self.host_result_roots
+                .extend(fired.iter().map(|&(_, _, cb)| cb).filter(|cb| cb.is_heap()));
+            let mut threw = false;
+            for &(_, _, cb) in &fired {
+                if let Err(Thrown(msg)) = self.call_value(cb, Value::UNDEFINED, &[]) {
+                    // Take the live throw: left in `pending_throw`, a later
+                    // entry's deopt check would read it as a throw in flight.
+                    let v = match self.pending_throw.take() {
+                        Some(v) => v,
+                        None => self.error_from_thrown(&msg),
+                    };
+                    if self.uncaught_timer_throw.is_none() {
+                        self.uncaught_timer_throw = Some(v);
+                    }
+                    threw = true;
+                    break;
+                }
+                self.drain_microtasks();
+            }
+            self.host_result_roots.truncate(roots_base);
+            if threw {
+                self.timer_queue.clear();
+                break;
+            }
+            // Resolve due waitAsync waiters "timed-out" — DEREGISTERING under
+            // the registry lock first. An entry already gone means a notify
+            // won the race: skip the resolution and keep the local tuple; the
+            // "ok" wake is already in the mailbox (notify delivers under the
+            // registry lock) and the next iteration's drain resolves it.
+            let waiters = std::mem::take(&mut self.async_waiters);
+            let mut due_waiters: Vec<u32> = Vec::new();
+            let mut kept = Vec::with_capacity(waiters.len());
+            for w in waiters {
+                let (buf, addr, p, d, id) = w;
+                if !d.is_some_and(|d| d <= now) {
+                    kept.push(w);
+                    continue;
+                }
+                let timed_out = id == 0 || {
+                    let mem_key = match self.heap.get(buf) {
+                        HeapObj::ArrayBuffer { data, .. } => {
+                            data.shared().map(|m| std::sync::Arc::as_ptr(m) as usize)
+                        }
+                        _ => None,
+                    };
+                    match mem_key {
+                        Some(k) => agents::take_async_waiter((k, addr), id),
+                        None => true,
+                    }
+                };
+                if timed_out {
+                    due_waiters.push(p);
+                } else {
+                    kept.push(w);
+                }
+            }
+            self.async_waiters = kept;
+            for p in due_waiters {
+                let _gc = self.gc_lock_guard();
+                let v = self.alloc_str("timed-out".to_string());
+                self.resolve(p, v);
+            }
+        }
+    }
+
+    // ── property / index access ──
+}
