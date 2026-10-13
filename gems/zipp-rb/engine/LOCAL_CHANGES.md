@@ -15,26 +15,25 @@ fix is additive embed API, and all of it is a candidate to propose upstream.
 
 ## Embed API (crates/zipp-vm/src/embed.rs, vm/host_api.rs, vm/natives.rs, vm/mod.rs, vm/engine/boot.rs)
 
-- **Re-entrant string host channel** — `HostCallReentrant`,
-  `ScriptState::set_host_call_reentrant`. The `HOST_CALL` native calls an
-  `Rc`'d host without taking it, so a nested `__zippHostCall` re-enters.
 - **Structured host channel** — `__zippHostCallValue` (`HOST_CALL_VALUE`,
   vm/native.rs + natives.rs), `HostCallValues`,
-  `ScriptState::set_host_call_values`. Arguments and reply cross as
-  `HostValue` trees (no JSON). The channel every zipp-rb callback uses.
+  `ScriptState::set_host_call_values`. The host closure is an `Rc` called
+  without being taken out of the VM, so a nested call re-enters it; arguments
+  and reply cross as `HostValue` trees (no JSON). The channel every zipp-rb
+  callback uses.
 - **`HostCtx` re-entry** — `HostCtx::eval_script`, `call_global_value`, and
   `call_handle_value` / `read_handle_value` / `release_handle_value` (handles
   checked against `Vm::host_owner_id`). Lets a host callback drive the same VM.
-- **Durable handles** — `HostHandle`, `ScriptState::handle_of_slot`,
-  `handle_of_global`, `call_handle`, `get_handle`, `release_handle`; the
-  handle table is a GC root (vm/gc.rs `mark_roots`).
+- **Durable handles** — `HostHandle`, `ScriptState::handle_of_global`,
+  `call_handle`, `get_handle`, `release_handle`; the handle table is a GC root
+  (vm/gc.rs `mark_roots`).
 - **Structured calls and errors** — `call_global_structured`,
   `eval_in_context_structured`, `JsError { name, message, stack }`; global
   name resolution unified on `host_resolve_global_by_name` so a function
   installed as `globalThis[name]` is found.
-- **Sinks** — `set_console_sink` (console lines), and
-  `set_unhandled_rejection_sink` (vm/async_runtime.rs: with a sink installed,
-  every unhandled rejection is reported, not only Test262's narrow case).
+- **Unhandled-rejection sink** — `set_unhandled_rejection_sink`
+  (vm/async_runtime.rs: with a sink installed, every unhandled rejection is
+  reported, not only Test262's narrow case).
 - **Lifecycle** — `ScriptState::dispose` / `disposed` (idempotent teardown),
   `gc_now` (`Vm::force_gc`, a no-op while a host conversion holds the GC lock).
 - **In-memory modules** — `HostModuleProvider`,

@@ -696,7 +696,7 @@ impl HostCallError {
 /// `name` and `message` properties (so a Ruby binding maps `TypeError` to a
 /// Ruby class rather than parsing a string) and the `stack` when the thrown
 /// value was an Error. Produced by the structured entry points
-/// (`ScriptState::call_slot_structured` / `eval_in_context_structured`); the
+/// (`ScriptState::call_global_structured` / `eval_in_context_structured`); the
 /// string entry points continue to report a rendered message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsError {
@@ -1281,12 +1281,6 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// A durable handle for the value currently in global slot `index`.
-    pub(crate) fn host_handle_of_slot(&mut self, index: u32) -> Option<u32> {
-        let v = *self.globals.get(index as usize)?;
-        Some(self.host_handle_new(v))
-    }
-
     /// A durable handle for the global binding `name` resolves to, by the same
     /// lookup a bare identifier read uses (program/eval bindings, the global
     /// object and its chain, then the builtins).
@@ -1574,39 +1568,6 @@ impl<'p> Vm<'p> {
             }
             Err(e) => Err(e),
         }
-    }
-
-    /// Call the function in global slot `index` and return its result as a
-    /// structured [`HostValue`], with a throw reported as a structured
-    /// [`JsError`] (name/message/stack). Drains microtasks like
-    /// [`Self::host_call_slot`].
-    pub(crate) fn host_call_slot_structured(
-        &mut self,
-        index: u32,
-        args: &[HostValue],
-    ) -> Result<HostValue, JsError> {
-        let callee = match self.globals.get(index as usize) {
-            Some(v) => *v,
-            None => {
-                return Err(JsError::from_message(&format!(
-                    "zipp: no global in slot {index}"
-                )))
-            }
-        };
-        if !self.is_callable(callee) {
-            return Err(JsError {
-                name: "TypeError".to_string(),
-                message: format!("global slot {index} is not a function"),
-                stack: None,
-            });
-        }
-        let argv: Vec<Value> = {
-            let _g = self.gc_lock_guard();
-            args.iter().map(|a| self.host_in(a, 0)).collect()
-        };
-        let res = self.host_invoke(callee, &argv);
-        let mut budget = HostValueBudget::default();
-        self.marshal_after_drain_structured(res, &mut budget, true)
     }
 
     /// Call the global function `name` with structured arguments and return

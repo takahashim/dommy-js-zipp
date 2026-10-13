@@ -219,7 +219,6 @@ impl<'p> Vm<'p> {
             console_sink: None,
             host: None,
             host_ctx: None,
-            host_reentrant: None,
             host_values: None,
             host_owner_id: 0,
             unhandled_rejection_sink: None,

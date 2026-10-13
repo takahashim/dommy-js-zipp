@@ -62,24 +62,15 @@ pub fn parse_f64(text: &str) -> Option<f64> {
 /// script to see.
 pub type HostCall = Box<dyn FnMut(&str, &[String]) -> Result<String, String>>;
 
-/// The re-entrant host channel, installed with
-/// [`ScriptState::set_host_call_reentrant`]. Like [`HostCallCtx`], it receives
-/// the VM as [`HostCtx`] (so it may resolve typed arrays, evaluate JS and call
-/// globals), but it is shared behind an `Rc` and invoked through a cloned
-/// handle, so a guest that calls `__zippHostCall` again while a call is being
-/// served re-enters the same closure instead of failing with "no host
-/// installed". The closure is `Fn`: mutable host state lives behind the host's
-/// own interior mutability (which also makes re-entry the host's decision to
-/// allow or refuse). This is the channel a Ruby binding needs for the common
-/// JS→Ruby→JS round trip.
-pub type HostCallReentrant =
-    std::rc::Rc<dyn Fn(&mut dyn HostCtx, &str, &[String]) -> Result<String, String>>;
-
 /// The structured host channel, installed with
-/// [`ScriptState::set_host_call_values`]. Backs the `__zippHostCallValue` native:
-/// like [`HostCallReentrant`] it is shared behind an `Rc` and re-entrant, but
-/// every argument and the reply cross as an owned [`HostValue`] tree rather
-/// than a ToString'd string, so numbers, arrays, plain objects, `Float32Array`s
+/// [`ScriptState::set_host_call_values`]. Backs the `__zippHostCallValue` native.
+/// Like [`HostCallCtx`] it receives the VM as [`HostCtx`] (so it may evaluate
+/// JS and call globals), but it is shared behind an `Rc` and invoked through a
+/// cloned handle, so a guest that calls the host again while a call is being
+/// served re-enters the same closure instead of failing with "no host
+/// installed". The closure is `Fn`: mutable host state lives behind the
+/// host's own interior mutability. Every argument and the reply cross as an
+/// owned [`HostValue`] tree rather than a ToString'd string, so numbers, arrays, plain objects, `Float32Array`s
 /// and lone-surrogate strings round-trip exactly — no JSON in the path. This is
 /// the channel a Ruby binding uses for anything that is not a bare string.
 pub type HostCallValues = std::rc::Rc<
@@ -135,7 +126,7 @@ impl JsValue {
 }
 
 /// A durable, VM-scoped handle to a JS value the host keeps across re-entries
-/// (see [`ScriptState::handle_of_slot`]). Opaque on purpose: the value it roots
+/// (see [`ScriptState::handle_of_global`]). Opaque on purpose: the value it roots
 /// lives in the VM's heap and is only meaningful to that VM. Using it on
 /// another VM, or after the VM is dropped, is refused rather than reinterpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -367,20 +358,10 @@ impl ScriptState {
         self.with_vm(|vm| vm.host_ctx = Some(host));
     }
 
-    /// Install the re-entrant host channel (see [`HostCallReentrant`]). Served
-    /// in preference to both [`Self::set_host_call_ctx`] and
-    /// [`Self::set_host_call`]. Unlike them it is not taken out of the VM for
-    /// the duration of a call, so the guest may call `__zippHostCall` again
-    /// while a call is being served, and the host may evaluate JS or call
-    /// globals through the [`HostCtx`] it receives.
-    pub fn set_host_call_reentrant(&mut self, host: HostCallReentrant) {
-        self.with_vm(|vm| vm.host_reentrant = Some(host));
-    }
-
     /// Install the structured host channel backing `__zippHostCallValue` (see
     /// [`HostCallValues`]). Leaves the string channels
-    /// ([`Self::set_host_call`], [`Self::set_host_call_ctx`],
-    /// [`Self::set_host_call_reentrant`]) in place for `__zippHostCall`; the two
+    /// ([`Self::set_host_call`], [`Self::set_host_call_ctx`]) in place for
+    /// `__zippHostCall`; the two
     /// natives are independent, so a host may serve either or both.
     pub fn set_host_call_values(&mut self, host: HostCallValues) {
         self.with_vm(|vm| vm.host_values = Some(host));
@@ -875,15 +856,6 @@ impl ScriptState {
     // keep a JS callback and invoke it on a later event. Handles are scoped to
     // one VM: using one on another is refused.
 
-    /// Take a durable handle to the value in global slot `index`. `None` when
-    /// the slot has no such value (out of range).
-    pub fn handle_of_slot(&mut self, index: u32) -> Option<HostHandle> {
-        let vm_id = self.vm_id;
-        self.with_vm(|vm| vm.host_handle_of_slot(index))
-            .flatten()
-            .map(|idx| HostHandle::new(vm_id, idx))
-    }
-
     /// Take a durable handle to the global binding `name` resolves to. `None`
     /// when the name does not resolve.
     pub fn handle_of_global(&mut self, name: &str) -> Option<HostHandle> {
@@ -962,23 +934,9 @@ impl ScriptState {
     // `message` and `stack`, so a binding can map JS error classes and attach
     // a backtrace. Same rooting, drain and value-marshalling rules otherwise.
 
-    /// [`Self::call_slot`] returning a structured [`JsError`] on a throw.
-    pub fn call_slot_structured(
-        &mut self,
-        index: u32,
-        args: &[HostValue],
-    ) -> Result<HostValue, JsError> {
-        let result = self
-            .with_vm(|vm| vm.host_call_slot_structured(index, args))
-            .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)));
-        self.report_rejections();
-        result
-    }
-
     /// Call the global function `name` with structured arguments, returning a
-    /// structured [`HostValue`] and a throw as a structured [`JsError`]. The
-    /// by-name counterpart of [`Self::call_slot_structured`]: it resolves the
-    /// name a bare identifier read would (program and eval-created bindings,
+    /// structured [`HostValue`] and a throw as a structured [`JsError`]. It
+    /// resolves the name a bare identifier read would (program and eval-created bindings,
     /// the global object and its chain, then the builtins), so an
     /// eval-declared function or a `globalThis` property is found.
     pub fn call_global_structured(
@@ -2398,32 +2356,6 @@ mod tests {
     }
 
     #[test]
-    fn reentrant_host_channel_serves_nested_calls() {
-        let mut st = compile_script("").expect("compiles");
-        st.run_init().expect("runs");
-        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
-        let seen = calls.clone();
-        st.set_host_call_reentrant(std::rc::Rc::new(
-            move |ctx: &mut dyn HostCtx, kind: &str, _args: &[String]| -> Result<String, String> {
-                seen.borrow_mut().push(kind.to_string());
-                if kind == "outer" {
-                    // The guest calls the host again from inside the host call;
-                    // the reentrant channel must serve it instead of throwing.
-                    let v = ctx.eval_script("__zippHostCall('inner')")?;
-                    Ok(format!("{v:?}"))
-                } else {
-                    Ok("inner".into())
-                }
-            },
-        ));
-        assert_eq!(
-            st.eval_in_context("__zippHostCall('outer')"),
-            Ok(JsValue::String("String(\"inner\")".into()))
-        );
-        assert_eq!(*calls.borrow(), vec!["outer".to_string(), "inner".to_string()]);
-    }
-
-    #[test]
     fn host_ctx_can_eval_and_call_globals() {
         let mut st = compile_script("function greet(n){ return 'hi ' + n; }").expect("compiles");
         st.run_init().expect("runs");
@@ -2605,8 +2537,7 @@ mod tests {
 
         let mut st = compile_script("function boom(){ throw new RangeError('rng'); }").expect("compiles");
         st.run_init().expect("runs");
-        let slot = slot_of(&st, "boom");
-        let err = st.call_slot_structured(slot, &[]).expect_err("throws");
+        let err = st.call_global_structured("boom", &[]).expect_err("throws");
         assert_eq!(err.name, "RangeError");
         assert_eq!(err.message, "rng");
 

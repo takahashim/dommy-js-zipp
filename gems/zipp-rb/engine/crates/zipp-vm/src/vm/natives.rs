@@ -5330,13 +5330,10 @@ impl<'p> Vm<'p> {
                     self.preflight_guest_string_size(aggregate)?;
                     rest.push(value);
                 }
-                // The re-entrant hook first: a cloned `Rc` is called while the
-                // `Vm` is passed as `HostCtx`, so the host may resolve typed
-                // arrays, evaluate JS, and be re-entered by the guest without
-                // the "no host installed" failure the taken-out hooks produce.
-                let reply = if let Some(host) = self.host_reentrant.clone() {
-                    host(self, &kind, &rest)
-                } else if let Some(mut host) = self.host_ctx.take() {
+                // The context-taking hook first: it receives the VM, so the
+                // host may resolve typed arrays and call guest functions while
+                // it runs (`crate::vm::host_api::HostCtx`).
+                let reply = if let Some(mut host) = self.host_ctx.take() {
                     let reply = host(self, &kind, &rest);
                     self.host_ctx = Some(host);
                     reply

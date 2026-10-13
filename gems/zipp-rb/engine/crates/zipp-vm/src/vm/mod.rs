@@ -1666,22 +1666,12 @@ pub struct Vm<'p> {
     /// already produces. The host counterpart of the browser's
     /// `unhandledrejection` event.
     pub(crate) unhandled_rejection_sink: Option<Box<dyn FnMut(&str)>>,
-    /// Re-entrant host channel: like `host_ctx`, but stored behind an `Rc`
-    /// and called through a cloned handle rather than taken out of the `Vm`,
-    /// so a guest that calls `__zippHostCall` again while a call is being
-    /// served re-enters the SAME closure instead of throwing "no host
-    /// installed". The closure is `Fn` (not `FnMut`); host-side mutable state
-    /// belongs behind the host's own interior mutability. Preferred over
-    /// `host_ctx` and `host` when installed. A Ruby binding needs this: a
-    /// host call that dispatches a DOM event can run a handler that calls
-    /// back into the host.
-    pub(crate) host_reentrant:
-        Option<std::rc::Rc<dyn Fn(&mut dyn crate::vm::host_api::HostCtx, &str, &[String]) -> Result<String, String>>>,
-    /// Structured host channel backing the `HOST_CALL_VALUE` native. Like
-    /// `host_reentrant`, it is shared behind an `Rc` and called through a
-    /// cloned handle (so it is re-entrant), but arguments and the reply cross
-    /// as owned `HostValue` trees rather than strings. The channel a Ruby
-    /// binding uses for everything that is not a bare string.
+    /// Structured host channel backing the `HOST_CALL_VALUE` native. Unlike
+    /// `host_ctx` it is shared behind an `Rc` and called through a cloned
+    /// handle rather than taken out of the `Vm`, so a guest that calls the
+    /// host again while a call is being served re-enters the same closure;
+    /// arguments and the reply cross as owned `HostValue` trees rather than
+    /// strings. The channel a Ruby binding uses.
     pub(crate) host_values: Option<
         std::rc::Rc<
             dyn Fn(
