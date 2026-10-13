@@ -640,7 +640,9 @@ impl<'p> Vm<'p> {
             // The synthesized `prototype` is {writable:true, enumerable:false,
             // configurable:false}: converting it to an ACCESSOR — or making it
             // configurable/enumerable — is an illegal non-configurable
-            // redefinition (a data-value redefine stays accepted-but-unmodelled).
+            // redefinition. A function's may be made non-writable (WebIDL's
+            // legacy factory functions, `Image`, are), after which only the
+            // same value may be restated.
             let (v, get, set, wr, d_en, d_cf) = self.read_descriptor(desc)?;
             if get.is_some() || set.is_some() || d_cf == Some(true) || d_en == Some(true) {
                 return Err(Thrown::from_static(
@@ -655,8 +657,14 @@ impl<'p> Vm<'p> {
                     "TypeError: Cannot redefine property: prototype",
                 ));
             }
+            let readonly = self.fn_proto_readonly.contains(&idx);
+            if readonly && wr == Some(true) {
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot redefine property: prototype",
+                ));
+            }
             if let Some(v) = v {
-                if is_class {
+                if is_class || readonly {
                     let cur = self.prototype_of(obj).unwrap_or(Value::UNDEFINED);
                     if !self.same_value(v, cur) {
                         return Err(Thrown::from_static(
@@ -671,6 +679,13 @@ impl<'p> Vm<'p> {
                         self.prototypes.insert(idx, v.heap_index());
                     }
                 }
+            }
+            if !is_class && wr == Some(false) && !readonly {
+                // Pin the current value as the override (rooting the function
+                // for the set, see `fn_proto_readonly`).
+                let cur = self.prototype_of(obj).unwrap_or(Value::UNDEFINED);
+                self.fn_proto_override.entry(idx).or_insert(cur);
+                self.fn_proto_readonly.insert(idx);
             }
             return Ok(());
         }

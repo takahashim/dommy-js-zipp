@@ -1574,16 +1574,7 @@ impl<'p> Vm<'p> {
     /// its result as a structured [`HostValue`], reporting a throw as a
     /// structured [`JsError`]. Resolves `name` the way a bare identifier read
     /// is (so an eval-declared function or a `globalThis` property is found).
-    pub(crate) fn host_call_global_structured(
-        &mut self,
-        name: &str,
-        args: &[HostValue],
-    ) -> Result<HostValue, JsError> {
-        self.host_call_global_structured_opts(name, args, true)
-    }
-
-    /// [`Self::host_call_global_structured`], draining microtasks afterwards
-    /// only when `drain_microtasks` is set.
+    /// Microtasks are drained afterwards only when `drain_microtasks` is set.
     pub(crate) fn host_call_global_structured_opts(
         &mut self,
         name: &str,
@@ -1614,23 +1605,9 @@ impl<'p> Vm<'p> {
     /// structured [`HostValue`], with a throw reported as a structured
     /// [`JsError`]. Mirrors [`Self::host_eval_rich`] otherwise.
     pub(crate) fn host_eval_structured(&mut self, src: &str) -> Result<HostValue, JsError> {
-        let res = self.do_eval(
-            src,
-            false,
-            false,
-            None,
-            None,
-            false,
-            false,
-            Value::UNDEFINED,
-            None,
-            true,
-            None,
-            Vec::new(),
-            None,
-            None,
-            None,
-        );
+        // A host's evaluation is a classic script, not an eval: a strict one's
+        // declarations still reach the global (see `host_run_script`).
+        let res = self.host_run_script(src);
         let mut budget = HostValueBudget::default();
         self.marshal_after_drain_structured(res, &mut budget, true)
     }
@@ -1664,13 +1641,22 @@ impl<'p> Vm<'p> {
                     let idx = v.heap_index();
                     let name = self.read_data_prop(idx, "name").map(|n| self.display(n));
                     let message = self.read_data_prop(idx, "message").map(|m| self.display(m));
-                    // The engine does not populate Error.stack in embedded
-                    // states; an empty/absent stack is reported as `None` so a
-                    // host leaves Ruby's own backtrace in place.
-                    let stack = self
-                        .read_data_prop(idx, "stack")
-                        .map(|s| self.display(s))
-                        .filter(|s| !s.is_empty());
+                    // An own `stack` the script assigned wins; an Error reports
+                    // the frames it was created in. An empty one is `None`, so
+                    // a host leaves its own backtrace in place.
+                    let own_stack = match self.heap.get(idx) {
+                        HeapObj::Object(m) => m
+                            .pos("stack")
+                            .filter(|&i| !m.attr_at(i).accessor)
+                            .map(|i| m.val_at(i)),
+                        _ => None,
+                    };
+                    let stack = match own_stack {
+                        Some(s) => Some(self.display(s)),
+                        None if self.error_data.contains(&idx) => self.error_stack_string(idx).ok(),
+                        None => None,
+                    }
+                    .filter(|s| !s.is_empty());
                     if name.is_some() || message.is_some() || stack.is_some() {
                         return JsError {
                             name: name.unwrap_or_else(|| "Error".to_string()),
@@ -2316,6 +2302,9 @@ pub trait HostCtx {
     fn release_handle_value(&mut self, _handle: crate::embed::HostHandle) -> bool {
         false
     }
+    /// [`crate::embed::ScriptState::set_script_name`] from inside the host
+    /// call. The default implementation ignores it.
+    fn set_script_name(&mut self, _name: Option<&str>) {}
 }
 
 /// The context-taking twin of [`crate::embed::HostCall`]: the same string
@@ -2514,7 +2503,8 @@ impl<'p> HostCtx for Vm<'p> {
     /// stay queued for the outermost entry (see [`HostCtx::eval_script`]).
     fn eval_script(&mut self, src: &str) -> Result<HostValue, String> {
         let mut budget = HostValueBudget::default();
-        self.host_eval_rich_opts(src, &mut budget, false)
+        let res = self.host_run_script(src);
+        self.marshal_after_drain(res, &mut budget, false)
             .map_err(HostCallError::into_message)
     }
 
@@ -2566,5 +2556,9 @@ impl<'p> HostCtx for Vm<'p> {
 
     fn release_handle_value(&mut self, handle: crate::embed::HostHandle) -> bool {
         handle.vm_id() == self.host_owner_id && self.host_handle_release(handle.index())
+    }
+
+    fn set_script_name(&mut self, name: Option<&str>) {
+        self.script_name = name.map(std::sync::Arc::from);
     }
 }

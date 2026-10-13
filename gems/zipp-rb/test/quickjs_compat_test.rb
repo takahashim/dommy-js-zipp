@@ -51,7 +51,9 @@ class QuickjsCompatTest < Minitest::Test
   def test_plain_object_becomes_hash
     v = vm
     assert_equal({}, v.eval("const o = {}; o"))
-    assert_equal({ "a" => "1", "b" => 1 }, v.eval("const o = { a: '1', b: 1 }; o;"))
+    # A top-level `const` persists into later evaluations (script semantics),
+    # so the second one needs a name of its own.
+    assert_equal({ "a" => "1", "b" => 1 }, v.eval("const o2 = { a: '1', b: 1 }; o2;"))
   end
 
   def test_plain_array_becomes_array

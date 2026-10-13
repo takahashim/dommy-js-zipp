@@ -349,6 +349,8 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         upvalues,
         eval_sites,
         source,
+        positions,
+        script,
     } = f;
     w.str(name);
     w.len(code.len());
@@ -419,6 +421,19 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         w.strs(lexical);
     }
     sources.encode(w, source);
+    w.len(positions.len());
+    for p in positions {
+        w.u32(p.ip);
+        w.u32(p.line);
+        w.u32(p.col);
+    }
+    match script {
+        None => w.u8(0),
+        Some(name) => {
+            w.u8(1);
+            w.str(name);
+        }
+    }
 }
 
 fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
@@ -486,6 +501,15 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         eval_sites.push((bindings, collisions, r.strs()?));
     }
     let source = sources.decode(r)?;
+    let mut positions = Vec::new();
+    for _ in 0..r.len()? {
+        positions.push(crate::bytecode::SourcePos { ip: r.u32()?, line: r.u32()?, col: r.u32()? });
+    }
+    let script = match r.u8()? {
+        0 => None,
+        1 => Some(std::sync::Arc::from(r.str()?)),
+        b => return Err(format!("bad option {b}")),
+    };
     Ok(FuncProto {
         name,
         code,
@@ -510,6 +534,8 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         upvalues,
         eval_sites,
         source,
+        positions,
+        script,
     })
 }
 

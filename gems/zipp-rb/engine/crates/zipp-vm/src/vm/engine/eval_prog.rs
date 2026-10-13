@@ -165,6 +165,9 @@ impl<'p> Vm<'p> {
         // 5. Re-index function-id, global-slot, and class-id operands, leak each
         //    FuncProto (stable address — raw pointers live into it), append.
         let mut new_funcs: Vec<&'static FuncProto> = Vec::with_capacity(eval_prog.functions.len());
+        // The script the functions came from, for their Error stacks: the
+        // module being installed, else what the host named this evaluation.
+        let script = self.installing_module.clone().or_else(|| self.script_name.clone());
         for mut f in eval_prog.functions {
             for ins in f.code.iter_mut() {
                 match ins {
@@ -281,6 +284,9 @@ impl<'p> Vm<'p> {
             }
             if let Some(s) = f.name_global {
                 f.name_global = Some(gmap[s as usize]);
+            }
+            if f.script.is_none() {
+                f.script = script.clone();
             }
             new_funcs.push(Box::leak(Box::new(f)));
         }
@@ -712,6 +718,33 @@ impl<'p> Vm<'p> {
         }
         // Script GlobalDeclarationInstantiation (not eval semantics) for this
         // program: prepare_eval_program consumes the flag.
+        self.eval_script_gdi = true;
+        let (completion, _gmap) = self.run_eval_program(
+            prog,
+            None,
+            false,
+            None,
+            None,
+            Value::UNDEFINED,
+            None,
+            true,
+            None,
+            None,
+        )?;
+        Ok(completion)
+    }
+
+    /// Run `code` as a classic script in the live realm — what a browser does
+    /// with a `<script>`: script GlobalDeclarationInstantiation, so its
+    /// top-level `var`s and functions become global-object properties and its
+    /// `let`/`const`/`class` global lexicals visible to later scripts, even
+    /// when the script is strict (an indirect eval would keep both to
+    /// itself). Returns the completion value.
+    pub(crate) fn host_run_script(&mut self, code: &str) -> Result<Value, Thrown> {
+        self.require_external_code_enabled()?;
+        let ast = crate::front::parse_script(code).map_err(Thrown)?;
+        let prog = crate::compile::compile_script_with_completion(&ast, code)
+            .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
         self.eval_script_gdi = true;
         let (completion, _gmap) = self.run_eval_program(
             prog,

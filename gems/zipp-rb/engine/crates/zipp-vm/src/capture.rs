@@ -690,7 +690,7 @@ fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>, scoped: bool) {
         names
     };
     match s {
-        Stmt::Expr(e) => expr_refs(e, out),
+        Stmt::Expr(e, _) => expr_refs(e, out),
         // The with OBJECT expression and every reference in the body count
         // (an outer local referenced only inside a with body must be captured).
         Stmt::With { object, body } => {
@@ -751,7 +751,7 @@ fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>, scoped: bool) {
                 stmt_refs(body, out, scoped);
             });
         }
-        Stmt::Return(r) => {
+        Stmt::Return(r, _) => {
             if let Some(a) = r {
                 expr_refs(a, out);
             }
@@ -830,7 +830,7 @@ fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>, scoped: bool) {
                 }
             });
         }
-        Stmt::Throw(t) => expr_refs(t, out),
+        Stmt::Throw(t, _) => expr_refs(t, out),
         Stmt::Labeled { body, .. } => stmt_refs(body, out, scoped),
         Stmt::ClassDecl(c) => class_free(c, out),
         // NOTE: `Stmt::Import`/`Stmt::Export` fall here and contribute nothing.
@@ -1247,7 +1247,7 @@ fn class_free<'a>(class: &'a Class, out: &mut Names<'a>) {
 /// Union of free vars of functions nested DIRECTLY in `s` (one level down).
 fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
     match s {
-        Stmt::Expr(e) => collect_nested_free_expr(e, out),
+        Stmt::Expr(e, _) => collect_nested_free_expr(e, out),
         Stmt::VarDecl(d) => {
             for decl in &d.decls {
                 if let Some(init) = &decl.init {
@@ -1325,7 +1325,7 @@ fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
             collect_nested_free_expr(right, out);
             collect_nested_free(body, out);
         }
-        Stmt::Return(r) => {
+        Stmt::Return(r, _) => {
             if let Some(a) = r {
                 collect_nested_free_expr(a, out);
             }
@@ -1364,7 +1364,7 @@ fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
                 }
             }
         }
-        Stmt::Throw(t) => collect_nested_free_expr(t, out),
+        Stmt::Throw(t, _) => collect_nested_free_expr(t, out),
         Stmt::Labeled { body, .. } => collect_nested_free(body, out),
         Stmt::ClassDecl(c) => class_free(c, out),
         _ => {}

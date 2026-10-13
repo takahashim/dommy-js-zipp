@@ -156,6 +156,17 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The name a module's Error stack frames report: what the host's
+    /// `import.meta.url` hook answers for its path, else the path.
+    pub(crate) fn module_name_for_stack(&self, path: &std::path::Path) -> std::sync::Arc<str> {
+        let name = self
+            .module_meta_url
+            .as_ref()
+            .and_then(|url_of| url_of(path))
+            .unwrap_or_else(|| path.display().to_string());
+        std::sync::Arc::from(name)
+    }
+
     /// Install a host module provider over a virtual `root`: specifiers under
     /// `root` resolve lexically and each module's bytes come from `provider`
     /// (never from the filesystem). `root` must be absolute; it need not exist.
@@ -743,6 +754,8 @@ impl<'p> Vm<'p> {
         let mut full: Vec<(String, u32)> = Vec::new();
         if early_prepare {
             let prog = prog_opt.take().expect("module program");
+            // Its functions' Error stacks name the module.
+            let saved_module = self.installing_module.replace(self.module_name_for_stack(&path));
             let prepared = self.prepare_eval_program(
                 prog,
                 true,
@@ -761,6 +774,7 @@ impl<'p> Vm<'p> {
                 },
                 None,
             );
+            self.installing_module = saved_module;
             match prepared {
                 Ok((gmap, base_func)) => {
                     let end = (self.main_func_count + self.eval_funcs.len()) as u32;
@@ -1037,6 +1051,8 @@ impl<'p> Vm<'p> {
             Some(p) => p,
             None => {
                 let prog = prog_opt.take().expect("module program");
+                // Its functions' Error stacks name the module.
+                let saved_module = self.installing_module.replace(self.module_name_for_stack(&path));
                 let prepared = self.prepare_eval_program(
                     prog,
                     true,
@@ -1059,6 +1075,7 @@ impl<'p> Vm<'p> {
                         Some(&prealloc)
                     },
                 );
+                self.installing_module = saved_module;
                 match prepared {
                     Ok((gmap, base_func)) => {
                         let end = (self.main_func_count + self.eval_funcs.len()) as u32;

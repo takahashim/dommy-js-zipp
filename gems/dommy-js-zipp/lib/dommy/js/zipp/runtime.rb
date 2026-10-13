@@ -26,9 +26,23 @@ module Dommy
         # long a never-settling result takes to raise ZippRb::NoAwaitError.
         AWAIT_MAX_MS = 100
 
-        # Options go to the VM (timeout_msec:, memory_limit:, step_limit:).
-        def initialize(**vm_opts)
+        # Register an ES module process-wide under its canonical name (the one
+        # its relative imports resolve against, a page module's resolved URL),
+        # for a later Runtime to preload. `source:` is a String or a Proc
+        # returning one, read when a Runtime first preloads it.
+        def self.register_module(name, source:)
+          ModuleRegistry.register(name, source: source)
+        end
+
+        # `preload_modules:` names registered modules (see .register_module)
+        # this Runtime finds by name before asking its module loader; a loader
+        # answer of `{as: name}` lands on one too. A name not registered raises
+        # ArgumentError. Other options go to the VM (timeout_msec:,
+        # memory_limit:, step_limit:).
+        def initialize(preload_modules: [], **vm_opts)
+          preloaded = ModuleRegistry.sources_for(preload_modules)
           @backend = Backend.new(**vm_opts)
+          @backend.preload_modules(preloaded) unless preloaded.empty?
           @bridge = Dommy::Js::HostBridge.new(@backend)
           @environment = BrowserEnvironment.new(@backend)
           @errors = ErrorTranslator.new(@backend, @bridge)
@@ -94,8 +108,9 @@ module Dommy
         end
 
         # Zipp has no bytecode cache; an external script is parsed each time.
+        # `cache_key` is its URL, which its Errors' stack frames report.
         def load_script_cached(js, cache_key: nil)
-          load_script(js)
+          in_page_turn { @backend.load(js, filename: cache_key) }
         end
 
         # Install the ESM module resolver: a callable `(specifier, importer) ->
@@ -189,6 +204,13 @@ module Dommy
         end
 
         # --- Introspection and teardown ---
+
+        # Handle-oriented JS access for a wasm guest (see WasmBridge). Memoized
+        # so the guest's `__rbWasmInvoke` dispatcher stays registered for the
+        # VM's lifetime.
+        def wasm_bridge
+          @wasm_bridge ||= WasmBridge.new(@backend)
+        end
 
         # Run JS GC then drain, so FinalizationRegistry callbacks release the
         # handles of proxies no longer referenced.

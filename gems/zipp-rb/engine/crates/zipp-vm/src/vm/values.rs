@@ -1562,6 +1562,7 @@ impl<'p> Vm<'p> {
             self.proto_of.insert(obj, Value::heap(p));
         }
         self.error_data.insert(obj); // [[ErrorData]] internal slot
+        self.capture_error_frames(obj);
         Value::heap(obj)
     }
 

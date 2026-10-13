@@ -620,6 +620,10 @@ impl<'p> Vm<'p> {
                         return Err(Thrown(msg.to_string()));
                     }
                 }
+                // The pc of the innermost interpreted frame, for an Error's
+                // stack (see `Vm::capture_error_frames`): `ip` is a local and
+                // `frames[..].ip` is stale here. One store per instruction.
+                self.interp_pc = ((frame_idx as u64) << 32) | ip as u64;
                 match *instr {
                     Instr::LoadConst { dst, idx } => {
                         // String constants are sentinels. Short, immutable-safe

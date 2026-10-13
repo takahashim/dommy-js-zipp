@@ -161,10 +161,16 @@ struct Compiler {
     /// The full program source, kept so each function can record its exact
     /// source slice (by span) for `Function.prototype.toString`.
     source: String,
+    /// Byte offsets of the starts of `source`'s lines, built on first use by
+    /// `line_col`.
+    line_starts: Option<Vec<u32>>,
     /// True when compiling an `eval` code string: the top-level script returns
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
     eval_mode: bool,
+    /// A SCRIPT (not an eval) whose top level still yields its completion
+    /// value, for a host that runs scripts and reads what they evaluate to.
+    script_completion: bool,
     /// Set for a DIRECT eval from a class-member context: the eval's top-level
     /// script (and its arrows) inherits the caller's home class for `super`
     /// (compiled against the u32::MAX sentinel).
@@ -421,6 +427,8 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         upvalues: Vec::new(),
         eval_sites: Vec::new(),
         source: String::new(),
+        positions: Vec::new(),
+        script: None,
     }
 }
 
@@ -446,6 +454,8 @@ fn fn_directives(f: &ast::Function) -> &[ast::Directive] {
 struct FnCompiler<'a> {
     cx: &'a mut Compiler,
     code: Vec<Instr>,
+    /// Statement positions recorded as `code` grows (`FuncProto::positions`).
+    positions: Vec<crate::bytecode::SourcePos>,
     constants: Vec<Value>,
     string_constants: Vec<String>,
     static_key_plans: Vec<crate::bytecode::StaticKeyPlan>,

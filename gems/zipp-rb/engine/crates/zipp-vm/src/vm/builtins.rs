@@ -1375,7 +1375,9 @@ impl<'p> Vm<'p> {
                     return Ok(Some(Value::bool(b)));
                 }
                 let key = self.to_property_key(a0)?;
-                return Ok(Some(Value::bool(self.has_own_property(recv, &key))));
+                // `_dyn`, as the native is: a Proxy's getOwnPropertyDescriptor
+                // trap answers for it (`nodeList.hasOwnProperty(0)`).
+                return Ok(Some(Value::bool(self.has_own_property_dyn(recv, &key)?)));
             }
             "propertyIsEnumerable" => {
                 let key =

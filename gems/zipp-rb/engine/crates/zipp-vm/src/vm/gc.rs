@@ -1047,6 +1047,7 @@ impl Vm<'_> {
         self.immutable_buffers.retain_marked(&marks);
         self.pinned_buffers.retain_marked(&marks);
         self.error_data.retain(|&k| marks[k as usize]);
+        self.error_frames.retain_marked(&marks);
         self.arguments_objs.retain_marked(&marks);
         self.gen_args_obj
             .retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
@@ -1385,6 +1386,7 @@ impl Vm<'_> {
                 self.error_data.remove(i);
             }
         }
+        prune_map!(self.error_frames);
         prune_slots!(self.arguments_objs);
         // Dies with EITHER endpoint: the generator (key) or its arguments
         // object (value).

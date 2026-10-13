@@ -57,6 +57,43 @@ impl Compiler {
             && !self.eval_outer_scope.iter().any(|n| n == name)
     }
 
+    /// The 1-based line and column of byte offset `pos` in the source; the
+    /// column counts UTF-16 code units. Line terminators are JS's: LF, CR,
+    /// CRLF, U+2028 and U+2029.
+    pub(crate) fn line_col(&mut self, pos: u32) -> (u32, u32) {
+        let source = &self.source;
+        let starts = self.line_starts.get_or_insert_with(|| {
+            let mut starts = vec![0u32];
+            let mut chars = source.char_indices().peekable();
+            while let Some((i, c)) = chars.next() {
+                let next = match c {
+                    '\r' if chars.peek().map(|&(_, n)| n) == Some('\n') => continue,
+                    '\n' | '\r' | '\u{2028}' | '\u{2029}' => i + c.len_utf8(),
+                    _ => continue,
+                };
+                starts.push(next as u32);
+            }
+            starts
+        });
+        let line = starts.partition_point(|&s| s <= pos).max(1);
+        let start = starts[line - 1] as usize;
+        let col = source
+            .get(start..(pos as usize).min(source.len()))
+            .map_or(0, |s| s.encode_utf16().count());
+        (line as u32, col as u32 + 1)
+    }
+
+    /// Give `proto` a position at its first instruction — where the function
+    /// starts in the source — unless a statement already has one there, so a
+    /// frame in it (an arrow with an expression body, say) still reports one.
+    pub(crate) fn default_position(&mut self, proto: &mut FuncProto, start: u32) {
+        if proto.positions.first().is_some_and(|p| p.ip == 0) {
+            return;
+        }
+        let (line, col) = self.line_col(start);
+        proto.positions.insert(0, crate::bytecode::SourcePos { ip: 0, line, col });
+    }
+
     pub(crate) fn new(source: String) -> Compiler {
         Compiler {
             functions: Vec::new(),
@@ -69,7 +106,9 @@ impl Compiler {
             hoisted_globals: Vec::new(),
             hoisted_set: rustc_hash::FxHashSet::default(),
             source,
+            line_starts: None,
             eval_mode: false,
+            script_completion: false,
             eval_inherit_super: None,
             in_field_init: false,
             module_mode: false,
@@ -322,7 +361,7 @@ impl Compiler {
         // loop body — which alone demoted such loops off the INT register
         // tier (3× on the isolated nest). Eval scripts keep it: `eval()`'s
         // RESULT is the completion value.
-        let eval_completion = is_script && self.eval_mode && !self.module_mode;
+        let eval_completion = is_script && (self.eval_mode || self.script_completion) && !self.module_mode;
         // A real function body leaves any enclosing field-initializer context
         // (the eval ROOT script keeps it: PerformEval's ContainsArguments check
         // spans the eval program's top level and its arrows).
@@ -1126,6 +1165,8 @@ impl Compiler {
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by the caller from the function node's span
+            positions: std::mem::take(&mut fc.positions),
+            script: None,
         })
     }
 
@@ -1475,6 +1516,8 @@ impl Compiler {
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // class methods: caller may override from span
+            positions: std::mem::take(&mut fc.positions),
+            script: None,
         })
     }
 
@@ -1762,6 +1805,8 @@ impl Compiler {
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by compile_arrow from the arrow's span
+            positions: std::mem::take(&mut fc.positions),
+            script: None,
         })
     }
 }

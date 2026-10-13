@@ -33,17 +33,19 @@ module ZippRb
     end
 
     # Evaluate +src+ in the VM's global context and return the completion value.
-    def eval(src)
+    # +filename+ names the script in its Errors' stack frames (`at f
+    # (filename:3:7)`); unnamed code reports `<anonymous>`.
+    def eval(src, filename: nil)
       check_usable!
-      ZippRb._eval(@id, src)
+      with_script_name(filename) { ZippRb._eval(@id, src) }
     end
 
     # Evaluate +src+ for its side effects, discarding the completion value.
     # Prefer this to #eval when a script's last expression is a large object
     # (loading a bundle): the completion value is not marshalled into Ruby.
-    def load(src)
+    def load(src, filename: nil)
       check_usable!
-      ZippRb._load(@id, src)
+      with_script_name(filename) { ZippRb._load(@id, src) }
       nil
     end
 
@@ -219,6 +221,22 @@ module ZippRb
     end
 
     private
+
+    # Run the block with the code it evaluates named +filename+, restoring the
+    # previous name afterwards (an evaluation may nest inside a callback).
+    def with_script_name(filename)
+      return yield if filename.nil?
+
+      previous = @script_name
+      ZippRb._set_script_name(@id, filename.to_s)
+      @script_name = filename.to_s
+      begin
+        yield
+      ensure
+        ZippRb._set_script_name(@id, previous) unless disposed?
+        @script_name = previous
+      end
+    end
 
     def check_owner!
       return if Thread.current.equal?(@thread)

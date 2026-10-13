@@ -239,8 +239,18 @@ pub(crate) fn js_error(ruby: &Ruby, vm_id: u64, e: &JsError) -> Error {
     };
     if let Some(obj) = RObject::from_value(instance.as_value()) {
         let _ = obj.ivar_set("@js_name", e.name.clone());
+        // The JS frames (`at f (script:1:2)`), without the stack's
+        // `Name: message` header, as the Ruby backtrace.
         if let Some(stack) = &e.stack {
-            let _ = obj.funcall::<_, _, Value>("set_backtrace", (stack.clone(),));
+            let frames: Vec<String> = stack
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("at "))
+                .map(str::to_string)
+                .collect();
+            if !frames.is_empty() {
+                let _ = obj.funcall::<_, _, Value>("set_backtrace", (ruby.ary_from_vec(frames),));
+            }
         }
     }
     Error::from(instance)

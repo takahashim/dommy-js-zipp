@@ -805,6 +805,7 @@ impl<'s> Parser<'s> {
     }
 
     pub(crate) fn parse_var_decl(&mut self, kind: VarKind) -> PResult<VarDecl> {
+        let decl_pos = self.cur().span.start;
         let mut decls = Vec::new();
         loop {
             let pos = self.cur().span.start;
@@ -857,7 +858,7 @@ impl<'s> Parser<'s> {
                 break;
             }
         }
-        Ok(VarDecl { kind, decls })
+        Ok(VarDecl { kind, decls, pos: decl_pos })
     }
 
     /// Declare every name a pattern binds.
@@ -950,7 +951,7 @@ impl<'s> Parser<'s> {
                         Some(self.parse_expr_full()?)
                     };
                     self.semicolon()?;
-                    Ok(Stmt::Return(arg))
+                    Ok(Stmt::Return(arg, start))
                 }
                 Keyword::Throw => {
                     self.bump_before_operand()?;
@@ -961,7 +962,7 @@ impl<'s> Parser<'s> {
                     }
                     let e = self.parse_expr_full()?;
                     self.semicolon()?;
-                    Ok(Stmt::Throw(e))
+                    Ok(Stmt::Throw(e, start))
                 }
                 Keyword::Break | Keyword::Continue => {
                     let is_break = kw == Keyword::Break;
@@ -1163,7 +1164,7 @@ impl<'s> Parser<'s> {
         }
         let e = self.parse_expr_full()?;
         self.semicolon()?;
-        Ok(Stmt::Expr(e))
+        Ok(Stmt::Expr(e, start))
     }
 
     /// Run `f` inside a Block scope, for an IfStatement clause (Annex B B.3.4).
@@ -1292,6 +1293,7 @@ impl<'s> Parser<'s> {
                 let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
                 let left = ForTarget::Var(VarDecl {
                     kind,
+                    pos: for_pos,
                     decls: vec![Declarator {
                         id: pat,
                         init: None,
@@ -1344,6 +1346,7 @@ impl<'s> Parser<'s> {
                     let left = ForTarget::Var(VarDecl {
                         kind,
                         decls: vec![Declarator { id: pat, init }],
+                        pos: for_pos,
                     });
                     Stmt::ForIn { left, right, body }
                 } else {
@@ -1378,7 +1381,7 @@ impl<'s> Parser<'s> {
                     }
                     self.ctx.in_ = saved_in;
                     self.expect(Punct::Semi, true)?;
-                    self.parse_for_classic(Some(ForInit::Var(VarDecl { kind, decls })))?
+                    self.parse_for_classic(Some(ForInit::Var(VarDecl { kind, decls, pos: for_pos })))?
                 }
             }
         } else {

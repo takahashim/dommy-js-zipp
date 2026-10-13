@@ -40,14 +40,32 @@ pub fn compile_main_module(prog: &ast::Program, source: &str) -> R<Program> {
     compile_program_inner(prog, source, true, true)
 }
 
+/// Compile a classic SCRIPT a host runs into a live realm (script
+/// GlobalDeclarationInstantiation, see `Vm::host_run_script`) whose top level
+/// yields its completion value, as an eval's does.
+pub fn compile_script_with_completion(prog: &ast::Program, source: &str) -> R<Program> {
+    compile_program_with(prog, source, false, false, true)
+}
+
 pub(crate) fn compile_program_inner(
     prog: &ast::Program,
     source: &str,
     module_mode: bool,
     main_goal: bool,
 ) -> R<Program> {
+    compile_program_with(prog, source, module_mode, main_goal, false)
+}
+
+fn compile_program_with(
+    prog: &ast::Program,
+    source: &str,
+    module_mode: bool,
+    main_goal: bool,
+    script_completion: bool,
+) -> R<Program> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     let mut c = Compiler::new(source.to_string());
+    c.script_completion = script_completion;
     c.module_mode = module_mode;
     c.main_goal = main_goal;
     // The parser has already folded the directive prologue, the Module goal

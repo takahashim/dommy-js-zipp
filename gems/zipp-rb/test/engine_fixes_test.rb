@@ -90,4 +90,48 @@ class EngineFixesTest < Minitest::Test
     @vm.load("(0, eval)('performance = 1');")
     assert_equal ["number", 1], @vm.eval("[probe(), read()]")
   end
+
+  # `obj.hasOwnProperty(k)` on a Proxy asks its trap, as the
+  # `Object.prototype.hasOwnProperty.call` form does (testharness.js's
+  # assert_array_equals reads a NodeList this way).
+  def test_has_own_property_method_on_a_proxy_uses_its_trap
+    @vm.load("var p = new Proxy({}, { getOwnPropertyDescriptor: (t, k) => (k === '0' ? { value: 1, configurable: true } : undefined) });")
+    assert_equal [true, true, false], @vm.eval("[p.hasOwnProperty(0), p.hasOwnProperty('0'), p.hasOwnProperty(1)]")
+  end
+
+  # A host's load/eval runs a classic script, as a browser runs <script>: its
+  # declarations reach the global even when the script is strict, and its
+  # completion value is the result.
+  def test_a_strict_script_declares_into_the_global
+    @vm.load('"use strict"; var v = 1; function f() {} const c = 3; let l = 4; class K {}')
+    assert_equal %w[number function number number function], @vm.eval("[typeof v, typeof f, typeof c, typeof l, typeof K]")
+    assert_equal 10, @vm.eval('"use strict"; var w = 5; w * 2')
+    assert_raises(ZippRb::SyntaxError) { @vm.eval("const c = 1;") }
+  end
+
+  # A function's `prototype` made non-writable by defineProperty stays so
+  # (WebIDL's legacy factory functions, `Image`, are defined this way).
+  def test_a_function_prototype_can_be_made_non_writable
+    @vm.load("var P = {}; function F() {} Object.defineProperty(F, 'prototype', { value: P, writable: false });")
+    assert_equal [false, false, true], @vm.eval("var d = Object.getOwnPropertyDescriptor(F, 'prototype'); [d.writable, d.configurable, F.prototype === P]")
+    assert_equal true, @vm.eval("F.prototype = {}; F.prototype === P")
+    assert_raises(ZippRb::TypeError) { @vm.eval("'use strict'; F.prototype = {};") }
+    assert_raises(ZippRb::TypeError) { @vm.eval("Object.defineProperty(F, 'prototype', { writable: true })") }
+  end
+
+  # A function whose [[Prototype]] is a class (or another function) inherits
+  # its static members, as Stimulus's `bless` relies on.
+  def test_a_function_inherits_the_statics_of_its_prototype_class
+    @vm.load(<<~JS)
+      class C { static s() { return "static"; } }
+      C.data = [1];
+      function f() {}
+      Reflect.setPrototypeOf(f, C);
+      function g() {}
+      g.own = 2;
+      function h() {}
+      Object.setPrototypeOf(h, g);
+    JS
+    assert_equal [[1], "static", 2], @vm.eval("[f.data, f.s(), h.own]")
+  end
 end

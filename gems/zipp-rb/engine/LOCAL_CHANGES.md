@@ -56,6 +56,34 @@ candidate to propose upstream.
   `ScriptState::set_module_provider` (vm/engine/modules.rs): modules under a
   virtual root served from host memory, sharing the confined loader's budgets.
 
+## Error stacks (crates/zipp-vm/src)
+
+`Error.prototype.stack` was always empty. Now it is V8's format
+(`Name: message` then `    at f (script:line:col)`):
+
+- **Positions** — `Stmt::Expr` / `Return` / `Throw` carry their start offset
+  and `VarDecl` a `pos` (parse/ast.rs, parse/stmt.rs, parse/funcs.rs); the
+  compiler records `FuncProto::positions` (`SourcePos { ip, line, col }`) in
+  `FnCompiler::note_stmt_pos` (compile/decls.rs), with the function's own
+  start at ip 0 (`Compiler::default_position`, compile/funcs.rs) and
+  `Compiler::line_col` (compile/compiler.rs). Matches on those variants in
+  capture.rs, parse/limits.rs, compile/decls.rs and vm/engine/run.rs gained
+  the extra field. bytecode_codec.rs encodes both new FuncProto fields.
+- **Script names** — `FuncProto::script`, stamped in `prepare_eval_program`
+  (vm/engine/eval_prog.rs) from `Vm::script_name`
+  (`ScriptState::set_script_name`, `HostCtx::set_script_name`) or, for a
+  module, `module_name_for_stack` (vm/engine/modules.rs).
+- **Capture** — `Vm::interp_pc` (written per instruction in
+  vm/dispatch.rs; measured at no cost) gives the innermost frame's pc;
+  `capture_error_frames` (vm/error_stack.rs) runs wherever an object gains
+  [[ErrorData]] (vm/values.rs, async_runtime.rs, construct/inherit.rs,
+  construct/modules_dispose.rs) into `Vm::error_frames`, pruned by both GC
+  paths (vm/gc.rs). The `stack` getter (vm/natives.rs) formats it.
+- **Host** — a JsError's `stack` is the formatted stack (vm/host_api.rs;
+  `read_data_prop` had returned the inherited accessor's getter), and
+  `ScriptState::load_in_context` reports a throw structured. The
+  `FuncProto` size pin is 312 (bytecode.rs).
+
 ## Resource limits (crates/zipp-vm/src/vm/instrument.rs, embed.rs)
 
 - **Run deadline** — `Recorder::deadline`, `ScriptState::set_deadline`. Every
@@ -74,6 +102,29 @@ candidate to propose upstream.
 
 ## Correctness (crates/zipp-vm/src)
 
+- **A host runs classic scripts, not evals** — `Vm::host_run_script`
+  (vm/engine/eval_prog.rs, with `compile_script_with_completion` /
+  `Compiler::script_completion` in compile/) runs a script with script
+  GlobalDeclarationInstantiation (the `$262.evalScript` path) and its
+  completion value. `ScriptState::load_in_context`,
+  `eval_in_context_structured` (`host_eval_structured`) and
+  `HostCtx::eval_script` use it (vm/host_api.rs, embed.rs): as indirect
+  evals, a strict script's `var`s and functions stayed inside it, and no
+  script's `let`/`const`/`class` reached later ones (WPT's `common.js`
+  files are strict). Test: `test/engine_fixes_test.rb`.
+- **`obj.hasOwnProperty(k)` on a Proxy runs its trap** — the builtin-method
+  lane (vm/builtins.rs) used the trap-less `has_own_property`; it now uses
+  `has_own_property_dyn`, as the native does (testharness.js's
+  `assert_array_equals` reads a NodeList this way).
+- **A function's `prototype` can be made non-writable** — `fn_proto_readonly`
+  (vm/mod.rs; vm/props/define.rs, descriptors.rs, vm/access.rs): a
+  `defineProperty(fn, "prototype", {writable: false})` was accepted and
+  dropped, so WebIDL's `Image` reported a writable prototype.
+- **A class or function in a [[Prototype]] chain is searched** —
+  `proto_member_get` (vm/props/member.rs) skipped class statics and a
+  callable's own properties when one was spliced into a chain
+  (`Reflect.setPrototypeOf(fn, SomeClass)`, Stimulus's `bless`), so
+  `fn.staticOfTheClass` read undefined.
 - **A builtin replaced on the global object is the binding later scripts
   see** — `eval_global_slot` seeded a later script's fresh slot for a builtin
   name (`setTimeout`, `Map`, …) from the boot intrinsic, ignoring an own data

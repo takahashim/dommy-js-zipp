@@ -87,16 +87,36 @@ impl<'a> FnCompiler<'a> {
     /// alias lane (`typeof_alias.rs`) see statement nesting: a fact recorded
     /// inside `s` dies with it, and a re-entering `s` starts clean.
     pub(crate) fn stmt(&mut self, s: &ast::Stmt) -> R<()> {
+        self.note_stmt_pos(s);
         self.typeof_alias_stmt_enter(s);
         let r = self.stmt_inner(s);
         self.typeof_alias_stmt_exit();
         r
     }
 
+    /// Record where `s` starts against the next instruction, for an Error's
+    /// stack (`FuncProto::positions`). Only statements that carry a position
+    /// do; one that emits nothing is overwritten by the next.
+    fn note_stmt_pos(&mut self, s: &ast::Stmt) {
+        use ast::Stmt as S;
+        let pos = match s {
+            S::Expr(_, pos) | S::Return(_, pos) | S::Throw(_, pos) => *pos,
+            S::VarDecl(d) => d.pos,
+            _ => return,
+        };
+        let (line, col) = self.cx.line_col(pos);
+        let ip = self.code.len() as u32;
+        let at = crate::bytecode::SourcePos { ip, line, col };
+        match self.positions.last_mut() {
+            Some(last) if last.ip == ip => *last = at,
+            _ => self.positions.push(at),
+        }
+    }
+
     fn stmt_inner(&mut self, s: &ast::Stmt) -> R<()> {
         use ast::Stmt as S;
         match s {
-            S::Expr(e) => {
+            S::Expr(e, _) => {
                 // Discarded — UNLESS this is an eval program, where the value
                 // becomes the completion and `i++` must still yield the old one.
                 let r = if self.completion_reg.is_none() {
@@ -326,7 +346,7 @@ impl<'a> FnCompiler<'a> {
                 }
             }
             S::Switch { disc, cases } => self.switch_stmt(disc, cases)?,
-            S::Return(argument) => {
+            S::Return(argument, _) => {
                 // Proper tail call: strict `return <expr with a call in tail
                 // position>` in an UNPROTECTED context (no try handlers, no
                 // enclosing loop with an iterator to close, no using scope,
@@ -426,7 +446,7 @@ impl<'a> FnCompiler<'a> {
                 }
             }
             S::FnDecl(f) => self.func_decl(f)?,
-            S::Throw(argument) => {
+            S::Throw(argument, _) => {
                 let v = self.expr(argument)?;
                 self.emit(Instr::Throw { src: v });
             }

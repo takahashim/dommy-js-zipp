@@ -62,9 +62,12 @@ module Dommy
 
         # Run `js` in global scope for its side effects; the completion value is
         # not converted (a UMD bundle's last statement can be a large object).
-        def load(js) = guarded { @vm.load(js) }
+        # `filename` names it in its Errors' stack frames.
+        def load(js, filename: nil) = guarded { @vm.load(js, filename: filename) }
 
-        def run_bundle(_cache_key, source) = load(source)
+        # The cache key names the bundle's frames (`host_runtime.js`), which is
+        # how a host tells the bridge's own frames from the page's.
+        def run_bundle(cache_key, source) = load(source, filename: cache_key.to_s)
 
         # Run `body` as an async function body, awaiting its result for at most
         # `max_ms`.
@@ -75,8 +78,24 @@ module Dommy
 
         # Install the ESM resolver: `(specifier, importer) -> source | {code:,
         # as:} | {as:} | nil`, consulted for every static and dynamic import.
+        # A preloaded module (see #preload_modules) is found by its name before
+        # the loader is asked, and a loader's `{as: name}` lands on it.
         def module_loader=(callable)
-          @vm.module_loader = callable
+          preloaded = @preloaded_modules || {}
+          @vm.module_loader = lambda do |specifier, importer|
+            next {code: preloaded[specifier], as: specifier} if preloaded.key?(specifier)
+
+            answer = callable&.call(specifier, importer)
+            name = answer.is_a?(Hash) && !answer.key?(:code) && !answer.key?("code") && (answer[:as] || answer["as"])
+            name && preloaded.key?(name.to_s) ? {code: preloaded[name.to_s], as: name.to_s} : answer
+          end
+        end
+
+        # Make the modules `sources` (name => source) available to this VM's
+        # imports by name, without asking the loader (Runtime#initialize).
+        def preload_modules(sources)
+          @preloaded_modules = sources
+          self.module_loader = nil
         end
 
         # Evaluate the module named `url` (resolved and fetched by the module
