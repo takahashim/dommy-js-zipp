@@ -1843,6 +1843,10 @@ pub struct Vm<'p> {
     pub(crate) interp_pc: u64,
     /// The tz-database zone local time is in (`local_time.rs`); `None` is UTC.
     pub(crate) local_tz: Option<u16>,
+    /// A derived class's pre-made instance whose `prototype` Get waits for the
+    /// base that adopts it: instance heap index -> (newTarget, class). GC
+    /// roots the newTargets; pruned with the instance.
+    pub(crate) deferred_instance_protos: std::collections::HashMap<u32, (Value, u32)>,
     /// The name the host gave the code it is evaluating (a script URL), stamped
     /// on the functions it installs (`FuncProto::script`).
     pub(crate) script_name: Option<std::sync::Arc<str>>,

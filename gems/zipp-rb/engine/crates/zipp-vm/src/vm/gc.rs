@@ -672,6 +672,9 @@ impl Vm<'_> {
             root_idx!(promise);
         }
         root_val!(self.promise_rejection_hook);
+        for &(new_target, _) in self.deferred_instance_protos.values() {
+            root_val!(new_target);
+        }
         for &promise in self.reported_rejections.iter().chain(&self.rejections_handled_late) {
             root_idx!(promise);
         }
@@ -1048,6 +1051,7 @@ impl Vm<'_> {
         self.pinned_buffers.retain_marked(&marks);
         self.error_data.retain(|&k| marks[k as usize]);
         self.error_frames.retain_marked(&marks);
+        self.deferred_instance_protos.retain_marked(&marks);
         self.arguments_objs.retain_marked(&marks);
         self.gen_args_obj
             .retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
@@ -1387,6 +1391,7 @@ impl Vm<'_> {
             }
         }
         prune_map!(self.error_frames);
+        prune_map!(self.deferred_instance_protos);
         prune_slots!(self.arguments_objs);
         // Dies with EITHER endpoint: the generator (key) or its arguments
         // object (value).

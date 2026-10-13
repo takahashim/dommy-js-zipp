@@ -244,6 +244,7 @@ impl<'p> Vm<'p> {
             promise_rejection_hook: Value::UNDEFINED,
             interp_pc: u64::MAX,
             local_tz: None,
+            deferred_instance_protos: std::collections::HashMap::new(),
             script_name: None,
             installing_module: None,
             error_frames: std::collections::HashMap::new(),

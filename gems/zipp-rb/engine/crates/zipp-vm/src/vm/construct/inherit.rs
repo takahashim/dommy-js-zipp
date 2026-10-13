@@ -414,6 +414,14 @@ impl<'p> Vm<'p> {
                 // chain already reaches the error prototype (so name/toString/
                 // instanceof resolve), so nothing else is needed here.
                 _ => {
+                    // A Proxy parent makes the object itself (its [[Construct]]);
+                    // any other non-class parent adopts the pre-made one, whose
+                    // deferred `prototype` Get stands for its own.
+                    if self.proxy_parts(cval.heap_index()).is_some() {
+                        self.deferred_instance_protos.remove(&obj.heap_index());
+                    } else {
+                        self.apply_deferred_instance_proto(obj)?;
+                    }
                     // `super(...)` to a BUILT-IN EXOTIC parent (`class X extends Set/…`):
                     // brand the plain-Object instance with the builtin's internal
                     // representation so its methods work and it is a real instanceof. The
@@ -536,6 +544,11 @@ impl<'p> Vm<'p> {
                     return Ok(obj);
                 }
             };
+        // A BASE class adopts the pre-made instance as the object its
+        // [[Construct]] would have created.
+        if parent.is_none() || extends_null {
+            self.apply_deferred_instance_proto(obj)?;
+        }
         if has_explicit {
             // An explicit ctor produces `this`: its object-return (return-override)
             // becomes the effective instance; a non-object/undefined return keeps obj.

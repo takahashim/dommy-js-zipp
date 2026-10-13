@@ -162,4 +162,22 @@ class EngineFixesTest < Minitest::Test
     assert_equal "TypeError", @vm.eval("try { new arrow(); 'constructed' } catch (e) { e.name }")
     assert_equal "object", @vm.eval("typeof new fn()")
   end
+
+  # A derived class does not read newTarget.prototype itself; the base that
+  # creates the object does, once — and a Proxy base with a construct trap
+  # reads it only if the trap does (dommy's HTMLElement is such a Proxy).
+  def test_a_derived_class_leaves_the_prototype_get_to_its_base
+    @vm.load(<<~JS)
+      function counter(C) {
+        let n = 0;
+        const p = new Proxy(C, { get(t, k, r) { if (k === "prototype") n++; return Reflect.get(t, k, r); } });
+        return [p, () => n];
+      }
+      class A {} class B extends A {}
+      const Base = new Proxy(function () {}, { construct(t, a, nt) { return Object.create(nt.prototype); } });
+      class D extends Base {}
+      var results = [B, D].map((K) => { const [p, n] = counter(K); const o = new p(); return [n(), Object.getPrototypeOf(o) === K.prototype]; });
+    JS
+    assert_equal [[1, true], [1, true]], @vm.eval("results")
+  end
 end

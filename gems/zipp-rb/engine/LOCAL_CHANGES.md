@@ -118,6 +118,15 @@ candidate to propose upstream.
   extracted into locals and each slot written once. A const reassignment's
   TypeError also carries V8's message (compile/bindings.rs). Test:
   `test/engine_fixes_test.rb`.
+- **A derived class leaves `newTarget.prototype` to its base** — class
+  construction (vm/construct/construct.rs) pre-makes the instance and read
+  `newTarget.prototype` for it even for a derived class, whose [[Construct]]
+  creates nothing; with a Proxy base whose construct trap makes the object
+  (dommy's HTMLElement), the read was a second, observable Get. The Get is
+  now deferred (`deferred_instance_protos`, rooted and pruned in vm/gc.rs)
+  to the base that adopts the instance (`apply_deferred_instance_proto`,
+  vm/construct/inherit.rs `run_class_ctor`) and dropped for a Proxy base.
+  Test: `test/engine_fixes_test.rb`.
 - **A typed array's indices are own properties** — `has_own_property`
   (vm/construct/iterate.rs) had no TypedArray arm, so `u8.hasOwnProperty(0)`
   was false. Test: `test/engine_fixes_test.rb`.

@@ -67,7 +67,29 @@ impl<'p> Vm<'p> {
     /// runs there), so a chain that ends in a built-in constructor
     /// (`class A extends Array`) falls back to that built-in's prototype
     /// (%Array.prototype%), and every other chain to %Object.prototype%.
-    fn class_intrinsic_proto(&self, class_idx: u32) -> u32 {
+    /// The deferred GetPrototypeFromConstructor of a derived class's
+    /// pre-made instance `obj` (see the derived arm of class construction):
+    /// run it now, when a base adopts `obj` as the object it creates.
+    pub(crate) fn apply_deferred_instance_proto(&mut self, obj: Value) -> Result<(), Thrown> {
+        if self.deferred_instance_protos.is_empty() || !obj.is_heap() {
+            return Ok(());
+        }
+        let Some((new_target, class_idx)) = self.deferred_instance_protos.remove(&obj.heap_index()) else {
+            return Ok(());
+        };
+        let p = self.get_prop(new_target, "prototype")?;
+        let proto = if self.is_object_value(p) {
+            p
+        } else {
+            let intrinsic = self.class_intrinsic_proto(class_idx);
+            self.newtarget_intrinsic_fallback(new_target, intrinsic)?
+        };
+        self.note_class_instance_reproto(obj.heap_index());
+        self.proto_of.insert(obj.heap_index(), proto);
+        Ok(())
+    }
+
+    pub(crate) fn class_intrinsic_proto(&self, class_idx: u32) -> u32 {
         let mut cur = class_idx;
         // Bounded: an `extends` chain is acyclic by construction.
         for _ in 0..10_000 {
@@ -1098,7 +1120,15 @@ impl<'p> Vm<'p> {
         // code), and an instance allocated first was only a Rust local across
         // it — a collection there handed the constructor a reused slot as `this`.
         let mut proto_override: Option<Value> = None;
-        if new_target.is_heap() && new_target != cv {
+        // A DERIVED class creates no object of its own (its [[Construct]] does
+        // no OrdinaryCreateFromConstructor; the base's does). This engine
+        // pre-makes the instance here, so the `prototype` Get is deferred to
+        // the base that adopts it (`apply_deferred_instance_proto`) — and
+        // skipped when the base makes its own object (a Proxy's construct
+        // trap): reading it here was observable, a second Get of a counting
+        // newTarget's `prototype` (WPT custom-elements/HTMLElement-constructor).
+        let derived = parent.is_some() && !extends_null;
+        if new_target.is_heap() && new_target != cv && !derived {
             let p = self.get_prop(new_target, "prototype")?;
             proto_override = Some(if self.is_object_value(p) {
                 p
@@ -1116,6 +1146,10 @@ impl<'p> Vm<'p> {
         let mut map = ObjMap::new();
         map.class = Some(cv.heap_index());
         let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
+        if derived && new_target.is_heap() && new_target != cv {
+            self.deferred_instance_protos
+                .insert(obj.heap_index(), (new_target, cv.heap_index()));
+        }
         if let Some(p) = proto_override {
             // A class instance with its own proto entry no longer matches the
             // class-shape inline caches.
