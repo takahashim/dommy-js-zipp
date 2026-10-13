@@ -31,6 +31,9 @@ vm.dispose
 - A VM belongs to the thread that created it. A VM without Ruby callbacks
   releases the GVL while it runs.
 
+`VM#eval` / `#load` take `filename:`, which an Error's `stack` (and the
+backtrace of a `ZippRb::Error`) reports as the script of its frames.
+
 Other API: `VM#load` (run for side effects), `#eval_async` (top-level
 `await`; with `features: [ZippRb::FEATURE_TIMEOUT]` for timers), `#invoke`
 (`#call` that leaves microtasks for `#drain_jobs!`), `#handle`,

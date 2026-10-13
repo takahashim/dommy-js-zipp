@@ -122,7 +122,7 @@ fn nesting_within(program: &Program, limit: usize) -> bool {
                 | Stmt::Continue(_)
                 | Stmt::Debugger
                 | Stmt::Import(_) => {}
-                Stmt::Expr(expr) | Stmt::Throw(expr) => work.push(Work::Expr(expr, child)),
+                Stmt::Expr(expr, _) | Stmt::Throw(expr, _) => work.push(Work::Expr(expr, child)),
                 Stmt::If { test, cons, alt } => {
                     work.push(Work::Expr(test, child));
                     work.push(Work::Stmt(cons, child));
@@ -178,7 +178,7 @@ fn nesting_within(program: &Program, limit: usize) -> bool {
                         push_stmts(&mut work, &case.body, child);
                     }
                 }
-                Stmt::Return(expr) => {
+                Stmt::Return(expr, _) => {
                     if let Some(expr) = expr {
                         work.push(Work::Expr(expr, child));
                     }

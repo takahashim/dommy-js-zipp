@@ -84,11 +84,15 @@ pub struct Directive {
 // Statements
 // ============================================================================
 
+/// A byte offset into the compiled source: where a statement starts, for the
+/// positions an Error's `stack` reports (see `FuncProto::positions`).
+pub type Pos = u32;
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Block(Vec<Stmt>),
     Empty,
-    Expr(Expr),
+    Expr(Expr, Pos),
     /// `if (test) cons else alt`
     If {
         test: Expr,
@@ -125,8 +129,8 @@ pub enum Stmt {
         disc: Expr,
         cases: Vec<SwitchCase>,
     },
-    Return(Option<Expr>),
-    Throw(Expr),
+    Return(Option<Expr>, Pos),
+    Throw(Expr, Pos),
     Try {
         block: Vec<Stmt>,
         handler: Option<CatchClause>,
@@ -184,6 +188,8 @@ impl VarKind {
 pub struct VarDecl {
     pub kind: VarKind,
     pub decls: Vec<Declarator>,
+    /// Where the first declarator starts.
+    pub pos: Pos,
 }
 
 #[derive(Debug, Clone)]
@@ -979,7 +985,7 @@ mod tests {
             goal: Goal::Script,
             strict: false,
             directives: vec![],
-            body: vec![Stmt::Expr(Expr::Num(1.0))],
+            body: vec![Stmt::Expr(Expr::Num(1.0), 0)],
         };
         let shared = std::sync::Arc::new(p);
         let clone = std::sync::Arc::clone(&shared);

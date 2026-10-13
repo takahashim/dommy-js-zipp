@@ -165,6 +165,9 @@ impl<'p> Vm<'p> {
         // 5. Re-index function-id, global-slot, and class-id operands, leak each
         //    FuncProto (stable address — raw pointers live into it), append.
         let mut new_funcs: Vec<&'static FuncProto> = Vec::with_capacity(eval_prog.functions.len());
+        // The script the functions came from, for their Error stacks: the
+        // module being installed, else what the host named this evaluation.
+        let script = self.installing_module.clone().or_else(|| self.script_name.clone());
         for mut f in eval_prog.functions {
             for ins in f.code.iter_mut() {
                 match ins {
@@ -281,6 +284,9 @@ impl<'p> Vm<'p> {
             }
             if let Some(s) = f.name_global {
                 f.name_global = Some(gmap[s as usize]);
+            }
+            if f.script.is_none() {
+                f.script = script.clone();
             }
             new_funcs.push(Box::leak(Box::new(f)));
         }

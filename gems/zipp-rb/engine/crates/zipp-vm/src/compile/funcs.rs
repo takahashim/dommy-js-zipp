@@ -135,6 +135,7 @@ impl<'a> FnCompiler<'a> {
             enclosing,
         )?;
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
+        self.cx.default_position(&mut proto, f.span.start);
         let id = self.cx.functions.len() as u32;
         let has_upvalues = !proto.upvalues.is_empty();
         // Resolve the name once. A script-level function hoists to a GLOBAL var
@@ -1522,6 +1523,7 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = self.cx.src_slice(func.span.start, func.span.end);
+            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             method_defs.push((mname.clone(), fid));
@@ -1550,6 +1552,7 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = self.cx.src_slice(func.span.start, func.span.end);
+            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             getter_defs.push((gname.clone(), fid));
@@ -1578,6 +1581,7 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = self.cx.src_slice(func.span.start, func.span.end);
+            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             setter_defs.push((sname.clone(), fid));
@@ -1602,6 +1606,7 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = method_source(self.cx.src_slice(func.span.start, func.span.end), true);
+            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_defs.push((sname.clone(), fid));
@@ -1630,6 +1635,7 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = method_source(self.cx.src_slice(func.span.start, func.span.end), true);
+            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_getter_defs.push((gname.clone(), fid));
@@ -1657,6 +1663,7 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = method_source(self.cx.src_slice(func.span.start, func.span.end), true);
+            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_setter_defs.push((sname.clone(), fid));
@@ -1744,6 +1751,7 @@ impl<'a> FnCompiler<'a> {
             )?;
             if let Some(cf) = ctor_fn {
                 proto.source = self.cx.src_slice(cf.span.start, cf.span.end);
+                self.cx.default_position(&mut proto, cf.span.start);
             }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -2015,6 +2023,7 @@ impl<'a> FnCompiler<'a> {
             enclosing,
         )?;
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
+        self.cx.default_position(&mut proto, f.span.start);
         let has_upvalues = !proto.upvalues.is_empty();
         let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);
@@ -2051,6 +2060,7 @@ impl<'a> FnCompiler<'a> {
         )?;
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
+        self.cx.default_position(&mut proto, a.span.start);
         let has_upvalues = !proto.upvalues.is_empty();
         let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);

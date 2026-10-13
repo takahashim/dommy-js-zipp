@@ -1848,7 +1848,7 @@ impl<'p> Vm<'p> {
         if fn_ctor
             && !matches!(
                 ast.body.as_slice(),
-                [crate::parse::ast::Stmt::Expr(crate::parse::ast::Expr::Function(_))]
+                [crate::parse::ast::Stmt::Expr(crate::parse::ast::Expr::Function(_), _)]
             )
         {
             return Err(Thrown(

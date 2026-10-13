@@ -58,8 +58,7 @@ pub(crate) fn memory_usage(ruby: &Ruby, id: u64) -> Result<RHash, Error> {
 /// Evaluate `src` for its side effects, discarding the completion value. Much
 /// cheaper than `eval` when a script's last expression is a large object (a
 /// UMD factory's return value, say): `eval` marshals that value into Ruby,
-/// whereas this only asks the engine for the shallow `ToString`-class result
-/// and drops it.
+/// whereas this does not convert it at all.
 pub(crate) fn load(ruby: &Ruby, id: u64, src: String) -> Result<(), Error> {
     if let Some(ptr) = active_ctx(id) {
         let ctx: &mut dyn HostCtx = unsafe { &mut *ptr };
@@ -68,9 +67,8 @@ pub(crate) fn load(ruby: &Ruby, id: u64, src: String) -> Result<(), Error> {
     }
     with_entry(ruby, id, |entry| {
         entry
-            .run_nogvl(ruby, |s| s.eval_in_context(&src))?
-            .map(|_| ())
-            .map_err(|msg| js_error_from_message(ruby, id, &msg))
+            .run_nogvl(ruby, |s| s.load_in_context(&src))?
+            .map_err(|e| js_error(ruby, id, &e))
     })
 }
 
@@ -90,4 +88,15 @@ pub(crate) fn call(ruby: &Ruby, id: u64, name: String, args: RArray, drain: bool
             Err(e) => Err(js_error(ruby, id, &e)),
         }
     })
+}
+
+/// Name the code VM `id` evaluates from now on (nil: unnamed), for the
+/// script its functions' Error stack frames report.
+pub(crate) fn set_script_name(ruby: &Ruby, id: u64, name: Option<String>) -> Result<(), Error> {
+    if let Some(ptr) = active_ctx(id) {
+        let ctx: &mut dyn HostCtx = unsafe { &mut *ptr };
+        ctx.set_script_name(name.as_deref());
+        return Ok(());
+    }
+    with_entry(ruby, id, |entry| entry.run(ruby, |s| s.set_script_name(name.as_deref())))
 }

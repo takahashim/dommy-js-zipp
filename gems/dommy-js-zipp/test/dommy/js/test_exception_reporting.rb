@@ -80,7 +80,6 @@ class Dommy::Js::TestExceptionReporting < Minitest::Test
   # do, so those have to be there: one that throws while reading them never
   # reaches its own preventDefault, and the report it meant to cancel stands.
   def test_a_script_error_reaches_the_page_as_a_real_error
-    skip "Zipp leaves Error.prototype.stack empty and reports no source positions"
     html = <<~HTML
       <html><body>
         <script>
@@ -254,7 +253,6 @@ class Dommy::Js::TestExceptionReporting < Minitest::Test
   # --- Where the error happened ---
 
   def test_an_external_script_reports_its_own_url_and_position
-    skip "Zipp leaves Error.prototype.stack empty and reports no source positions"
     resources = Dommy::Resources.static(
       "/reports-position.js" => {"content_type" => "application/javascript",
                     "body" => "function inner() { throw new Error('deep') }\ninner();"}
@@ -278,7 +276,6 @@ class Dommy::Js::TestExceptionReporting < Minitest::Test
   # A listener's throw crosses as an opaque JS value, so its frames have to
   # travel with the throw or the position is lost.
   def test_a_listener_error_reports_a_position
-    skip "Zipp leaves Error.prototype.stack empty and reports no source positions"
     html = <<~HTML
       <html><body><script>
         window.__at = null;

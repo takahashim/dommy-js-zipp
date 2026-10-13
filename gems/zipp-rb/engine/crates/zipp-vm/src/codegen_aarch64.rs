@@ -728,6 +728,8 @@ mod tests {
             upvalues: Vec::new(),
             eval_sites: Vec::new(),
             source: String::new(),
+            positions: Vec::new(),
+            script: None,
         }
     }
 

@@ -2713,6 +2713,23 @@ pub struct FuncProto {
     /// the synthetic top-level script body and for placeholders, in which case
     /// `toString` falls back to the native-function form.
     pub source: String,
+    /// Where each positioned statement's code starts, in `ip` order: what an
+    /// Error's `stack` reports for a frame executing this function (the last
+    /// entry at or before its `ip`). Empty for synthetic functions.
+    pub positions: Vec<SourcePos>,
+    /// The name of the script this function was compiled from (a URL, a file
+    /// name), stamped when the program is installed; `None` when the host
+    /// gave none.
+    pub script: Option<std::sync::Arc<str>>,
+}
+
+/// A statement's first instruction and its 1-based source line and column
+/// (columns count UTF-16 code units, as browsers report them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourcePos {
+    pub ip: u32,
+    pub line: u32,
+    pub col: u32,
 }
 
 /// Immutable property names shared by all objects created at one eligible
@@ -2921,7 +2938,9 @@ mod static_key_plan_layout_tests {
     fn func_proto_and_plan_metadata_layouts_are_pinned() {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
         assert_eq!(std::mem::size_of::<StaticKeyPlanData>(), 32);
-        assert_eq!(std::mem::size_of::<FuncProto>(), 272);
+        // 272 upstream, plus `positions` (a Vec, 24) and `script` (an
+        // Option<Arc<str>>, 16) for Error stacks.
+        assert_eq!(std::mem::size_of::<FuncProto>(), 312);
     }
 }
 

@@ -30,8 +30,10 @@ scripts, import maps and dynamic `import()`.
 
 ## Differences from dommy-js-quickjs
 
-- **No `Error.stack`.** Zipp leaves it empty, so an error carries no JS frames
-  and `ErrorEvent` has no file or position. The five skipped tests are these.
+- **Stack positions are per statement.** An Error's `stack` names the
+  statement each frame was executing (and the start of an expression-bodied
+  arrow), not the exact expression; names come from declarations, so an
+  arrow assigned to a variable reports as anonymous.
 - **No bytecode cache.** `load_script_cached` and the bridge's runtime bundles
   are parsed on every Runtime (Zipp parses the bundles in tens of ms), and
   there is no `register_module` / `preload_modules:`.

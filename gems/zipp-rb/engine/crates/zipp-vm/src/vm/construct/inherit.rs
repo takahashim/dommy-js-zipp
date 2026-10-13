@@ -450,6 +450,7 @@ impl<'p> Vm<'p> {
                             map.define("suppressed", suppressed, attr);
                         }
                         self.error_data.insert(obj.heap_index());
+                        self.capture_error_frames(obj.heap_index());
                         return Ok(obj);
                     }
                     if let Some(k) = self
@@ -459,6 +460,7 @@ impl<'p> Vm<'p> {
                     {
                         // `class X extends Error` instance: it has the [[ErrorData]] slot.
                         self.error_data.insert(obj.heap_index());
+                        self.capture_error_frames(obj.heap_index());
                         let msg = if k == 7 {
                             args.get(1).copied()
                         } else {

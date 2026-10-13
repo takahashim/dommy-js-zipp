@@ -56,6 +56,34 @@ candidate to propose upstream.
   `ScriptState::set_module_provider` (vm/engine/modules.rs): modules under a
   virtual root served from host memory, sharing the confined loader's budgets.
 
+## Error stacks (crates/zipp-vm/src)
+
+`Error.prototype.stack` was always empty. Now it is V8's format
+(`Name: message` then `    at f (script:line:col)`):
+
+- **Positions** — `Stmt::Expr` / `Return` / `Throw` carry their start offset
+  and `VarDecl` a `pos` (parse/ast.rs, parse/stmt.rs, parse/funcs.rs); the
+  compiler records `FuncProto::positions` (`SourcePos { ip, line, col }`) in
+  `FnCompiler::note_stmt_pos` (compile/decls.rs), with the function's own
+  start at ip 0 (`Compiler::default_position`, compile/funcs.rs) and
+  `Compiler::line_col` (compile/compiler.rs). Matches on those variants in
+  capture.rs, parse/limits.rs, compile/decls.rs and vm/engine/run.rs gained
+  the extra field. bytecode_codec.rs encodes both new FuncProto fields.
+- **Script names** — `FuncProto::script`, stamped in `prepare_eval_program`
+  (vm/engine/eval_prog.rs) from `Vm::script_name`
+  (`ScriptState::set_script_name`, `HostCtx::set_script_name`) or, for a
+  module, `module_name_for_stack` (vm/engine/modules.rs).
+- **Capture** — `Vm::interp_pc` (written per instruction in
+  vm/dispatch.rs; measured at no cost) gives the innermost frame's pc;
+  `capture_error_frames` (vm/error_stack.rs) runs wherever an object gains
+  [[ErrorData]] (vm/values.rs, async_runtime.rs, construct/inherit.rs,
+  construct/modules_dispose.rs) into `Vm::error_frames`, pruned by both GC
+  paths (vm/gc.rs). The `stack` getter (vm/natives.rs) formats it.
+- **Host** — a JsError's `stack` is the formatted stack (vm/host_api.rs;
+  `read_data_prop` had returned the inherited accessor's getter), and
+  `ScriptState::load_in_context` reports a throw structured. The
+  `FuncProto` size pin is 312 (bytecode.rs).
+
 ## Resource limits (crates/zipp-vm/src/vm/instrument.rs, embed.rs)
 
 - **Run deadline** — `Recorder::deadline`, `ScriptState::set_deadline`. Every

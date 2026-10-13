@@ -116,7 +116,6 @@ class Dommy::Js::TestZipp < Minitest::Test
   # responsible, not just the scheduler internals. The error's class/message are
   # preserved (the message is the dedup key).
   def test_throwing_timer_error_carries_its_scheduling_stack
-    skip "Zipp leaves Error.prototype.stack empty, so no scheduling stack is captured"
     rt = Dommy::Js::Zipp::Runtime.new
     rt.install_window(@win)
     errors = []

@@ -24,6 +24,7 @@ impl<'a> FnCompiler<'a> {
         let mut fc = FnCompiler {
             cx,
             code: Vec::new(),
+            positions: Vec::new(),
             constants: Vec::new(),
             string_constants: Vec::new(),
             static_key_plans: Vec::new(),

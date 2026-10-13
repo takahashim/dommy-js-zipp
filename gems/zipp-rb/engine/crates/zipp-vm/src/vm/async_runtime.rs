@@ -3417,6 +3417,7 @@ impl<'p> Vm<'p> {
         map.define("errors", errs, attr);
         let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
         self.error_data.insert(idx); // [[ErrorData]] internal slot
+        self.capture_error_frames(idx);
                                      // Link [[Prototype]] to %AggregateError.prototype% (error_protos[7]) so the
                                      // internally-created error is a real AggregateError instance:
                                      // getPrototypeOf === AggregateError.prototype and `.constructor` resolves to

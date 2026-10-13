@@ -1838,6 +1838,18 @@ pub struct Vm<'p> {
     /// when one so reported gains a handler. UNDEFINED when not installed.
     /// GC ROOT, as are the two lists below.
     pub(crate) promise_rejection_hook: Value,
+    /// `(frame index << 32) | ip` of the instruction the interpreter is
+    /// executing, written at each instruction (see `dispatch_body`).
+    pub(crate) interp_pc: u64,
+    /// The name the host gave the code it is evaluating (a script URL), stamped
+    /// on the functions it installs (`FuncProto::script`).
+    pub(crate) script_name: Option<std::sync::Arc<str>>,
+    /// The module being installed, while its program is, for the same stamp.
+    pub(crate) installing_module: Option<std::sync::Arc<str>>,
+    /// The frames an Error object was created in, innermost first, as
+    /// `(func id, ip)`: what its `stack` reports. Keyed by the Error's heap
+    /// index and pruned with it.
+    pub(crate) error_frames: std::collections::HashMap<u32, Vec<(u32, u32)>>,
     /// Rejections reported to the hook and not yet handled.
     pub(crate) reported_rejections: Vec<u32>,
     /// Reported rejections that gained a handler since the last report point.
@@ -3219,6 +3231,7 @@ mod builtins;
 pub(crate) mod clock;
 mod dispatch;
 mod engine;
+mod error_stack;
 pub(crate) mod host_api;
 mod indexing_date;
 /// Step budget, cooperative abort, and the optional execution trace. Off by

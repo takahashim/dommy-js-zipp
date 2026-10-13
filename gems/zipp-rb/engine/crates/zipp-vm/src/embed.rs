@@ -439,6 +439,14 @@ impl ScriptState {
         .unwrap_or_else(torn_down)
     }
 
+    /// Name the code evaluated from now on (a script's URL or file name): the
+    /// functions it defines report it in their Errors' `stack` frames. `None`
+    /// goes back to unnamed (`<anonymous>`). A module is named by its path, or
+    /// by what [`Self::set_module_meta_url`] answers for it.
+    pub fn set_script_name(&mut self, name: Option<&str>) {
+        self.with_vm(|vm| vm.script_name = name.map(std::sync::Arc::from));
+    }
+
     /// Install the JS function that `expression` (evaluated once, in global
     /// scope) yields as the promise rejection hook, HTML's
     /// HostPromiseRejectionTracker: at each report point it is called as
@@ -552,6 +560,21 @@ impl ScriptState {
             result
         })
         .unwrap_or_else(torn_down)
+    }
+
+    /// [`Self::eval_in_context`] for its side effects: the completion value is
+    /// not marshalled, and a throw is reported as a structured [`JsError`]
+    /// (with its `stack`), not just its message.
+    pub fn load_in_context(&mut self, src: &str) -> Result<(), JsError> {
+        self.with_vm(|vm| {
+            let result = match eval_indirect(vm, src) {
+                Ok(_) => Ok(()),
+                Err(thrown) => Err(vm.take_host_throw_structured(thrown)),
+            };
+            vm.finish_weak_job();
+            result
+        })
+        .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)))
     }
 
     /// Call the global function `name` with `args`, returning its result.

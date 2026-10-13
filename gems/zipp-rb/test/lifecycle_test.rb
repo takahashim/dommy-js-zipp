@@ -101,8 +101,13 @@ class LifecycleTest < Minitest::Test
 
   def test_gc_reclaims_an_unreferenced_vm
     ids = []
-    -> { 10.times { ids << ZippRb::VM.new.instance_variable_get(:@id) } }.call
+    # Held until they are counted: a GC while the loop allocates would
+    # otherwise reclaim the first ones before the check.
+    held = []
+    -> { 10.times { held << ZippRb::VM.new } }.call
+    ids.concat(held.map { |vm| vm.instance_variable_get(:@id) })
     assert_equal 0, ids.count { |i| ZippRb._disposed?(i) }
+    held.clear
     10.times do
       GC.start(full_mark: true, immediate_sweep: true)
       break if ids.all? { |i| ZippRb._disposed?(i) }
