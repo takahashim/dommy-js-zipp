@@ -99,6 +99,35 @@ candidate to propose upstream.
   deadline); the interpreter fast path defers to the slow path when a deadline
   is set. zipp-rb's `timeout_msec` uses this instead of a timer thread.
 
+## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, compile/*, vm/dispatch.rs)
+
+- **JIT mirrors only for the x86-64 JIT** — the per-slot `hot_mirror`,
+  `this_mirror` and `upvals_mirror` (32 bytes on every slot) were kept
+  unless `meter-only`; only the x86-64 JIT (`codegen/`) reads them. They are
+  now `cfg(all(feature = "jit", target_arch = "x86_64"))`, with the
+  mirrorless fallbacks (the `meter-only` ones) for every other build. zipp-rb
+  builds without `jit` (ext/zipp_rb/Cargo.toml), so a slot is 101 bytes, not
+  133. `rake engine:test` runs both feature sets.
+- **Unwritten captured bindings are captured by value** — a captured
+  binding took a heap cell (a whole slot) even when nothing ever wrote it,
+  and dommy's per-node proxy handler closes over dozens of `const`s.
+  `capture::value_captures` (capture/value.rs) picks the captured
+  `let`/`const`s and simple parameters that are declared once, never
+  assigned anywhere (nested functions included), initialized before any
+  closure over them is made, outside `switch` cases, in a function with no
+  `eval`/`with` (and, for a parameter, no `arguments`). Those stay plain
+  registers (`FnCompiler::value_captured`); a nested function captures them
+  through `UpvalSource::ParentValue`, for which `Heap::capture_value` hands
+  the closure the value's own slot (with its cell-value mirror entry set to
+  itself, so every cell read — interpreter and JIT — yields the value) or,
+  for a primitive, an immutable cell shared per value (`shared_cells`,
+  dropped when the cell is freed). `pin_mirror_dict` no longer clears the
+  cell-value mirror. A function making such closures is not JIT-eligible
+  (`FuncProto::makes_value_captures`, vm/engine/boot.rs): the native tiers
+  see a capture source only through its `MakeCell`. gethtml.html's heap:
+  548MB → 326MB. Tests: vm/gc.rs `value_capture_tests`, heap.rs,
+  `test/engine_fixes_test.rb`.
+
 ## Performance (crates/zipp-vm/src/parse/parser.rs, src/compile/*)
 
 - **Scope lookups indexed** — parser `Scope` gains `lex_all` / `lex_nonfn` /

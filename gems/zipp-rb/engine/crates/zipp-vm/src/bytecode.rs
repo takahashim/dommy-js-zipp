@@ -2696,6 +2696,11 @@ pub struct FuncProto {
     /// frame finds the cell to capture: a local register holding a cell, or one
     /// of the defining frame's own upvalues (nested-of-nested capture).
     pub upvalues: Vec<UpvalSource>,
+    /// Whether a closure this function makes captures one of its locals BY
+    /// VALUE (`UpvalSource::ParentValue`). The native tiers see a capture
+    /// source register as read only through the `MakeCell` that boxed it, so
+    /// such a function is left to the interpreter (`jit_func_eligible`).
+    pub makes_value_captures: bool,
     /// Per direct-eval CALL SITE in this function: the visible caller bindings
     /// (name, kind, idx) — kind 0 = a boxed local CELL in register idx, kind 1
     /// = an eval root's own upvalue (forwarded caller scope). The eval program
@@ -3198,6 +3203,13 @@ pub enum UpvalSource {
     ParentLocal(Reg),
     /// Capture the defining frame's own upvalue `idx` (re-capture up the chain).
     ParentUpval(u16),
+    /// Capture the VALUE in the defining frame's register `reg`, which is a
+    /// plain (unboxed) local: a binding the compiler proved is never written
+    /// once initialized, and initialized before any closure over it exists
+    /// (`capture::value_captures`). The closure's upvalue is then the value's
+    /// own heap slot, or a shared immutable cell for a primitive
+    /// (`Heap::capture_value`), so the binding costs no cell of its own.
+    ParentValue(Reg),
 }
 
 /// A program's functions, by id.

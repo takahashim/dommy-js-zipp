@@ -41,6 +41,9 @@ use crate::parse::ast::{
 /// it", so nothing needs owning until a result leaves the module.
 type Names<'a> = FxHashSet<&'a str>;
 
+mod value;
+pub use value::{value_captures, value_captures_arrow};
+
 fn owned(set: Names<'_>) -> HashSet<String> {
     set.into_iter().map(str::to_string).collect()
 }

@@ -18,4 +18,9 @@ magnus = { version = "0.8", features = ["rb-sys"] }
 rb-sys = "0.9"
 # The in-tree engine. The gem ships engine/, so this path resolves in an
 # installed gem as it does in the checkout.
-zipp-vm = { path = "../../engine/crates/zipp-vm", features = ["instrument"] }
+#
+# Without the `jit` feature: a VM with a deadline (every dommy VM) never ran
+# the aarch64 JIT, and page scripts are eval programs the JIT never compiles.
+# Without it the heap also drops the x86-64 JIT's per-slot mirrors (32 bytes
+# a slot; see engine/LOCAL_CHANGES.md).
+zipp-vm = { path = "../../engine/crates/zipp-vm", default-features = false, features = ["instrument"] }

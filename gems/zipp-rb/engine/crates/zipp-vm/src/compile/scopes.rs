@@ -75,6 +75,8 @@ impl<'a> FnCompiler<'a> {
             using_scope_reg: None,
             self_name: None,
             captured,
+            value_captured: HashSet::new(),
+            makes_value_captures: Rc::new(std::cell::Cell::new(false)),
             cell_regs: HashSet::new(),
             lexical_regs: HashSet::new(),
             const_regs: HashSet::new(),
@@ -158,15 +160,20 @@ impl<'a> FnCompiler<'a> {
                 cell_locals.push((name.clone(), *reg));
             }
         }
+        let mut value_locals = Vec::new();
         for scope in &self.scopes {
             for (name, reg) in scope {
                 if self.cell_regs.contains(reg) {
                     cell_locals.push((name.clone(), *reg));
+                } else if self.value_captured.contains(name) {
+                    value_locals.push((name.clone(), *reg));
                 }
             }
         }
         EnclosingFn {
             cell_locals,
+            value_locals,
+            makes_value_captures: self.makes_value_captures.clone(),
             upvalues: self.upvalues.clone(),
         }
     }
@@ -714,6 +721,7 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn bound_in_enclosing(&self, name: &str) -> bool {
         self.enclosing.iter().any(|enc| {
             enc.cell_locals.iter().any(|(n, _)| n == name)
+                || enc.value_locals.iter().any(|(n, _)| n == name)
                 || enc.upvalues.borrow().iter().any(|(n, _)| n == name)
         })
     }

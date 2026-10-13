@@ -180,4 +180,25 @@ class EngineFixesTest < Minitest::Test
     JS
     assert_equal [[1, true], [1, true]], @vm.eval("results")
   end
+
+  # Captured bindings nobody writes are captured by value (no cell); the
+  # cases that must keep a shared cell still see every write.
+  def test_bindings_captured_by_value_keep_their_semantics
+    @vm.load(<<~JS)
+      function mk(a, b) { const x = {n: 1}, y = 42, s = "s"; let z = 3.5; return () => [a.n, b, x.n, y, s, z]; }
+      function outer() { const k = [1, 2]; return function () { return () => k.length; }; }
+      function rec() { const fact = (n) => n <= 1 ? 1 : n * fact(n - 1); return fact(5); }
+      function late() { let v = 1; const g = () => v; v = 2; return g(); }
+      function loops() { const fs = []; for (const q of [1, 2, 3]) fs.push(() => q); return fs.map((f) => f()).join(); }
+      function sw(k) { switch (k) { case 0: const t = 5; case 1: return () => t; } }
+      function aliased(p) { const g = () => p; arguments[0] = 9; return g(); }
+      function constWrite() { const c = 1; return () => { try { c = 2; } catch (e) { return e.constructor.name; } }; }
+      function nestedWrite() { let w = 1; const g = () => w; (() => { w = 5; })(); return g(); }
+      function viaEval() { const e = 1; const g = () => e; return eval("g()"); }
+      var results = [mk({n: 7}, 8)(), outer()()(), rec(), late(), loops(), (() => { try { return sw(1)(); } catch (e) { return e.constructor.name; } })(),
+        sw(0)(), aliased(1), constWrite()(), nestedWrite(), viaEval()];
+    JS
+    assert_equal [[7, 8, 1, 42, "s", 3.5], 2, 120, 2, "1,2,3", "ReferenceError", 5, 9, "TypeError", 5, 1],
+      @vm.eval("results")
+  end
 end
