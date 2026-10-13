@@ -96,9 +96,11 @@ class BoundaryRegressionTest < Minitest::Test
     assert_equal false, thread.status
   end
 
-  def test_throw_through_a_callback_is_reported_not_swallowed
-    @vm.define_function("thrower") { throw :done }
-    assert_raises(ZippRb::Error) { catch(:done) { @vm.eval("try { thrower() } catch (e) {}; 'after'") } }
+  def test_throw_through_a_callback_reaches_its_catch_not_js
+    @vm.define_function("thrower") { throw :done, :thrown }
+    result = catch(:done) { @vm.eval("try { thrower() } catch (e) {}; 'after'") }
+    assert_equal :thrown, result
+    assert_equal 2, @vm.eval("1 + 1"), "the VM stays usable"
   end
 
   # --- interrupts around the GVL-free path ----------------------------------

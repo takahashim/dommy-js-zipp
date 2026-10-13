@@ -7182,7 +7182,10 @@ mod local_sroa_tests {
             const pair = [point.x + point.y, point.tag.length];
             checksum = (checksum + pair[0] + pair[1]) | 0;
           }
-          console.log(checksum);
+          // Observe the result without a call: this fork compiles
+          // `console.log(…)` as a real call (LOCAL_CHANGES.md), which local
+          // SROA does not support anywhere in the function.
+          const result = checksum;
         }
         main();
     "#;

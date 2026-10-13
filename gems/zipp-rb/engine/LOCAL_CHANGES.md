@@ -173,3 +173,9 @@ candidate to propose upstream.
 `cargo test -p zipp-vm --lib --features instrument` (`rake engine:test` in
 gems/zipp-rb). Local additions include `deadline_stops_execution_like_abort`
 and `host_ctx_reaches_handles_of_its_own_vm_only`.
+
+`codegen/plan_region.rs` `local_sroa_tests` (x86-64 only): the fixture's
+post-loop `console.log(checksum)` became `const result = checksum;`. With the
+`Print` lowering removed (see "A replaced `console` method is called") the
+call compiles to `LoadGlobal` + `CallMethod`, which local SROA rejects
+anywhere in the function, so the fixture no longer exercised the planner.
