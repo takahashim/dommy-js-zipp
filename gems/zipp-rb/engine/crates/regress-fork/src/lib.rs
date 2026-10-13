@@ -1,0 +1,287 @@
+#![cfg_attr(feature = "prohibit-unsafe", forbid(unsafe_code))]
+
+/*!
+
+# regress - REGex in Rust with EcmaScript Syntax
+
+This crate provides a regular expression engine which targets EcmaScript (aka JavaScript) regular expression syntax.
+
+# Example: test if a string contains a match
+
+```rust
+use regress::Regex;
+let re = Regex::new(r"\d{4}").unwrap();
+let matched = re.find("2020-20-05").is_some();
+assert!(matched);
+```
+
+# Example: iterating over matches
+
+Here we use a backreference to find doubled characters:
+
+```rust
+use regress::Regex;
+let re = Regex::new(r"(\w)\1").unwrap();
+let text = "Frankly, Miss Piggy, I don't give a hoot!";
+for m in re.find_iter(text) {
+    println!("{}", &text[m.range()])
+}
+// Output: ss
+// Output: gg
+// Output: oo
+
+```
+
+# Example: using capture groups
+
+Capture groups are available in the `Match` object produced by a successful match.
+A capture group is a range of byte indexes into the original string.
+
+```rust
+use regress::Regex;
+let re = Regex::new(r"(\d{4})").unwrap();
+let text = "Today is 2020-20-05";
+let m = re.find(text).unwrap();
+let group = m.group(1).unwrap();
+println!("Year: {}", &text[group]);
+// Output: Year: 2020
+```
+
+# Example: using with Pattern trait (nightly only)
+
+When the `pattern` feature is enabled and using nightly Rust, `Regex` can be used with standard string methods:
+
+```rust,ignore
+#![feature(pattern)]
+use regress::Regex;
+let re = Regex::new(r"\d+").unwrap();
+let text = "abc123def456";
+
+// Use with str methods
+assert_eq!(text.find(&re), Some(3));
+assert!(text.contains(&re));
+let parts: Vec<&str> = text.split(&re).collect();
+assert_eq!(parts, vec!["abc", "def", ""]);
+```
+
+# Example: escaping strings for literal matching
+
+Use the `escape` function to escape special regex characters in a string:
+
+```rust
+use regress::{escape, Regex};
+let user_input = "How much $ do you have? (in dollars)";
+let escaped = escape(user_input);
+let re = Regex::new(&escaped).unwrap();
+assert!(re.find(user_input).is_some());
+```
+
+# Supported Syntax
+
+regress targets ES 2018 syntax. You can refer to the many resources about JavaScript regex syntax.
+
+There are some features which have yet to be implemented:
+
+- Named character classes liks `[[:alpha:]]`
+- Unicode property escapes like `\p{Sc}`
+
+Note the parser assumes the `u` (Unicode) flag, as the non-Unicode path is tied to JS's UCS-2 string encoding and the semantics cannot be usefully expressed in Rust.
+
+# Unicode remarks
+
+regress supports Unicode case folding. For example:
+
+```rust
+use regress::Regex;
+let re = Regex::with_flags("\u{00B5}", "i").unwrap();
+assert!(re.find("\u{03BC}").is_some());
+```
+
+Here the U+00B5 (micro sign) was case-insensitively matched against U+03BC (small letter mu).
+
+regress does NOT perform normalization. For example,  e-with-accute-accent can be precomposed or decomposed, and these are treated as not equivalent:
+
+```rust
+use regress::{Regex, Flags};
+let re = Regex::new("\u{00E9}").unwrap();
+assert!(re.find("\u{0065}\u{0301}").is_none());
+```
+
+This agrees with JavaScript semantics. Perform any required normalization before regex matching.
+
+## Ascii matching
+
+regress has an "ASCII mode" which treats each 8-bit quantity as a separate character.
+This may provide improved performance if you do not need Unicode semantics, because it can avoid decoding UTF-8 and has simpler (ASCII-only) case-folding.
+
+Example:
+
+```rust
+use regress::Regex;
+let re = Regex::with_flags("BC", "i").unwrap();
+assert!(re.find("abcd").is_some());
+```
+
+# Comparison to regex crate
+
+regress supports features (required by the EcmaScript spec) that regex does not, including backreferences and zero-width lookaround assertions.
+However the regex crate provides linear-time matching guarantees, while regress does not. This difference is due
+to the architecture: regex uses finite automata while regress uses "classical backtracking."
+
+
+# Architecture
+
+regress has a parser, intermediate representation, optimizer which acts on the IR, bytecode emitter, and two bytecode interpreters, referred to as "backends".
+
+The major interpreter is the "classical backtracking" which uses an explicit backtracking stack, similar to JS implementations. There is also the "PikeVM" pseudo-toy backend which is mainly used for testing and verification.
+
+# Crate features
+
+- **utf16**. When enabled, additional APIs are made available that allow matching text formatted in UTF-16 and UCS-2 (`&[u16]`) without going through a conversion to and from UTF-8 (`&str`) first. This is particularly useful when interacting with and/or (re)implementing existing systems that use those encodings, such as JavaScript, Windows, and the JVM.
+
+- **pattern**. When enabled (nightly only), implements the `std::str::pattern::Pattern` trait for `Regex`, allowing it to be used with standard string methods like `str::find`, `str::contains`, `str::split`, etc.
+
+*/
+
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(feature = "pattern", feature(pattern))]
+#![warn(clippy::all)]
+#![allow(
+    clippy::upper_case_acronyms,
+    clippy::match_like_matches_macro,
+    clippy::uninlined_format_args,
+    clippy::collapsible_if
+)]
+// Clippy's manual_range_contains suggestion produces worse codegen.
+#![allow(clippy::manual_range_contains)]
+
+#[cfg(not(feature = "std"))]
+#[macro_use]
+extern crate alloc;
+
+pub use crate::api::*;
+
+/// PATCH (see FORK.md): whether `c` has the Unicode property `ID_Start`, from
+/// the table behind `\p{ID_Start}` and a named group's first character. The
+/// engine's lexer asks here, so a module carries the property once.
+pub fn is_id_start(c: char) -> bool {
+    unicodetables::id_start_ranges().contains_identifier(c.into())
+}
+
+/// PATCH (see FORK.md): whether `c` has the Unicode property `ID_Continue`.
+pub fn is_id_continue(c: char) -> bool {
+    unicodetables::id_continue_ranges().contains_identifier(c.into())
+}
+
+/// PATCH (see VENDORED.md): `ZIPP_RXSTATS=1` classical-backtrack counters —
+/// (attempts, greedy 1-char backtrack pushes, retry iterations, possessive
+/// pushes elided, failed-run skips). See possessify.rs for the mechanism.
+#[cfg(feature = "std")]
+pub fn rx_stats() -> (u64, u64, u64, u64, u64) {
+    classicalbacktrack::rx_stats()
+}
+
+/// PATCH (see suffix_start.rs): local `ZIPP_RXSTATS=1` ASCII start-prefilter
+/// counters: (derived-literal hits, attempted candidates, cap fallbacks).
+#[cfg(feature = "std")]
+pub fn rx_suffix_start_stats() -> (u64, u64, u64) {
+    classicalbacktrack::rx_suffix_start_stats()
+}
+
+/// PATCH (see VENDORED.md and rxjit.rs): `ZIPP_RXSTATS=1` regex-JIT counters —
+/// (regexes compiled, declined: unsupported insn, declined: limits,
+/// native attempts, interpreter attempts, native bails). Zeros when the
+/// `rx-jit` feature or the x86-64 target is absent.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+pub fn rx_jit_stats() -> (u64, u64, u64, u64, u64, u64) {
+    rxjit::stats()
+}
+#[cfg(not(all(feature = "rx-jit", target_arch = "x86_64")))]
+pub fn rx_jit_stats() -> (u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0)
+}
+
+/// PATCH (test hook, see rxjit.rs): force the regex JIT on (compile on first
+/// attempt) or off, overriding the use-counter policy and the env switch.
+/// For the differential harness only.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __rxjit_force(mode: Option<bool>) {
+    rxjit::force(mode)
+}
+
+/// PATCH (test hook, see rxjit.rs): force the scan-session path on or off,
+/// overriding the `ZIPP_NO_RX_SCANSESSION` env switch. For the differential
+/// harness only.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __rx_scansession_force(mode: Option<bool>) {
+    rxjit::session_force(mode)
+}
+
+/// PATCH (test hook, see rxjit.rs): force the read-only session-entry gate on
+/// or off, overriding the `ZIPP_NO_RX_ACQGATE` env switch. For the
+/// differential harness only.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __rx_acqgate_force(mode: Option<bool>) {
+    rxjit::acqgate_force(mode)
+}
+
+/// PATCH (test hook, see rxjit.rs): force the emitted capture-slot reset on
+/// or off, overriding the `ZIPP_NO_RX_GROUPINIT` env switch. Read when a
+/// regex COMPILES, so a regex must be constructed after the call for the
+/// setting to reach it. For the differential harness only.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __rx_groupinit_force(mode: Option<bool>) {
+    rxjit::groupinit_force(mode)
+}
+
+/// PATCH (see rxjit.rs): scan sessions opened — the hoisted advance loop
+/// engaged in place of the per-attempt wrapper. Zero when the `rx-jit`
+/// feature or the x86-64 target is absent.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+pub fn rx_session_stats() -> u64 {
+    rxjit::session_stats()
+}
+#[cfg(not(all(feature = "rx-jit", target_arch = "x86_64")))]
+pub fn rx_session_stats() -> u64 {
+    0
+}
+
+#[macro_use]
+mod util;
+
+mod api;
+mod bytesearch;
+mod charclasses;
+mod classicalbacktrack;
+mod codepointset;
+mod cursor;
+mod emit;
+mod exec;
+mod indexing;
+mod insn;
+mod ir;
+#[cfg(feature = "linear-ascii")]
+mod linear;
+mod matchers;
+mod optimizer;
+mod packed_intervals;
+mod packed_strings;
+mod parse;
+mod position;
+mod possessify;
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+mod rxjit;
+mod scm;
+mod startpredicate;
+mod suffix_start;
+mod types;
+mod unicode;
+mod unicodetables;
+mod unicodetables_unknown;
+
+#[cfg(feature = "backend-pikevm")]
+mod pikevm;

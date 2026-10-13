@@ -1,0 +1,27 @@
+# frozen_string_literal: true
+
+require "bundler/gem_tasks"
+require "rake/testtask"
+require "rb_sys/extensiontask"
+
+gemspec = Gem::Specification.load("zipp-rb.gemspec")
+
+Rake::ExtensionTask.new("zipp_rb", gemspec) do |ext|
+  ext.lib_dir = "lib/zipp_rb"
+end
+
+Rake::TestTask.new(:test) do |t|
+  t.libs << "test" << "lib"
+  t.test_files = FileList["test/**/*_test.rb"]
+end
+
+# The engine's own Rust unit tests, with the feature set the extension builds.
+# `no_core_float_parse_in_engine_sources` reads crates/zipp-wasm, which is not
+# vendored (see engine/UPSTREAM), so it is skipped rather than patched.
+desc "Run the Zipp engine's Rust unit tests"
+task "engine:test" do
+  sh "cargo test --manifest-path engine/Cargo.toml -p zipp-vm --lib --features instrument " \
+     "-- --skip num_parse::tests::no_core_float_parse_in_engine_sources"
+end
+
+task default: %i[compile test]

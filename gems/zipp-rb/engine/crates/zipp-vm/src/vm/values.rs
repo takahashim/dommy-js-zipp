@@ -1,0 +1,2280 @@
+#![allow(unused_imports)]
+use super::props::ClassLookup;
+use super::*;
+use crate::bytecode::{Instr, Program, UpvalSource};
+use crate::heap::{
+    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
+    PromiseState, PropAttr, ReactionPair, Reactions,
+};
+use crate::value::Value;
+
+const ERROR_MESSAGE_ATTR: PropAttr = PropAttr {
+    writable: true,
+    enumerable: false,
+    configurable: true,
+    accessor: false,
+    setter: Value::UNDEFINED,
+};
+
+/// Everything the RegExp constructor reads out of `pattern` BEFORE RegExpAlloc.
+/// See [`Vm::regexp_pattern_snapshot`].
+pub(crate) struct RegExpPre {
+    pattern_is_regexp: bool,
+    real_regexp: Option<(String, String)>,
+    exact_bytes: Option<Vec<u8>>,
+}
+
+impl<'p> Vm<'p> {
+    /// Exact identity gate shared by user-visible bare-builtin bytecodes. The
+    /// expected handles are setup-time main-realm permanent roots, so equality
+    /// also rejects same-native-id functions allocated in another realm.
+    #[inline]
+    pub(crate) fn bare_builtin_is_intrinsic(&self, expected: u32, callee: Value) -> bool {
+        expected != 0 && callee.is_heap() && callee.heap_index() == expected
+    }
+
+    #[inline]
+    pub(crate) fn global_fn_is_intrinsic(
+        &self,
+        op: crate::bytecode::GlobalFn,
+        callee: Value,
+    ) -> bool {
+        self.bare_builtin_is_intrinsic(self.global_fn_intrinsics[op.index()], callee)
+    }
+
+    #[inline]
+    pub(crate) fn captured_regexp_method_is_intrinsic(
+        &self,
+        op: crate::bytecode::RegExpMethod,
+        callee: Value,
+    ) -> bool {
+        self.bare_builtin_is_intrinsic(self.regexp_method_intrinsics[op.index()], callee)
+    }
+
+    /// Allocation-free exact Get for a hot captured RegExp/String method. This
+    /// is used by generated GetProp code before argument evaluation: only a
+    /// main-realm intrinsic data property can be returned directly. Every own
+    /// shadow, accessor, foreign prototype, or replacement declines before an
+    /// observable effect and is replayed by the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn captured_regexp_method_get_intrinsic(
+        &self,
+        op: crate::bytecode::RegExpMethod,
+        recv: Value,
+    ) -> Option<Value> {
+        let expected = *self.regexp_method_intrinsics.get(op.index())?;
+        if expected == 0 || !recv.is_heap() {
+            return None;
+        }
+        let name = match op {
+            crate::bytecode::RegExpMethod::Test => "test",
+            crate::bytecode::RegExpMethod::Exec => "exec",
+            crate::bytecode::RegExpMethod::MatchAll => "matchAll",
+            crate::bytecode::RegExpMethod::Replace => "replace",
+        };
+        let idx = recv.heap_index();
+        let proto = match op {
+            crate::bytecode::RegExpMethod::Test | crate::bytecode::RegExpMethod::Exec => {
+                if !matches!(self.heap.get(idx), HeapObj::RegExp { .. })
+                    || self
+                        .arr_props
+                        .get(&idx)
+                        .is_some_and(|props| props.pos(name).is_some())
+                {
+                    return None;
+                }
+                match self.proto_of.get(&idx) {
+                    None => self.regexp_proto,
+                    Some(value) if value.is_heap() => value.heap_index(),
+                    _ => return None,
+                }
+            }
+            crate::bytecode::RegExpMethod::MatchAll | crate::bytecode::RegExpMethod::Replace => {
+                if !self.heap.is_str_like(idx)
+                    || self.active_realm_proto(self.str_proto) != self.str_proto
+                {
+                    return None;
+                }
+                self.str_proto
+            }
+        };
+        let live = match self.heap.get(proto) {
+            HeapObj::Object(map) => map
+                .pos(name)
+                .and_then(|slot| (!map.attr_at(slot).accessor).then(|| map.val_at(slot))),
+            _ => None,
+        }?;
+        (live.is_heap() && live.heap_index() == expected).then_some(live)
+    }
+
+    /// `key in obj` — does `obj` have the property `key`? Own object keys, a
+    /// class instance's inherited methods/getters, array indices / `length`,
+    /// Map/Set `size`, and class static members. `in` on a primitive throws
+    /// in JS; here it's `false` (rare).
+    /// `[[HasProperty]]` for a fixed string key — walks the prototype chain
+    /// (unlike has_own_property). Allocates a transient key string; used by
+    /// ToPropertyDescriptor, where an inherited/accessor field counts as present.
+    pub(crate) fn has_property_str(&mut self, obj: Value, key: &str) -> bool {
+        let k = self.alloc_str(key.to_string());
+        self.has_property(obj, k)
+    }
+
+    /// Proxy-aware, THROWING `[[HasProperty]]` for a fixed string key — the
+    /// fallible twin of `has_property_str`. ToPropertyDescriptor must use this:
+    /// a descriptor that is itself a Proxy answers every field through its `has`
+    /// trap, and the infallible walk (which cannot dispatch a trap) reported such
+    /// a descriptor as entirely empty.
+    pub(crate) fn has_property_str_dyn(&mut self, obj: Value, key: &str) -> Result<bool, Thrown> {
+        let k = self.alloc_str(key.to_string());
+        self.has_property_dyn(obj, k)
+    }
+
+    /// The key's text viewed IN PLACE: `Some` iff `key` is a flat string
+    /// whose WTF-8 bytes are valid UTF-8 — byte-identical to what `key_of`
+    /// would allocate. A rope / lone-surrogate / Symbol / non-string key is
+    /// `None`; the caller falls back to `key_of`. So is a string `key_of`
+    /// would escape ("@@…", see `escape_guest_key`).
+    #[inline]
+    pub(crate) fn flat_key_str(&self, key: Value) -> Option<&str> {
+        if !key.is_heap() {
+            return None;
+        }
+        match self.heap.str_wtf8_cow(key.heap_index()) {
+            Some(std::borrow::Cow::Borrowed(b)) if !b.starts_with(b"@@") => {
+                std::str::from_utf8(b).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// The array index a STRING key spells in canonical form — `"0"` or
+    /// `[1-9][0-9]{0,9}` valued at most 2^32-2; `"05"`, `"+5"`, `" 5"` and
+    /// `"4294967295"` are ordinary string keys. Decided on the key's bytes
+    /// in place; a rope/surrogate/Symbol key is judged on its `key_of` text
+    /// (which decides identically, and is rare — a for-in snapshot key is a
+    /// flat string). `None` for a non-heap key: a numeric key is the
+    /// caller's `array_index` fast path, and no other primitive's key text
+    /// can spell a canonical index.
+    #[inline]
+    pub(crate) fn str_key_array_index(&self, key: Value) -> Option<usize> {
+        if !key.is_heap() {
+            return None;
+        }
+        match self.flat_key_str(key) {
+            Some(k) => canonical_u32_key(k).map(|n| n as usize),
+            None => canonical_u32_key(&self.key_of(key)).map(|n| n as usize),
+        }
+    }
+
+    /// The canonical integer index `key` addresses on an array: a numeric
+    /// Value (`array_index`), else a canonical numeric string. Replaces the
+    /// `key_of` + `parse::<u32>` + `n.to_string() == k` spelling, which paid
+    /// two String allocations per probe to re-derive text the key already
+    /// carried; the answers are identical by construction.
+    /// `ZIPP_NO_ARRKEY_FAST=1` restores the old spelling so the change is
+    /// A/B-able and bisectable on one binary.
+    #[inline]
+    pub(crate) fn key_array_index(&self, key: Value) -> Option<usize> {
+        if let Some(i) = array_index(key) {
+            return Some(i);
+        }
+        if arrkey_fast_enabled() {
+            return self.str_key_array_index(key);
+        }
+        let k = self.key_of(key);
+        match k.parse::<u32>() {
+            Ok(n) if n != u32::MAX && n.to_string() == k => Some(n as usize),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn has_property(&self, mut obj: Value, key: Value) -> bool {
+        // The infallible/internal variant cannot surface the shared RangeError,
+        // so keep its ordinary (non-Proxy) prototype traversal iterative. The
+        // public `in`/Reflect.has path below is fallible and depth-guards every
+        // dynamic/Proxy edge instead.
+        'prototype_chain: loop {
+            if !obj.is_heap() {
+                return false;
+            }
+            let idx = obj.heap_index();
+            match self.heap.get(idx) {
+                HeapObj::Object(map) => {
+                    let k = self.key_of(key);
+                    if map.get(&k).is_some() {
+                        return true;
+                    }
+                    // %Array.prototype% is an Array exotic: its `length` is a real
+                    // own property (virtual, in arr_proto_len), so
+                    // `"length" in Object.create(Array.prototype)` is true.
+                    if k == "length" && idx == self.arr_proto && self.arr_proto != 0 {
+                        return true;
+                    }
+                    // The global object's SLOT-backed own properties (script `var`s
+                    // and function declarations, and the built-ins that never got an
+                    // ObjMap entry). `globalThis.assert` read fine while
+                    // `"assert" in globalThis` was false, because only the member-get
+                    // and descriptor paths consulted the slot table
+                    // (staging/sm/Reflect/set.js line 126).
+                    if idx == self.global_this
+                        && self.global_this != 0
+                        && self.global_by_name(&k).is_some()
+                    {
+                        return true;
+                    }
+                    // A class instance: its class chain's member tables answer for
+                    // the levels that still match their prototype objects; past
+                    // them (or for a key no table declares) the live chain does —
+                    // `C.prototype.z = 1` / `delete C.prototype.m` are visible.
+                    if let Some(cidx) = map.class {
+                        let next = match self.class_member_lookup(idx, cidx, &k) {
+                            ClassLookup::Method(_) | ClassLookup::Accessor { .. } => return true,
+                            ClassLookup::Live(p) => p,
+                            ClassLookup::Miss => self.class_instance_live_proto(idx, cidx),
+                        };
+                        if !next.is_heap() {
+                            return false;
+                        }
+                        obj = next;
+                        continue 'prototype_chain;
+                    }
+                    // [[HasProperty]] continues up the prototype chain: an explicit
+                    // `Object.create` proto, then the base Object.prototype (which
+                    // carries toString/hasOwnProperty/valueOf/…). Mirrors get_member's
+                    // proto resolution.
+                    let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                        p.is_heap().then_some(p)
+                    } else if self.obj_proto != 0 && idx != self.obj_proto {
+                        Some(Value::heap(self.obj_proto))
+                    } else {
+                        None
+                    };
+                    match proto {
+                        Some(p) => {
+                            obj = p;
+                            continue 'prototype_chain;
+                        }
+                        None => return false,
+                    }
+                }
+                HeapObj::Array(items) => {
+                    let len = items.len();
+                    // A canonical integer index: a numeric Value, or a canonical numeric
+                    // string ("0", not "01"/"-1") — decided on the key's bytes in place
+                    // (key_array_index; the old spelling allocated two Strings per probe,
+                    // once per key per chain level of the for-in liveness re-check).
+                    let int_index = self.key_array_index(key);
+                    if let Some(i) = int_index {
+                        // An in-range slot is present iff it is not a hole.
+                        if i < len && !items[i].is_hole() {
+                            return true;
+                        }
+                        // A hole OR an out-of-range index is not an own element, but it may
+                        // be overridden (a defineProperty'd index in arr_props) or inherited
+                        // from the prototype chain — [[HasProperty]] must keep walking (an
+                        // out-of-range `i` was previously reported absent without this check).
+                        // The overlay is keyed by the canonical decimal string, spelled into
+                        // a stack buffer — never a per-probe String allocation.
+                        if let Some(m) = self.arr_props.get(&idx) {
+                            let mut buf = [0u8; 20];
+                            if m.pos(crate::heap::index_key(&mut buf, i)).is_some() {
+                                return true;
+                            }
+                        }
+                        // Walk the ACTUAL [[Prototype]] (a setPrototypeOf custom proto
+                        // carries inherited indices), else %Array.prototype%.
+                        let proto = match self.proto_of.get(&idx) {
+                            Some(&p) => p,
+                            None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                            None => Value::NULL,
+                        };
+                        if !proto.is_heap() {
+                            return false;
+                        }
+                        obj = proto;
+                        continue 'prototype_chain;
+                    }
+                    // A non-index key: `length` is always own; else an arr_props named
+                    // prop; else inherited. A flat string key's bytes are viewed in
+                    // place — key_of allocated a fresh String per probe, per chain
+                    // level (ZIPP_NO_ARRKEY_FAST=1 restores that).
+                    let kbuf;
+                    let k: &str = match arrkey_fast_enabled()
+                        .then(|| self.flat_key_str(key))
+                        .flatten()
+                    {
+                        Some(s) => s,
+                        None => {
+                            kbuf = self.key_of(key);
+                            &kbuf
+                        }
+                    };
+                    if k == "length" {
+                        return true;
+                    }
+                    if self
+                        .arr_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(k).is_some())
+                    {
+                        return true;
+                    }
+                    if self.regexp_result_prop(idx, &k).is_some() {
+                        return true;
+                    }
+                    // Inherited: the actual [[Prototype]] (custom via setPrototypeOf),
+                    // else Array.prototype (push/map/…) then Object.prototype.
+                    let proto = match self.proto_of.get(&idx) {
+                        Some(&p) => p,
+                        None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                        None => Value::NULL,
+                    };
+                    if !proto.is_heap() {
+                        return false;
+                    }
+                    obj = proto;
+                    continue 'prototype_chain;
+                }
+                HeapObj::Str(s) => {
+                    return match array_index(key) {
+                        Some(i) => i < s.units(),
+                        None => self.display(key) == "length",
+                    }
+                }
+                HeapObj::Cons { len, .. } => {
+                    return match array_index(key) {
+                        Some(i) => i < *len,
+                        None => self.display(key) == "length",
+                    }
+                }
+                // A TypedArray's integer-indexed exotic own properties (`0 in ta`),
+                // then any named own prop (`ta.constructor` override in arr_props),
+                // then the %TypedArray%.prototype chain (`"subarray" in ta`).
+                HeapObj::TypedArray { .. } => {
+                    let k = self.key_of(key);
+                    // A CanonicalNumericIndexString is absorbed by the integer-indexed
+                    // exotic [[HasProperty]]: present iff it's a VALID integer index,
+                    // and never inherited from the prototype (so `TA.prototype[5]`
+                    // does not make `5 in ta` true on a shorter array).
+                    if self.is_canonical_numeric_index(&k) {
+                        return self.ta_valid_index(idx, &k).is_some();
+                    }
+                    if self
+                        .arr_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(&k).is_some())
+                    {
+                        return true;
+                    }
+                    match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
+                        Some(p) => {
+                            obj = p;
+                            continue 'prototype_chain;
+                        }
+                        None => return false,
+                    }
+                }
+                // Static members (data + `static get`/`set` accessors) are own
+                // properties of the class value and are inherited up the chain.
+                HeapObj::Class(_) => {
+                    let k = self.key_of(key);
+                    // A class always owns `prototype`.
+                    if k == "prototype" && self.callable_has_prototype(obj) {
+                        return true;
+                    }
+                    let mut cur = Some(idx);
+                    while let Some(cidx) = cur {
+                        match self.heap.get(cidx) {
+                            HeapObj::Class(c) => {
+                                if c.statics.get(&k).is_some()
+                                    || c.static_getters.iter().any(|(n, _)| *n == k)
+                                    || c.static_setters.iter().any(|(n, _)| *n == k)
+                                {
+                                    return true;
+                                }
+                                cur = c.parent;
+                            }
+                            _ => break,
+                        }
+                    }
+                    return false;
+                }
+                _ => {
+                    let k = self.key_of(key);
+                    // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*,
+                    // …) keep their named own props in the arr_props side table.
+                    if self
+                        .arr_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(&k).is_some())
+                    {
+                        return true;
+                    }
+                    // A RegExp instance's `lastIndex` is an own data property held
+                    // in the heap object itself (not arr_props) —
+                    // `"lastIndex" in re` is true.
+                    if k == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+                        return true;
+                    }
+                    // A callable's assigned own properties (`fn.x = …`) live in the
+                    // SEPARATE fn_props side table — `"x" in fn` must see them too
+                    // (mirrors get_own_property; read_descriptor relies on this for a
+                    // Function-object descriptor).
+                    if matches!(
+                        self.heap.get(idx),
+                        HeapObj::Func(_)
+                            | HeapObj::Closure { .. }
+                            | HeapObj::Bound { .. }
+                            | HeapObj::Wrapped { .. }
+                            | HeapObj::Native(_)
+                            | HeapObj::NativeClosure { .. }
+                    ) && self
+                        .fn_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(&k).is_some())
+                    {
+                        return true;
+                    }
+                    // A function's synthesized `prototype` own property (ordinary
+                    // functions + generators; not arrows/methods/async/bound/native).
+                    if k == "prototype" && self.callable_has_prototype(obj) {
+                        return true;
+                    }
+                    // A boxed String wrapper exposes the wrapped string's chars +
+                    // `length` as integer-indexed own properties.
+                    if let HeapObj::Boxed { kind: 0, value } = self.heap.get(idx) {
+                        let v = *value;
+                        let clen = match self.heap.get(v.heap_index()) {
+                            HeapObj::Str(s) => Some(s.units()),
+                            HeapObj::Cons { len, .. } => Some(*len),
+                            _ => None,
+                        };
+                        if let Some(n) = clen {
+                            // The index may arrive as a NUMBER (`4 in str`) or as its
+                            // canonical STRING form (`"4" in str`, and every
+                            // `Reflect.has`, which passes ToPropertyKey's result).
+                            // Only `array_index` was consulted, so the string form
+                            // reported absent (staging/sm/Reflect/has.js).
+                            let i = array_index(key).or_else(|| match k.parse::<u32>() {
+                                Ok(u) if u != u32::MAX && u.to_string() == k => Some(u as usize),
+                                _ => None,
+                            });
+                            if let Some(i) = i {
+                                if i < n {
+                                    return true;
+                                }
+                            }
+                            if k == "length" {
+                                return true;
+                            }
+                        }
+                    }
+                    // The prototype chain: an explicit `proto_of`, else the intrinsic
+                    // prototype for this object's kind — so inherited methods/accessors
+                    // are visible to `in` (`"toFixed" in Object(2.5)`, `"call" in fn`),
+                    // mirroring get_member. Without this fallback `in` saw only own
+                    // props on a boxed primitive / callable / Date / Promise / …
+                    let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                        p.is_heap().then_some(p)
+                    } else {
+                        let bp = match self.heap.get(idx) {
+                            HeapObj::Func(_)
+                            | HeapObj::Closure { .. }
+                            | HeapObj::Bound { .. }
+                            | HeapObj::Native(_)
+                            | HeapObj::NativeClosure { .. } => self.fn_proto,
+                            HeapObj::Boxed { kind: 0, .. } => self.str_proto,
+                            HeapObj::Boxed { kind: 1, .. } => self.num_proto,
+                            HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
+                            HeapObj::Boxed { kind: 3, .. } => self.symbol_proto,
+                            HeapObj::Boxed { kind: 4, .. } => self.bigint_proto,
+                            HeapObj::Date(_) => self.date_proto,
+                            HeapObj::Promise { .. } => self.promise_proto,
+                            HeapObj::RegExp { .. } => self.regexp_proto,
+                            // Map/Set previously answered ONLY `"size"` from a
+                            // dedicated arm, so neither their assigned own props
+                            // (`m.x = 1`) nor their inherited methods (`"has" in m`)
+                            // were visible to `in`/Reflect.has — and a for-in whose
+                            // prototype is a Map dropped every inherited key (the
+                            // per-iteration liveness re-check uses this walk).
+                            HeapObj::Map { .. } => self.map_proto,
+                            HeapObj::Set(_) => self.set_proto,
+                            HeapObj::WeakMap { .. } => self.weakmap_proto,
+                            HeapObj::WeakSet(_) => self.weakset_proto,
+                            HeapObj::WeakRef(_) => self.weakref_proto,
+                            HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
+                            HeapObj::Generator { .. } => self.gen_proto,
+                            HeapObj::AsyncGenerator(_) => self.asyncgen_proto,
+                            HeapObj::Iterator { proto, .. } => *proto,
+                            HeapObj::IterHelper { .. } => self.iterator_helper_proto,
+                            _ => 0,
+                        };
+                        (bp != 0).then_some(Value::heap(bp))
+                    };
+                    match proto {
+                        Some(p) => {
+                            obj = p;
+                            continue 'prototype_chain;
+                        }
+                        None => return false,
+                    }
+                }
+            }
+        }
+    }
+
+    /// The ORDERED lexical private-brand chain of the class body currently
+    /// executing — resolved from the running frame's callee (a method/getter/setter
+    /// VALUE, or the class value for the ctor/field-init/static block; both recorded
+    /// in `method_brand` at MakeClass). `None` outside a class body.
+    pub(crate) fn current_private_brands(&self) -> Option<&Vec<u64>> {
+        self.private_brands_of(self.frames.last()?.callee)
+    }
+
+    /// The lexical private-brand chain of the class body whose code `callee` (a
+    /// function VALUE recorded in `method_brand`) runs. `current_private_brands`
+    /// asks this for the running frame; a frame-free JIT activation asks it for
+    /// its own callee, because the top frame then belongs to a caller.
+    /// A function defined INSIDE a class body shares that body's private
+    /// scope: `method(){ const self = this; function inner(){ self.#m = 1; } }`
+    /// is legal, and so is an arrow doing the same, because a private name is
+    /// lexically scoped rather than tied to being a method. Copy the defining
+    /// code's chain onto the new function value, so `resolve_private` finds
+    /// the declaring class from inside it (the textual fall-back it used
+    /// instead could not see a private ACCESSOR at all, and would have
+    /// accepted another class's same-named private).
+    pub(crate) fn inherit_private_brands(&mut self, defining: Value, closure: u32) {
+        if self.method_brand.is_empty() || !defining.is_heap() {
+            return;
+        }
+        if let Some(chain) = self.method_brand.get(&defining.heap_index()).cloned() {
+            self.method_brand.insert(closure, chain);
+        }
+    }
+
+    pub(crate) fn private_brands_of(&self, callee: Value) -> Option<&Vec<u64>> {
+        if !callee.is_heap() {
+            return None;
+        }
+        self.method_brand.get(&callee.heap_index())
+    }
+
+    /// Whether `receiver` was constructed by a class evaluation carrying `brand`
+    /// (or one of its ancestors) — i.e. the private brand is installed on it.
+    /// Walks the instance's class chain collecting each ClassData.private_brand.
+    pub(crate) fn instance_has_brand(&self, receiver: Value, brand: u64) -> bool {
+        if !receiver.is_heap() {
+            return false;
+        }
+        // A static private member's receiver IS the class value: walk its own
+        // chain (the lenient textual paths accept ancestors; the precise
+        // static check is private_receiver_ok's receiver==owner).
+        if matches!(self.heap.get(receiver.heap_index()), HeapObj::Class(_)) {
+            let mut cur = Some(receiver.heap_index());
+            while let Some(cidx) = cur {
+                match self.heap.get(cidx) {
+                    HeapObj::Class(c) => {
+                        if c.private_brand == brand {
+                            return true;
+                        }
+                        cur = c.parent;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        // An INSTANCE carries exactly the brands explicitly installed on it —
+        // each class in the construction chain installs its own at ITS
+        // InitializeInstanceElements point (base: ctor entry; derived: its
+        // super() completion). Before that point the class's privates are NOT
+        // yet on the instance (prod-private-*-before-super-return), even
+        // though map.class already links to the class.
+        self.instance_brand
+            .get(&receiver.heap_index())
+            .is_some_and(|bs| bs.contains(&brand))
+    }
+
+    /// PrivateBrandAdd: install a class's own private brand on an instance at
+    /// its InitializeInstanceElements point. Only classes that DECLARE private
+    /// members brand (keeps the side map empty on the hot path).
+    pub(crate) fn brand_instance(&mut self, inst: Value, classval: Value) {
+        if !inst.is_heap() || !classval.is_heap() {
+            return;
+        }
+        let own = self
+            .method_brand
+            .get(&classval.heap_index())
+            .and_then(|c| c.first())
+            .copied();
+        if let Some(own) = own {
+            if !self.brand_private_names.contains_key(&own) {
+                return;
+            }
+            let e = self.instance_brand.entry(inst.heap_index()).or_default();
+            if !e.contains(&own) {
+                e.push(own);
+                #[cfg(feature = "instrument")]
+                self.instrument_mark_external_heap_growth();
+            }
+        }
+    }
+
+    /// Infallible extensibility of a plain heap target (no proxy traps): an
+    /// Object's flag; string/symbol/bigint primitives are never extensible
+    /// targets; everything else (Array/Class/Date/…) keeps its flag in the
+    /// arr_props side table (where preventExtensions stores it).
+    pub(crate) fn target_is_extensible(&self, v: Value) -> bool {
+        if !v.is_heap() {
+            return true;
+        }
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Object(m) => m.extensible,
+            HeapObj::Str(_)
+            | HeapObj::Cons { .. }
+            | HeapObj::Symbol { .. }
+            | HeapObj::BigInt(_)
+            | HeapObj::BigIntBig(_) => false,
+            _ => self
+                .arr_props
+                .get(&v.heap_index())
+                .map_or(true, |m| m.extensible),
+        }
+    }
+
+    /// Checked InitializeInstanceElements / PrivateBrandAdd / PrivateFieldAdd
+    /// entry: adding `classval`'s private elements to `inst` (when the class
+    /// declares any) throws TypeError if `inst` ALREADY carries this class's
+    /// own brand (double initialization via return-override — spec
+    /// PrivateMethodOrAccessorAdd/PrivateFieldAdd step "entry is not empty"),
+    /// or if `inst` is non-extensible (nonextensible-applies-to-private).
+    /// `is_override` gates the duplicate check: a NORMAL instance's map.class
+    /// chain carries the constructing class's brand by construction (that is
+    /// the pending initialization, not a completed one).
+    pub(crate) fn private_init_checked(
+        &mut self,
+        inst: Value,
+        classval: Value,
+        is_override: bool,
+    ) -> Result<(), Thrown> {
+        if !inst.is_heap() || !classval.is_heap() {
+            return Ok(());
+        }
+        let own = match self
+            .method_brand
+            .get(&classval.heap_index())
+            .and_then(|c| c.first())
+        {
+            Some(&b) => b,
+            None => return Ok(()),
+        };
+        let has_instance_privates = self
+            .brand_private_names
+            .get(&own)
+            .is_some_and(|ns| ns.iter().any(|(_, k)| k & 8 == 0));
+        if has_instance_privates {
+            if is_override && self.instance_has_brand(inst, own) {
+                return Err(Thrown::from_static(
+                    "TypeError: cannot initialize the same private elements twice on an object",
+                ));
+            }
+            if let HeapObj::Object(m) = self.heap.get(inst.heap_index()) {
+                if !m.extensible {
+                    return Err(Thrown::from_static(
+                        "TypeError: cannot define private elements on a non-extensible object",
+                    ));
+                }
+            }
+        }
+        self.brand_instance(inst, classval);
+        Ok(())
+    }
+
+    /// The activation's EvalScope, CREATING it on the frame when the running
+    /// function contains a sloppy function-context direct eval: closures made
+    /// BEFORE the eval call must share the scope the eval later populates.
+    pub(crate) fn ensure_frame_eval_scope(&mut self, frame_idx: usize) -> Option<u32> {
+        if let Some(sc) = self.frame_eval_scope(frame_idx) {
+            return Some(sc);
+        }
+        if self.func_has_sloppy_eval(self.frames[frame_idx].func as usize) {
+            let s = self
+                .heap
+                .alloc(HeapObj::EvalScope(std::collections::HashMap::new()));
+            self.frames[frame_idx].eval_scope = s;
+            return Some(s);
+        }
+        None
+    }
+
+    /// Memoised: does this function's code contain a DirectEval whose var
+    /// environment is a FUNCTION activation (sloppy, non-global var env)?
+    fn func_has_sloppy_eval(&mut self, func_id: usize) -> bool {
+        if func_id >= self.sloppy_eval_memo.len() {
+            self.sloppy_eval_memo.resize(func_id + 1, 0);
+        }
+        match self.sloppy_eval_memo[func_id] {
+            1 => false,
+            2 => true,
+            _ => {
+                let has = self.func(func_id).code.iter().any(|i| {
+                    matches!(
+                        i,
+                        crate::bytecode::Instr::DirectEval {
+                            var_env_is_global: false,
+                            strict_caller: false,
+                            ..
+                        }
+                    )
+                });
+                self.sloppy_eval_memo[func_id] = if has { 2 } else { 1 };
+                has
+            }
+        }
+    }
+
+    /// The running activation's dynamic EvalScope: the frame's own, or the
+    /// one stamped on its callee (closures created under an eval scope).
+    pub(crate) fn frame_eval_scope(&self, frame_idx: usize) -> Option<u32> {
+        let f = &self.frames[frame_idx];
+        if f.eval_scope != u32::MAX {
+            return Some(f.eval_scope);
+        }
+        if f.callee.is_heap() {
+            return self.closure_eval_scope.get(&f.callee.heap_index()).copied();
+        }
+        None
+    }
+
+    /// The EvalScopes visible to a frame, INNERMOST FIRST: its own (or, failing
+    /// that, the one stamped on its callee), then each enclosing scope reached
+    /// through `eval_scope_parent`. These are nested variable environments, so a
+    /// name must be resolved against all of them — a closure that runs its own
+    /// direct eval has a scope of its own AND still sees the one it was created
+    /// under.
+    pub(crate) fn eval_scope_chain(&self, frame_idx: usize) -> impl Iterator<Item = u32> + '_ {
+        let mut cur = self.frame_eval_scope(frame_idx);
+        // Bounded: the parent links form a chain of activations, never a cycle,
+        // but a corrupt one must not hang the engine.
+        let mut budget = 64;
+        std::iter::from_fn(move || {
+            let sc = cur?;
+            budget -= 1;
+            cur = if budget > 0 {
+                self.eval_scope_parent.get(&sc).copied()
+            } else {
+                None
+            };
+            Some(sc)
+        })
+    }
+
+    /// Dynamic-first lookup for the LoadGlobalDyn family: the current
+    /// activation's EvalScope binding for the slot's NAME, if any.
+    pub(crate) fn eval_scope_lookup(&self, idx: u32) -> Option<Value> {
+        let fi = self.frames.len().checked_sub(1)?;
+        let name = self.global_slot_name(idx)?;
+        for sc in self.eval_scope_chain(fi) {
+            if let HeapObj::EvalScope(m) = self.heap.get(sc) {
+                if let Some(v) = m.get(&name) {
+                    return Some(*v);
+                }
+            }
+        }
+        None
+    }
+
+    /// Dynamic-first store: write an EXISTING EvalScope binding; false = fall
+    /// back to the ordinary global store.
+    pub(crate) fn eval_scope_store(&mut self, idx: u32, v: Value) -> bool {
+        let Some(fi) = self.frames.len().checked_sub(1) else {
+            return false;
+        };
+        let Some(name) = self.global_slot_name(idx) else {
+            return false;
+        };
+        // Innermost binding of the name wins, exactly as the read does.
+        let Some(target) = self.eval_scope_chain(fi).find(
+            |&sc| matches!(self.heap.get(sc), HeapObj::EvalScope(m) if m.contains_key(&name)),
+        ) else {
+            return false;
+        };
+        // Nursery barrier: an EvalScope is a mutable heap object like a Cell.
+        self.heap.write_barrier_val(target, v);
+        if let HeapObj::EvalScope(m) = self.heap.get_mut(target) {
+            if let Some(slot) = m.get_mut(&name) {
+                *slot = v;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// PrivateFieldFind: the field's value for the EXACT (instance, brand,
+    /// name), or None (spec: empty -> TypeError at the access site).
+    pub(crate) fn private_field_get(&self, inst: Value, brand: u64, key: &str) -> Option<Value> {
+        if !inst.is_heap() {
+            return None;
+        }
+        self.private_fields
+            .get(&inst.heap_index())?
+            .get(&(brand, key.to_string()))
+            .copied()
+    }
+
+    /// PrivateFieldAdd (`add=true`: upsert — field-init stores) or
+    /// PrivateFieldSet (`add=false`: only an EXISTING entry). Returns whether
+    /// the write happened.
+    pub(crate) fn private_field_set(
+        &mut self,
+        inst: Value,
+        brand: u64,
+        key: &str,
+        v: Value,
+        add: bool,
+    ) -> bool {
+        if !inst.is_heap() {
+            return false;
+        }
+        let m = self.private_fields.entry(inst.heap_index()).or_default();
+        let k = (brand, key.to_string());
+        if !add && !m.contains_key(&k) {
+            return false;
+        }
+        let _retained_new_key = m.insert(k, v).is_none();
+        #[cfg(feature = "instrument")]
+        if _retained_new_key {
+            self.instrument_mark_external_heap_growth();
+        }
+        true
+    }
+
+    /// Lenient any-brand lookup for the textual-fallback paths (the accessing
+    /// chain was unresolvable — e.g. a class defined in a static initializer).
+    pub(crate) fn private_field_scan(&self, inst: Value, key: &str) -> Option<Value> {
+        if !inst.is_heap() {
+            return None;
+        }
+        let m = self.private_fields.get(&inst.heap_index())?;
+        m.iter().find(|((_, n), _)| n == key).map(|(_, &v)| v)
+    }
+
+    pub(crate) fn private_field_scan_has(&self, inst: Value, key: &str) -> bool {
+        self.private_field_scan(inst, key).is_some()
+    }
+
+    /// Any-brand write-if-present for the textual-fallback paths.
+    pub(crate) fn private_field_scan_set(&mut self, inst: Value, key: &str, v: Value) -> bool {
+        if !inst.is_heap() {
+            return false;
+        }
+        let Some(m) = self.private_fields.get_mut(&inst.heap_index()) else {
+            return false;
+        };
+        let Some(k) = m.keys().find(|(_, n)| n == key).cloned() else {
+            return false;
+        };
+        m.insert(k, v);
+        true
+    }
+
+    /// Declaring-class private resolution (kind-aware): walk the ACCESSING
+    /// code's lexical brand chain innermost-first; for the first brand that
+    /// DECLARES `key`, return (brand, kind, declaring-class heap idx). `None`
+    /// when the chain is unresolvable, the name is foreign to the chain, or
+    /// the declaring class value is unknown — the caller keeps its textual
+    /// path. kind bits: 1 = method, 2 = getter, 4 = setter; 0 = field.
+    pub(crate) fn resolve_private(&self, key: &str) -> Option<(u64, u8, u32)> {
+        self.resolve_private_in(self.frames.last()?.callee, key)
+    }
+
+    /// `resolve_private` against the brand chain of `ctx` (see
+    /// `private_brands_of`) rather than the running frame's.
+    pub(crate) fn resolve_private_in(&self, ctx: Value, key: &str) -> Option<(u64, u8, u32)> {
+        let chain = self.private_brands_of(ctx)?;
+        for &b in chain.iter() {
+            if let Some(names) = self.brand_private_names.get(&b) {
+                if let Some(kind) = names.iter().find(|(n, _)| n == key).map(|&(_, k)| k) {
+                    let owner = *self.brand_owner.get(&b)?;
+                    return Some((b, kind, owner));
+                }
+            }
+        }
+        None
+    }
+
+    /// A private member's VALUE from its DECLARING class. `want`: 1 = method,
+    /// 2 = getter, 4 = setter (each searches the instance + static lists; a
+    /// class cannot declare the same private name twice, so order is moot).
+    pub(crate) fn private_member_from_owner(
+        &self,
+        owner: u32,
+        key: &str,
+        want: u8,
+    ) -> Option<Value> {
+        let HeapObj::Class(c) = self.heap.get(owner) else {
+            return None;
+        };
+        let from = |list: &[(String, Value)]| list.iter().find(|(n, _)| n == key).map(|&(_, v)| v);
+        let is_static = want & 8 != 0;
+        match want & 7 {
+            1 => {
+                if is_static {
+                    c.statics.get(key)
+                } else {
+                    from(&c.methods)
+                }
+            }
+            2 => from(if is_static {
+                &c.static_getters
+            } else {
+                &c.getters
+            }),
+            4 => from(if is_static {
+                &c.static_setters
+            } else {
+                &c.setters
+            }),
+            _ => None,
+        }
+    }
+
+    /// Spec-side brand check for a RESOLVED private member: a STATIC member's
+    /// brand lives on the declaring class VALUE itself (PrivateBrandAdd(F, F) —
+    /// not on subclasses, not on instances); an INSTANCE member's brand lives
+    /// on constructed instances (map.class chain or return-override extras) —
+    /// never on the class value.
+    pub(crate) fn private_receiver_ok(&self, recv: Value, b: u64, kind: u8, owner: u32) -> bool {
+        if !recv.is_heap() {
+            return false;
+        }
+        if kind & 8 != 0 {
+            return recv.heap_index() == owner;
+        }
+        if matches!(self.heap.get(recv.heap_index()), HeapObj::Class(_)) {
+            // A class value reads an INSTANCE private only if it was itself
+            // branded as a return-override instance.
+            return self
+                .instance_brand
+                .get(&recv.heap_index())
+                .is_some_and(|bs| bs.contains(&b));
+        }
+        self.instance_has_brand(recv, b)
+    }
+
+    /// Brand-aware private presence for accessing private name `key`:
+    /// `Some(true/false)` when the accessing class body's brand chain is
+    /// resolvable, `None` when not (the caller keeps its textual check).
+    ///
+    /// Resolution is name-precise: walk the lexical chain INNERMOST-first and, for
+    /// the first brand whose class actually DECLARES `key`, require the receiver to
+    /// carry THAT specific brand (so a `#x` declared in an enclosing/shadowing
+    /// class resolves to the right class, not merely "some class in scope"). If no
+    /// chain brand is known to declare `key` (e.g. the name set is incomplete),
+    /// fall back to the lenient any-brand check — never tighter than the chain, so
+    /// this can only ADD precision, never reject a previously-accepted access.
+    pub(crate) fn private_brand_ok(&self, receiver: Value, key: &str) -> Option<bool> {
+        self.private_brand_ok_in(self.frames.last()?.callee, receiver, key)
+    }
+
+    /// `private_brand_ok` against the brand chain of `ctx`.
+    pub(crate) fn private_brand_ok_in(
+        &self,
+        ctx: Value,
+        receiver: Value,
+        key: &str,
+    ) -> Option<bool> {
+        let chain = self.private_brands_of(ctx)?;
+        for &b in chain.iter() {
+            if self
+                .brand_private_names
+                .get(&b)
+                .is_some_and(|names| names.iter().any(|(n, _)| n == key))
+            {
+                return Some(self.instance_has_brand(receiver, b));
+            }
+        }
+        // The name is FOREIGN to the entire lexical chain: the access sits in a
+        // context whose chain is incomplete (e.g. a class defined inside a
+        // STATIC FIELD INITIALIZER runs in the defining frame, so its methods'
+        // chains miss the outer class's brand). Defer to the caller's textual
+        // fallback rather than rejecting — names DECLARED by a chain brand keep
+        // the precise per-evaluation check above.
+        if !chain.iter().any(|&b| {
+            self.brand_private_names
+                .get(&b)
+                .is_some_and(|names| !names.is_empty())
+        }) || chain.iter().all(|&b| {
+            self.brand_private_names
+                .get(&b)
+                .map_or(true, |names| !names.iter().any(|(n, _)| n == key))
+        }) {
+            return None;
+        }
+        Some(chain.iter().any(|&b| self.instance_has_brand(receiver, b)))
+    }
+
+    /// PrivateMethodCall's reference half for `recv.#m(...)` (a private `key`),
+    /// accessed from the class body whose brand chain `ctx` names: the brand
+    /// check (TypeError when the receiver's class did not declare `key`), then
+    /// the callee — the declaring class's method, a getter's result, or a
+    /// private field's value. `Ok(None)` when no chain brand resolves `key` and
+    /// the receiver passes the textual presence check without a private field
+    /// value; the caller then takes its ordinary property lookup.
+    ///
+    /// The interpreter's `CallMethod` passes the running frame's callee. The JIT
+    /// region-call fallback passes the callee of the code that is actually
+    /// running: it used to look `#m` up as a plain property, so one class could
+    /// call another class's same-named `#m`.
+    pub(crate) fn private_method_callee(
+        &mut self,
+        ctx: Value,
+        recv: Value,
+        key: &str,
+    ) -> Result<Option<Value>, Thrown> {
+        if let Some((b, kind, owner)) = self.resolve_private_in(ctx, key) {
+            // Declaring-class-resolved, KIND-aware (FIX-3).
+            if !self.private_receiver_ok(recv, b, kind, owner) {
+                return Err(Thrown(format!(
+                    "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+                )));
+            }
+            let f = if kind & 1 != 0 {
+                self.private_member_from_owner(owner, key, (kind & 8) | 1)
+                    .unwrap_or(Value::UNDEFINED)
+            } else if kind & 2 != 0 {
+                let g = self
+                    .private_member_from_owner(owner, key, (kind & 8) | 2)
+                    .unwrap_or(Value::UNDEFINED);
+                self.call_value(g, recv, &[])?
+            } else if kind & 4 != 0 {
+                return Err(Thrown(format!(
+                    "TypeError: '{key}' was defined without a getter"
+                )));
+            } else {
+                match self.private_field_get(recv, b, key) {
+                    Some(v) => v,
+                    None => {
+                        return Err(Thrown(format!(
+                            "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+                        )));
+                    }
+                }
+            };
+            return Ok(Some(f));
+        }
+        let textual = self.has_property_str(recv, key) || self.private_field_scan_has(recv, key);
+        let present = match self.private_brand_ok_in(ctx, recv, key) {
+            Some(b) => textual && b,
+            None => textual,
+        };
+        if !present {
+            return Err(Thrown(format!(
+                "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+            )));
+        }
+        Ok(self.private_field_scan(recv, key))
+    }
+
+    /// Proxy-aware [[HasProperty]] (`in` / Reflect.has). Mirrors `has_property`
+    /// but is `&mut` so it can dispatch a `has` trap — both when `obj` itself is a
+    /// Proxy AND when a Proxy sits in the prototype chain (e.g.
+    /// `Object.create(proxy)`), which the immutable `has_property` cannot do.
+    pub(crate) fn has_property_dyn(&mut self, obj: Value, key: Value) -> Result<bool, Thrown> {
+        if !obj.is_heap() {
+            return Ok(false);
+        }
+        let idx = obj.heap_index();
+        // The standalone WASM embedder cannot create deferred namespaces.
+        // Keep this direct trigger under the same gate as defer_check; one
+        // surviving call otherwise retains the entire filesystem loader.
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
+        if !self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx) {
+            let ks = self.key_of(key);
+            if Self::defer_key_triggers(&ks) {
+                self.defer_ns_trigger(idx)?;
+            }
+        }
+        // A Proxy: dispatch the `has` trap (with the post-trap invariant), or
+        // forward to the target's [[HasProperty]] when there is no trap.
+        if let Some((target, handler, revoked)) = self.proxy_parts(idx) {
+            if revoked {
+                return Err(Thrown::from_static(
+                    "TypeError: Cannot perform 'has' on a revoked proxy",
+                ));
+            }
+            return match self.proxy_trap(handler, "has")? {
+                Some(trap) => {
+                    let ks = self.key_of(key);
+                    let kv = self.key_to_value(&ks);
+                    let res = self.call_value(trap, handler, &[target, kv])?;
+                    let present = self.truthy(res);
+                    // A `false` result is illegal when the target has the own
+                    // property non-configurable, or the target is non-extensible.
+                    if !present {
+                        let desc = self.object_get_own_property_descriptor(target, &ks);
+                        if desc != Value::UNDEFINED {
+                            let cfg = self.get_prop(desc, "configurable")?;
+                            if !self.truthy(cfg) || !self.is_extensible(target)? {
+                                return Err(Thrown::from_static(
+                                    "TypeError: proxy 'has' returned false for a non-configurable / non-extensible-target own property",
+                                ));
+                            }
+                        }
+                    }
+                    Ok(present)
+                }
+                None => self.with_native_recursion_guard(|vm| vm.has_property_dyn(target, key)),
+            };
+        }
+        // A plain object: own data property or an inherited method/getter/setter
+        // on the class chain; else walk the [[Prototype]] (which may be a Proxy)
+        // via has_property_dyn, using has_property's proto resolution. Each
+        // `self.heap.get` borrow is scoped so the recursive &mut call is free.
+        if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+            let k = self.key_of(key);
+            if matches!(self.heap.get(idx), HeapObj::Object(m) if m.get(&k).is_some()) {
+                return Ok(true);
+            }
+            // %Array.prototype%'s exotic `length` (virtual own prop) — mirrors
+            // has_property's Object arm.
+            if k == "length" && idx == self.arr_proto && self.arr_proto != 0 {
+                return Ok(true);
+            }
+            // The global object's slot-backed own properties — mirrors
+            // `has_property`'s Object arm (see the comment there).
+            if idx == self.global_this && self.global_this != 0 && self.global_by_name(&k).is_some()
+            {
+                return Ok(true);
+            }
+            let class = match self.heap.get(idx) {
+                HeapObj::Object(m) => m.class,
+                _ => None,
+            };
+            let proto = if let Some(cidx) = class {
+                // A class instance: the member tables answer while they still
+                // describe their prototype objects, the live chain otherwise
+                // (see `has_property`). PRIVATE members are not observable via
+                // the ordinary [[HasProperty]] (`in` / Reflect.has): a "#..."
+                // key skips the tables. (has_property_str keeps them — the
+                // legacy textual private brand checks rely on it.)
+                let next = if k.starts_with('#') {
+                    self.class_instance_live_proto(idx, cidx)
+                } else {
+                    match self.class_member_lookup(idx, cidx, &k) {
+                        ClassLookup::Method(_) | ClassLookup::Accessor { .. } => return Ok(true),
+                        ClassLookup::Live(p) => p,
+                        ClassLookup::Miss => self.class_instance_live_proto(idx, cidx),
+                    }
+                };
+                next.is_heap().then_some(next)
+            } else if let Some(&p) = self.proto_of.get(&idx) {
+                p.is_heap().then_some(p)
+            } else if self.obj_proto != 0 && idx != self.obj_proto {
+                Some(Value::heap(self.obj_proto))
+            } else {
+                None
+            };
+            return match proto {
+                Some(p) => self.with_native_recursion_guard(|vm| vm.has_property_dyn(p, key)),
+                None => Ok(false),
+            };
+        }
+        // An ARRAY with a custom prototype chain can have a Proxy in it whose
+        // 'has' trap must fire with the right (target, key) arguments
+        // (has/call-in-prototype-index) — the immutable walk treats it as
+        // inert. Check the own properties (dense index / length / arr_props),
+        // then recurse dynamically up the ACTUAL chain.
+        if matches!(self.heap.get(idx), HeapObj::Array(_)) {
+            // NUMERIC-key fast path: resolve the index straight off the Value —
+            // `key_of` would allocate a fresh key String per probe, which
+            // dominated the hot hole-aware `i in arr` iteration. The canonical
+            // key is spelled into a stack buffer only for the (rare) side-table
+            // check, and the answers are identical to the general path below
+            // (key_of of a canonical numeric Value IS the decimal of `i`).
+            if let Some(i) = array_index(key) {
+                if matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len() && !items[i].is_hole())
+                {
+                    return Ok(true);
+                }
+                if let Some(m) = self.arr_props.get(&idx) {
+                    let mut buf = [0u8; 20];
+                    if m.pos(crate::heap::index_key(&mut buf, i)).is_some() {
+                        return Ok(true);
+                    }
+                }
+                let proto = match self.proto_of.get(&idx) {
+                    Some(&p) => p,
+                    None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                    None => Value::NULL,
+                };
+                // Default-chain MISS shortcut: the receiver chains to the PLAIN
+                // %Array.prototype% → %Object.prototype% (neither re-prototyped),
+                // no integer index was ever defined on either (every such write
+                // sets `array_proto_has_index` — note_array_proto_index), and
+                // %Array.prototype%'s dense store is empty (a direct
+                // `Array.prototype[i] = x` lands there) — the index is
+                // definitively absent: skip the recursive walk and its
+                // per-probe key-string allocations (the hot hole-aware
+                // `i in arr` loop spends its time there).
+                if !self.array_proto_has_index
+                    && proto.is_heap()
+                    && proto.heap_index() == self.arr_proto
+                    && !self.proto_of.contains_key(&self.arr_proto)
+                    && !self.proto_of.contains_key(&self.obj_proto)
+                    && matches!(self.heap.get(self.arr_proto), HeapObj::Array(items) if items.is_empty())
+                {
+                    return Ok(false);
+                }
+                return match proto.is_heap() {
+                    true => self.with_native_recursion_guard(|vm| vm.has_property_dyn(proto, key)),
+                    false => Ok(false),
+                };
+            }
+            // The same canonical-index decision as `has_property`'s Array arm,
+            // on the key's bytes in place (ZIPP_NO_ARRKEY_FAST=1 restores the
+            // key_of + parse + to_string spelling); the key TEXT is needed only
+            // for the named arr_props probe on the non-index side.
+            let own = if let Some(i) = self.key_array_index(key) {
+                matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len() && !items[i].is_hole())
+                    || self.arr_props.get(&idx).map_or(false, |m| {
+                        let mut buf = [0u8; 20];
+                        m.pos(crate::heap::index_key(&mut buf, i)).is_some()
+                    })
+            } else {
+                let kbuf;
+                let k: &str = match arrkey_fast_enabled()
+                    .then(|| self.flat_key_str(key))
+                    .flatten()
+                {
+                    Some(s) => s,
+                    None => {
+                        kbuf = self.key_of(key);
+                        &kbuf
+                    }
+                };
+                k == "length"
+                    || self
+                        .arr_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(k).is_some())
+                    || self.regexp_result_prop(idx, k).is_some()
+            };
+            if own {
+                return Ok(true);
+            }
+            let proto = match self.proto_of.get(&idx) {
+                Some(&p) => p,
+                None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                None => Value::NULL,
+            };
+            return match proto.is_heap() {
+                true => self.with_native_recursion_guard(|vm| vm.has_property_dyn(proto, key)),
+                false => Ok(false),
+            };
+        }
+        // A TypedArray with a USER prototype chain can have a Proxy in it whose
+        // 'has' trap must fire (the immutable walk below treats it as inert):
+        // absorb canonical numeric indices, check arr_props own props, then
+        // recurse dynamically up the chain.
+        if matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
+            let k = self.key_of(key);
+            if self.is_canonical_numeric_index(&k) {
+                return Ok(self.ta_valid_index(idx, &k).is_some());
+            }
+            if self
+                .arr_props
+                .get(&idx)
+                .map_or(false, |m| m.pos(&k).is_some())
+            {
+                return Ok(true);
+            }
+            return match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
+                Some(p) => self.with_native_recursion_guard(|vm| vm.has_property_dyn(p, key)),
+                None => Ok(false),
+            };
+        }
+        // Other heap kinds (Array / Str / …) carry no Proxy in their
+        // built-in prototype chain, so the exact immutable walk suffices.
+        Ok(self.has_property(obj, key))
+    }
+
+    /// READ-ONLY, infallible `in` for the JIT region helper (`jit_has_property`).
+    /// Returns `Some(present)` when the answer is computable WITHOUT running user
+    /// code (no Proxy `has` trap, no object-key ToString coercion) and WITHOUT a
+    /// TypeError, so it matches the interpreter's `in` (HasProp, brand=false) arm
+    /// bit-for-bit; returns `None` (deopt) for every case the interpreter would
+    /// handle by throwing or by re-entering user code, so the region bails and the
+    /// interpreter re-executes the op with full semantics.
+    ///
+    /// Deopt cases (the interpreter path that the helper declines to replicate):
+    ///   - RHS not an Object — `in` throws a TypeError.
+    ///   - key is a heap value that is NOT a flat string (an object/Symbol key:
+    ///     `coerce_index_key` runs ToString / ToPrimitive = user code, or maps a
+    ///     Symbol to its key form). A Number or String/Cons key needs none.
+    ///   - the receiver, or ANY node on its prototype chain, is a Proxy (the `has`
+    ///     trap is user code) or carries deferred-namespace state (a getter-like
+    ///     trigger). Proxies are vanishingly rare in hot `i in arr` loops.
+    /// Everything else is a pure read-only chain walk, so it delegates to the
+    /// infallible `has_property` — identical to what `has_property_dyn` computes
+    /// for a non-Proxy chain. `has_property` is `&self`: it performs no VM-heap
+    /// allocation (only a transient Rust `key_of` String for the rare arr_props
+    /// overlay probe), so no GC safe point and no pinned-pointer concern.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn has_property_jit(&self, obj: Value, key: Value) -> Option<bool> {
+        // RHS must be an Object (else `in` throws).
+        if !self.is_object_value(obj) {
+            return None;
+        }
+        // ── absent integer index on a pristine dense array ──────────────────
+        // `i in holey` where `i` is a HOLE or out of range. This is the hot half
+        // of a hole-aware scan (`if (i in a) …`) and the region JIT routes every
+        // such probe here: the inline in `codegen/region_mem.rs` answers `true`
+        // call-free for a PRESENT element but cannot invent a `false`, because an
+        // absent index may still be inherited.
+        //
+        // It is provably absent when nothing in the chain can supply an index:
+        // `array_proto_has_index` is the existing protector (set the moment an
+        // integer-like key is defined on Array.prototype/Object.prototype), the
+        // receiver has no own side table, and its prototype is the intrinsic.
+        // Answering here skips the 64-level Proxy walk below AND the generic
+        // `has_property`, whose `arr_props` probe formats the index into a fresh
+        // String on every call. Measured: that probe was 26 ns/element against
+        // node's 0.9, and 55% of sparse-array's entire gap to node.
+        //
+        // W19 (M3): THE OVERLAY ARM. The guard above used to include
+        // `!array_elements_overlaid(idx)`, which refused the shortcut at the
+        // RECEIVER level: one sparse element anywhere sent EVERY probe on that
+        // array — including the ones landing inside its dense prefix — down the
+        // generic walk. Measured on sparse-array's `sp` (a 1,047,501-slot dense
+        // prefix plus 39,161 overlay entries): `i in sp` cost 88.4 ns against
+        // node's 29.5, and an in-prefix probe cost 81.9 ns against 84.0 ns past
+        // it — indistinguishable, i.e. the dense half was paying the sparse
+        // price. `hasOwn.call(sp, i)` on the SAME receiver cost 36.8 ns, because
+        // it routes through `has_own_index_fast`, which answers the overlay
+        // directly. This arm gives `in` that same answer:
+        //   * a dense in-range non-hole slot is an own element → `true`
+        //     (`in` needs no chain walk once an own property is found);
+        //   * otherwise, when a side table can shadow an element, ONE `pos`
+        //     probe on the canonical index key — `index_key` formats into a
+        //     `[0u8; 20]` stack buffer, so this allocates nothing — and its
+        //     presence IS the answer for every descriptor shape, accessor and
+        //     non-enumerable included, exactly as the shipped `hasOwn` path
+        //     already answers it (construct/iterate.rs:404-414);
+        //   * otherwise absent, which is the pre-wave answer unchanged.
+        // A `!extensible` (sealed/frozen) array reaches the probe too and gets
+        // the same correct answer, since `overlays_elements` folds integrity in.
+        // Excluded, as before: a `setPrototypeOf`'d receiver and every arguments
+        // object (both recorded in `proto_of`), a Proxy or a non-Array receiver
+        // (not a `HeapObj::Array`, so the 64-level walk below still runs), and a
+        // negative key (an ordinary named property such as "-1", which must
+        // retain the full chain walk below).
+        if !self.array_proto_has_index && key.is_int() && obj.is_heap() {
+            let idx = obj.heap_index();
+            if !self.proto_of.contains_key(&idx) {
+                if let HeapObj::Array(items) = self.heap.get(idx) {
+                    let k = key.as_int();
+                    let overlaid = self.array_elements_overlaid(idx);
+                    if k >= 0 {
+                        let ku = k as usize;
+                        let dense_hit = items.get(ku).is_some_and(|v| !v.is_hole());
+                        if !overlaid {
+                            if !dense_hit {
+                                return Some(false);
+                            }
+                        } else if crate::codegen::index_in_overlay_enabled() {
+                            if dense_hit {
+                                return Some(true);
+                            }
+                            return Some(match self.arr_props.get(&idx) {
+                                Some(m) => m.element_pos(ku).is_some(),
+                                None => false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // A heap key that is not a flat string would need ToPropertyKey coercion
+        // (user code) or Symbol handling — interpreter only. A Number or a
+        // String/Cons key is taken verbatim (matches coerce_index_key's no-op).
+        if key.is_heap()
+            && !matches!(
+                self.heap.get(key.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+        {
+            return None;
+        }
+        // A private-name string key ("#m") must NOT leak via plain `in`: the
+        // interpreter's `has_property_dyn` skips `#`-prefixed class members, but
+        // `has_property` (which this helper delegates to) does NOT (its class-chain
+        // walk matches them for legacy brand checks). DEOPT so the interpreter
+        // computes the correct (false) answer. ONLY a heap STRING key can be a
+        // private name, so a numeric key (the hot `i in arr` path) skips this
+        // entirely — checking the key's FIRST BYTE in place (Cow::Borrowed for a
+        // flat string) avoids the per-probe `key_of` allocation that this check
+        // originally introduced into the hot loop.
+        if key.is_heap() {
+            let is_private = self
+                .heap
+                .str_wtf8_cow(key.heap_index())
+                .is_some_and(|b| matches!(b.first(), Some(b'#')));
+            if is_private {
+                return None;
+            }
+        }
+        // A Proxy anywhere in the chain (or a deferred namespace) dispatches user
+        // code / a trigger — let the interpreter run it. The walk mirrors
+        // has_property/has_property_dyn's proto resolution (explicit proto_of, then
+        // the intrinsic prototype for the receiver's kind), capped defensively.
+        let mut cur = obj.heap_index();
+        for _ in 0..64 {
+            if matches!(self.heap.get(cur), HeapObj::Proxy { .. })
+                || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&cur))
+            {
+                return None;
+            }
+            let proto = if let Some(&p) = self.proto_of.get(&cur) {
+                if p.is_heap() {
+                    p.heap_index()
+                } else {
+                    0
+                }
+            } else {
+                match self.heap.get(cur) {
+                    HeapObj::Object(_) => {
+                        if self.obj_proto != 0 && cur != self.obj_proto {
+                            self.obj_proto
+                        } else {
+                            0
+                        }
+                    }
+                    HeapObj::Array(_) | HeapObj::Cons { .. } => self.arr_proto,
+                    HeapObj::TypedArray { .. } => 0, // no intrinsic in proto_of → end
+                    HeapObj::Func(_)
+                    | HeapObj::Closure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. } => self.fn_proto,
+                    HeapObj::Boxed { kind: 0, .. } => self.str_proto,
+                    HeapObj::Boxed { kind: 1, .. } => self.num_proto,
+                    HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
+                    HeapObj::Date(_) => self.date_proto,
+                    HeapObj::Promise { .. } => self.promise_proto,
+                    HeapObj::RegExp { .. } => self.regexp_proto,
+                    _ => 0,
+                }
+            };
+            if proto == 0 || proto == cur {
+                break;
+            }
+            cur = proto;
+        }
+        Some(self.has_property(obj, key))
+    }
+
+    /// Build an Error object from an internal throw message. A message like
+    /// `"TypeError: cannot read …"` splits into `name="TypeError"` and
+    /// `message="cannot read …"`; anything else becomes a generic `Error` whose
+    /// message is the whole text. Mirrors the `{name, message}` shape the
+    /// compiler emits for `new TypeError(…)`, so both catch paths are uniform.
+    pub(crate) fn alloc_error_from_message(&mut self, raw: &str) -> Value {
+        // Internal errors are formatted "Name: message"; recover the kind so the
+        // synthesised object links to the right prototype (and `e instanceof X`,
+        // `e.constructor` work). Anything unrecognised is a base `Error`.
+        let (kind, message) = match raw.split_once(": ") {
+            Some((pre, rest)) => match native::ERROR_NAMES.iter().position(|&n| n == pre) {
+                Some(i) => (i as u8, rest.to_string()),
+                None => (0, raw.to_string()),
+            },
+            None => (0, raw.to_string()),
+        };
+        self.make_internal_error(kind, message)
+    }
+
+    /// Allocate a proto-linked error instance of the given kind (0=Error … 7=
+    /// AggregateError). `name` is set own for Error.prototype.toString;
+    /// `message` is set own only when supplied and not
+    /// `undefined` (else inherited as "" from the prototype). The prototype link
+    /// gives `.constructor`, `.toString`, and value-`instanceof` resolution.
+    /// Map a Thrown message ("SyntaxError: …") to a REAL error object of the
+    /// matching constructor, preserving the message text (used where a Thrown
+    /// must surface as a rejection value, e.g. import()).
+    pub(crate) fn error_from_thrown(&mut self, msg: &str) -> Value {
+        let (kind, text) = match msg.split_once(": ") {
+            Some((n, rest)) => {
+                let k: u8 = match n {
+                    "TypeError" => 1,
+                    "RangeError" => 2,
+                    "SyntaxError" => 3,
+                    "ReferenceError" => 4,
+                    "EvalError" => 5,
+                    "URIError" => 6,
+                    _ => 0,
+                };
+                (k, rest.to_string())
+            }
+            None => (0u8, msg.to_string()),
+        };
+        self.make_internal_error(kind, text)
+    }
+
+    /// Internal throws already own their message text. Lite reserves its single
+    /// property exactly and avoids coercing the freshly allocated string again.
+    #[cfg_attr(not(feature = "wasm-lite"), inline(always))]
+    fn make_internal_error(&mut self, kind: u8, message: String) -> Value {
+        let message = self.alloc_str(message);
+        // The exact-capacity path benefits Lite. Full profiles retain their
+        // previous allocation path after repeated error-throughput regressions.
+        #[cfg(not(feature = "wasm-lite"))]
+        return self.make_error(kind, Some(message));
+        #[cfg(feature = "wasm-lite")]
+        {
+            let mut map = ObjMap::with_capacity(1);
+            map.define("message", message, ERROR_MESSAGE_ATTR);
+            self.alloc_error_map(kind, map)
+        }
+    }
+
+    pub(crate) fn make_error(&mut self, kind: u8, msg: Option<Value>) -> Value {
+        let msg_idx = match msg {
+            Some(m) if m != Value::UNDEFINED => Some(self.to_str_idx(m)),
+            _ => None,
+        };
+        // `message` is a non-enumerable own data property (ES: CreateNonEnumerable-
+        // DataPropertyOrThrow). `name` is NOT own: it is inherited from the
+        // prototype, so `Error.prototype.name = …` and a newTarget prototype's
+        // `name` are what `e.name` / `String(e)` see. The kind lives in the
+        // prototype link and [[ErrorData]] (`error_data`).
+        let mut map = ObjMap::new();
+        if let Some(mi) = msg_idx {
+            map.define("message", Value::heap(mi), ERROR_MESSAGE_ATTR);
+        }
+        self.alloc_error_map(kind, map)
+    }
+
+    #[inline(always)]
+    fn alloc_error_map(&mut self, kind: u8, map: ObjMap) -> Value {
+        let k = (kind as usize).min(7);
+        let obj = self.heap.alloc(HeapObj::Object(Box::new(map)));
+        let p = self.error_protos[k];
+        if p != 0 {
+            self.proto_of.insert(obj, Value::heap(p));
+        }
+        self.error_data.insert(obj); // [[ErrorData]] internal slot
+        Value::heap(obj)
+    }
+
+    /// AggregateError(errors, …): install the `errors` data property — a
+    /// non-enumerable, writable, configurable own array built from
+    /// IterableToList(errorsArg) (spec 20.5.7.1 steps 4-5). `iterate_to_vec` runs the
+    /// argument's iterator (user code) under a GC lock, so `err` stays live across it.
+    /// InstallErrorCause (ES2022): an `options` object with a `cause` (HasProperty:
+    /// proto chain + a Proxy `has` trap, observable) gives the error a
+    /// non-enumerable own `cause` data property.
+    ///
+    /// The `has` trap and the `cause` getter are guest code, and a freshly made
+    /// error is still only a Rust local here, so it stays rooted across them.
+    pub(crate) fn install_error_cause(&mut self, err: Value, options: Value) -> Result<(), Thrown> {
+        if !self.is_object_value(options) {
+            return Ok(());
+        }
+        self.with_host_roots(&[err, options], |vm| {
+            let kc = vm.alloc_str("cause".to_string());
+            if vm.has_property_dyn(options, kc)? {
+                let cause = vm.get_prop(options, "cause")?;
+                // The trap/getter reached safe points: `err` may be old now.
+                vm.heap.write_barrier_val(err.heap_index(), cause);
+                if let HeapObj::Object(m) = vm.heap.get_mut(err.heap_index()) {
+                    m.define(
+                        "cause",
+                        cause,
+                        PropAttr {
+                            writable: true,
+                            enumerable: false,
+                            configurable: true,
+                            accessor: false,
+                            setter: Value::UNDEFINED,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn install_agg_errors(
+        &mut self,
+        err: Value,
+        errors_arg: Value,
+    ) -> Result<(), Thrown> {
+        // The iteration runs guest code while `err` can still be a Rust local.
+        let list = self.with_host_roots(&[err], |vm| vm.iterate_to_vec(errors_arg))?;
+        // CreateArrayFromList allocates in the CONSTRUCTOR's realm — the errors
+        // array of `new otherRealm.AggregateError([e])` carries the other realm's
+        // %Array.prototype% (staging/sm/Error/AggregateError.js line 85).
+        let arr = self.alloc_array_current_realm(list);
+        self.heap.write_barrier_val(err.heap_index(), arr);
+        if let HeapObj::Object(m) = self.heap.get_mut(err.heap_index()) {
+            m.define(
+                "errors",
+                arr,
+                PropAttr {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                },
+            );
+        }
+        // A `cause` getter that ran before this may have let a minor promote
+        // the error; the fresh array is then an old->young store.
+        self.heap.write_barrier_val(err.heap_index(), arr);
+        Ok(())
+    }
+
+    /// Build the `arguments` object for a (non-arrow) function activation. The
+    /// element store is still a dense Array (so `arguments[i]`/`.length` stay fast),
+    /// but it is given the spec-mandated ordinary shape:
+    ///   - [[Prototype]] = %Object.prototype% (arguments is NOT an Array — it must
+    ///     not inherit Array.prototype methods);
+    ///   - own @@iterator = %Array.prototype.values% { w:t, e:f, c:t };
+    ///   - own `callee`: a sloppy function gets a data property = the function
+    ///     { w:t, e:f, c:t }; a strict function gets the %ThrowTypeError% poison-pill
+    ///     accessor { e:f, c:f } (the unmapped-arguments callee).
+    /// (The exotic-vs-ordinary `length` distinction is left as-is for now.)
+    /// `mapinfo` = `Some((frame_idx, base, param_count))` for a MAPPED
+    /// arguments object (sloppy callee, simple parameter list): the upcoming
+    /// frame's position/window, recorded so `arguments[i]` aliases the formal
+    /// registers while that frame is live. `None` = unmapped (snapshot).
+    pub(crate) fn build_arguments_object(
+        &mut self,
+        args: Vec<Value>,
+        callee: Value,
+        // Strictness no longer changes the shape directly — every UNMAPPED
+        // arguments object (strict, or sloppy with non-simple params) gets the
+        // %ThrowTypeError% callee; kept for call-site readability.
+        _is_strict: bool,
+        mapinfo: Option<(usize, usize, usize)>,
+    ) -> Value {
+        let obj_proto = self.obj_proto;
+        let array_values = self.default_array_iter;
+        // The canonical %ThrowTypeError% (set up at init); a createRealm-child
+        // function's strict arguments object gets the CHILD's per-realm
+        // singleton (stable within the realm, distinct across realms). Fall
+        // back to a fresh thrower only in the unlikely event a strict
+        // arguments object is built pre-setup. EVERY unmapped arguments object
+        // gets the poison pill — strict functions AND sloppy ones with a
+        // non-simple parameter list (CreateUnmappedArgumentsObject step 8).
+        let unmapped = mapinfo.is_none();
+        let thrower = if unmapped {
+            let r = if self.realm_global_objs.is_empty() {
+                0
+            } else {
+                self.get_function_realm(callee)
+            };
+            if r != 0 {
+                self.realm_throw_type_error(r)
+            } else if self.throw_type_error != Value::UNDEFINED {
+                self.throw_type_error
+            } else {
+                Value::heap(
+                    self.heap
+                        .alloc(HeapObj::Native(native::FN_THROW_TYPE_ERROR)),
+                )
+            }
+        } else {
+            Value::UNDEFINED
+        };
+        let argc = args.len();
+        let idx = self.heap.alloc(HeapObj::Array(args));
+        let map = mapinfo.map(|(frame_idx, base, param_count)| crate::vm::ArgsMap {
+            frame_idx,
+            base,
+            mapped_count: param_count.min(argc),
+            unmapped: 0,
+            unmapped_hi: Vec::new(),
+        });
+        self.arguments_objs.insert(idx, map);
+        if obj_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(obj_proto));
+        }
+        let m = self
+            .arr_props
+            .entry(idx)
+            .or_insert_with(ObjMap::new_side_table);
+        // `length` is an ORDINARY data property of an arguments object
+        // (writable, non-enumerable, configurable — it can hold any value and
+        // be deleted), not the Array exotic length. Every Array-length special
+        // case is guarded with !arguments_objs.contains.
+        m.define(
+            "length",
+            Value::num(argc as f64),
+            PropAttr {
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            },
+        );
+        m.define(
+            "@@iterator",
+            array_values,
+            PropAttr {
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            },
+        );
+        if unmapped {
+            m.define(
+                "callee",
+                thrower,
+                PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    accessor: true,
+                    setter: thrower,
+                },
+            );
+        } else {
+            m.define(
+                "callee",
+                callee,
+                PropAttr {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                },
+            );
+        }
+        Value::heap(idx)
+    }
+
+    /// Re-link a resumed generator/async activation's MAPPED `arguments`
+    /// object (recorded in `gen_args_obj` at allocation) to the frame just
+    /// pushed at `frame_idx`/`base`, so its [[ParameterMap]] aliases the live
+    /// register window again for this resumption. While suspended, the
+    /// liveness check in `args_mapped_get`/`_set` fails and the dense store
+    /// (the escape snapshot) answers instead.
+    pub(crate) fn relink_mapped_args(&mut self, state_idx: u32, frame_idx: usize, base: usize) {
+        let Some(&aidx) = self.gen_args_obj.get(&state_idx) else {
+            return;
+        };
+        if let Some(Some(m)) = self.arguments_objs.get_mut(&aidx) {
+            m.frame_idx = frame_idx;
+            m.base = base;
+            if let Some(f) = self.frames.get_mut(frame_idx) {
+                f.args_obj = aidx;
+            }
+        }
+    }
+
+    /// Mapped-arguments [[Get]]: if `idx` is a LIVE mapped arguments object
+    /// and `i` a still-mapped formal index, the formal's register (through
+    /// its cell when captured) IS the current value. `None` = not mapped /
+    /// severed / frame dead → ordinary (dense-store) semantics apply.
+    pub(crate) fn args_mapped_get(&self, idx: u32, i: usize) -> Option<Value> {
+        let m = self.arguments_objs.get(&idx)?.as_ref()?;
+        if i >= m.mapped_count || m.is_unmapped(i) {
+            return None;
+        }
+        let f = self.frames.get(m.frame_idx)?;
+        if f.args_obj != idx || f.base != m.base {
+            return None;
+        }
+        let v = self.regs[m.base + 1 + i];
+        if v.is_heap() {
+            if matches!(self.heap.get(v.heap_index()), HeapObj::Cell) {
+                return Some(self.heap.cell_get(v.heap_index()));
+            }
+        }
+        Some(v)
+    }
+
+    /// Mapped-arguments [[Set]] companion: write the formal's register
+    /// (through its cell) when `idx`/`i` is live-mapped. The caller still
+    /// performs the ordinary store into the dense slot / side table, keeping
+    /// the escape store in sync. Returns whether the alias write happened.
+    pub(crate) fn args_mapped_set(&mut self, idx: u32, i: usize, val: Value) -> bool {
+        let Some(Some(m)) = self.arguments_objs.get(&idx) else {
+            return false;
+        };
+        if i >= m.mapped_count || m.is_unmapped(i) {
+            return false;
+        }
+        let (frame_idx, base) = (m.frame_idx, m.base);
+        let live = self
+            .frames
+            .get(frame_idx)
+            .map_or(false, |f| f.args_obj == idx && f.base == base);
+        if !live {
+            return false;
+        }
+        let slot = base + 1 + i;
+        let cur = self.regs[slot];
+        if cur.is_heap() {
+            // Nursery barrier: a mapped-arguments write through a captured
+            // CELL bypasses `Heap::cell_set` (which carries the usual one) —
+            // but it must still write through the B189 cell-value mirror, so
+            // the payload store itself goes through the heap's dedicated
+            // barrier-free entry point.
+            self.heap.write_barrier_val(cur.heap_index(), val);
+            if self.heap.cell_write_no_barrier(cur.heap_index(), val) {
+                return true;
+            }
+        }
+        self.regs[slot] = val;
+        true
+    }
+
+    /// Sever formal `i` from `idx`'s [[ParameterMap]] (map.Delete: a deleted
+    /// index, an accessor redefine, or a writable:false redefine) — reads and
+    /// writes permanently revert to the ordinary property. When `flush`, the
+    /// live formal value is copied into the dense slot first so the ordinary
+    /// property keeps the latest aliased value.
+    pub(crate) fn args_unmap(&mut self, idx: u32, i: usize, flush: bool) {
+        let cur = if flush {
+            self.args_mapped_get(idx, i)
+        } else {
+            None
+        };
+        if let Some(Some(m)) = self.arguments_objs.get_mut(&idx) {
+            // (An index past the formals was never mapped: nothing to record,
+            // and no bitset sized by an arbitrary index.)
+            if i < m.mapped_count {
+                m.set_unmapped(i);
+            }
+        }
+        if let Some(v) = cur {
+            // Nursery barrier: the flushed formal may be young; the arguments
+            // object may be old.
+            self.heap.write_barrier_val(idx, v);
+            if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                if i < items.len() {
+                    items[i] = v;
+                }
+            }
+        }
+    }
+
+    /// Refresh a LIVE-mapped arguments object's dense slots from the formal
+    /// registers (still-mapped indices only). Called before BULK dense reads
+    /// (spread / IterToArray fast paths) that bypass the per-index mapped
+    /// [[Get]] hooks; a no-op for everything else.
+    pub(crate) fn args_sync_dense(&mut self, idx: u32) {
+        let count = match self.arguments_objs.get(&idx) {
+            Some(Some(m)) => m.mapped_count,
+            _ => return,
+        };
+        for i in 0..count {
+            if let Some(v) = self.args_mapped_get(idx, i) {
+                // Nursery barrier (see `args_unmap`).
+                self.heap.write_barrier_val(idx, v);
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    if i < items.len() {
+                        items[i] = v;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Allocate a fresh unique `Symbol` with description `desc` (a string Value or
+    /// UNDEFINED) and a unique internal prop_key (`@@sym:N`). Recorded in
+    /// `symbol_keys` so the symbol can be reflected from an own property key.
+    pub(crate) fn make_symbol(&mut self, desc: Value) -> Value {
+        self.symbol_counter += 1;
+        let prop_key = format!("@@sym:{}", self.symbol_counter);
+        let v = Value::heap(self.heap.alloc(HeapObj::Symbol {
+            desc,
+            prop_key: prop_key.clone(),
+        }));
+        self.symbol_keys.insert(prop_key, v);
+        v
+    }
+
+    /// Allocate a symbol with a FIXED prop_key (well-known `@@iterator` etc., or a
+    /// `Symbol.for` registry key) — so distinct call sites share the same key.
+    pub(crate) fn make_named_symbol(&mut self, desc: Value, prop_key: &str) -> Value {
+        let v = Value::heap(self.heap.alloc(HeapObj::Symbol {
+            desc,
+            prop_key: prop_key.to_string(),
+        }));
+        self.symbol_keys.insert(prop_key.to_string(), v);
+        v
+    }
+
+    /// Coerce a Value used as a PROPERTY KEY to its string form: a Symbol → its
+    /// internal `prop_key` (`@@iterator` / `@@sym:N`), anything else → `display`.
+    pub(crate) fn key_of(&self, key: Value) -> String {
+        if key.is_heap() {
+            if let HeapObj::Symbol { prop_key, .. } = self.heap.get(key.heap_index()) {
+                return prop_key.clone();
+            }
+        }
+        // A string spelled like a symbol key ("@@…") is escaped out of that
+        // space (`escape_guest_key`).
+        escape_guest_key(self.display(key))
+    }
+
+    /// `ToPropertyKey(key)` (7.1.19): a Symbol maps to its registry key; anything
+    /// else is `ToString`-coerced (invoking `toString`/`valueOf` on an object and
+    /// throwing TypeError for a Symbol-returning conversion). Unlike [`key_of`]
+    /// this runs user coercion, so it is `&mut self` and fallible — use it for a
+    /// caller-supplied property-name argument (e.g. `Object.defineProperty`).
+    pub(crate) fn to_property_key(&mut self, key: Value) -> Result<String, Thrown> {
+        // ToPropertyKey: ToPrimitive(key, hint String) FIRST — a Symbol result
+        // (from a plain Symbol, or an object whose @@toPrimitive/toString returns a
+        // Symbol) is the property key (its "@@…" form); any other primitive is
+        // ToString'd. (Without the ToPrimitive step, an object key resolving to a
+        // Symbol would wrongly throw "Cannot convert a Symbol value to a string".)
+        let prim = self.to_primitive_string(key)?;
+        if prim.is_heap() {
+            if let HeapObj::Symbol { prop_key, .. } = self.heap.get(prim.heap_index()) {
+                return Ok(prop_key.clone());
+            }
+        }
+        self.to_js_string(prim).map(escape_guest_key)
+    }
+
+    /// The BigInt value `v`: the immediate for a small value (value.rs), a
+    /// heap BigInt otherwise. The one producer of BigInts in the i128 range,
+    /// which keeps them canonical.
+    #[inline]
+    pub(crate) fn make_bigint(&mut self, v: i128) -> Value {
+        match Value::small_bigint(v) {
+            Some(x) => x,
+            None => Value::heap(self.heap.alloc(HeapObj::BigInt(v))),
+        }
+    }
+
+    /// `ToBigInt(v)` (used by `BigInt(x)`, asIntN/asUintN, and `==`). A non-integer
+    /// number → RangeError; symbol/null/undefined/object → TypeError; a bad numeric
+    /// string → SyntaxError.
+    pub(crate) fn to_bigint(&mut self, v: Value) -> Result<BigVal, Thrown> {
+        if let Some(n) = self.bigint_val(v) {
+            return Ok(n);
+        }
+        if v.is_bool() {
+            return Ok(BigVal::Small(if v.as_bool() { 1 } else { 0 }));
+        }
+        // ToBigInt of a Number is a TypeError — a Number is only accepted by the
+        // BigInt() constructor's NumberToBigInt step (see `bigint_from`). This covers
+        // a boxed Number and an object whose ToPrimitive yields a Number (via the
+        // object branch below), not just a bare numeric literal.
+        if v.is_number() {
+            return Err(Thrown::from_static(
+                "TypeError: Cannot convert a Number to a BigInt",
+            ));
+        }
+        if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
+            let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+            // StringToBigInt trims StrWhiteSpace: U+FEFF counts, U+0085 does not
+            // (`BigInt("\u{85}1")` is a SyntaxError, `BigInt("\u{FEFF}1")` is 1n).
+            let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
+            if t.is_empty() {
+                return Ok(BigVal::Small(0));
+            }
+            return parse_bigint_str(t)
+                .ok_or_else(|| Thrown(format!("SyntaxError: Cannot convert {t} to a BigInt")));
+        }
+        // ToBigInt step 1: an object is first taken through ToPrimitive(number)
+        // (honouring Symbol.toPrimitive / valueOf / toString), then re-dispatched.
+        // to_primitive_number always yields a primitive or throws, so this recurses
+        // at most once into a non-object branch above.
+        if self.is_object_value(v) {
+            let prim = self.to_primitive_number(v)?;
+            return self.to_bigint(prim);
+        }
+        Err(Thrown::from_static(
+            "TypeError: Cannot convert this value to a BigInt",
+        ))
+    }
+
+    /// The `BigInt(value)` constructor coercion (NOT the abstract ToBigInt): the
+    /// value is taken through ToPrimitive(number); an integral Number is accepted
+    /// via NumberToBigInt (a non-integral Number is a RangeError), and any other
+    /// primitive falls through to the strict ToBigInt (Boolean/String/BigInt).
+    pub(crate) fn bigint_from(&mut self, v: Value) -> Result<BigVal, Thrown> {
+        let prim = if self.is_object_value(v) {
+            self.to_primitive_number(v)?
+        } else {
+            v
+        };
+        if prim.is_number() {
+            let d = prim.as_f64();
+            if !d.is_finite() || d.fract() != 0.0 {
+                return Err(Thrown::from_static(
+                    "RangeError: The number is not a safe integer and cannot be converted to a BigInt",
+                ));
+            }
+            // Safely within i128 → fast tier; near/beyond the boundary → exact
+            // num-bigint conversion (an f64 integer is always exact), then
+            // canonicalize (`BigInt(1e300)` is a real beyond-i128 BigInt now).
+            if d.abs() < (1i128 << 126) as f64 {
+                return Ok(BigVal::Small(d as i128));
+            }
+            use num_traits::FromPrimitive;
+            let b = num_bigint::BigInt::from_f64(d)
+                .ok_or_else(|| Thrown::from_static("RangeError: Cannot convert to a BigInt"))?;
+            return Ok(BigVal::from_num(b));
+        }
+        self.to_bigint(prim)
+    }
+
+    /// Build a RegExp from a pattern value + flags value (`/x/g`, `new RegExp(p,f)`).
+    /// A RegExp pattern contributes its source (+ its flags when none are given);
+    /// else ToString. Validates flags + compiles via `regress` (bad → SyntaxError).
+    pub(crate) fn build_regexp(&mut self, p: Value, f: Value) -> Result<Value, Thrown> {
+        let pre = self.regexp_pattern_snapshot(p)?;
+        self.build_regexp_snapshot(p, f, pre)
+    }
+
+    /// Admit one newly-compiled immutable RegExp program before it is wrapped
+    /// in an `Arc` or retained by a heap object/cache entry.
+    pub(crate) fn preflight_regex_program(&mut self, regex: &regress::Regex) -> Result<(), Thrown> {
+        let bytes = regex.resident_bytes();
+        if bytes > MAX_REGEX_PROGRAM_BYTES {
+            return Err(Thrown::from_static(
+                "RangeError: compiled regular expression exceeds the sandbox limit",
+            ));
+        }
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_external_heap_growth(bytes)
+            .map_err(|message| Thrown(message.into()))?;
+        // The program is about to be retained: let it ask for a collection.
+        self.heap.note_external_bytes(bytes);
+        Ok(())
+    }
+
+    /// The RegExp constructor's steps 1-4a: every OBSERVABLE read of `pattern`
+    /// that PRECEDES RegExpAlloc — `IsRegExp(pattern)` plus, for a real RegExp
+    /// exotic, its [[OriginalSource]]/[[OriginalFlags]]. Split out so
+    /// `Reflect.construct(RegExp, [re], nt)` can run RegExpAlloc's `Get(nt,
+    /// "prototype")` between this and RegExpInitialize: a `prototype` getter that
+    /// calls `re.compile("b")` must not change the source the new RegExp is built
+    /// from (staging/sm/RegExp/constructor-ordering.js), while `ToString(flags)`
+    /// stays in RegExpInitialize, i.e. AFTER the lookup
+    /// (staging/sm/RegExp/constructor-ordering-2.js).
+    pub(crate) fn regexp_pattern_snapshot(&mut self, p: Value) -> Result<RegExpPre, Thrown> {
+        // IsRegExp is an observable Get(pattern, @@match) which may itself MUTATE
+        // the pattern, so it runs before the slot snapshot. (Non-objects return
+        // false with no Get.)
+        let pattern_is_regexp = self.is_regexp(p)?;
+        // A real RegExp exotic contributes its [[OriginalSource]] (+ flags when
+        // none are given) via its slots, regardless of a falsy @@match override.
+        let real_regexp = match p.is_heap().then(|| self.heap.get(p.heap_index())) {
+            // The RegExp CONSTRUCTOR needs owned text (it may append a sticky flag,
+            // and the result becomes a different object's source), so materialise
+            // here — once per `new RegExp(...)`, never on a match path.
+            Some(HeapObj::RegExp { source, flags, .. }) => {
+                Some((source.to_string(), flags.to_string()))
+            }
+            _ => None,
+        };
+        // EXACT pattern bytes, captured when the pattern VALUE is a string
+        // holding lone surrogates: `new RegExp('\uD800')` must compile the
+        // surrogate itself (ToString below is LOSSY — it would compile U+FFFD).
+        // `regress::Regex::from_unicode` accepts the pattern characters directly.
+        // A RegExp pattern with an exact-source side entry contributes its
+        // exact bytes the same way (`new RegExp(re)` round-trips them).
+        let exact_bytes: Option<Vec<u8>> = if p.is_heap() && self.heap.is_str_like(p.heap_index()) {
+            self.heap.str_exact_if_not_wellformed(p.heap_index())
+        } else if real_regexp.is_some() {
+            self.regexp_exact_source.get(&p.heap_index()).cloned()
+        } else {
+            None
+        };
+        Ok(RegExpPre {
+            pattern_is_regexp,
+            real_regexp,
+            exact_bytes,
+        })
+    }
+
+    /// RegExpInitialize against an already-taken pattern snapshot.
+    pub(crate) fn build_regexp_snapshot(
+        &mut self,
+        p: Value,
+        f: Value,
+        pre: RegExpPre,
+    ) -> Result<Value, Thrown> {
+        let RegExpPre {
+            pattern_is_regexp,
+            real_regexp,
+            exact_bytes,
+        } = pre;
+        let (source, inherited) = if let Some((src, fl)) = real_regexp {
+            (src, Some(fl))
+        } else if p.is_undefined() {
+            (String::new(), None)
+        } else if pattern_is_regexp {
+            // A RegExp-LIKE object (truthy `@@match`, but not a real RegExp exotic):
+            // read `source`/`flags` via Get (observable, may throw) per the RegExp
+            // constructor, instead of ToString(pattern).
+            let src_v = self.get_prop(p, "source")?;
+            let src = if src_v.is_undefined() {
+                "(?:)".to_string()
+            } else {
+                self.to_js_string(src_v)?
+            };
+            let inh = if f.is_undefined() {
+                let fl_v = self.get_prop(p, "flags")?;
+                Some(if fl_v.is_undefined() {
+                    String::new()
+                } else {
+                    self.to_js_string(fl_v)?
+                })
+            } else {
+                None
+            };
+            (src, inh)
+        } else {
+            (self.to_js_string(p)?, None)
+        };
+        let flags = if f.is_undefined() {
+            inherited.unwrap_or_default()
+        } else {
+            self.to_js_string(f)?
+        };
+        #[cfg(feature = "safe-sandbox")]
+        {
+            const MAX_SAFE_REGEX_PATTERN_BYTES: usize = 16 << 10;
+            let exact_len = exact_bytes.as_ref().map_or(0, Vec::len);
+            if source.len().max(exact_len) > MAX_SAFE_REGEX_PATTERN_BYTES {
+                return Err(Thrown::from_static(
+                    "RangeError: regular expression pattern exceeds the sandbox limit",
+                ));
+            }
+        }
+        // Validate: only g/i/m/s/u/y/d/v, each at most once.
+        let mut seen = std::collections::HashSet::new();
+        for c in flags.chars() {
+            if !"gimsuyvd".contains(c) || !seen.insert(c) {
+                return Err(Thrown(format!(
+                    "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
+                )));
+            }
+        }
+        // `u` (Unicode) and `v` (UnicodeSets) select mutually-exclusive grammars;
+        // enabling both is a SyntaxError (ParsePattern). (Literal `/x/uv` is caught
+        // earlier by the parser; this guards the `new RegExp(p, "uv")` path.)
+        if seen.contains(&'u') && seen.contains(&'v') {
+            return Err(Thrown(format!(
+                "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
+            )));
+        }
+        // The matching flags `regress` understands (g/y/d are JS-level state).
+        // `u` enables Unicode mode and `v` the distinct UnicodeSets grammar (set
+        // operations, nested classes, `\q{…}`, properties-of-strings) — pass each
+        // through verbatim rather than collapsing `v` into `u`.
+        let mut rflags = String::new();
+        for c in flags.chars() {
+            match c {
+                'i' | 'm' | 's' | 'u' | 'v' => rflags.push(c),
+                _ => {}
+            }
+        }
+        // The PATTERN CHARACTERS fed to the regress parser. In `u`/`v` mode the
+        // pattern is a sequence of code points; otherwise the spec grammar reads
+        // UTF-16 CODE UNITS — an astral literal is its two surrogate halves,
+        // each its own pattern character, so `/𠮷/` (non-u) is the 2-unit
+        // sequence `𠮷` and matches over UCS-2 subject units (group NAMES
+        // recombine pairs — see `nonunicode_pattern_chars`). The exact-bytes
+        // form (lone-surrogate pattern string) feeds the surrogates verbatim;
+        // `.source` stays lossy (display only).
+        let unicode_mode = seen.contains(&'u') || seen.contains(&'v');
+        // NOTE: building the pattern-character vector is DEFERRED into the
+        // cache-miss arm below. A regex LITERAL evaluates afresh every time it is
+        // reached (ES5+ semantics: a new object per evaluation), so a literal in
+        // a loop hit this path once per iteration and paid the UTF-16 encode plus
+        // two Vec collects even though the compiled program was already cached —
+        // `/re/.test(s)` in a loop cost 79ms/200k against 22ms for the same regex
+        // hoisted out, while node treats the two identically (4ms).
+        // Compile, through the (source, flags) cache: @@matchAll/@@split
+        // construct a species clone per call, so hot loops re-build the same
+        // pattern — share the immutable compiled program instead.
+        // Lone-surrogate patterns (exact bytes ≠ lossy source) bypass it.
+        let cache_key = exact_bytes
+            .is_none()
+            .then(|| (source.clone(), rflags.clone(), false));
+        let regex: std::sync::Arc<regress::Regex> = match cache_key
+            .as_ref()
+            .and_then(|k| self.regex_compile_cache.get(k))
+        {
+            Some(rc) => rc.clone(),
+            None => {
+                let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
+                    (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
+                    (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
+                        &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
+                    ),
+                    (None, true) => source.chars().map(u32::from).collect(),
+                    (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
+                        &source.encode_utf16().collect::<Vec<u16>>(),
+                    ),
+                };
+                let r = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
+                    .map_err(|e| {
+                        Thrown(format!(
+                            "SyntaxError: Invalid regular expression: /{source}/: {e}"
+                        ))
+                    })?;
+                self.preflight_regex_program(&r)?;
+                let rc = std::sync::Arc::new(r);
+                if let Some(k) = cache_key {
+                    #[cfg(feature = "safe-sandbox")]
+                    const REGEX_CACHE_LIMIT: usize = 32;
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    const REGEX_CACHE_LIMIT: usize = 512;
+                    if self.regex_compile_cache.len() >= REGEX_CACHE_LIMIT {
+                        self.regex_compile_cache.clear();
+                    }
+                    self.regex_compile_cache.insert(k, rc.clone());
+                }
+                rc
+            }
+        };
+        let idx = self.heap.alloc(HeapObj::RegExp {
+            regex,
+            source: source.into(),
+            flags: flags.into(),
+            last_index: Value::int(0),
+            ascii_twin: None,
+        });
+        // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in
+        // the side table (the struct's `source: String` is lossy) so the
+        // `source` getter / `toString` round-trip the surrogates. The heap
+        // slot is fresh — no stale entry to clear on the None path.
+        if let Some(b) = exact_bytes {
+            self.regexp_exact_source.insert(idx, b);
+        }
+        // RegExpAlloc is OrdinaryCreateFromConstructor(%RegExp%, "%RegExp.prototype%"),
+        // and %RegExp% is the CURRENT Realm Record's — so a literal evaluated by
+        // createRealm-child code (`other.eval("/foo/")`) inherits the CHILD's
+        // %RegExp.prototype%. Without it `re.constructor === RegExp` in the main
+        // realm and `RegExp(re)` hands the foreign object straight back (ctor step
+        // 2.b). The native-side image comes first (a realm-COPIED @@split/@@matchAll
+        // building a species clone is the current realm even with no child frame).
+        if self.regexp_proto != 0 {
+            let home = self.native_home(self.regexp_proto);
+            let proto = if home != self.regexp_proto {
+                home
+            } else {
+                self.active_realm_proto(self.regexp_proto)
+            };
+            self.proto_of.insert(idx, Value::heap(proto));
+        }
+        Ok(Value::heap(idx))
+    }
+
+    // ── Temporal.Duration ──
+}

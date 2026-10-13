@@ -1,0 +1,3345 @@
+//! Explicit-frame register virtual machine.
+//!
+//! The defining choice: **JS recursion does not use the native Rust stack**.
+//! Every activation is a frame in `frames: Vec<Frame>` over one flat register
+//! file `regs: Vec<Value>`. A call pushes a frame and continues the same
+//! dispatch loop; a return pops it. Consequences:
+//!
+//! * Deep recursion is bounded by a counter, not by the OS stack — it throws a
+//!   catchable `RangeError` instead of segfaulting (a real bug in the old
+//!   engine's JIT path).
+//! * There is exactly one hot loop to optimise, and registers are explicit —
+//!   the shape a register-allocating JIT consumes directly. Keeping unboxed
+//!   `i32` live across a call boundary (where V8 wins and the old engine lost)
+//!   becomes a property of *this* loop's frame model rather than something
+//!   bolted on.
+//!
+//! Arithmetic has typed-`i32` fast paths inline; anything else falls to the
+//! generic `f64` path. v1 is an interpreter — it will be slower than the old
+//! JIT'd engine and than V8; the point is a clean substrate that a JIT can
+//! later make faster.
+
+#![allow(unused_imports)]
+// Lite shares internal types and Date's ISO helpers with the full engine.
+// Unreachable Intl/Temporal helpers are intentionally discarded by LTO.
+#![cfg_attr(feature = "wasm-lite", allow(dead_code))]
+use crate::bytecode::{Instr, Program, UpvalSource};
+use crate::heap::{
+    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
+    PromiseState, PropAttr, ReactionPair, Reactions,
+};
+use crate::value::Value;
+
+/// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
+/// than growing unbounded. 100k is far beyond any non-pathological recursion
+/// and the flat register file makes each frame cheap.
+#[cfg(feature = "safe-sandbox")]
+const MAX_FRAMES: usize = 4_096;
+#[cfg(not(feature = "safe-sandbox"))]
+const MAX_FRAMES: usize = 100_000;
+
+/// Hard cap on NESTED `run_loop` entries (native re-entries: builtin
+/// callbacks, generator/async resumes, direct evals, JIT bail-outs). Each one
+/// is a Rust frame on the OS stack — unlike interpreter calls, which stay flat
+/// inside one `run_loop` — so runaway recursion routed through a re-entry
+/// (e.g. a generator body that re-enters its driver) must hit this catchable
+/// RangeError before the native stack overflows. The native footprint of one
+/// re-entry varies substantially across builtin call paths.
+#[cfg(feature = "safe-sandbox")]
+// Two stacks bound this in the wasm build: the linear-memory shadow stack
+// (`-zstack-size=16777216`, 16 MiB, in build-variants.sh and both
+// .cargo/config.toml files) and the embedder's machine stack, which V8 caps
+// near 1 MiB for wasm frames. Measured on 2026-09-13 with both re-entry caps
+// lifted (tests/node/native-depth.cjs): every shape tried — nested Proxy get
+// traps, generator-in-generator, sort comparators, replace callbacks, JSON
+// toJSON, Python generators inside `sum`/`any` and Python `__iter__` chains —
+// ran 256 levels deep and failed between 384 and 512 with a catchable
+// RangeError from the machine stack; with node's stack raised to 8 MB the
+// shadow stack lasted past 1536. Thirty-two therefore keeps an order of
+// magnitude below the first limit. Python-shaped code needs the room: every
+// generator resumed by a builtin (`sum(x for ...)`, `''.join(...)`, a
+// `for` over a tensor's generator `__iter__`) is one nested entry, and a
+// research script nests four or five in ordinary use, where the earlier
+// ceiling of three (validated on a 1 MiB shadow stack) failed.
+const MAX_RUN_LOOP_DEPTH: u32 = 32;
+#[cfg(not(feature = "safe-sandbox"))]
+const MAX_RUN_LOOP_DEPTH: u32 = 4096;
+
+/// Hard cap on Rust recursion through guest-controlled object meta-operations.
+/// Ordinary JavaScript calls use the VM's explicit frame stack, but transparent
+/// Proxy forwarding and a few exotic/prototype algorithms call their Rust
+/// implementation recursively. A guest can build an arbitrarily deep wrapper
+/// chain before performing one `get`/`has`/`define`/etc.; without a separate
+/// budget that single bytecode instruction can exhaust the native/Wasm stack.
+#[cfg(feature = "safe-sandbox")]
+const MAX_NATIVE_RECURSION_DEPTH: u32 = 32;
+#[cfg(not(feature = "safe-sandbox"))]
+const MAX_NATIVE_RECURSION_DEPTH: u32 = 4096;
+
+/// Hard cap on CONSECUTIVE tail-reuse activations (`try_tail_reuse`) with no
+/// intervening frame pop. Proper tail calls run in O(1) frames, so runaway
+/// strict-mode tail recursion (`return f()` forever) never trips MAX_FRAMES —
+/// it would hang. Engines that shipped without PTC (node/V8) throw RangeError
+/// on that shape at ~10k depth; this budget matches that OUTCOME while staying
+/// ~100x above node's tolerance, so legitimate deep-but-terminating tail loops
+/// keep their constant-stack win.
+const MAX_TAIL_REUSE_STREAK: u32 = 1_000_000;
+
+/// Extra global slots reserved past `global_count` as JIT scratch "field globals"
+/// for object scalar-replacement (SROA). A field-promoted region uses pool slots
+/// `[global_count, global_count + n_fields)`; regions reuse the pool (synced per
+/// native run, never concurrent), so this caps fields-per-region, not total.
+const FIELD_POOL: usize = 64;
+
+/// Extra global slots reserved past the JIT field pool for every binding created
+/// after compile time: globals *created or first referenced inside `eval`* /
+/// `new Function` (sloppy `x = 1`, `var x`, hoisted function declarations, reads
+/// of builtins the main program never named), ShadowRealm names, and EVERY
+/// top-level binding of a loader-loaded ES module (exported or not) plus its
+/// namespace/source bookkeeping slots.
+///
+/// The CAPACITY is reserved once at startup so `globals` (and `global_gens`)
+/// never reallocate at runtime — the JIT pins both base pointers — while the
+/// LENGTH grows as slots are handed out (`Vm::alloc_global_pool_slot`), so GC
+/// root scans and resident-byte accounting see only slots in use. Exhaustion
+/// throws rather than growing the Vec. Native builds reserve address space
+/// generously (one bundled module can declare thousands of top-level
+/// functions; a 1024-slot pool failed real module graphs outright); the
+/// hardened and wasm profiles, whose reservation is real committed memory,
+/// keep the small pool.
+///
+/// NOT LARGER than this without fixing eval-global rooting first: past about
+/// 21,000 pool slots a function declared by one `eval` is collected while its
+/// slot still names it (it reads back as a swept object), which turns the
+/// clean "too many global bindings" error into silent wrong results. The
+/// defect is older than the pool size — reproduced by raising this constant
+/// alone on the base commit — but only a large pool makes it reachable.
+#[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+const EVAL_POOL: usize = 1 << 14;
+#[cfg(any(feature = "safe-sandbox", target_arch = "wasm32"))]
+const EVAL_POOL: usize = 1024;
+
+/// What an unnamed run-time pool slot binds (see `Vm::pool_slot_names`).
+pub(crate) enum PoolSlotName {
+    /// A module-scope declaration: uninitialized means its TDZ.
+    Module(Box<str>),
+    /// A ShadowRealm / createRealm name: uninitialized means never declared.
+    Realm(Box<str>),
+}
+
+/// Sentinel `closure` value for a frame whose callee is a plain (capture-free)
+/// function rather than a closure. Real heap indices are always `< u32::MAX`.
+const NO_CLOSURE: u32 = u32::MAX;
+
+/// Exact roots for one active Tier-C native activation.
+/// `active` is explicit because a compiled script/plain activation can have no
+/// Closure identity while still suspending an outer frame-free activation.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// repr(C): the B189b emitted call lane saves/installs/restores this state as
+// three raw qwords through `JIT_ACTIVATION_OFFSET`; the layout below is the
+// contract (active@0, frame_free@1, closure@4, callee@8, upvals_raw@16 — 24
+// bytes, compile-checked in host_api.rs).
+#[repr(C)]
+struct TiercActivationState {
+    active: bool,
+    frame_free: bool,
+    closure: u32,
+    callee: u32,
+    /// Raw base of `closure`'s `upvalues` slice (0 when there is none), cached
+    /// once per entry so the emitted `UpvalGet` needs no closure resolution
+    /// (B189). Valid for exactly the activation's lifetime: the closure is
+    /// rooted for the whole activation, the collector never moves live boxes,
+    /// and a closure's upvalue list is fixed at creation.
+    upvals_raw: u64,
+}
+
+/// Suspended frame-free Tier-C activations kept as explicit VM roots. A
+/// frame-backed outer activation consumes no slot, so retain two levels of
+/// headroom under the native-call cap for fail-before-native fallback.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const TIER_C_ACTIVATION_ROOT_STACK_MAX: usize = JIT_REGION_CALL_MAX as usize - 2;
+
+/// B243: the root stack of suspended frame-free activations, as a FIXED
+/// inline array with a depth counter instead of a `Vec`.
+///
+/// The emitted cross-call lane pushes here directly — three qword stores
+/// into `slots[depth]` then `inc depth` — and pops with one `sub`. A `Vec`
+/// could not be pushed from emitted code soundly: its push may reallocate,
+/// and its ptr/len/cap layout is unspecified. A fixed array inside the VM has
+/// a compile-time bound (the cap check the helper already performs) and an
+/// address that is `rdi`-relative like every other `JIT_*_OFFSET`. The GC
+/// scans `slots[..depth]` (`as_slice`); everything past `depth` is stale and
+/// never read. Layout is asserted in `host_api.rs`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+struct ActivationRootStack {
+    depth: u32,
+    _pad: u32,
+    slots: [TiercActivationState; TIER_C_ACTIVATION_ROOT_STACK_MAX],
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl ActivationRootStack {
+    const EMPTY: Self = Self {
+        depth: 0,
+        _pad: 0,
+        slots: [TiercActivationState::EMPTY; TIER_C_ACTIVATION_ROOT_STACK_MAX],
+    };
+
+    /// `false` when full: the caller declines before native entry, exactly
+    /// as the `len() >= MAX` check it replaces.
+    #[inline]
+    fn push(&mut self, s: TiercActivationState) -> bool {
+        let d = self.depth as usize;
+        if d >= TIER_C_ACTIVATION_ROOT_STACK_MAX {
+            return false;
+        }
+        self.slots[d] = s;
+        self.depth += 1;
+        true
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<TiercActivationState> {
+        if self.depth == 0 {
+            return None;
+        }
+        self.depth -= 1;
+        Some(self.slots[self.depth as usize])
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.depth as usize
+    }
+
+    #[inline]
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.depth == 0
+    }
+
+    /// The live prefix. A `depth` past the array is impossible by the push
+    /// guard; the slice bounds check is the release backstop if it ever were.
+    #[inline]
+    fn as_slice(&self) -> &[TiercActivationState] {
+        &self.slots[..self.depth as usize]
+    }
+}
+
+/// By-value restoration record for one Tier-C native entry. A suspended
+/// frame-free `prior` is also duplicated in `jit_tierc_activation_stack` so GC
+/// can see it while this token lives only in a Rust local. A frame-backed prior
+/// needs no duplicate root: its real interpreter `Frame` remains installed.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TiercActivationToken {
+    prior: TiercActivationState,
+    rooted_prior: bool,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl TiercActivationState {
+    const EMPTY: Self = Self {
+        active: false,
+        frame_free: false,
+        closure: NO_CLOSURE,
+        callee: NO_CLOSURE,
+        upvals_raw: 0,
+    };
+}
+
+/// Largest length a HOLE-extending operation materializes in an array's dense
+/// store (`Vec<Value>`). The spec allows lengths up to 2^32-1, and a dense Vec
+/// that long would be 32 GB, so past this cap `new Array(n)`, `arr.length = n`
+/// and a large-index write do not grow the Vec: the array becomes VIRTUAL — its
+/// JS length lives in the `array_js_len` side table and any element past the
+/// dense prefix in the `arr_props` sparse overlay. Nothing throws there. Every
+/// builtin sizes its work from `js_array_len`, never from the Vec: a virtual
+/// array takes the generic per-index Get/HasProperty protocol, and an operation
+/// that has to build a dense result from one (spread, `slice`, `Array.from`,
+/// `with`, `fill` materializing the store) may do so up to
+/// [`MAX_MATERIALIZED_ARRAY_LEN`] and throws a RangeError beyond it — it never
+/// truncates. Arrays grown element by element (`push`) are not capped.
+#[cfg(feature = "safe-sandbox")]
+pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 22;
+#[cfg(not(feature = "safe-sandbox"))]
+pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
+
+/// Largest dense array one native operation builds from a LENGTH rather than
+/// from elements that already exist: materializing a virtual array (see
+/// [`MAX_DENSE_ARRAY_LEN`]), draining an iterator eagerly, or copying an
+/// array-like by its `length`. Beyond it the operation throws a RangeError
+/// instead of attempting a multi-gigabyte allocation (`panic = "abort"` makes
+/// an allocation failure fatal). It is never below the dense cap, so any array
+/// the engine stores densely can still be copied.
+pub const MAX_MATERIALIZED_ARRAY_LEN: usize = if MAX_EAGER_ITER_RESULT > MAX_DENSE_ARRAY_LEN {
+    MAX_EAGER_ITER_RESULT
+} else {
+    MAX_DENSE_ARRAY_LEN
+};
+
+/// Maximum materialized string size. The hardened profile keeps a single
+/// allocation small enough that the periodic heap poll cannot overshoot a
+/// host's budget by hundreds of megabytes. Rope length is capped separately in
+/// UTF-16 units; three WTF-8 bytes per unit is its worst-case representation.
+///
+/// The units ceiling was 2^18 — 262,144 characters. Anything a program hands
+/// to a host as text has to fit there, and a data: URL is text: 262,144
+/// characters of base64 is about 196 KB, which is two seconds of 48 kHz 16-bit
+/// audio. An encoder generating an 8.5-second frame produced 1,093,691
+/// characters and could not hold the result at all — not by building it, not
+/// by concatenating it. Chunking the encode does not help when the answer is
+/// the thing that will not fit.
+///
+/// The hardened profile now allows 2^26 units (67M characters) and 2^27 bytes;
+/// the ordinary profile 2^28 of each. The byte cap is the one a builder of
+/// multi-byte text meets first, so every native builder admits its output in
+/// BYTES (`preflight_guest_string_size`) before it allocates, not only its
+/// length in units. A program that builds these steadily still meets the heap
+/// budget, and one absurd request is still refused outright.
+#[cfg(feature = "safe-sandbox")]
+pub const MAX_STRING_BYTES: usize = 1 << 27;
+#[cfg(not(feature = "safe-sandbox"))]
+pub const MAX_STRING_BYTES: usize = 1 << 28;
+#[cfg(feature = "safe-sandbox")]
+pub const MAX_STRING_UNITS: usize = 1 << 26;
+#[cfg(not(feature = "safe-sandbox"))]
+pub const MAX_STRING_UNITS: usize = 1 << 28;
+
+/// Maximum amount of host-side iteration one JavaScript builtin may perform
+/// without returning to the bytecode dispatch loop. The instruction meter can
+/// interrupt JavaScript callbacks, but it cannot see a native loop over holes
+/// or an attacker-controlled array-like `length`; keep those operations
+/// independently bounded in the hostile-code profile.
+// 2^18 units of work meant toBase64 stopped at 262,144 bytes and fromBase64
+// at 98,304 — below one Game Boy cartridge, one audio frame, or one image.
+// A bundle encoding a file hit "native builtin iteration limit exceeded",
+// which names the guard rather than the size and reads like corruption.
+// 2^26 covers the payloads a real application moves while still bounding a
+// native loop over an attacker-controlled length, which is the point.
+#[cfg(feature = "safe-sandbox")]
+pub const MAX_NATIVE_ITERATION_WORK: u64 = 1 << 26;
+#[cfg(not(feature = "safe-sandbox"))]
+pub const MAX_NATIVE_ITERATION_WORK: u64 = u64::MAX;
+
+/// Maximum owned memory retained by one compiled RegExp program in the
+/// hostile-code profile. Source length alone is not a sufficient bound:
+/// Unicode properties expand into owned interval tables or string-alternative
+/// programs. The regex parser has independent transient-expansion budgets;
+/// this cap covers the immutable program that survives compilation.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const MAX_REGEX_PROGRAM_BYTES: usize = 4 << 20;
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) const MAX_REGEX_PROGRAM_BYTES: usize = usize::MAX;
+
+/// Largest length an ITERATION METHOD will materialize eagerly as a dense
+/// result (`Array.prototype.map`). Distinct from `MAX_DENSE_ARRAY_LEN`, which
+/// is the point at which *storage* spills to the sparse overlay: an array can
+/// legitimately be far longer than that (`new Array(1 << 24)` works), and such
+/// an array must still `map` correctly rather than silently returning a
+/// truncated result. 2^24 elements ≈ 134 MB — the largest array the engine
+/// already builds eagerly — beyond which `map` reports a RangeError instead of
+/// attempting a multi-gigabyte allocation the host cannot satisfy.
+#[cfg(feature = "safe-sandbox")]
+pub const MAX_EAGER_ITER_RESULT: usize = 1 << 17;
+#[cfg(not(feature = "safe-sandbox"))]
+pub const MAX_EAGER_ITER_RESULT: usize = 1 << 24;
+
+/// An active `try` handler within a frame.
+/// One activation record.
+struct Frame {
+    func: u32,
+    /// Base index into `regs` of this frame's register window.
+    base: usize,
+    /// Instruction pointer within the function's code.
+    ip: usize,
+    /// Register in the *caller's* window that receives this call's result.
+    ret_dst: u16,
+    /// Heap index of the `Closure` object this frame is executing, or
+    /// `NO_CLOSURE` for a plain function. `UpvalGet`/`UpvalSet` read the
+    /// closure's captured cell indices through it.
+    closure: u32,
+    /// Active `try` handlers in this frame, innermost last. A `Throw` (or a
+    /// thrown error bubbling up from a builtin call) unwinds to the innermost
+    /// handler here, else propagates to the caller frame.
+    handlers: Vec<Handler>,
+    /// The function VALUE being invoked in this activation (the object the caller
+    /// actually called), or `UNDEFINED` when unknown/irrelevant (top-level script,
+    /// eval, generator/async resume). `LoadCallee` returns it so a named function
+    /// expression's own name has the SAME identity as the outer reference (rather
+    /// than a freshly-allocated `Func`); falls back to the closure/fresh-Func when
+    /// `UNDEFINED`.
+    callee: Value,
+    /// The `new.target` value for this activation: the constructor when entered
+    /// via `new` / `Reflect.construct` / `super(...)`, else `undefined` (a plain
+    /// call, `.call`/`.apply`, a method, a tagged template, …). Read by the
+    /// `LoadNewTarget` op; consumed from `pending_new_target` at frame setup.
+    new_target: Value,
+    /// A sloppy direct eval's dynamic variable environment for this
+    /// activation (heap index of a HeapObj::EvalScope), or u32::MAX. Created
+    /// lazily by the DirectEval op for function-context evals.
+    eval_scope: u32,
+    /// Whether a `super(...)` has completed in THIS activation. A second
+    /// `super()` in the same constructor frame throws a ReferenceError (after
+    /// running the parent ctor — spec evaluates the SuperCall fully, then
+    /// BindThisValue throws on re-initialization).
+    super_done: bool,
+    /// Heap index of THIS activation's `arguments` object, or u32::MAX. A
+    /// MAPPED arguments object's [[ParameterMap]] (see `ArgsMap`) aliases the
+    /// param registers only while `frames[frame_idx].args_obj` still equals
+    /// its own heap index — the liveness proof (each activation allocates a
+    /// fresh object, so a recycled frame slot can never spoof it).
+    args_obj: u32,
+    /// Absolute index into `regs` of this call's ARGUMENT window — the caller's
+    /// staging registers — with `argc` the number of values there. `u32::MAX`
+    /// when the arguments were not staged in a register window (a native
+    /// `call_value`, a generator/async resume, a JIT bail-out). Only the legacy
+    /// `f.arguments` accessor reads them, and only while this frame is live: the
+    /// caller is suspended at its call instruction, so its staging registers
+    /// cannot change underneath us, and they sit BELOW this frame's base so a
+    /// pop can never truncate them away first.
+    arg_win: u32,
+    argc: u16,
+    /// True for the frame running an `eval` program's body. The legacy
+    /// `f.caller` walk steps PAST these: an eval is not a function activation,
+    /// so `function nest(){ return eval("innermost();"); }` must report `nest`
+    /// as `innermost`'s caller, not the eval script.
+    is_eval: bool,
+}
+
+/// [[ParameterMap]] bookkeeping for a MAPPED arguments object (sloppy callee
+/// with a simple parameter list). While the creating frame is live, a still-
+/// mapped index i reads/writes the formal's register `regs[base + 1 + i]`
+/// (through its cell when the param is captured); the dense element store
+/// remains the descriptor/escape store. `None` in `arguments_objs` = an
+/// UNMAPPED arguments object (strict, or non-simple params): pure snapshot.
+pub(crate) struct ArgsMap {
+    /// Expected position of the creating activation in `frames`.
+    frame_idx: usize,
+    /// The creating frame's register-window base (revalidated with args_obj).
+    base: usize,
+    /// Indices `0..mapped_count` started mapped: min(param_count, argc).
+    mapped_count: usize,
+    /// Bit i set = formal i SEVERED from the map (delete / accessor redefine /
+    /// writable:false redefine) — permanently back to ordinary semantics.
+    /// Formals 0..64 live in `unmapped`; any past that (a sloppy function may
+    /// declare more) in `unmapped_hi`, which stays unallocated until needed.
+    unmapped: u64,
+    unmapped_hi: Vec<u64>,
+}
+
+impl ArgsMap {
+    /// Has formal `i` been severed from the map?
+    #[inline]
+    fn is_unmapped(&self, i: usize) -> bool {
+        if i < 64 {
+            (self.unmapped >> i) & 1 == 1
+        } else {
+            let j = i - 64;
+            self.unmapped_hi
+                .get(j / 64)
+                .is_some_and(|w| (w >> (j % 64)) & 1 == 1)
+        }
+    }
+
+    /// Sever formal `i` from the map.
+    fn set_unmapped(&mut self, i: usize) {
+        if i < 64 {
+            self.unmapped |= 1 << i;
+        } else {
+            let j = i - 64;
+            if self.unmapped_hi.len() <= j / 64 {
+                self.unmapped_hi.resize(j / 64 + 1, 0);
+            }
+            self.unmapped_hi[j / 64] |= 1 << (j % 64);
+        }
+    }
+}
+
+/// One in-flight `AsyncDisposableStack.prototype.disposeAsync`: the spec's
+/// DisposeResources loop with an Await after EVERY disposer call. `remaining`
+/// is popped from the END (LIFO); a `Value::NULL` entry is the marker a
+/// nullish `use()` records (contributes the needs-await tick, calls nothing).
+pub(crate) struct DisposeAsyncState {
+    remaining: Vec<Value>,
+    /// The pending throw completion: a single error stays as-is; each later
+    /// error wraps it as SuppressedError{error: new, suppressed: prior}.
+    error_chain: Option<Value>,
+    /// Whether any real disposer ran (its result got a real Await).
+    has_awaited: bool,
+    /// Whether a nullish-resource marker was seen (spec still performs one
+    /// Await(undefined) before resolving when nothing else awaited).
+    needs_await: bool,
+}
+
+/// Which array higher-order method `array_each` is driving (callback args are
+/// `[element, index]` for all three; only the result handling differs).
+#[derive(Clone, Copy)]
+pub(crate) enum EachMode {
+    Map,
+    Filter,
+    ForEach,
+}
+
+/// Whether a promise reaction is the fulfill or reject handler.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReactionKind {
+    Fulfill,
+    Reject,
+}
+
+/// How a suspended async activation is resumed: with an awaited value, or by
+/// throwing a rejection into it at the await point.
+#[derive(Clone, Copy)]
+pub(crate) enum Resume {
+    Value(Value),
+    Throw(Value),
+    /// Resume an async generator suspended at an async `yield*` (AsyncYieldDelegate)
+    /// because the consumer called `.return(v)` — the loop delegates to the inner
+    /// iterator's `return`. Only meaningful for an async generator at a delegate point.
+    Return(Value),
+}
+
+/// B214 latch: `ZIPP_NO_MICROTASK_ROOT=1` restores the pre-B214 whole-task
+/// GC suspension (the pricing comparator; it re-opens the TLA starvation).
+pub(crate) const COLL_PROOF_SLOTS: usize = 16;
+
+/// B215 latch: `ZIPP_NO_COLL_PROOF_CACHE=1` disables the receiver-half
+/// proof cache (every lookup runs the full intrinsic proof).
+pub(crate) fn coll_proof_cache_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_COLL_PROOF_CACHE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+pub(crate) fn microtask_root_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_MICROTASK_ROOT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// A queued microtask (the whole event loop). `Reaction` runs a promise reaction
+/// — `callback` (a JS fn, a native BoundResolver, or undefined for pass-through)
+/// applied to the settled `arg`, settling `dependent`. `AsyncResume` resumes a
+/// suspended async activation.
+#[derive(Clone)]
+pub(crate) enum Microtask {
+    Reaction {
+        callback: Value,
+        arg: Value,
+        dependent: u32,
+        kind: ReactionKind,
+        finally: bool,
+    },
+    AsyncResume {
+        activation: u32,
+        input: Resume,
+    },
+    /// A native intrinsic-`Promise.all` resolve-element job. This is the same
+    /// FIFO job as the `CombinatorResolver` callback path, represented directly
+    /// so the unobservable resolver does not need a heap object of its own.
+    CombinatorStep {
+        combinator: u32,
+        index: u32,
+        kind: ReactionKind,
+        arg: Value,
+    },
+    /// PromiseResolveThenableJob: resolving `promise` with a thenable defers
+    /// `then.call(thenable, resolveFn, rejectFn)` to this microtask (spec ordering).
+    ThenableJob {
+        thenable: Value,
+        then: Value,
+        promise: u32,
+        /// Resolving functions are created when the job starts. They are
+        /// installed here one allocation at a time so the in-flight task stays
+        /// their traced owner across stress collection and arbitrary `then`.
+        resolve: Value,
+        reject: Value,
+    },
+    /// B218: the deferred finish for a `Promise.all` whose resolve-element
+    /// jobs all ran EAGERLY at subscription (queue empty, every element
+    /// already fulfilled, no user code in any job). This single job stands
+    /// where the FIRST element job would have been queued, which puts the
+    /// result promise's reactions exactly where the spec's last element job
+    /// would have put them — see `eager_combinator_enabled`.
+    CombinatorFinish {
+        combinator: u32,
+    },
+    /// CleanupFinalizationRegistry job. The registry owns the callback and
+    /// cleared cells; the job roots only the registry identity.
+    FinalizationCleanup {
+        registry: u32,
+    },
+}
+
+/// Native (built-in) function ids — the discriminant carried by `HeapObj::Native`.
+/// Each maps to an arm of `Vm::call_native`.
+
+/// What `object_enum_own` collects.
+#[derive(Clone, Copy)]
+pub(crate) enum EnumWhat {
+    Keys,
+    Values,
+    Entries,
+}
+
+/// A module whose dependencies are still evaluating (top-level await):
+/// everything needed to execute its body once they settle. Holds NO heap
+/// Values (slots/ids only) — the namespace itself is rooted via module_cache.
+#[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
+pub(crate) struct DeferredModuleExec {
+    pub remaining: usize,
+    pub base_func: u32,
+    pub ns_idx: u32,
+    pub full2: Vec<(String, u32)>,
+}
+
+/// The phase of a static module request (ModuleRequest Record [[Phase]]).
+/// Evaluation-time walks — InnerModuleEvaluation's request loop,
+/// GatherAsynchronousTransitiveDependencies, ReadyForSyncExecution — follow
+/// EVALUATION and DEFER requests only; a SOURCE request (`import source`,
+/// and the bindingless load-only phase form) is loaded but never linked or
+/// evaluated, so it is an edge of the load graph alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModuleRequestPhase {
+    Evaluation,
+    Defer,
+    Source,
+}
+
+/// The deferred Annex B legacy statics: a ROOTED subject plus unit ranges for
+/// `regexp_last` slots 2..=13 (lastParen, leftContext, rightContext, `$1`..`$9`).
+///
+/// `subj` exists purely so GC keeps the subject string alive while the ranges
+/// point into it — dropping it would let a collection free the bytes a later
+/// `RegExp.leftContext` read still has to slice. `subj_idx` is its heap index (the
+/// form `ascii_slice_value` takes). `None` in `ranges` is the empty string, which
+/// is what the eager form pushed for a non-participating capture.
+pub(crate) struct RegexpLastLazy {
+    pub subj: Value,
+    pub subj_idx: u32,
+    /// Unit ranges for `regexp_last` slots **1..=13** — lastMatch, lastParen,
+    /// leftContext, rightContext, `$1`..`$9`. Slot 0 (`input`) is a whole Value and
+    /// stays eager.
+    ///
+    /// Slot 1 joined this in B71. It used to be eager because `whole` "is computed
+    /// for the result array regardless" — true for `exec`, false for `test`, which
+    /// returns a boolean and so paid a malloc + memcpy + `is_ascii` rescan of the
+    /// matched text per successful call for nothing.
+    pub ranges: [Option<(u32, u32)>; 13],
+    /// Whether `subj` is ASCII, so a range is a byte slice of the heap string.
+    /// Otherwise materialisation decodes the subject to UTF-16 once and slices
+    /// the units -- the same text `exec` matched against, recomputed on the
+    /// rare read instead of copied for every match.
+    pub ascii: bool,
+}
+
+/// The standard named properties of a pristine RegExp match-result Array.
+///
+/// Keeping these four values in a fixed record avoids three owned key strings
+/// and the `ObjMap`'s three per-object vectors on every successful
+/// `exec`/`matchAll` step. `values[3] == undefined` means the optional `indices`
+/// property is absent (under `/d` its value is always an Array, so that sentinel
+/// is unambiguous). Reads and presence checks use this record directly;
+/// mutation, reflection, and integrity operations materialise ordinary
+/// writable/enumerable/configurable data properties into `arr_props` first.
+#[derive(Clone, Copy)]
+pub(crate) struct RegexpResultProps {
+    /// `index`, `input`, `groups`, and optional `indices`, in creation order.
+    pub values: [Value; 4],
+}
+
+/// Storage for object-method `[[HomeObject]]` edges.
+///
+/// Heap indices are dense slot ids, so the default uses a direct vector plus an
+/// authoritative presence bitmap. An absent slot's value is cleared as well,
+/// but the bitmap (rather than a `Value` sentinel) distinguishes absence: every
+/// possible `Value`, including `undefined`, remains a valid strong edge. The
+/// vectors grow only to the heap's own high-water slot id and, like the heap,
+/// retain that capacity after collection.
+///
+/// The HashMap variant is retained behind `ZIPP_NO_DENSE_CLOSURE_HOME=1` for
+/// same-binary A/B and as a simple differential oracle. Both variants expose
+/// the same operations and preserve the edge's GC semantics exactly.
+#[derive(Default)]
+struct DenseClosureHomes {
+    values: Vec<Value>,
+    present: Vec<u64>,
+    len: usize,
+}
+
+impl DenseClosureHomes {
+    #[inline]
+    fn position(key: u32) -> (usize, u64) {
+        let slot = key as usize;
+        (slot >> 6, 1u64 << (slot & 63))
+    }
+
+    #[inline]
+    fn contains(&self, key: u32) -> bool {
+        let (word, mask) = Self::position(key);
+        self.present
+            .get(word)
+            .is_some_and(|present| present & mask != 0)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn retain_scan_cost(&self) -> usize {
+        // `retain` reads each high-water bitmap word and invokes `keep` once
+        // per populated slot. Include both pieces so a very sparse old table
+        // prefers direct removals during a minor.
+        self.present.len().saturating_add(self.len)
+    }
+
+    #[inline]
+    fn get(&self, key: &u32) -> Option<&Value> {
+        if self.contains(*key) {
+            // `insert` grows `values` before publishing the presence bit.
+            Some(&self.values[*key as usize])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, key: u32, value: Value) -> Option<Value> {
+        let slot = key as usize;
+        let needed = slot
+            .checked_add(1)
+            .expect("closure-home slot index overflow");
+        if self.values.len() < needed {
+            self.values.resize(needed, Value::UNDEFINED);
+        }
+        let (word, mask) = Self::position(key);
+        if self.present.len() <= word {
+            self.present.resize(word + 1, 0);
+        }
+
+        let old = if self.present[word] & mask != 0 {
+            Some(self.values[slot])
+        } else {
+            self.present[word] |= mask;
+            self.len += 1;
+            None
+        };
+        self.values[slot] = value;
+        old
+    }
+
+    #[inline]
+    fn remove(&mut self, key: &u32) -> Option<Value> {
+        let slot = *key as usize;
+        let (word, mask) = Self::position(*key);
+        let present = self.present.get_mut(word)?;
+        if *present & mask == 0 {
+            return None;
+        }
+        *present &= !mask;
+        self.len -= 1;
+        Some(std::mem::replace(&mut self.values[slot], Value::UNDEFINED))
+    }
+
+    fn retain<F: FnMut(&u32, &mut Value) -> bool>(&mut self, mut keep: F) {
+        for word_idx in 0..self.present.len() {
+            // Walk only populated slots. Keep a snapshot because removals update
+            // the authoritative word while the iteration is in progress.
+            let mut occupied = self.present[word_idx];
+            while occupied != 0 {
+                let bit = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                let slot = (word_idx << 6) + bit;
+                let key = slot as u32;
+                if !keep(&key, &mut self.values[slot]) {
+                    self.present[word_idx] &= !(1u64 << bit);
+                    self.values[slot] = Value::UNDEFINED;
+                    self.len -= 1;
+                }
+            }
+        }
+    }
+}
+
+enum ClosureHomeTable {
+    Dense(DenseClosureHomes),
+    Map(std::collections::HashMap<u32, Value>),
+}
+
+impl Default for ClosureHomeTable {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        let dense = match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("ZIPP_NO_DENSE_CLOSURE_HOME").is_none();
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        };
+        if dense {
+            Self::Dense(DenseClosureHomes::default())
+        } else {
+            Self::Map(std::collections::HashMap::new())
+        }
+    }
+}
+
+impl ClosureHomeTable {
+    #[inline]
+    fn get(&self, key: &u32) -> Option<&Value> {
+        match self {
+            Self::Dense(table) => table.get(key),
+            Self::Map(table) => table.get(key),
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, key: u32, value: Value, heap_slots: usize) -> Option<Value> {
+        // All production callers pass a freshly allocated or otherwise live
+        // heap holder. Keep that invariant explicit so a corrupt u32 can never
+        // turn the direct-index backend into an attacker-sized allocation.
+        assert!(
+            (key as usize) < heap_slots,
+            "closure-home holder is outside the VM heap"
+        );
+        match self {
+            Self::Dense(table) => table.insert(key, value),
+            Self::Map(table) => table.insert(key, value),
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, key: &u32) -> Option<Value> {
+        match self {
+            Self::Dense(table) => table.remove(key),
+            Self::Map(table) => table.remove(key),
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn contains_key(&self, key: &u32) -> bool {
+        self.get(key).is_some()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(table) => table.len(),
+            Self::Map(table) => table.len(),
+        }
+    }
+
+    fn retain<F: FnMut(&u32, &mut Value) -> bool>(&mut self, keep: F) {
+        match self {
+            Self::Dense(table) => table.retain(keep),
+            Self::Map(table) => table.retain(keep),
+        }
+    }
+
+    /// Drop entries whose holder slot was reclaimed by a minor. The dense
+    /// backend's retain scans its high-water bitmap and visits populated entries;
+    /// HashMap's retain walks bucket capacity. Choose between a table scan and
+    /// O(1) removals using the appropriate cost.
+    fn prune_freed(&mut self, freed: &[u32], live_bits: &[bool]) {
+        let scan_cost = match self {
+            Self::Dense(table) => table.retain_scan_cost(),
+            Self::Map(table) => table.capacity(),
+        };
+        if scan_cost <= freed.len() {
+            self.retain(|&key, _| live_bits[key as usize]);
+        } else {
+            for key in freed {
+                self.remove(key);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn dense_for_test() -> Self {
+        Self::Dense(DenseClosureHomes::default())
+    }
+
+    #[cfg(test)]
+    fn map_for_test() -> Self {
+        Self::Map(std::collections::HashMap::new())
+    }
+}
+
+/// B189: a slot-keyed side map with an inline `nonempty` byte the emitted
+/// same-proto call preflight reads through the VM pointer (`HashMap` exposes
+/// no field native code could guard on). Reads deref straight to the map;
+/// every mutation goes through the wrapper's own methods so the byte cannot
+/// miss an insert — there is deliberately NO `DerefMut`, which makes any
+/// unrouted mutation a compile error rather than a stale-flag soundness bug.
+/// Shrinking ops re-derive the byte from the map, so a map that empties
+/// re-arms the native lane.
+pub(crate) struct JitGuardedMap {
+    map: std::collections::HashMap<u32, u32>,
+    /// 0 = empty (the native call lane may skip this map's per-callee
+    /// checks), 1 = has entries. Read at `JIT_*_NONEMPTY_OFFSET`.
+    pub(crate) nonempty_raw: u8,
+}
+
+impl JitGuardedMap {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            nonempty_raw: 0,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, k: u32, v: u32) -> Option<u32> {
+        self.nonempty_raw = 1;
+        self.map.insert(k, v)
+    }
+
+    pub(crate) fn remove(&mut self, k: &u32) -> Option<u32> {
+        let out = self.map.remove(k);
+        self.nonempty_raw = u8::from(!self.map.is_empty());
+        out
+    }
+
+    pub(crate) fn retain<F: FnMut(&u32, &mut u32) -> bool>(&mut self, f: F) {
+        self.map.retain(f);
+        self.nonempty_raw = u8::from(!self.map.is_empty());
+    }
+}
+
+impl std::ops::Deref for JitGuardedMap {
+    type Target = std::collections::HashMap<u32, u32>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+/// Explicit-layout owner for the VM's contiguous register file.
+///
+/// `storage.len()` is the initialized high-water extent and never decreases.
+/// `logical_len` is the live prefix visible to the interpreter, GC and safe
+/// indexing. Keeping those lengths separate lets native calls cheaply revive a
+/// previously initialized window without writing `Vec`'s private fields. The
+/// first two fields are an emitted-code ABI; their offsets are compile-checked
+/// in `host_api`.
+///
+/// Invariants after every safe operation (and after `set_len`):
+///
+/// * `logical_len <= storage.len() <= storage.capacity()`;
+/// * `ptr_mirror == storage.as_ptr().expose_provenance()`;
+/// * every element in `storage` is an initialized `Value`, while only
+///   `storage[..logical_len]` is live or traced.
+///
+/// The checked profile has its own definition below: it emits no code, so it
+/// has no window to revive and no layout to keep.
+#[cfg(not(feature = "safe-sandbox"))]
+#[repr(C)]
+pub(crate) struct RegisterFile {
+    /// Exposed allocation address for emitted machine code. This is an integer
+    /// deliberately: retaining a raw pointer returned by `Vec::as_mut_ptr`
+    /// across ordinary safe element references is outside that method's narrow
+    /// aliasing guarantee. Rust callers always derive a fresh pointer from the
+    /// owning `Vec` through `as_ptr` / `as_mut_ptr` below.
+    ptr_mirror: usize,
+    logical_len: usize,
+    storage: Vec<Value>,
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl RegisterFile {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self::from_vec(Vec::new())
+    }
+
+    /// The live prefix.
+    #[inline(always)]
+    fn live(&self) -> &[Value] {
+        &self.storage[..self.logical_len]
+    }
+
+    #[inline(always)]
+    fn live_mut(&mut self) -> &mut [Value] {
+        &mut self.storage[..self.logical_len]
+    }
+
+    #[inline]
+    pub(crate) fn from_vec(mut storage: Vec<Value>) -> Self {
+        let logical_len = storage.len();
+        let ptr_mirror = storage.as_mut_ptr().expose_provenance();
+        Self {
+            ptr_mirror,
+            logical_len,
+            storage,
+        }
+    }
+
+    #[inline(always)]
+    fn refresh_ptr(&mut self) {
+        self.ptr_mirror = self.storage.as_mut_ptr().expose_provenance();
+    }
+
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.logical_len
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Vec-compatible surface; used by feature-specific paths.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.logical_len == 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.storage.capacity()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Native/JIT pointer API; absent callers in safe builds.
+    pub(crate) fn as_ptr(&self) -> *const Value {
+        self.storage.as_ptr()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Native/JIT pointer API; absent callers in safe builds.
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut Value {
+        self.storage.as_mut_ptr()
+    }
+
+    #[inline(always)]
+    // Read by the JIT plan builders and the full instrument tracer only (the
+    // meter-only profile compiles no trace consumer).
+    #[cfg(any(
+        feature = "jit",
+        all(feature = "instrument", not(feature = "meter-only"))
+    ))]
+    pub(crate) fn get(&self, index: usize) -> Option<&Value> {
+        self.storage[..self.logical_len].get(index)
+    }
+
+    #[inline(always)]
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) unsafe fn get_unchecked(&self, index: usize) -> &Value {
+        // SAFETY: forwarded from the caller; the slice limits the contract to
+        // the live prefix rather than the initialized inactive tail.
+        unsafe { self.storage[..self.logical_len].get_unchecked(index) }
+    }
+
+    #[inline(always)]
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut Value {
+        // SAFETY: forwarded from the caller; callers prove index < logical_len.
+        unsafe { self.storage[..self.logical_len].get_unchecked_mut(index) }
+    }
+
+    /// Set the live length, preserving all backing elements as initialized.
+    ///
+    /// # Safety
+    /// Callers must additionally establish that every newly exposed slot holds
+    /// a semantically valid `Value`. The hard bound check keeps this operation
+    /// memory-safe in release builds as well as debug builds.
+    #[inline(always)]
+    // Only the x86-64 JIT call protocol resizes the file without initialising.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit"))]
+    pub(crate) unsafe fn set_len(&mut self, new_len: usize) {
+        assert!(
+            new_len <= self.storage.len(),
+            "register logical length exceeds initialized high-water"
+        );
+        self.logical_len = new_len;
+    }
+
+    /// Vec-compatible resize of the live prefix. Revived inactive slots are
+    /// overwritten with `fill`; shrinking never reduces the initialized extent.
+    pub(crate) fn resize(&mut self, new_len: usize, fill: Value) {
+        let old_logical = self.logical_len;
+        if new_len > old_logical {
+            let old_high_water = self.storage.len();
+            if new_len > old_high_water {
+                self.storage.resize(new_len, fill);
+            }
+            let revived_end = new_len.min(old_high_water);
+            if old_logical < revived_end {
+                self.storage[old_logical..revived_end].fill(fill);
+            }
+        }
+        self.logical_len = new_len;
+        self.refresh_ptr();
+    }
+
+    #[inline]
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        self.logical_len = self.logical_len.min(new_len);
+    }
+
+    #[inline]
+    #[allow(dead_code)] // Vec-compatible surface; used by feature-specific paths.
+    pub(crate) fn clear(&mut self) {
+        self.logical_len = 0;
+    }
+
+    /// Reserve relative to the live length, matching `Vec::reserve` even when
+    /// the initialized inactive tail is longer than the live prefix.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        let wanted = self
+            .logical_len
+            .checked_add(additional)
+            .expect("capacity overflow");
+        if wanted > self.storage.capacity() {
+            self.storage.reserve(wanted - self.storage.len());
+        }
+        self.refresh_ptr();
+    }
+
+    /// Append to the live prefix, reusing and overwriting initialized inactive
+    /// storage before extending the high-water extent.
+    pub(crate) fn extend_from_slice(&mut self, values: &[Value]) {
+        let old_logical = self.logical_len;
+        let new_len = old_logical
+            .checked_add(values.len())
+            .expect("capacity overflow");
+        self.reserve(values.len());
+
+        let revived = (self.storage.len() - old_logical).min(values.len());
+        if revived != 0 {
+            self.storage[old_logical..old_logical + revived].copy_from_slice(&values[..revived]);
+        }
+        if revived < values.len() {
+            self.storage.extend_from_slice(&values[revived..]);
+        }
+        self.logical_len = new_len;
+        self.refresh_ptr();
+    }
+
+    /// Detach a copy of the logical tail while retaining initialized backing
+    /// storage in this file for later window reuse.
+    pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
+        assert!(at <= self.logical_len, "split index out of bounds");
+        let tail = self.storage[at..self.logical_len].to_vec();
+        self.logical_len = at;
+        tail
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // JIT high-water proof and focused invariant tests.
+    pub(crate) fn initialized_len(&self) -> usize {
+        self.storage.len()
+    }
+}
+
+/// The checked profile's register file: the `Vec` itself, its length the
+/// live length.
+///
+/// The interpreter reads and writes a register two or three times an
+/// instruction, and in this profile each access is bounds-checked. Against a
+/// live prefix of a longer backing store that is two checks, the prefix
+/// within the store and the index within the prefix, and the first is a
+/// range index: a call into `Vec`'s `Index` that a size-first build does not
+/// inline. It was 38% of an integer loop in the Lite module. With no emitted
+/// code there is no window to revive without writing it, so the backing
+/// store need not outlive the live length, and an access is one check
+/// against the `Vec`'s own length through the slice the compiler indexes
+/// itself.
+///
+/// The surface and what it does are the other definition's: growing writes
+/// `fill` into every slot it exposes, and shrinking keeps the allocation.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) struct RegisterFile {
+    storage: Vec<Value>,
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl RegisterFile {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self::from_vec(Vec::new())
+    }
+
+    #[inline]
+    pub(crate) fn from_vec(storage: Vec<Value>) -> Self {
+        Self { storage }
+    }
+
+    /// The live registers. `as_slice` and an index by `usize` are all an
+    /// access costs; nothing here goes through `Vec`'s `Index`.
+    #[inline(always)]
+    fn live(&self) -> &[Value] {
+        self.storage.as_slice()
+    }
+
+    #[inline(always)]
+    fn live_mut(&mut self) -> &mut [Value] {
+        self.storage.as_mut_slice()
+    }
+
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Vec-compatible surface; used by feature-specific paths.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.storage.is_empty()
+    }
+
+    #[inline(always)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.storage.capacity()
+    }
+
+    #[inline(always)]
+    // Read by the full instrument tracer only (the meter-only profile
+    // compiles no trace consumer).
+    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+    pub(crate) fn get(&self, index: usize) -> Option<&Value> {
+        self.storage.get(index)
+    }
+
+    pub(crate) fn resize(&mut self, new_len: usize, fill: Value) {
+        self.storage.resize(new_len, fill);
+    }
+
+    #[inline]
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        self.storage.truncate(new_len);
+    }
+
+    #[inline]
+    #[allow(dead_code)] // Vec-compatible surface; used by feature-specific paths.
+    pub(crate) fn clear(&mut self) {
+        self.storage.clear();
+    }
+
+    pub(crate) fn extend_from_slice(&mut self, values: &[Value]) {
+        self.storage.extend_from_slice(values);
+    }
+
+    /// Detach a copy of the tail, keeping this file's allocation.
+    pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
+        assert!(at <= self.storage.len(), "split index out of bounds");
+        let tail = self.storage.as_slice()[at..].to_vec();
+        self.storage.truncate(at);
+        tail
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Focused invariant tests.
+    pub(crate) fn initialized_len(&self) -> usize {
+        self.storage.len()
+    }
+}
+
+impl Default for RegisterFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Vec<Value>> for RegisterFile {
+    fn from(storage: Vec<Value>) -> Self {
+        Self::from_vec(storage)
+    }
+}
+
+impl std::ops::Deref for RegisterFile {
+    type Target = [Value];
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        self.live()
+    }
+}
+
+impl std::ops::DerefMut for RegisterFile {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.live_mut()
+    }
+}
+
+impl<'a> IntoIterator for &'a RegisterFile {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.live().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut RegisterFile {
+    type Item = &'a mut Value;
+    type IntoIter = std::slice::IterMut<'a, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.live_mut().iter_mut()
+    }
+}
+
+#[cfg(all(test, feature = "safe-sandbox"))]
+mod checked_register_file_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_then_resize_overwrites_every_revived_slot() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1), Value::int(2), Value::int(3)]);
+        let capacity = regs.capacity();
+        regs.truncate(1);
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs.initialized_len(), 1);
+        regs.resize(3, Value::int(9));
+        assert_eq!(&*regs, &[Value::int(1), Value::int(9), Value::int(9)]);
+        assert_eq!(regs.capacity(), capacity, "shrinking keeps the allocation");
+    }
+
+    #[test]
+    fn split_off_detaches_the_tail_and_keeps_the_allocation() {
+        let mut regs = RegisterFile::from_vec(vec![
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+        ]);
+        let capacity = regs.capacity();
+        let tail = regs.split_off(2);
+        assert_eq!(tail, vec![Value::int(3), Value::int(4)]);
+        assert_eq!(&*regs, &[Value::int(1), Value::int(2)]);
+        assert_eq!(regs.capacity(), capacity);
+
+        regs.extend_from_slice(&[Value::int(7), Value::int(8)]);
+        assert_eq!(
+            &*regs,
+            &[Value::int(1), Value::int(2), Value::int(7), Value::int(8)]
+        );
+        assert_eq!((&regs).into_iter().count(), 4);
+    }
+
+    #[test]
+    fn an_access_past_the_live_length_is_refused() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1), Value::int(2), Value::int(3)]);
+        regs.truncate(2);
+        assert_eq!(regs[1], Value::int(2));
+        // Slot 2 is still inside the allocation; it is not a register.
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regs[2]));
+        assert!(read.is_err());
+        let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut regs = RegisterFile::from_vec(vec![Value::int(1)]);
+            regs[1] = Value::int(5);
+        }));
+        assert!(write.is_err());
+    }
+}
+
+#[cfg(all(test, not(feature = "safe-sandbox")))]
+mod register_file_tests {
+    use super::*;
+
+    #[test]
+    fn pointer_mirror_refreshes_after_reserve_and_growth() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1)]);
+        regs.reserve(4_096);
+        assert_eq!(regs.ptr_mirror, regs.storage.as_ptr().expose_provenance());
+        regs.resize(4_097, Value::UNDEFINED);
+        assert_eq!(regs.ptr_mirror, regs.storage.as_ptr().expose_provenance());
+        assert_eq!(regs.len(), 4_097);
+        assert_eq!(regs.initialized_len(), 4_097);
+    }
+
+    #[test]
+    fn truncate_then_resize_overwrites_every_revived_slot() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1), Value::int(2), Value::int(3)]);
+        regs.truncate(1);
+        assert_eq!(regs.initialized_len(), 3);
+        regs.resize(3, Value::int(9));
+        assert_eq!(&*regs, &[Value::int(1), Value::int(9), Value::int(9)]);
+        assert_eq!(regs.initialized_len(), 3);
+    }
+
+    #[test]
+    fn split_off_detaches_logical_tail_without_shrinking_backing() {
+        let mut regs = RegisterFile::from_vec(vec![
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+        ]);
+        let tail = regs.split_off(2);
+        assert_eq!(tail, vec![Value::int(3), Value::int(4)]);
+        assert_eq!(&*regs, &[Value::int(1), Value::int(2)]);
+        assert_eq!(regs.initialized_len(), 4);
+
+        regs.extend_from_slice(&[Value::int(7), Value::int(8)]);
+        assert_eq!(
+            &*regs,
+            &[Value::int(1), Value::int(2), Value::int(7), Value::int(8)]
+        );
+        assert_eq!(regs.initialized_len(), 4);
+    }
+
+    #[test]
+    // Same gate as `set_len` itself: only the x86-64 JIT call protocol has it.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit"))]
+    fn unsafe_logical_set_len_is_bounded_by_initialized_high_water() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1), Value::int(2)]);
+        regs.truncate(1);
+        // SAFETY: slot 1 remains initialized in the retained backing extent.
+        unsafe { regs.set_len(2) };
+        assert_eq!(&*regs, &[Value::int(1), Value::int(2)]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // This intentionally violates the API precondition; the hard check
+            // must reject it before logical state changes.
+            unsafe { regs.set_len(3) };
+        }));
+        assert!(result.is_err());
+        assert_eq!(regs.len(), 2);
+        assert_eq!(regs.initialized_len(), 2);
+    }
+}
+
+/// The console stream a line was written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleStream {
+    /// `console.log`/`info`/`debug` and `print`.
+    Stdout,
+    /// `console.error`/`warn`.
+    Stderr,
+}
+
+pub struct Vm<'p> {
+    program: &'p Program,
+    /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
+    /// `Box<FuncProto>` so its address is stable (the whole-function JIT and the
+    /// run loop hold raw pointers into FuncProtos, so they must never move). A
+    /// unified `func_id` addresses `program.functions` for `id < main_func_count`
+    /// and `eval_funcs[id - main_func_count]` beyond it.
+    eval_funcs: Vec<&'p crate::bytecode::FuncProto>,
+    /// Every function by its unified id: the program's, then `eval_funcs`.
+    /// `func` reads this one table, so a lookup is one bounds-checked load
+    /// whichever kind the id names. The program's prototypes are behind
+    /// shared pointers (`FuncTable`), which would cost a second load on every
+    /// lookup, and the two-table form cost a compare before that.
+    /// `main_func_count` and `eval_funcs` remain the boundary other code asks
+    /// about. Appended to only by `install_func`.
+    funcs: Vec<&'p crate::bytecode::FuncProto>,
+    /// Aggregate retained static-key plans across the main Program and every
+    /// successfully/partially prepared eval/module Program. Incoming programs
+    /// beyond either ceiling are rewritten to legacy NewObject before leaking.
+    static_key_plan_sites: usize,
+    static_key_plan_retained_bytes: usize,
+    /// Number of functions in the compile-time `program` (the boundary between
+    /// program function ids and runtime `eval_funcs` ids).
+    main_func_count: usize,
+    /// Classes compiled at runtime by `eval`. Like `eval_funcs`: each is a leaked
+    /// `Box<ClassDef>` addressed by a unified class_id (`program.classes` below
+    /// `main_class_count`, `eval_classes` beyond). Their func-id members and the
+    /// referencing `MakeClass`/`Super*` ops are re-indexed at install time.
+    eval_classes: Vec<&'static crate::bytecode::ClassDef>,
+    /// Number of classes in the compile-time `program` (boundary between program
+    /// and runtime `eval_classes` class ids).
+    main_class_count: usize,
+    /// Globals introduced by `eval`: maps a global NAME (one not present in the
+    /// compile-time `program.global_names`) to the EVAL_POOL slot it was assigned.
+    /// Persists across `eval` calls so repeated evals see each other's globals.
+    eval_global_map: std::collections::HashMap<String, u32>,
+    /// Pool slots that deliberately have NO `eval_global_map` entry, by what
+    /// they bind: a loaded module's own declarations (per-module, so two
+    /// modules' same-named bindings never collide) and ShadowRealm names.
+    /// Consulted only when such a slot is read or written uninitialized, so
+    /// the error names the binding and no global-object fallback runs for a
+    /// name the incubating realm could shadow.
+    pool_slot_names: rustc_hash::FxHashMap<u32, PoolSlotName>,
+    /// Next free EVAL_POOL slot — always `globals.len()`. Starts at
+    /// `global_count + FIELD_POOL`; bumped as pool slots are handed out, capped
+    /// at `+ EVAL_POOL` (the reserved capacity).
+    eval_global_next: u32,
+    /// Every builtin global NAME → its heap value, recorded at setup regardless of
+    /// whether the running program referenced it. Lets `eval`'d code resolve
+    /// builtins the main program never named (`eval("new RangeError()")`,
+    /// `eval("Object.keys(x)")`) instead of seeing the never-declared sentinel.
+    /// Values are permanent roots (traced in gc, never pruned).
+    builtin_globals: std::collections::HashMap<String, u32>,
+    /// Hash-free twin of `builtin_globals` for the namespaces the intrinsic
+    /// guards probe per operation (`helpers_misc::builtin_ns_index`);
+    /// `u32::MAX` = not registered. Filled beside the map at boot.
+    builtin_ns_slots: [u32; crate::vm::helpers_misc::BUILTIN_NS_COUNT],
+    /// Per-`MathFn` memo for the bare `MathOp` guard: (heap generation of the
+    /// `Math` object when the slot was resolved, own slot index of `Math.<op>`);
+    /// `u32::MAX` slot = not resolved. See `Vm::math_bare_is_intrinsic`.
+    math_bare_memo: [(u32, u32); crate::bytecode::MATH_FN_COUNT],
+    /// Most-recent class value per class_id (filled by `MakeClass`), so a
+    /// `super` call can reach its lexical superclass value at runtime.
+    class_values: Vec<Option<Value>>,
+    /// Bumped on every `class_values` write (class declaration / redefinition).
+    /// The JIT method-inline `super.m()` arm bakes this epoch + a pointer to it
+    /// and re-checks it each call: a re-executed class declaration swaps
+    /// `class_values[home_class_id]` to a new class WITHOUT mutating the old
+    /// prototype objects the inline's hop guards watch, so this coarse epoch is
+    /// the discriminator that makes the inline match the interpreter's live
+    /// `class_values[id]` resolution (a mismatch falls to the helper).
+    mi_class_epoch: u32,
+    /// Bumped whenever a class's member tables stop describing live objects:
+    /// the first divergence of its `C.prototype` (`ClassData::proto_dirty`) or
+    /// the first instance given an explicit `[[Prototype]]`
+    /// (`ClassData::reproto_instances`). Both flags are sticky, so this moves at
+    /// most twice per class. Every cache that resolved a member through the
+    /// tables — the interpreter's `Class*` IC ways and the JIT's class
+    /// method/accessor inline arms — bakes it and misses once it moves.
+    pub(crate) class_proto_epoch: u32,
+    /// Q7 method/accessor-inline receiver recording: per `(func_id<<32)|ip`
+    /// CallMethod/GetProp/SetProp site that resolved a Class method/getter/setter,
+    /// the ≤8 distinct receiver Value-bits seen at IC-fill time (warmup). The JIT
+    /// planner reads this to bake a per-receiver-instance inline arm — the
+    /// class-keyed IC records no instances, and the obj-reg/array trace is
+    /// unreliable for `var o = arr[i]; o.x` (o is loaded indirectly). NOT a GC
+    /// root: a stale/reused-slot entry is rebuilt-from-live at compile time and
+    /// each arm is runtime identity+version-guarded, so a dead entry is harmless.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    mi_recv: rustc_hash::FxHashMap<u64, Vec<u64>>,
+    /// Reusable scratch buffer for the `GetIndexConcat`/`SetIndexConcat` fused
+    /// computed-key fast path: the `"prefix" + i` key is assembled here and
+    /// looked up by `&str`, so the dictionary-churn idiom never allocates a
+    /// throwaway heap string per access. Taken via `mem::take` for the duration
+    /// of a single op (no aliasing) and returned; grows once, then reused.
+    idx_key_scratch: String,
+    /// Where `o[k]` last found the flat string key `k` among the plain object
+    /// `o`'s own properties: a direct-mapped table of (receiver, key, slot)
+    /// that predicts the slot, which every use verifies (`keyed_memo_slot`).
+    pub(crate) keyed_slot_memo: Box<[indexing_date::KeyedSlotMemo]>,
+    /// JSON.stringify fast-path cache: `(obj_proto version, arr_proto version,
+    /// either default prototype has a callable `toJSON`)`. Keyed on the two proto
+    /// shape versions so any mutation that adds/removes `toJSON` on the default
+    /// Object/Array prototype auto-invalidates it (no manual invalidation). Lets
+    /// the serializer skip the per-value `get_prop(v,"toJSON")` chain walk for a
+    /// plain object/array when no default prototype carries `toJSON`.
+    json_default_tj: Option<(u32, u32, bool)>,
+    /// Interpreter inline caches: per main-program or loader-recorded module
+    /// function (outer index = func_id), per instruction (inner index = ip), a lazily-allocated
+    /// per-site cache for the hot call/property paths. See `vm/ic.rs` for the
+    /// guard model; intentionally NOT a GC root (entries are validated or
+    /// re-read against live, guard-checked objects before any use).
+    site_ics: Vec<Option<Box<[Option<Box<ic::SiteIc>>]>>>,
+    /// The Python runtime's registry (`vm::py_rt`), once it bound itself.
+    #[cfg(feature = "python")]
+    py_rt: Option<Box<py_rt::PyRt>>,
+    /// Bytes of `site_ics` storage drawn by runtime-installed (`eval` /
+    /// `new Function`) functions, against `ic::DYNAMIC_IC_BUDGET_BYTES`.
+    dynamic_ic_bytes: usize,
+    /// Bounded interpreter `LoadConst` memo for short string literals, keyed by
+    /// the immutable unified `(func_id, constant-slot)` pair. JavaScript strings
+    /// are primitives, so repeated loads may share a representation; entries
+    /// are explicit GC roots because the map is VM-internal. See
+    /// `const_cache.rs` for the mutation exclusion and resource bounds.
+    const_string_cache: rustc_hash::FxHashMap<u64, Value>,
+    /// The heap string enumeration hands out for a property key, by the key's
+    /// stored text (`Vm::alloc_key_str`). `for (k in o)`, `Object.keys` and
+    /// their kin made a fresh string for every key of every object on every
+    /// pass: 77 ns a key against V8's 1.3, and every one of them young
+    /// garbage (485,000 of the 485,000 a walk of a 150,000-node tree
+    /// allocated). Bounded by `KEY_STR_CACHE_MAX_ENTRIES` short keys; the
+    /// values are roots (`Vm::mark_roots`) and frozen, since many holders
+    /// name each one.
+    pub(crate) key_str_cache: rustc_hash::FxHashMap<Box<str>, Value>,
+    /// The own enumerable string keys an object of a given shape has, in
+    /// spec order, as `key_str_cache`'s strings (which root them): a shape
+    /// names a key sequence with its attributes, so every object of the
+    /// shape enumerates the same list. Filled by `shaped_own_enum_keys`.
+    ///
+    /// Indexed by the shape id: ids are small and dense (`shape.rs` issues
+    /// at most 4,096 and never reuses one), so the list is one bounds check
+    /// away, and the modules do not carry a hash table instantiated for this
+    /// one map (1.5 KB of each).
+    pub(crate) enum_key_cache: Vec<Option<Box<[Value]>>>,
+    /// Per-function result of the conservative in-place-string-op scan. A
+    /// function that can mutate a compiler-proved-unique string buffer must keep
+    /// receiving a fresh literal representation, so none of its literals enter
+    /// the shared cache.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    const_string_cache_funcs: rustc_hash::FxHashMap<u32, bool>,
+    /// Latched at VM construction so `ZIPP_NO_CONST_STRING_CACHE=1` is a
+    /// same-binary ablation with no environment lookup in the dispatch loop.
+    const_string_cache_enabled: bool,
+    /// `ZIPP_BUILTINSTATS` sampled once per native VM. The global histogram is
+    /// still process-wide; this removes an atomic latch from every disabled
+    /// builtin dispatch. The field is absent from wasm32, where the diagnostic
+    /// call sites compile to a no-op.
+    #[cfg(not(target_arch = "wasm32"))]
+    builtin_stats_enabled: bool,
+    heap: Heap,
+    globals: Vec<Value>,
+    /// Raw base of `globals`, loaded by Tier-C code through the live VM on
+    /// entry. The vector's capacity is reserved to its final FIELD_POOL +
+    /// EVAL_POOL extent at boot and never exceeded, so neither growing its
+    /// length nor moving `Vm` invalidates the allocation address. Kept explicit: emitted code must not depend on
+    /// Rust's private `Vec` field layout.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    globals_raw: u64,
+    /// One contiguous register file shared by all live frames; each frame owns
+    /// the window `[base, base + reg_count)`.
+    regs: RegisterFile,
+    frames: Vec<Frame>,
+    /// Step budget / abort flag / execution trace, when an embedder has asked
+    /// for them. `None` — the only state a default build can be in — means the
+    /// dispatch hook returns immediately. Boxed so the `Option` costs one
+    /// pointer in the hot struct rather than the recorder's whole footprint.
+    #[cfg(feature = "instrument")]
+    pub(crate) instr_rec: Option<Box<instrument::Recorder>>,
+    /// B269: what the last exact heap audit counted BEYOND the heap's own O(1)
+    /// resident figure (VM-owned side tables, frames, regex programs). The
+    /// per-operation headroom checks add it to the cheap figure, so between
+    /// audits they answer exactly what the audit did for everything but heap
+    /// objects that grew in place -- which is the case the strided audit exists
+    /// to reconcile.
+    pub(crate) heap_audit_extra: std::cell::Cell<usize>,
+    /// Steps lent to the native tier, charged directly by compiled code as
+    /// `sub QWORD [rdi + off], <block length>` — `rdi` is the VM pointer every
+    /// region and whole-function body already holds, so this needs no spare
+    /// register and no frame slot. Reconciled against the real budget by
+    /// `meter_lend`/`meter_return`; 0 and unread in an unmetered VM.
+    ///
+    /// A plain field rather than part of the boxed `Recorder` so its offset from
+    /// the VM pointer is fixed for compiled code, and so the hot path is one
+    /// memory operand rather than a pointer chase.
+    #[cfg(feature = "instrument")]
+    pub(crate) jit_steps: i64,
+    /// Lines produced by `Print` (console.log/info/debug → stdout), in order.
+    pub output: Vec<String>,
+    /// Lines produced by `console.error`/`console.warn` (→ stderr in node).
+    pub errput: Vec<String>,
+    /// Which stream each console line went to, in production order, so the
+    /// two buffers can be merged back into one chronological log. One byte
+    /// per line; the lines themselves are stored once, above.
+    pub console_order: Vec<ConsoleStream>,
+    /// When set, console lines go to this sink as they are produced instead
+    /// of into the buffers above (a CLI that prints progress while a long
+    /// program runs). `None` everywhere else.
+    pub(crate) console_sink: Option<Box<dyn FnMut(ConsoleStream, &str)>>,
+    /// Embedder host hook, backing the `HOST_CALL` native. `None` in every
+    /// engine-internal path (`run`, `run_module_file`, the CLI, test262), so a
+    /// stock build has no host surface at all; only `crate::embed` installs one.
+    /// Taken out of the `Vm` for the duration of the call so the closure may
+    /// re-enter the VM (a host that evaluates JS re-borrows `&mut self`).
+    pub(crate) host: Option<Box<dyn FnMut(&str, &[String]) -> Result<String, String>>>,
+    /// The context-taking twin of `host`: the closure receives the VM as
+    /// [`crate::vm::host_api::HostCtx`], so a host may resolve the guest's
+    /// typed arrays to memory regions and call guest functions while the
+    /// call runs. Preferred over `host` when both are installed; taken out
+    /// of the `Vm` for the duration of the call like `host`.
+    pub(crate) host_ctx: Option<crate::vm::host_api::HostCallCtx>,
+    /// Embedder hook for unhandled Promise rejections. When installed, every
+    /// rejection that reaches the microtask checkpoint with no handler is
+    /// reported here with its rendered message, in addition to (never
+    /// instead of) the Test262 `errput` line `report_unhandled_errors`
+    /// already produces. The host counterpart of the browser's
+    /// `unhandledrejection` event.
+    pub(crate) unhandled_rejection_sink: Option<Box<dyn FnMut(&str)>>,
+    /// Structured host channel backing the `HOST_CALL_VALUE` native. Unlike
+    /// `host_ctx` it is shared behind an `Rc` and called through a cloned
+    /// handle rather than taken out of the `Vm`, so a guest that calls the
+    /// host again while a call is being served re-enters the same closure;
+    /// arguments and the reply cross as owned `HostValue` trees rather than
+    /// strings. The channel a Ruby binding uses.
+    pub(crate) host_values: Option<
+        std::rc::Rc<
+            dyn Fn(
+                &mut dyn crate::vm::host_api::HostCtx,
+                &str,
+                &[crate::vm::host_api::HostValue],
+            ) -> Result<crate::vm::host_api::HostValue, String>,
+        >,
+    >,
+    /// The owning `ScriptState`'s id, so a [`crate::embed::HostHandle`] used
+    /// through [`crate::vm::host_api::HostCtx`] can be checked against this
+    /// VM as `ScriptState`'s own handle methods check it. 0 outside a
+    /// `ScriptState`.
+    pub(crate) host_owner_id: u64,
+    /// Durable roots a host holds across re-entries via
+    /// [`crate::embed::HostHandle`]. A `Some` entry is a live JS value the
+    /// collector must trace (see `mark_roots`); a `None` entry is a released
+    /// or never-used handle. `host_handle_free` lists the `None` indices, so a
+    /// release is reused rather than growing the table. Empty in every
+    /// engine-internal path.
+    pub(crate) host_handles: Vec<Option<Value>>,
+    pub(crate) host_handle_free: Vec<u32>,
+    /// Monotonic-clock reading at VM start — the zero point for
+    /// `performance.now()` (which reports fractional milliseconds elapsed
+    /// since the program began). A host-installed clock's reading when one
+    /// is installed (see `clock::now_mono_ms`).
+    start_mono_ms: f64,
+    /// The JS value currently being thrown, set when a `Throw` (or an internal
+    /// error) begins unwinding and cleared when a `catch` handler receives it.
+    /// Carrying the real `Value` (not just a message) lets `catch (e)` bind the
+    /// exact thrown object/string/number, and survives propagation across
+    /// nested `run_loop` invocations (builtin callbacks) until caught.
+    pending_throw: Option<Value>,
+    /// One-shot `new.target` for the NEXT frame entered: `construct` /
+    /// `Reflect.construct` / `super(...)` set it to the constructor right before
+    /// invoking the body; the frame-setup path consumes it into `Frame::new_target`
+    /// and resets it to `undefined`, so ordinary calls observe `new.target` undefined.
+    pending_new_target: Value,
+    /// One-shot "the NEXT frame entered runs an eval program" flag, set right
+    /// before `execute_eval_program` invokes the compiled eval script and
+    /// consumed into `Frame::is_eval` at frame setup (same one-shot idiom as
+    /// `pending_new_target`). Lets the legacy `f.caller` walk skip eval frames.
+    pending_eval_frame: bool,
+    /// One-shot "the NEXT do_eval compiles a CreateDynamicFunction wrapper"
+    /// flag, set by `build_function_kind` (`new Function` & kin) and consumed
+    /// into `compile_eval`'s `fn_ctor` (same one-shot idiom as
+    /// `pending_eval_frame`). Suppresses the "anonymous" wrapper's self-name
+    /// binding (constructor-binding.js).
+    pending_fn_ctor_eval: bool,
+    /// Host policy for a VM that may execute its already-compiled main program
+    /// but must not compile or load any additional source. This is independent
+    /// of instrumentation and leaves every JIT tier enabled. All runtime source
+    /// entry points check it before parsing or reading: eval/Function-family/
+    /// ShadowRealm.evaluate, `$262.evalScript`, agents, and module loading.
+    external_code_disabled: bool,
+    /// Set by a `Yield` op to hand a generator's yielded value (+ the yield's
+    /// bytecode ip, for the resume point) back to `generator_method`, which
+    /// `.take()`s it to distinguish a suspension from a normal return.
+    pending_yield: Option<(Value, usize)>,
+    /// Set by the `Yield`/`GenStart` ops to the suspending frame's active `try`
+    /// handlers, so a SYNC generator's `generator_method` can park them in the
+    /// `HeapObj::Generator` and restore them on resume (enabling `gen.throw(e)`
+    /// to land in an enclosing `try`/`catch`). The ASYNC `drive_async_gen`
+    /// consumer ignores this — async-gen suspension semantics are unchanged.
+    pending_yield_handlers: Vec<Handler>,
+    /// The suspending frame's dynamic EvalScope (or u32::MAX), captured with
+    /// `pending_yield`; the parker stamps it on the generator so a resume can
+    /// restore it (param-prologue evals outlive the GenStart suspension).
+    pending_yield_eval_scope: u32,
+    /// Set by `IterDelegate` when its not-done step is about to be yielded by the
+    /// following `YieldDelegate`: the yielded value IS the inner iterator's raw
+    /// result object, and `gen_resume` must forward it to the caller VERBATIM
+    /// (spec GeneratorYield(innerResult)) instead of re-wrapping in a fresh
+    /// `{value, done}` — the inner object's identity/extra props are observable.
+    pending_yield_raw: bool,
+    /// Set by an `Await` op (the awaited value + the Await's ip + the activation's
+    /// live `try` handlers); `drive_async` `.take()`s it to suspend the async
+    /// activation, mirroring `pending_yield`. Unlike generators, async activations
+    /// PRESERVE handlers across a suspension so `try { await p } catch` works.
+    pending_await: Option<(Value, usize, Vec<Handler>)>,
+    /// Scratch slot for NewPromiseCapability: the capturing executor (CAP_EXECUTOR)
+    /// writes its (resolve, reject) arguments here during `new C(executor)`, which
+    /// `new_promise_capability` `.take()`s immediately after construction. `Some`
+    /// while a capture is in flight (a second executor call → TypeError).
+    cap_capture: Option<(Value, Value)>,
+    /// FIFO microtask queue — the entire event loop (no timers/IO exist). Drained
+    /// to empty by `drain_microtasks` after the main script returns; a microtask
+    /// may enqueue more, which run in the same drain.
+    /// B215: the receiver half of the collection intrinsic proof, cached
+    /// per (idx, method) under the receiver's heap version (see
+    /// `collection_method_is_intrinsic`). Direct-mapped; entries are
+    /// (idx, version, name_id, kind); idx == u32::MAX is empty.
+    pub(crate) coll_proof_cache: [(u32, u32, u8, u8); COLL_PROOF_SLOTS],
+    microtasks: std::collections::VecDeque<Microtask>,
+    /// B214: the microtask currently EXECUTING, kept reachable for the GC.
+    /// `drain_microtasks` used to suspend collection for each task's whole
+    /// scope instead — but a top-level-await module's entire body is ONE
+    /// microtask, so a TLA program ran with GC off (npm-nanoid: 1 minor for
+    /// 240k allocs, peak 241k slots vs the 16k budget; a long-lived TLA
+    /// server shape grows without bound). Rooting the in-flight task lets
+    /// the interpreter's ordinary safepoints work inside resumed bodies.
+    /// Saved/restored around nested drains.
+    current_microtask: Option<Microtask>,
+    /// Heap Values held only in Rust by an in-flight Promise abstract operation:
+    /// fresh targets, capability functions, and transient constructor results.
+    /// Executors/callbacks/`then` getters may re-enter and collect, so keep a
+    /// small nesting stack in the VM root set instead of disabling GC across
+    /// arbitrary JavaScript.
+    promise_resolution_roots: Vec<u32>,
+    /// Test262 host reporting (`ZIPP_REPORT_UNHANDLED=1`, which
+    /// tools/run_test262.py sets): promises that a THROWING JOB rejected while
+    /// no handler was attached, in rejection order. GC ROOTS: a `.then`
+    /// dependent is unreachable once its reaction has run, and that is exactly
+    /// the rejection being reported. `report_unhandled_errors` names the ones
+    /// still unhandled at exit. Never pushed when reporting is off.
+    unhandled_rejections: Vec<u32>,
+    /// Set only while `reject_thrown_job` is settling a promise, so `settle`
+    /// can tell an exception that escaped a job from an ordinary
+    /// `reject(value)`. Test262 scores the first as a lost failure and the
+    /// second not at all.
+    rejecting_thrown_job: bool,
+    /// Marker lines for exceptions that escaped a `setTimeout` callback,
+    /// recorded only while reporting is on (the event loop otherwise drops
+    /// them, as it has no HostReportErrors hook).
+    uncaught_timer_errors: Vec<String>,
+    report_unhandled: bool,
+    /// The `.raw` array of a tagged-template strings object, keyed by the cooked
+    /// array's heap index. Arrays don't carry named properties here, so a
+    /// template object's `raw` lives in this side table (read by `get_prop`).
+    template_raws: std::collections::HashMap<u32, Value>,
+    /// GetTemplateObject memoization: the canonical frozen tagged-template object
+    /// per source call site, keyed by (function id, per-function site index). The
+    /// cached objects are permanent GC roots (they live as long as the realm).
+    template_cache: std::collections::HashMap<(u32, u32), Value>,
+    /// `(JIT ic site, receiver shape) -> slot`, for the JIT's named-property
+    /// Get/Set MISS paths.
+    ///
+    /// The JIT's cache ways are keyed on receiver IDENTITY, so a site reading one
+    /// property from many objects of the SAME shape thrashes all eight ways and
+    /// misses every time — measured as a cliff at exactly 9 receivers, flat and
+    /// 100% miss thereafter. Every one of those misses then re-ran `map.pos(key)`,
+    /// a string scan, to rediscover a slot the shape already determines.
+    ///
+    /// Sound for the same reason the interpreter's shape guard is: a named
+    /// property's key is a compile-time constant (`string_constants[name]`),
+    /// and a shape fixes the whole key -> slot mapping. Both helpers still
+    /// revalidate live bounds, key and descriptor before reading/writing.
+    /// Bounded because shapes and sites are bounded; pure memo entries may be
+    /// dropped freely.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_shape_slot: rustc_hash::FxHashMap<(u32, u32), u32>,
+    /// Prototype objects known to contribute NOTHING to a `for-in`: no own key
+    /// is enumerable, and none can shadow a farther level because the walk ends
+    /// there. Keyed by heap index, valued by the heap version the answer was
+    /// computed at, so any structural change to the object invalidates it.
+    ///
+    /// This exists for one shape, which is almost every shape:
+    /// `obj -> %Object.prototype% -> null`. `%Object.prototype%` carries a dozen
+    /// own methods, all non-enumerable, and the walk re-derived that on EVERY
+    /// `for-in` — running `spec_key_order` over its whole key list and testing
+    /// each key. Measured, `for (k in o)` on a one-key object cost 185ns against
+    /// node's 3.
+    for_in_barren: rustc_hash::FxHashMap<u32, u32>,
+    /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index —
+    /// see [`proxy_regexp::RegexpIterRec`] for the record's fields.
+    // W11 (B124): FxHashMap — the fused matchAll step probes this map once
+    // per step (600k/run on regex-log-scan); SipHash was ~17ns of that probe.
+    regexp_string_iters: rustc_hash::FxHashMap<u32, proxy_regexp::RegexpIterRec>,
+    /// Drained matchAll scans for live `ITFB_FUSED` iterators, keyed by the
+    /// same iterator heap index as (and pruned alongside) the
+    /// `regexp_string_iters` record — see [`proxy_regexp::MatchBatch`].
+    /// Integers only: GC never traces it (the paired record roots the
+    /// matcher and subject).
+    matchall_batches: rustc_hash::FxHashMap<u32, proxy_regexp::MatchBatch>,
+    /// Allocation scratch for the batch's per-step publish (the capture Vec a
+    /// `regress::Match` owns) and per-drain triple storage: taken empty,
+    /// returned cleared, so the steady state re-mallocs neither. Plain ranges
+    /// and integers — never traced, never pruned.
+    matchall_caps_scratch: Vec<Option<std::ops::Range<usize>>>,
+    matchall_flat_scratch: Vec<u32>,
+    /// The UTF-16 code units of the last non-ASCII RegExp exec subject, so a
+    /// global exec/match/split/replace loop over one string encodes it once
+    /// instead of once per exec (see [`proxy_regexp::RegexSubjectUnits`]).
+    /// Integers only: never traced; a major GC drops it with its subject.
+    regex_subject_units: Option<proxy_regexp::RegexSubjectUnits>,
+    /// Native bytes owned by completed RegExp matches that an outer operation
+    /// retains while guest code can re-enter the VM (notably functional
+    /// replacement callbacks). `heap_bytes()` cannot see those Rust-local
+    /// `Vec`s, so every nested bounded search subtracts this process-wide-for-
+    /// the-VM reservation from both its fixed regex allowance and finite heap
+    /// headroom. An `Arc` lets the scoped guard release without borrowing the
+    /// VM across the callback.
+    #[cfg(feature = "safe-sandbox")]
+    regex_transient_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Single pending result for the exact MEM-only non-global exec region.
+    /// No native/user-code re-entry is permitted while populated; every
+    /// region exit first materializes it into its skipped global binding.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    regexp_scalar_exec_pending: Option<proxy_regexp::RegexpScalarExecPending>,
+    /// RegExp legacy statics backing `RegExp.input`/`$_`/`lastMatch`/`$&`/
+    /// `lastParen`/`$+`/`leftContext`/`$``/`rightContext`/`$'`/`$1`–`$9`, laid
+    /// out as [input, lastMatch, lastParen, leftContext, rightContext, $1..$9]
+    /// (14 slots). Refreshed by every successful RegExpBuiltinExec; empty until
+    /// the first match (the accessors then yield their empty-string defaults).
+    regexp_last: Vec<Value>,
+    /// Native iterator steps taken so far, for the heap-ceiling re-check
+    /// inside long drains (`iterhelpers::note_iterator_drain_step`). Wraps.
+    pub(crate) iterator_drain_steps: u32,
+    /// The eight `typeof` result strings, interned once in `setup_globals` (so
+    /// below `gc_floor` and pinned for the VM's lifetime). Indexed by position in
+    /// [`crate::bytecode::TYPEOF_NAMES`]. `UNDEFINED` before setup runs, which
+    /// `typeof_value` treats as "not ready" and falls back to allocating.
+    ///
+    /// Before this, every unfused `typeof` allocated a fresh string and the
+    /// `t === "number"` that follows content-compared it: 65ns per evaluation
+    /// against the fused `TypeOfIs` form's 4ns.
+    typeof_strs: [Value; 8],
+    /// Deferred form of `regexp_last`'s slots 2..=13 after a successful match on a
+    /// flat-ASCII subject: the twelve of them are all slices of that one subject,
+    /// and materialising them cost ~8.7% of `regex-log-scan` for values almost no
+    /// program reads (see `regexp_exec_impl` and `regexp_last_materialise`).
+    /// `Some` means slots 2..=13 of `regexp_last` hold placeholders and the getter
+    /// must materialise first. Cleared by the eager (non-ASCII) path.
+    regexp_last_lazy: Option<RegexpLastLazy>,
+    /// Native re-entry depth of `run_loop`: calls INSIDE one interpreter
+    /// invocation stay flat (frame push + re-loop), but every NESTED entry — a
+    /// builtin callback's `call_value`, a generator/async resume, a direct
+    /// eval, a JIT bail-out — is a real Rust frame on the OS stack. Runaway
+    /// recursion THROUGH those re-entries (a generator body re-entering its
+    /// driver) would overflow the native stack long before MAX_FRAMES, so the
+    /// nesting is capped (see MAX_RUN_LOOP_DEPTH) and surfaces as a catchable
+    /// RangeError instead.
+    run_loop_depth: u32,
+    /// Active Rust recursion edges through guest-controlled Proxy/prototype
+    /// meta-operations. Unlike `run_loop_depth`, this covers transparent native
+    /// forwarding that never re-enters the bytecode loop.
+    native_recursion_depth: u32,
+    /// Consecutive `try_tail_reuse` activations since the last frame pop.
+    /// Tail reuse grows neither `frames` nor the native stack, so runaway
+    /// tail recursion is invisible to both depth guards — this streak counter
+    /// is its budget (see MAX_TAIL_REUSE_STREAK). Reset by `pop_frame_with`;
+    /// any terminating tail loop pops eventually and starts fresh.
+    tail_reuse_streak: u32,
+    /// Heap indices currently being stringified by Array join/toString/
+    /// toLocaleString. A recursive encounter contributes an empty element;
+    /// the bounded stack also prevents acyclic guest graphs from consuming the
+    /// native/WASM stack inside one VM instruction.
+    array_stringify_active: Vec<u32>,
+    /// RegExp heap idx → EXACT WTF-8 bytes of its [[OriginalSource]], present
+    /// ONLY when the pattern holds lone surrogates (the struct's `source:
+    /// String` field is the LOSSY view — U+FFFD per surrogate). The `source`
+    /// getter / `toString` / re-compile paths check this first so a
+    /// lone-surrogate pattern round-trips exactly. Holds no `Value`s (pure
+    /// bytes, idx-keyed): GC only needs the sweep-time retain in gc.rs.
+    regexp_exact_source: std::collections::HashMap<u32, Vec<u8>>,
+    /// Compiled-pattern cache, keyed by (source text, regress flags, byteopt):
+    /// `RegExp.prototype[@@matchAll]` / `@@split` CONSTRUCT a species clone of
+    /// the regex per call (per spec), which would re-parse + re-compile the
+    /// same pattern on every iteration of a hot loop. The compiled program is
+    /// immutable, so identical (source, flags) share one `Arc`.
+    /// Lone-surrogate patterns (exact-bytes side channel) bypass the cache.
+    /// Holds no `Value`s; cleared wholesale when it exceeds a small cap.
+    regex_compile_cache:
+        rustc_hash::FxHashMap<(String, String, bool), std::sync::Arc<regress::Regex>>,
+    /// Reusable pointer/size pairs for deduplicating shared compiled RegExp
+    /// programs during the periodic resident-memory audit. Regex literals,
+    /// species clones, the compile cache, and inline ASCII twins can all hold
+    /// the same `Arc`; charging it once per reference would reject harmless
+    /// clones while still failing to describe actual resident memory.
+    regex_program_audit_scratch: std::cell::RefCell<Vec<(usize, usize)>>,
+    /// Lazy SameValueZero hash index over a Map/Set/WeakMap/WeakSet's backing
+    /// Vec, keyed by the collection's heap index (see vm/collections.rs). An
+    /// ABSENT entry means linear-scan behavior (always correct); an entry is
+    /// built once a collection crosses the size threshold and maintained by
+    /// the coll_* helpers every mutation routes through. Holds NO `Value`s
+    /// (u32 hash tags -> u32 slot positions): GC only needs the sweep-time
+    /// hygiene retain in gc.rs.
+    collection_index: rustc_hash::FxHashMap<u32, collections::CollIndex>,
+    /// Monotone counter minting a fresh private brand per class evaluation (1 = first;
+    /// 0 = unbranded).
+    next_private_brand: u64,
+    /// A class method/getter/setter VALUE (and the class VALUE itself, for ctor /
+    /// field-init / static blocks) heap index → the ORDERED lexical private-brand
+    /// CHAIN of its class body: own brand first, then each lexically ENCLOSING
+    /// class's brand. A private access threaded with lexical DEPTH d checks the
+    /// receiver against `chain[d]` — the SPECIFIC declaring class's brand. Pruned by GC.
+    method_brand: crate::slot_table::SlotTable<Vec<u64>>,
+    /// Extra private brands installed on a specific INSTANCE that its `map.class`
+    /// chain does not cover — namely a constructor RETURN-OVERRIDE object, which
+    /// receives a class's private fields/brand without becoming an instanceof that
+    /// class. Checked by `instance_has_brand` alongside the class chain. Pruned by GC.
+    instance_brand: crate::slot_table::SlotTable<Vec<u64>>,
+    /// Private NAMES (with the "#" prefix) declared by the class owning each brand.
+    /// Lets a private access resolve "#x" to the innermost brand in the lexical
+    /// chain whose class actually declares it (precise + shadow-aware) instead of
+    /// accepting ANY chain brand. A name absent here falls back to the lenient
+    /// any-brand check. Keyed by brand; pruned by GC to brands still referenced.
+    brand_private_names: rustc_hash::FxHashMap<u64, Vec<(String, u8)>>,
+    /// Brand -> heap index of the class VALUE that minted it (the DECLARING
+    /// class), so a private access resolves members from the declaring class
+    /// rather than the receiver's chain (kind-aware: shadowed/missing
+    /// getter/setter errors). NOT a GC root: pruned when the class dies (no
+    /// live accessor can then need it).
+    brand_owner: rustc_hash::FxHashMap<u64, u32>,
+    /// Lazily-created `.prototype` object for a function/class value, keyed by the
+    /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
+    /// stable object (identity: `C.prototype === C.prototype`), so it is built on
+    /// first access and cached here. For a class it carries the own methods +
+    /// `constructor`; for a plain function just `constructor`.
+    prototypes: crate::slot_table::SlotTable<u32>,
+    /// Reverse of `prototypes` for CLASS values only: materialized prototype
+    /// object → its class. Consulted (behind `ObjMap::class_proto`) when such a
+    /// prototype is mutated; an entry is trusted only while `prototypes` still
+    /// pairs the two. Pruned with the other slot-keyed tables.
+    class_proto_owner: rustc_hash::FxHashMap<u32, u32>,
+    /// A built-in constructor object's `name` as created ([[InitialName]]),
+    /// captured just before the first redefinition or deletion of its own
+    /// `name` so `Function.prototype.toString` keeps rendering a well-formed
+    /// NativeFunction. Pruned with the other slot-keyed tables.
+    ctor_initial_name: rustc_hash::FxHashMap<u32, String>,
+    /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
+    /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
+    proto_of: crate::slot_table::SlotTable<Value>,
+    /// Per-function-id LEARNED own-property count of the instances a user
+    /// constructor produces, used to pre-size the next instance's `ObjMap`.
+    ///
+    /// An object literal gets its size from `NewObject { hint }` or its
+    /// compiler-prepared `NewPlannedObject` key count; a constructor has no
+    /// equivalent, so `new P(a, b)` started from an EMPTY map and every
+    /// `this.x = v` paid an allocation-or-regrow of all three parallel vectors.
+    /// Measured, that made a two-field constructor 71ns/field against the same
+    /// two fields in a literal at 28ns/field.
+    ///
+    /// Learned rather than computed from the bytecode because the property count
+    /// is a runtime fact — conditional assignments, a loop over a config object,
+    /// a superclass — and getting it slightly wrong costs only capacity. It is a
+    /// pure allocation hint: it never changes which properties exist, so a stale
+    /// or absent entry is always correct.
+    ctor_field_hint: Vec<u16>,
+    /// Own properties set on a function value (`fn.x = y`, e.g. `assert.sameValue`),
+    /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
+    /// so their (rare) own props live here.
+    fn_props: crate::slot_table::SlotTable<ObjMap>,
+    /// The own-property state of every exotic object that has nowhere inline to
+    /// put it, keyed by its heap index: an Array's named props (`arr.foo = 1`,
+    /// and a regex match-result's `index`/`input`/`groups`), a Map/Set/Date/
+    /// RegExp/Intl instance's assigned props, and the per-object
+    /// extensible/sealed/frozen markers. `HeapObj::Array` is a dense `Vec<Value>`
+    /// with no inline property map, so this mirrors `fn_props` for callables.
+    ///
+    /// NOT only named keys, despite the name: a SPARSE element past the dense
+    /// prefix and a `defineProperty`'d index override both live here under the
+    /// canonical decimal key, and `length` can too. That is why the dense-array
+    /// fast paths cannot use mere presence as their disqualifier — they have to
+    /// ask whether any key here actually names an element.
+    ///
+    /// Keyed by heap slot, so it is a [`crate::slot_table::SlotTable`] rather than
+    /// a hash map: `exec`/`matchAll` park `index`/`input`/`groups` here, which on
+    /// `regex-log-scan` inflates the table to hundreds of thousands of entries
+    /// inside one phase. Ablating those four properties is −14.9% of that row and
+    /// **79% of it survives when only the table insert is removed** — the cost was
+    /// the container, not the properties. See the `slot_table` module note.
+    arr_props: crate::slot_table::SlotTable<ObjMap>,
+    /// Compact pristine `RegExpBuiltinExec` result metadata. This is disjoint
+    /// from `arr_props`: the first operation that can change descriptors, key
+    /// order, or extensibility moves the record there. Its Values are GC roots
+    /// while the owning Array is live, just like an `arr_props` entry's values.
+    regexp_result_props: crate::slot_table::SlotTable<RegexpResultProps>,
+    /// Resizable ArrayBuffers: heap idx → maxByteLength. Presence marks a buffer
+    /// as resizable (a side table avoids changing the ArrayBuffer heap variant).
+    ab_max: std::collections::HashMap<u32, usize>,
+    /// Length-tracking TypedArrays/DataViews (created on a resizable buffer with
+    /// no explicit length): heap idx set. Their effective length follows the
+    /// buffer's current byte length.
+    ta_tracking: std::collections::HashSet<u32>,
+    /// Heap indices of async activations (`AsyncState` / `AsyncGenerator`) that
+    /// may still be suspended. A suspended activation is referenced only by the
+    /// await-reaction it registered — a cycle the program cannot otherwise reach
+    /// — so the collector must root it explicitly. It used to find them by
+    /// LINEARLY SCANNING THE WHOLE HEAP on every collection, which costs
+    /// ~2.8ns per slot in every program, including programs with no async code
+    /// at all (measured 1.9% of the benchmark suite, streaming hundreds of MB to
+    /// find nothing). Registering the two allocation sites instead makes the
+    /// root phase proportional to the number of activations. Stale entries are
+    /// pruned in the same pass that roots them, so completion needs no
+    /// deregistration at any of the 11 sites that finish an activation.
+    async_activations: Vec<u32>,
+    /// Length-tracking DataViews (created on a resizable/growable buffer with no
+    /// explicit byteLength): heap idx set. Their byteLength follows the buffer's
+    /// current size, and byteLength/byteOffset throw (IsViewOutOfBounds) once the
+    /// offset exceeds the shrunk buffer.
+    dv_tracking: std::collections::HashSet<u32>,
+    /// Callables expose `name`/`length` as synthesized own properties (computed
+    /// from the proto, not stored). They're `configurable: true`, so `delete
+    /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |
+    /// 1=length)`. Empty in normal programs; only `delete` on these keys fills it.
+    deleted_callable_intrinsics: std::collections::HashSet<(u32, u8)>,
+    /// Names of built-in globals (`Number`, `Date`, …) removed via
+    /// `delete globalThis.X`. They live in `builtin_globals`/`globals`, not as own
+    /// `global_this` entries, so deletion is recorded here and `global_by_name`
+    /// gates on it — making get/has-own/descriptor all agree the property is gone.
+    /// Empty in normal programs; cleared for a name when it's re-defined.
+    deleted_globals: std::collections::HashSet<String>,
+    /// THE GLOBAL-ROUTE EPOCH. Bumped whenever a global slot stops being the thing
+    /// compiled code assumes every slot is — "a live, plain, writable data binding
+    /// readable and writable as `[r12 + idx*8]`".
+    ///
+    /// Compiled code checks that assumption ONCE, at compile time
+    /// (`globals_ok` in the Tier A/C gate, `region_globals_ok`,
+    /// `build_leaf_inline_plan`), and those checks all rest on "once a slot holds a
+    /// real value it can never go back". That is false in exactly two ways, and both
+    /// were silent wrong answers at default thresholds (B66's first two open items):
+    ///
+    /// * `delete implicitG` returns the slot to `UNINITIALIZED`. The interpreter's
+    ///   `LoadGlobal` throws ReferenceError on the sentinel; the emitted
+    ///   `mov rax, [r12 + idx*8]` handed it back as a value, which prints
+    ///   `undefined`.
+    /// * a REAL own property appears on the global object behind a slot
+    ///   (`Object.defineProperty(globalThis, "x", …)`), after which a store must
+    ///   route through `[[Set]]` — `global_real_own_route`, which the interpreter
+    ///   consults and native code did not.
+    ///
+    /// `0` — the value for every program that does neither — makes the entry check a
+    /// single compare against zero, so the common path pays one `cmp`. See
+    /// `Vm::jit_globals_still_routable`.
+    global_route_epoch: u32,
+    /// Memo for the (rare) non-zero-epoch entry check: `func_id` → the epoch at
+    /// which its direct global accesses were last VALIDATED, and the verdict. Keeps a
+    /// hot function that survived a global delete from re-scanning its whole body on
+    /// every call. Only ever touched while `global_route_epoch != 0`.
+    jit_global_route_ok: rustc_hash::FxHashMap<u32, (u32, bool)>,
+    /// One u32 GENERATION per global slot, bumped by every NON-BYTECODE Rust
+    /// write to `globals` (`Vm::bump_global_gen`). A spliced leaf call whose
+    /// callee register provably holds slot g's value guards `global_gens[g]`
+    /// (one 32-bit compare) instead of re-checking the callee bits+version per
+    /// execution — sound only for slots NO bytecode store can ever hit (see
+    /// `bytecode_stored_slots`), which makes the enumerated Rust writers
+    /// exhaustive. Reserved with `globals` at boot, grown in lockstep with it
+    /// and NEVER reallocated (the JIT bakes element addresses); module
+    /// bookkeeping draws from that same preallocated pool.
+    global_gens: Vec<u32>,
+    /// Global slots ANY bytecode store op targets (StoreGlobal / -Strict /
+    /// -Resolved / -Dyn / EvalScopeSet), collected over the main program at
+    /// boot and extended by every eval/Function registration. `slot_guard`
+    /// keying declines for members — fail-closed: a slot writable by bytecode
+    /// could change without a `bump_global_gen`.
+    bytecode_stored_slots: rustc_hash::FxHashSet<u32>,
+    /// Global-slot indices that `CheckGlobalResolvable` (a strict `name = …` on
+    /// a name this program never declares) found UNRESOLVABLE when the reference
+    /// was created, i.e. before the RHS evaluated. PutValue's ReferenceError
+    /// fires only AFTER the RHS (an RHS throw wins), so the check records here
+    /// and the matching `StoreGlobalResolved` raises at store time. Nested
+    /// assignments stack (`a = (b = 1)`); a later check that finds the slot
+    /// resolvable clears any stale entry a caught RHS throw left behind.
+    strict_unresolvable_globals: Vec<u32>,
+    /// Heap indices of arrays whose `length` was made non-writable via
+    /// `Object.defineProperty(arr, "length", { writable: false })`. An array's
+    /// length lives in the dense Vec with no per-array attribute state, so the
+    /// (rare) non-writable flag is recorded here — read by the length descriptor,
+    /// `arr.length = n`, and the push/pop/shift/unshift mutators.
+    ///
+    /// A bit a slot (`SlotSet`): every dense-array pin snapshot and compiled
+    /// append tests it, and the test is one load. It was a hash set of its
+    /// own kind, which each WebAssembly module carried a table for.
+    array_length_nonwritable: crate::slot_table::SlotSet,
+    /// SPARSE arrays: heap idx → the JS `length` when it EXCEEDS the dense
+    /// element count (`new Array(4e9)`, `a[3e9] = v`, `a.length = 2**32-1`).
+    /// Sparse elements themselves live in `arr_props` under canonical index
+    /// keys (GC-traced there); this table holds no Values — sweep-only. Absent
+    /// for every fully-materialized array, so dense behavior is unchanged
+    /// (`js_array_len` falls back to `items.len()`). Values are `1..=u32::MAX`
+    /// (a JS length is at most 2^32-1) and always exceed both the dense length
+    /// and `MAX_DENSE_ARRAY_LEN` at insertion time.
+    array_js_len: crate::slot_table::SlotTable<u32>,
+    /// The INDEXED-PROTOTYPE PROTECTOR, inverted: `false` means "nothing in a plain
+    /// array's prototype chain can supply an integer index", which is the state every
+    /// hole/OOB/append/bounded-gap fast path — interpreter and JIT helper alike —
+    /// requires before it may answer absence itself.
+    ///
+    /// Sticky: it is set, never cleared, for the life of the VM. Reconstructing
+    /// validity after the mutations that invalidate it is not worth the correctness
+    /// risk, and they are rare. Two distinct mutations invalidate it, and BOTH must
+    /// go through [`Vm::invalidate_indexed_proto_protector`]:
+    ///
+    /// 1. an integer-like own property DEFINED on `Array.prototype`/`Object.prototype`
+    ///    (`note_array_proto_index`);
+    /// 2. RE-PROTOTYPING one of them — `Object.setPrototypeOf(Array.prototype, x)`
+    ///    splices a whole new chain in, and `x` may supply the index now or gain one
+    ///    later. B66 left this half open: the protector saw only (1), so a hot
+    ///    `a[5]` kept inventing `undefined` where the interpreter answered `"M5"`.
+    ///
+    /// Every reader must treat `true` as "MAY supply an index" — i.e. as a demand for
+    /// the full protocol — never as an assertion that one exists.
+    array_proto_has_index: bool,
+    /// Heap indices of derived-class instances whose `super(...)` has run during
+    /// construction (set by the SuperCtor ops, read+cleared in `construct`). A
+    /// derived constructor that returns `undefined` without `super()` having run
+    /// throws a ReferenceError. Transient — entries live only across one
+    /// in-flight `construct`.
+    super_called: crate::slot_table::SlotSet,
+    /// Heap indices of derived-class instances whose `this` is still in the
+    /// constructor TDZ (between derived-ctor entry and its `super()`
+    /// completing). The `ThisCheck` op throws a ReferenceError while the
+    /// instance is here. Transient — inserted by `construct`/`run_class_ctor`,
+    /// removed on `super()` completion and cleared on every `construct` exit.
+    this_tdz: crate::slot_table::SlotSet,
+    /// The produced `this` of a completed `super(...)` whose parent ctor
+    /// RETURN-OVERRODE the instance, keyed by the pre-allocated instance's heap
+    /// index. A derived ctor that then returns `undefined` must yield THIS
+    /// value as the construction result (reg 0 was rebound, but the original
+    /// instance is what `construct` holds). Read+cleared by `construct` /
+    /// `run_class_ctor`; transient like `super_called`.
+    super_this: crate::slot_table::SlotTable<Value>,
+    /// Private FIELD storage — spec [[PrivateElements]] of kind "field":
+    /// instance heap idx -> ((brand, name) -> value). Keyed by the
+    /// per-evaluation brand so same-named fields of sibling classes or other
+    /// evaluations never collide; invisible to reflection, proxy traps and
+    /// property enumeration by construction. Values are GC roots; entries
+    /// pruned when the instance dies.
+    private_fields: std::collections::HashMap<u32, std::collections::HashMap<(u64, String), Value>>,
+    /// Heap index of the canonical %eval% native — the DirectEval op's runtime
+    /// identity check (a REBOUND global `eval` gets an ordinary call).
+    eval_fn_idx: u32,
+    /// EvalScope stamps for closures created in frames that carry one (so
+    /// arrows/functions made during or after the eval still see its
+    /// bindings). Keyed by the closure value's heap index; pruned at GC.
+    closure_eval_scope: JitGuardedMap,
+    /// EvalScope → the ENCLOSING EvalScope it was created under (child → parent).
+    /// A closure stamped with its creator's scope that then runs a direct eval of
+    /// its own gets a fresh scope of its own — which used to REPLACE the stamp,
+    /// hiding the creator's eval `var`s from the rest of the closure body
+    /// (staging/sm/regress/regress-554955-{2,3}.js: `b` read the global 1, not
+    /// the 2 the creator's `eval("var b = 2")` had bound). Pruned at GC.
+    eval_scope_parent: std::collections::HashMap<u32, u32>,
+    /// Memo per func id: 0 unknown, 1 no, 2 yes — "code contains a sloppy
+    /// function-context DirectEval". Drives EAGER EvalScope creation at
+    /// closure-stamp time, so closures made before the eval call share the
+    /// scope the eval later populates.
+    sloppy_eval_memo: Vec<u8>,
+    /// Heap indices of the built-in prototype objects (`Object.prototype`,
+    /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
+    /// the [[Prototype]] for plain objects / functions / arrays so their methods
+    /// resolve as values and `getPrototypeOf` returns them. 0 until set up.
+    obj_proto: u32,
+    fn_proto: u32,
+    /// The `Function` constructor object — identified in `construct` /
+    /// `call_ctor_as_function` so `new Function(args, body)` / `Function(...)`
+    /// compile and return a real function (via `do_eval` of a function literal).
+    function_ctor: u32,
+    /// The %GeneratorFunction% / %AsyncFunction% / %AsyncGeneratorFunction%
+    /// intrinsic constructors and their `.prototype` objects. Not global — reached
+    /// via `Object.getPrototypeOf(function*(){}).constructor` etc. A generator/
+    /// async/async-generator function's [[Prototype]] is the matching `*_fn_proto`
+    /// (so its `.constructor` resolves to the matching ctor); the ctors build new
+    /// functions via `do_eval` of `(function*|async ... anonymous(){...})`.
+    gen_fn_ctor: u32,
+    gen_fn_proto: u32,
+    async_fn_ctor: u32,
+    async_fn_proto: u32,
+    asyncgen_fn_ctor: u32,
+    asyncgen_fn_proto: u32,
+    arr_proto: u32,
+    /// %Array.prototype%'s own `length` (it is an Array EXOTIC object):
+    /// tracks integer-index definitions on it; writable, non-enumerable,
+    /// non-configurable.
+    arr_proto_len: u32,
+    /// The `Array` constructor (the `%Array%` intrinsic). 0 until setup. Used by
+    /// ArraySpeciesCreate to take the fast dense path when the resolved species is
+    /// just `%Array%` itself.
+    array_ctor: u32,
+    /// Exact main-realm identities for the guarded `GlobalFn` bytecode, indexed
+    /// by `GlobalFn::index()`. A fixed table keeps the hot guard hash-free.
+    global_fn_intrinsics: [u32; crate::bytecode::GlobalFn::COUNT],
+    /// Exact main-realm identities for captured `RegExpMethod` calls. Unlike a
+    /// live prototype-slot proof these remain valid when an argument mutates
+    /// the property after EvaluateCall has already captured its old value.
+    regexp_method_intrinsics: [u32; crate::bytecode::RegExpMethod::COUNT],
+    /// Exact main-realm identities consumed by RegExp protocol-collapse proofs
+    /// (`exec`, Symbol methods, flags accessors, and `@@species`). Native ids are
+    /// shared by realm copies, so they are not an identity proof.
+    regexp_protocol_intrinsics: [u32; proxy_regexp::REGEXP_PROTOCOL_INTRINSIC_COUNT],
+    /// `String.prototype` — primitive string values delegate here for method
+    /// access (`"x".charAt`, `"x".slice`, …, as values), 0 until `setup_globals`.
+    str_proto: u32,
+    /// `Map`/`Set`/`Date`/`Promise`.prototype — instances delegate here for
+    /// method access as VALUES (`new Map().set`, `d.getHours`). 0 until set up.
+    map_proto: u32,
+    set_proto: u32,
+    /// B183: memo for `collection_method_is_intrinsic`'s prototype half —
+    /// per (kind: 0=Set,1=Map) × (method-name id) the proven
+    /// `(proto_version, slot, method fn bits)`. A hit re-checks the LIVE
+    /// version (key add/remove/redefine/freeze/setPrototypeOf all bump it)
+    /// AND the live slot's Value bits (an in-place overwrite of the same
+    /// slot bumps nothing — the B78-style value guard is what makes a
+    /// version cache sound here, exactly as the string-method doc warns).
+    /// Pure cache: entries self-validate, nothing invalidates them.
+    coll_intrinsic_memo: [[Option<(u32, u32, u64)>; COLL_MEMO_NAMES]; 2],
+    /// B191: boot-time snapshots of %String.prototype% / %Array.prototype%'s
+    /// own method slots (`name` → the installed native's Value bits, captured
+    /// at the end of `setup_globals`, when the native heap slots are pinned
+    /// below the GC floor). The primitive-method dispatch fast paths and the
+    /// JIT's dedicated helpers prove `live slot bits == baseline[name]`
+    /// before serving an intrinsic by name — overwriting, deleting, or
+    /// accessorizing a prototype method sends the call down the generic
+    /// property-Get route, which observes the override (the class the
+    /// string_regexp guard's doc records; B191 completes it).
+    str_proto_baseline: rustc_hash::FxHashMap<Box<str>, u64>,
+    arr_proto_baseline: rustc_hash::FxHashMap<Box<str>, u64>,
+    /// B191 memo over the proof above, exactly the B183 form: per hot name,
+    /// `(proto version, slot, fn bits)` — version+bits BOTH required (an
+    /// in-place overwrite bumps no version). Indexed by the small name enums
+    /// in builtins.rs.
+    str_intrinsic_memo: [Option<(u32, u32, u64)>; STR_MEMO_NAMES],
+    arr_intrinsic_memo: [Option<(u32, u32, u64)>; ARR_MEMO_NAMES],
+    date_proto: u32,
+    promise_proto: u32,
+    /// `Number`/`Boolean`.prototype — number/boolean PRIMITIVES delegate here for
+    /// method-as-value access (`(5).toFixed`, `true.toString`). 0 until set up.
+    num_proto: u32,
+    bool_proto: u32,
+    /// `WeakMap`/`WeakSet`/`WeakRef`.prototype — instances delegate here.
+    weakmap_proto: u32,
+    weakset_proto: u32,
+    weakref_proto: u32,
+    finreg_proto: u32,
+    /// The `WeakRef` / `FinalizationRegistry` constructor objects, so the
+    /// value-form `[[Construct]]` (Reflect.construct / subclassing) can build an
+    /// instance and honour `newTarget.prototype`.
+    weakref_ctor: u32,
+    finreg_ctor: u32,
+    /// The `WeakMap` / `WeakSet` constructor objects, so the value-form
+    /// `[[Construct]]` (Reflect.construct / subclassing) builds an instance,
+    /// honours `newTarget.prototype`, and AddEntriesFromIterable via the adder.
+    weakmap_ctor: u32,
+    weakset_ctor: u32,
+    /// Error prototypes, indexed by the canonical error kind (0=Error.prototype,
+    /// 1=TypeError.prototype, …, 7=AggregateError.prototype). The subtype protos
+    /// chain to `error_protos[0]`; every error instance links here via `proto_of`
+    /// so `.constructor`/`.name`/`.message`/`.toString`/`instanceof` resolve. 0
+    /// until `setup_globals`.
+    error_protos: [u32; 8],
+    /// The matching error constructor function values (`Error`, `TypeError`, …),
+    /// indexed the same way. Stored on each proto as `.constructor` and used by the
+    /// runtime `new (TypeError)()` / `Reflect.construct` path.
+    error_ctors: [u32; 8],
+    /// `Symbol.prototype` heap index (toString/valueOf/description) and the `Symbol`
+    /// constructor object heap index (callable, NOT constructable). 0 until setup.
+    symbol_proto: u32,
+    symbol_ctor: u32,
+    /// `BigInt.prototype` and the `BigInt` constructor object (callable, NOT
+    /// constructable — like `Symbol`). 0 until setup.
+    bigint_proto: u32,
+    bigint_ctor: u32,
+    /// `RegExp.prototype` and the `RegExp` constructor object. 0 until setup.
+    regexp_proto: u32,
+    regexp_ctor: u32,
+    /// `%RegExpStringIteratorPrototype%` — the prototype of the iterator returned
+    /// by `RegExp.prototype[Symbol.matchAll]` / `String.prototype.matchAll`.
+    regexp_string_iter_proto: u32,
+    /// The `%TypedArray%` intrinsic (abstract base ctor) + its prototype, the 11
+    /// concrete TypedArray ctors + their prototypes (indexed by `kind`), and the
+    /// `ArrayBuffer`/`DataView` ctors + prototypes. 0 until setup.
+    ta_base_ctor: u32,
+    ta_base_proto: u32,
+    ta_ctors: [u32; 12],
+    ta_protos: [u32; 12],
+    arraybuffer_ctor: u32,
+    arraybuffer_proto: u32,
+    dataview_ctor: u32,
+    dataview_proto: u32,
+    /// Boot snapshot for the interpreter's main-realm DataView getter proof.
+    /// The shape proves the prototype's exact key/descriptor layout; exact
+    /// `Value` bits prove each numeric getter still names its pinned intrinsic
+    /// function object (a native id alone would not prove realm identity).
+    dataview_proto_shape: u32,
+    dataview_numeric_getter_bits: [u64; 8],
+    /// `SharedArrayBuffer` ctor + prototype. A SharedArrayBuffer reuses the
+    /// `HeapObj::ArrayBuffer` representation; its heap index is recorded in
+    /// `shared_buffers` so property/prototype/`instanceof` resolution treats it as
+    /// shared (growable instead of resizable, never detached, `SharedArrayBuffer`
+    /// toStringTag). 0 until setup.
+    sab_ctor: u32,
+    sab_proto: u32,
+    /// Heap indices of ArrayBuffers that are actually SharedArrayBuffers.
+    shared_buffers: std::collections::HashSet<u32>,
+    /// Heap indices of ArrayBuffers that are immutable (ES2026): their `immutable`
+    /// getter is true, they are never resizable/detachable, and writes through a
+    /// TypedArray view throw a TypeError.
+    immutable_buffers: std::collections::HashSet<u32>,
+    /// ArrayBuffers a host holds a view over ([`HostCtx::typed_array_region`]):
+    /// GC roots for the VM's lifetime, and never resized, transferred or
+    /// detached, so the host's view stays over the bytes it was given.
+    pub(crate) pinned_buffers: std::collections::HashSet<u32>,
+    /// Heap indices of objects that have the [[ErrorData]] internal slot (real
+    /// Error instances — built-in error ctors, internal throws, and
+    /// `class X extends Error` instances). Distinguishes a true error from a
+    /// plain object that merely inherits Error.prototype (which `is_error_instance`
+    /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
+    /// getter. Pruned on GC sweep. Written once for every error made and
+    /// removed once for every error collected, so it is a bit a slot: as a
+    /// hashed set of slots those two were 7% of a throw-and-catch loop.
+    error_data: crate::slot_table::SlotSet,
+    /// Set by the module loader just before executing a MODULE BODY: the
+    /// next alloc_async (the body's own activation) marks its result promise
+    /// in module_body_results. Consumed (mem::take) at alloc_async entry.
+    pending_module_body_marker: bool,
+    /// Result promises of MODULE BODY activations: they settle with
+    /// UNDEFINED, never the body's completion value — spec Evaluate()
+    /// resolves the capability with undefined, so a thenable completion
+    /// value (e.g. a promise-valued last statement) must NOT be adopted
+    /// (adoption makes a completed module look suspended and deadlocks its
+    /// importers). Entries are removed at settle; pruned on GC sweep.
+    module_body_results: std::collections::HashSet<u32>,
+    /// Body promises of modules whose evaluation SUSPENDED (top-level await,
+    /// or deps still pending): canonical path → the promise importers settle
+    /// from. A LATER import of the same module (its namespace is already
+    /// cached) re-publishes this as pending_module_body so the new importer
+    /// chains on the SAME TopLevelCapability instead of resolving with the
+    /// incomplete namespace. Entries persist after settlement.
+    /// The bool: true = registered via the DEPS-PENDING (capability) path —
+    /// an ANCESTOR whose body waits on other suspended modules (a cycle
+    /// root); false = a direct top-level-await suspension. Late importers of
+    /// a TLA module inside a cycle wait on the cycle ROOT's capability.
+    module_body_promise: std::collections::HashMap<std::path::PathBuf, (Value, bool)>,
+    /// Typed-module cache: (canonical path, type attribute) → namespace for
+    /// `with { type: "json" | "text" }` imports — DISTINCT records from the
+    /// same file's JS module. Values are GC roots like module_cache.
+    typed_module_cache: std::collections::HashMap<(std::path::PathBuf, String), Value>,
+    /// The function VALUE being invoked for the generator/async allocation in
+    /// flight (set by the call site just before alloc_generator /
+    /// alloc_async / alloc_async_generator; consumed at their entry).
+    pending_gen_callee: Value,
+    /// Generator / AsyncGenerator heap index → the function
+    /// value that created it. Resumes bind it as Frame.callee so LoadCallee
+    /// (a named function expression's self-name) keeps the caller-visible
+    /// identity across suspensions. Values are GC roots; keys pruned on sweep.
+    gen_callee: crate::slot_table::SlotTable<Value>,
+    /// Heap indices of IMMUTABLE cells — named function expressions' own-name
+    /// bindings (MakeCellFnName). UpvalSet/StoreUpvalDyn writes through one
+    /// no-op in sloppy code and throw TypeError in strict code. Pruned on GC
+    /// sweep (the cells themselves are ordinary traced heap objects).
+    fn_name_cells: crate::slot_table::SlotSet,
+    /// Heap indices of `const`/`using` cells (MarkCellConst). A write through a
+    /// closure or a direct eval (UpvalSet/StoreUpvalDyn) is a TypeError in BOTH
+    /// modes — the compiler can only reject the declaring function's own
+    /// assignments, since `Binding::Upvalue` carries no const-ness. Pruned on GC
+    /// sweep like `fn_name_cells`.
+    const_cells: crate::slot_table::SlotSet,
+    /// B201: sticky "a const cell exists" byte for the emitted inline cell
+    /// ops (set at the single insert site, never cleared — GC pruning may
+    /// empty the set but the sticky byte just keeps the inline lane
+    /// declined, which is the safe direction).
+    pub(crate) const_cells_nonempty: u8,
+    /// B201: sticky nonempty byte for `fn_name_cells`, same contract.
+    pub(crate) fn_name_cells_nonempty: u8,
+    /// `$262.evalScript` flag: the NEXT eval-program instantiation uses SCRIPT
+    /// GlobalDeclarationInstantiation semantics (non-configurable brandNew
+    /// bindings, lexical-collision SyntaxErrors, realm-persistent lexicals)
+    /// instead of EvalDeclarationInstantiation. Consumed (mem::take) by
+    /// prepare_eval_program.
+    eval_script_gdi: bool,
+    /// Realm slots bound as LEXICALS (let/const/class) by `$262.evalScript`
+    /// scripts: collision SyntaxErrors + invisible to global-object property
+    /// reflection (the main program's own lexicals live in
+    /// program.lexical_globals).
+    eval_lexical_globals: std::collections::HashSet<u32>,
+    /// The `const` subset of eval_lexical_globals: a write to an INITIALIZED
+    /// one throws TypeError (the initializing write sees UNINITIALIZED).
+    eval_const_globals: std::collections::HashSet<u32>,
+    /// Realm slots declared var/function by `$262.evalScript` scripts —
+    /// HasVarDeclaration for later scripts' lexical-collision checks.
+    eval_var_globals: std::collections::HashSet<u32>,
+    /// Set while a PRELUDE script runs (`run_with_prelude` — the test262 harness).
+    /// CreateGlobalVar/FunctionBinding then initializes the SLOT rather than
+    /// parking an own property and leaving the slot UNINITIALIZED. A prelude is a
+    /// realm-setup script, not observed code, and the own-property representation
+    /// is only correct for paths that carry the interpreter's own-prop fallback:
+    /// every JIT tier reads the slot directly, so an own-backed binding read from
+    /// compiled code yields `undefined` and the two tiers disagree. Ordinary
+    /// `$262.evalScript` keeps the own-property behaviour, which the
+    /// non-configurability and reflection tests depend on.
+    pub(crate) eval_prelude_mode: bool,
+    /// `arguments` exotic objects (Array-backed): heap index → the live
+    /// [[ParameterMap]] for a MAPPED one (sloppy + simple params), or `None`
+    /// for an unmapped one (strict / non-simple). Presence alone drives the
+    /// `[object Arguments]` toString tag and the Array-exotic carve-outs
+    /// (ordinary `length`, no Vec growth). Pruned on GC sweep.
+    arguments_objs: crate::slot_table::SlotTable<Option<ArgsMap>>,
+    /// Generator/async-function activations with a MAPPED `arguments` object:
+    /// state heap index (HeapObj::Generator / AsyncState / AsyncGenState) → the
+    /// arguments object's heap index. Each resume re-links the [[ParameterMap]]
+    /// to the freshly spliced frame (`relink_mapped_args`), so the live aliasing
+    /// survives suspension. Pruned on GC sweep alongside `arguments_objs`.
+    gen_args_obj: std::collections::HashMap<u32, u32>,
+    /// Directory the running script was loaded from, used to resolve a dynamic
+    /// `import(specifier)` against the filesystem (relative + bare specifiers).
+    /// `None` when running from a string (eval/embedding) — then `import()` has no
+    /// host loader and rejects.
+    module_base_dir: Option<std::path::PathBuf>,
+    /// Optional canonical filesystem boundary for the module loader. Every
+    /// module read (including typed/deferred/source-phase imports and recursive
+    /// re-exports) must remain below this directory. `None` preserves the
+    /// unrestricted loader used by the compatibility CLI and test262. When set,
+    /// aggregate path/byte/depth budgets in `engine::modules` also apply.
+    module_root: Option<std::path::PathBuf>,
+    /// Maximum bytes read from any one module while `module_root` is active.
+    /// `None` preserves the unrestricted compatibility loader.
+    module_max_bytes: Option<u64>,
+    /// Host-provided module sources for a VIRTUAL module root, keyed by the
+    /// module's path under `module_root`. When installed, the loader resolves
+    /// specifiers lexically (never touching the filesystem) and asks this
+    /// closure for each module's bytes; a path it does not know is
+    /// "module not found". This is what lets an embedder (a Ruby binding)
+    /// register module sources in memory and import them with no files on disk.
+    pub(crate) module_provider:
+        Option<std::rc::Rc<dyn Fn(&std::path::Path) -> Option<Vec<u8>>>>,
+    /// Canonical confined module paths and the largest byte length successfully
+    /// observed for each. All loader variants share this ledger, so rereading a
+    /// file (including as a typed/deferred/source-phase module) does not charge
+    /// it twice; if it grows, only the growth is charged.
+    module_read_bytes: std::collections::HashMap<std::path::PathBuf, u64>,
+    /// Sum of `module_read_bytes`, bounded independently of the per-file cap.
+    module_total_bytes: u64,
+    /// Current confined module-loader recursion depth. This covers recursive
+    /// evaluation, prescans, and export/request graph walks.
+    module_load_depth: u32,
+    /// Dynamic-import namespace cache: resolved module path → its namespace value.
+    /// A module is evaluated at most once, so re-importing the same path returns the
+    /// SAME namespace object (identity). Values are GC roots (modules persist).
+    module_cache: std::collections::HashMap<std::path::PathBuf, Value>,
+    /// Module Namespace exotic objects: namespace heap index → its (export name →
+    /// global slot) map. Each module's exported bindings live in PER-MODULE fresh
+    /// global slots (see run_eval_program module mode), so a namespace's [[Get]]
+    /// reads the LIVE binding without colliding with another module's same-named
+    /// export. [[Set]] is a no-op. Pruned on GC sweep.
+    module_namespaces: std::collections::HashMap<u32, std::collections::HashMap<String, u32>>,
+    /// Modules CURRENTLY being linked (cycle detection): resolved path → its OWN
+    /// export name→live-slot map (re-exports not yet resolved). Present only during
+    /// `import_module`; a re-export back into an in-progress module (a self/mutual
+    /// cycle) resolves against this own-exports snapshot instead of recursing. Holds
+    /// only slot indices into `globals` (a GC root), so it needs no separate rooting.
+    module_own:
+        std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<String, u32>>,
+    /// Per-namespace AMBIGUOUS export names (a name supplied by two different
+    /// `export *` sources): excluded from the namespace; resolving one by name
+    /// through `export {x} from` / `import {x}` is a SyntaxError.
+    module_ambiguous: std::collections::HashMap<u32, std::collections::HashSet<String>>,
+    /// CANONICAL live global slot of each module's NAMESPACE binding
+    /// (canonical path → slot into `globals`, which is a GC root). Every
+    /// `import * as ns from M` local and `export * as n from M` entry aliases
+    /// THIS slot, so (a) the binding identity matches the spec's
+    /// (module, ~namespace~) ResolvedBinding — two star-export routes to the
+    /// same module's namespace are UNAMBIGUOUS — and (b) the namespace object
+    /// is trivially identical everywhere. Slot indices only — no rooting.
+    module_ns_slots: std::collections::HashMap<std::path::PathBuf, u32>,
+    /// CANONICAL live global slot of each module's ModuleSource binding
+    /// (`import source x from M`; the synthetic `<module source>` host module
+    /// included). The slot holds the target's %AbstractModuleSource%-linked
+    /// source object; aliasing it gives source re-exports the spec's
+    /// (module, ~source~) binding identity. Slot indices only — no rooting.
+    module_source_slots: std::collections::HashMap<std::path::PathBuf, u32>,
+    /// Per-module `import.meta` objects (module key = its namespace heap index
+    /// → the lazily-created meta object). Values are GC ROOTS (gc.rs).
+    module_metas: std::collections::HashMap<u32, u32>,
+    /// Unified-function-id ranges owned by loader-loaded modules:
+    /// (start, end, namespace heap index). The `ImportMeta` op resolves the
+    /// CURRENT module as the one whose range contains the executing frame's
+    /// func id (each module's functions install contiguously at prepare time);
+    /// ids outside every range (entry script / eval code) use the Vm-wide
+    /// `import_meta` singleton.
+    module_func_ranges: Vec<(u32, u32, u32)>,
+    /// The lazily-created `import.meta` object (for NON-loader code: the entry
+    /// script / direct `run_module` pipeline; host-defined, ordinary extensible
+    /// null-proto). 0 = not yet allocated. Loader-loaded modules each get a
+    /// DISTINCT object via `module_metas`.
+    import_meta: u32,
+    /// AgentCanSuspend: false when launched with ZIPP_CAN_BLOCK=0 (the
+    /// test262 CanBlockIsFalse harness mode) — Atomics.wait then throws.
+    can_block: bool,
+    /// The body promise of the most recent `import_module` whose top-level
+    /// await SUSPENDED (still Pending on return). Taken by the dynamic-import
+    /// site (which settles its promise from it) or by a static importer
+    /// (which rejects — stage-1 TLA). GC ROOT while set.
+    pending_module_body: Option<Value>,
+    /// Body/capability promises of STATIC dependencies that suspended at
+    /// top-level await, collected during the CURRENT import_module's link
+    /// (mark/split_off discipline keeps nested links separate). GC ROOTS.
+    link_pending_deps: Vec<Value>,
+    /// Registered Atomics.waitAsync waiters: (buffer heap idx, byte address,
+    /// pending promise idx, optional deadline, global-registry waiter id).
+    /// `notify` (local or via the cross-thread mailbox) resolves matching
+    /// entries "ok"; a due deadline resolves "timed-out" in the event loop —
+    /// unless its registry entry is already gone (a notify won the race).
+    /// Buffer + promise indices are GC ROOTS; the id needs no rooting.
+    async_waiters: Vec<(u32, usize, u32, Option<clock::Instant>, u64)>,
+    /// `$262.agent.setTimeout` macrotasks: (due, callback). Callback Values
+    /// are GC ROOTS.
+    timer_queue: Vec<(clock::Instant, Value)>,
+    /// Monotonic-clock reading at VM construction — the
+    /// `$262.agent.monotonicNow()` epoch.
+    vm_start_mono_ms: f64,
+    /// Cross-agent state for the `$262.agent` worker subsystem (report FIFO +
+    /// one handle per started agent). `None` until the first `agent.start` —
+    /// a run that never starts an agent pays nothing; each worker Vm holds a
+    /// clone of the same Arc.
+    #[cfg(not(feature = "wasm-single-agent"))]
+    agent_shared: Option<std::sync::Arc<agents::AgentShared>>,
+    /// Whether this Vm is the CLI entry agent (`Main`) or an `agent.start`
+    /// worker thread's Vm (`Worker`).
+    #[cfg(not(feature = "wasm-single-agent"))]
+    agent_role: agents::AgentRole,
+    /// Worker-side `$262.agent.receiveBroadcast` callback, invoked as
+    /// `cb(sab, id)` for each broadcast retrieved. GC ROOT (gc.rs).
+    #[cfg(not(feature = "wasm-single-agent"))]
+    broadcast_cb: Value,
+    /// In the single-agent artifact profile, preserve main-side report/FIFO
+    /// semantics without retaining Arc/Mutex/channel worker state.
+    #[cfg(feature = "wasm-single-agent")]
+    agent_reports: std::collections::VecDeque<String>,
+    /// This Vm's cross-thread `Atomics.waitAsync` wake channel: a `notify`
+    /// in ANY agent pushes a woken waiter's id here and signals the condvar;
+    /// the event loop sleeps on that condvar and drains the ids first each
+    /// iteration. Created unconditionally so a remote notify never races a
+    /// lazy init; holds no Values (nothing to root).
+    mailbox: std::sync::Arc<agents::Mailbox>,
+    /// The ShadowRealm whose code is CURRENTLY evaluating (heap index of the
+    /// realm object), if any — global-name resolution inside `evaluate` binds
+    /// non-builtin names to that realm's own slot table.
+    active_realm: Option<u32>,
+    /// Per-ShadowRealm global bindings: realm object idx → name → live global
+    /// slot. Slot values live in `globals` (rooted wholesale); the map is
+    /// pruned when its realm object dies.
+    realm_globals: std::collections::HashMap<u32, std::collections::HashMap<String, u32>>,
+    /// Canonical paths of modules whose BODY is currently executing — a
+    /// deferred-namespace trigger targeting one is a TypeError (you cannot
+    /// synchronously evaluate a module that is already mid-evaluation).
+    executing_modules: std::collections::HashSet<std::path::PathBuf>,
+    /// Modules whose evaluation completed ABRUPTLY: the thrown error is
+    /// permanent — every later import re-throws it without re-running the
+    /// body. Values are GC ROOTS.
+    module_errors: std::collections::HashMap<std::path::PathBuf, Value>,
+    /// Spec [[DFSIndex]] / [[DFSAncestorIndex]] of every module on an
+    /// evaluation DFS stack (InnerModuleEvaluation's `stack`): canonical
+    /// path → (index, ancestor index). A module is present exactly while its
+    /// [[Status]] is EVALUATING — from the start of its link until its
+    /// strongly connected component closes — so membership is the engine's
+    /// EVALUATING test: it covers `module_loading`, `executing_modules` AND
+    /// the finished members of a component whose root has not closed yet.
+    /// Holds paths only (nothing to root).
+    module_dfs: std::collections::HashMap<std::path::PathBuf, (u32, u32)>,
+    /// The evaluation DFS stack itself: pushed at link entry, popped when
+    /// the component closes or the evaluation aborts.
+    module_dfs_stack: Vec<std::path::PathBuf>,
+    /// The next [[DFSIndex]]. Monotonic for the life of the Vm so segment
+    /// bases stay comparable.
+    module_dfs_next: u32,
+    /// The [[DFSIndex]] at which the CURRENT Evaluate() invocation's stack
+    /// segment starts. A dynamic import, a deferred-namespace trigger and
+    /// the entry load are each a fresh Evaluate() with a stack of their own;
+    /// the engine runs some of them inline while an outer body executes, so
+    /// a module below the base belongs to that OUTER evaluation and is not
+    /// "on this stack" for cycle bookkeeping.
+    module_dfs_seg_base: u32,
+    /// Modules whose LINK (dependency loop + re-export link) is in flight,
+    /// innermost last, each with its `link_pending_deps` mark: the top is
+    /// the requester of every static request edge taken right now.
+    module_link_stack: Vec<(std::path::PathBuf, usize)>,
+    /// Recorded [[CycleRoot]] of every module that closed as a member of a
+    /// NON-TRIVIAL strongly connected component (a module that is its own
+    /// root has no entry): canonical path → root path. Evaluate step 2.a
+    /// redirects a later import of a member to this root: its error, its
+    /// pending capability. Recorded at DFS time (InnerModuleEvaluation step
+    /// 16), never re-derived from the static graph — an `import defer` or
+    /// `import source` request is not an evaluation edge and creates no
+    /// component. Paths only.
+    module_cycle_root: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// Parsed request lists (LoadRequestedModules' view of a file): canonical
+    /// path → its direct requests in source order, each with its phase.
+    /// Filled on first use — module source is immutable for the life of the
+    /// loader, so no walk re-reads or re-parses a file. Paths only.
+    module_requests_cache: std::collections::HashMap<
+        std::path::PathBuf,
+        std::sync::Arc<Vec<(std::path::PathBuf, ModuleRequestPhase)>>,
+    >,
+    /// Memoised [[HasTLA]] per canonical path (the check compiles the file).
+    module_tla_cache: std::collections::HashMap<std::path::PathBuf, bool>,
+    /// Per-module DEFERRED namespace singleton (`import defer * as ns`):
+    /// canonical path → the deferred namespace object. Values are GC ROOTS.
+    deferred_ns_cache: std::collections::HashMap<(std::path::PathBuf, Option<String>), Value>,
+    /// Deferred namespaces NOT YET evaluated: object idx → module path.
+    /// Removed when a triggering access evaluates the module.
+    /// Value carries the module TYPE alongside the path (`with { type: "json" }`):
+    /// the trigger re-imports through `import_module`, and dropping the type there
+    /// re-parsed a JSON module as JavaScript.
+    deferred_ns_state: std::collections::HashMap<u32, (std::path::PathBuf, Option<String>)>,
+    /// Async modules waiting on pending dependencies: capability-promise
+    /// index → the state needed to run the body once the last dependency
+    /// settles. Keys are GC roots (the capability promise must survive).
+    deferred_mods: std::collections::HashMap<u32, DeferredModuleExec>,
+    /// Canonical paths of modules whose IMPORT RESOLUTION is in flight —
+    /// guards static-import cycles (self-imports alias instead).
+    module_loading: std::collections::HashSet<std::path::PathBuf>,
+    /// Static `export … from` (exported, imported, specifier) + `export *`
+    /// specifiers + `export * as name from` (exported, specifier) entries +
+    /// base dir of modules whose LINK is in flight: a cyclic resolve_export
+    /// back into one walks these statically (spec ResolveExport through a
+    /// cycle) instead of failing or re-evaluating.
+    module_pending_reexports: std::collections::HashMap<
+        std::path::PathBuf,
+        (
+            Vec<(String, String, String)>,
+            Vec<String>,
+            Vec<(String, String)>,
+            Option<std::path::PathBuf>,
+        ),
+    >,
+    /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
+    /// them), keyed by the closure's heap index → the object the method was defined
+    /// in. `super.x` in such a method resolves via GetPrototypeOf(home). Class
+    /// methods use the compile-time `home_class_id` path instead. GC treats each
+    /// entry as a strong edge FROM the keyed closure to the value; dead closure/home
+    /// cycles are collectible, and dead keys are pruned on sweep.
+    closure_home: ClosureHomeTable,
+    /// Lexically-captured `new.target` for ARROW closures created inside a
+    /// constructed activation (and arrows nested in those), keyed by the
+    /// closure's heap index. An arrow's own frame has no [[NewTarget]];
+    /// `new.target` inside it must observe the enclosing function's. Only
+    /// non-undefined values are recorded. GC traces the value from a reachable
+    /// keyed closure; dead keys are pruned on sweep (mirrors `closure_home`).
+    closure_new_target: crate::slot_table::SlotTable<Value>,
+    /// Memoized final shape per `FinalizeObject` plan, keyed by (unified
+    /// func id, plan index). The value is the exact fold of `shape::add` over
+    /// the plan's keys with data attributes — what per-field appends would
+    /// produce. Shape ids are thread-local and the transition tree never prunes
+    /// ids, so a memo computed on this VM's thread stays valid for its life;
+    /// (fid, plan) keys are append-only over the program + eval tables, so an
+    /// entry can never alias a different plan.
+    finalize_shapes: rustc_hash::FxHashMap<(u32, u16), u32>,
+    /// The key plan of an iterator result object (`["value", "done"]`) and
+    /// the shape two data appends of those keys reach, made at the first
+    /// result (`Vm::iter_result`).
+    iter_result_plan: Option<(crate::bytecode::StaticKeyPlan, u32)>,
+    /// The lazily-compiled `Array.fromAsync` JS polyfill (an async function value).
+    /// Compiled on first call via `do_eval`, then cached + GC-rooted. `None` until
+    /// the first `Array.fromAsync(...)` invocation.
+    from_async_fn: Option<Value>,
+    /// The lazily-compiled `%AsyncIteratorPrototype%[@@asyncDispose]` JS polyfill
+    /// (an async function). Compiled on first call via `do_eval`, cached + GC-rooted.
+    async_dispose_fn: Option<Value>,
+    /// The lazily-compiled body of GetDisposeMethod's async-hint fallback closure
+    /// (see `sync_dispose_shim`). Cached + GC-rooted like the polyfills above.
+    sync_dispose_shim_fn: Option<Value>,
+    /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
+    /// `disposablestack_proto`; its disposer stack + disposed flag live in
+    /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).
+    disposablestack_ctor: u32,
+    disposablestack_proto: u32,
+    dispose_stacks: std::collections::HashMap<u32, (Vec<Value>, bool)>,
+    /// `AsyncDisposableStack` ctor + prototype, and the set of dispose-stack
+    /// instances that are ASYNC (their `use` prefers @@asyncDispose and their
+    /// disposal goes through `disposeAsync`, which returns a Promise).
+    asyncdisposablestack_ctor: u32,
+    asyncdisposablestack_proto: u32,
+    async_stacks: std::collections::HashSet<u32>,
+    /// In-flight `AsyncDisposableStack.prototype.disposeAsync` drivers, keyed
+    /// by the capability promise heap index. Each disposer's result is awaited
+    /// before the next runs (the DISPOSE_ASYNC_STEP reactions re-enter
+    /// `dispose_async_drive`). GC: keys + held Values are roots (gc.rs).
+    dispose_async_state: std::collections::HashMap<u32, DisposeAsyncState>,
+    /// `SuppressedError` ctor + prototype (ES2026). Unlike the 8 standard errors,
+    /// it carries `error` + `suppressed` own properties; its prototype chains to
+    /// %Error.prototype% so `instanceof Error` holds.
+    suppressederror_ctor: u32,
+    suppressederror_proto: u32,
+    /// `ShadowRealm` ctor + prototype, and the set of branded instances. Note the
+    /// realm is NOT truly isolated (evaluate reuses the shared global eval path);
+    /// isolation-specific tests won't pass, but structure + evaluate of a string
+    /// to a primitive + the argument/return TypeError checks do.
+    shadowrealm_ctor: u32,
+    shadowrealm_proto: u32,
+    shadow_realms: std::collections::HashSet<u32>,
+    /// Callable created by a ShadowRealm's `evaluate` → its realm INSTANCE heap
+    /// idx. A WrappedFunction call switches `active_realm` to the target's
+    /// realm so `globalThis.x` in its body binds the realm's slots at CALL time
+    /// (not just during `evaluate`). u32→u32 (no Values); gc.rs roots the realm
+    /// instances and retains live keys.
+    shadow_fn_realm: std::collections::HashMap<u32, u32>,
+    /// `%AbstractModuleSource%` ctor + prototype (source-phase-imports proposal).
+    /// Reached via `$262.AbstractModuleSource`; the ctor always throws when
+    /// called/constructed and the prototype carries the @@toStringTag accessor.
+    abstractmodulesource_ctor: u32,
+    abstractmodulesource_proto: u32,
+    /// CreateResolvingFunctions [[AlreadyResolved]] records: `resolver_pair_next`
+    /// hands out fresh pair ids; a pair id enters `resolved_pairs` the first time
+    /// either function of the pair fires (ids only — no `Value`s, GC-inert).
+    resolver_pair_next: u32,
+    resolved_pairs: std::collections::HashSet<u32>,
+    /// The intrinsic %Promise% constructor and %Promise.prototype.then% heap
+    /// indices (the objects built in setup_globals), independent of later
+    /// patches — identity anchors for the adoption fast-path check.
+    promise_ctor_intrinsic: u32,
+    promise_then_intrinsic: u32,
+    /// The pristine-%Promise.prototype% proof resolved to slot indices plus
+    /// the versions guarding them (see [`async_runtime::PromisePristineSlots`]).
+    /// `None` until first proven pristine (and whenever last proven NOT
+    /// pristine); validated per call by version compares, re-resolved by the
+    /// full proof on any guard mismatch.
+    promise_pristine_slots: Option<async_runtime::PromisePristineSlots>,
+    /// The prototype/constructor half of `regexp_matchall_fast_ok` resolved
+    /// to slot indices plus the versions guarding them (see
+    /// [`proxy_regexp::MatchallFastSlots`]). `None` until first proven
+    /// pristine (and whenever last proven NOT pristine); validated per call
+    /// by version compares, re-resolved by the full gate on any mismatch.
+    matchall_fast_slots: Option<proxy_regexp::MatchallFastSlots>,
+    /// `$262.createRealm()` realm registry. `realms[r]` maps a MAIN-realm intrinsic
+    /// prototype heap index to realm `r`'s corresponding prototype (realm 0 = the
+    /// main realm, an empty map). `obj_realm` tags a heap index (a realm's
+    /// constructor, its prototype, or an object created in it) with its realm id —
+    /// `GetFunctionRealm`. Used so `Reflect.construct(C, args, newTargetFromRealmR)`
+    /// with a non-object `newTarget.prototype` falls back to realm R's `%C.prototype%`.
+    realms: Vec<std::collections::HashMap<u32, u32>>,
+    obj_realm: JitGuardedMap,
+    /// A realm constructor's heap index → the MAIN-realm constructor it mirrors, so
+    /// `new other.Array()` / `other.Symbol('x')` route to the real construction /
+    /// call behaviour (with the realm's prototype + realm tag).
+    realm_ctor_main: std::collections::HashMap<u32, u32>,
+    /// A `$262.createRealm()` child realm's GLOBAL object heap index → its realm
+    /// id. Doubles as the `active_realm`/`realm_globals` key space for child
+    /// realms (disjoint from ShadowRealm instance indices) and as the gate for
+    /// the realm-global property interception in `get_member`/`set_prop`.
+    /// Keys are GC roots (gc.rs) so the id mapping never goes stale.
+    realm_global_objs: JitGuardedMap,
+    /// `other.eval` / `realm.evalScript` function objects (per createRealm child):
+    /// fn heap index → (the child's global-object index, kind 0=eval 1=evalScript).
+    /// `call_value` intercepts these and runs the code with `active_realm` set to
+    /// the child, so its globals bind in the CHILD's table. Keys are GC roots.
+    realm_fns: std::collections::HashMap<u32, (u32, u8)>,
+    /// The realm of the realm-COPIED built-in currently executing via
+    /// `call_native` (None for main-realm built-ins): `this === %RegExp
+    /// .prototype%`-style HOME checks resolve against the COPY's realm image
+    /// (`native_home`). Saved/restored around the call; holds no Values.
+    native_callee_realm: Option<u32>,
+    /// Per-createRealm-child %ThrowTypeError% singleton (realm id → fn heap
+    /// index): a strict arguments object built for a CHILD-realm function gets
+    /// the child's thrower, so the `callee` accessor identity is stable within
+    /// a realm and distinct across realms. Values are GC roots.
+    realm_throw_type_errors: std::collections::HashMap<u32, u32>,
+    /// An explicit `fn.prototype = value` assignment, for ANY value — including a
+    /// NON-object (undefined/null/primitive) which the `prototypes` map (heap-only)
+    /// can't hold. Consulted FIRST by the `.prototype` read / `prototype_of` /
+    /// getOwnPropertyDescriptor, so a function whose prototype was set to a
+    /// non-object reports it (and OrdinaryCreateFromConstructor then falls back).
+    fn_proto_override: std::collections::HashMap<u32, Value>,
+    /// Heap indices of `[[IsHTMLDDA]]` exotic objects (`$262.IsHTMLDDA`, the
+    /// `document.all` emulation): `typeof` is "undefined", loose `== null`/`==
+    /// undefined` is true, ToBoolean is false, and calling it returns undefined —
+    /// yet it is otherwise an ordinary object (and `Object.is`/`===` do NOT treat
+    /// it as undefined).
+    is_htmldda: std::collections::HashSet<u32>,
+    /// Scalar mirror of the singleton `is_htmldda` member, or `u32::MAX` before
+    /// globals are installed / if the set ever stops being a singleton. The set
+    /// remains the authoritative representation and the
+    /// `ZIPP_NO_HTMLDDA_SCALAR=1` fallback; setup is the sole insertion site, so
+    /// an exact integer comparison can replace a randomized hash-table probe on
+    /// the hot `typeof` / loose-null / truthiness paths.
+    htmldda_idx: u32,
+    /// VM-construction-latched same-binary ablation for `htmldda_idx`.
+    htmldda_scalar_enabled: bool,
+    /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
+    proxy_ctor: u32,
+    /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.
+    temporal_ns: u32,
+    duration_ctor: u32,
+    duration_proto: u32,
+    plaindate_ctor: u32,
+    plaindate_proto: u32,
+    plaintime_ctor: u32,
+    plaintime_proto: u32,
+    plaindatetime_ctor: u32,
+    plaindatetime_proto: u32,
+    instant_ctor: u32,
+    instant_proto: u32,
+    plainyearmonth_ctor: u32,
+    plainyearmonth_proto: u32,
+    plainmonthday_ctor: u32,
+    plainmonthday_proto: u32,
+    zoneddatetime_ctor: u32,
+    zoneddatetime_proto: u32,
+    /// `Temporal.ZonedDateTime` time-zone id per instance heap index (the id is a
+    /// heap string, kept here so it's GC-traced — the `Temporal{fields:Vec<i64>}`
+    /// layout can't hold a heap reference). The instance's `fields` are
+    /// `[epochNs hi, epochNs lo, offsetNanoseconds]`.
+    zdt_tz: std::collections::HashMap<u32, Value>,
+    /// The `[[Calendar]]` slot of every calendar-bearing Temporal instance, as a
+    /// `Cal` discriminant keyed by heap index. Absent means `iso8601`, so an
+    /// ISO-only program never touches this map. Instances always store their
+    /// *ISO* date in `fields`; the calendar is the view applied on read
+    /// (see `vm/temporal/calendar.rs`).
+    temporal_cal: std::collections::HashMap<u32, u8>,
+    intl_ns: u32,
+    intl_ctors: [u32; native::INTL_KINDS],
+    intl_protos: [u32; native::INTL_KINDS],
+    /// realm id (0 = main) → that realm's `%Intl%.[[FallbackSymbol]]`. Rooted
+    /// indirectly: every entry is also in `symbol_keys`.
+    intl_fallback_syms: std::collections::HashMap<u32, Value>,
+    /// Monotonic counter giving each `Symbol()` a unique internal property key
+    /// (`@@sym:N`), so distinct symbols never collide as object keys.
+    symbol_counter: u64,
+    /// The `Symbol.for` global registry: registry key string → the shared Symbol.
+    symbol_registry: std::collections::HashMap<String, Value>,
+    /// Internal prop_key (`@@iterator`, `@@sym:N`, …) → the Symbol value, so a
+    /// symbol-keyed own property can be reflected back to its Symbol by
+    /// `Object.getOwnPropertySymbols`.
+    symbol_keys: std::collections::HashMap<String, Value>,
+    /// `%Iterator.prototype%` (the shared root of all iterator prototypes; holds
+    /// the ES2025 helper methods), `%IteratorHelperPrototype%` (next/return for
+    /// lazy helpers, chains to the root), and the `Iterator` constructor.
+    iterator_proto_root: u32,
+    iterator_helper_proto: u32,
+    /// `%GeneratorPrototype%` — the prototype of generator instances: next/return/
+    /// throw + @@iterator + @@toStringTag, chaining to %Iterator.prototype% so a
+    /// generator inherits the iterator-helper methods (`g().map(...)` etc.).
+    gen_proto: u32,
+    /// `%AsyncGeneratorPrototype%` — async-generator instances: next/return/throw
+    /// (returning Promises) + @@asyncIterator + @@toStringTag, chaining to
+    /// %AsyncIteratorPrototype%.
+    asyncgen_proto: u32,
+    /// The default `Array.prototype[Symbol.iterator]` (the `values` function), so
+    /// array destructuring can fast-path plain arrays yet still honour a replaced
+    /// `Array.prototype[Symbol.iterator]` (drain via the iterator protocol).
+    default_array_iter: Value,
+    /// The pristine %ArrayIteratorPrototype%.next (see default_array_iter).
+    default_array_iter_next: Value,
+    /// The pristine `@@iterator` of the other kinds IterNext and spread walk
+    /// positionally (String.prototype / Map.prototype.entries /
+    /// Set.prototype.values / %TypedArray%.prototype.values) and the pristine
+    /// `next` of the String/Map/Set iterator prototypes (a TypedArray's
+    /// iterator is an Array Iterator). See `Vm::builtin_iter_pristine`.
+    /// The default `@@iterator` of Set.prototype (`values`), Map.prototype
+    /// (`entries`), String.prototype and %TypedArray%.prototype (`values`): the
+    /// positional for-of / spread / destructuring shortcuts for those kinds are
+    /// taken only while the method GetIterator reads is still this one
+    /// (`builtin_iter_pristine`).
+    default_set_iter: Value,
+    default_map_iter: Value,
+    default_string_iter: Value,
+    default_ta_iter: Value,
+    /// Memo for the prototype half of `builtin_iter_pristine`, per built-in
+    /// iterator prototype (Array, Set, Map, String): the heap versions and the
+    /// `next` slot/bits of the last successful proof. Pure cache — a hit
+    /// re-checks every version and the live `next` bits (an in-place
+    /// overwrite bumps no version), so nothing has to invalidate it.
+    iter_proto_memo: [std::cell::Cell<construct::IterProtoProof>; 4],
+    /// The same kind of memo for `builtin_iter_fast`'s holder half: per
+    /// Array / Set / Map / String prototype, `(heap version + 1, slot)` of
+    /// the own `@@iterator` data property last proven to be the default.
+    iter_method_memo: [std::cell::Cell<(u32, u32)>; 4],
+    /// The single canonical %ThrowTypeError% intrinsic — shared by
+    /// Function.prototype.{caller,arguments} and a strict (unmapped) arguments
+    /// object's `callee` poison-pill, so all references compare `===`.
+    throw_type_error: Value,
+    iterator_ctor: u32,
+    /// The test262 `$262` host object (0 until set up).
+    dollar262: u32,
+    /// Whether to install `$262` at all.
+    ///
+    /// It is a TEST HARNESS object — `agent.start()` spawns detached OS threads
+    /// running their own VMs, `createRealm` builds a fresh global, `evalScript`
+    /// and `detachArrayBuffer` reach past ordinary JS — and a host running code
+    /// it did not write wants none of it. `zipp js` and the test262 runner keep
+    /// it; `embed::compile_script` turns it off, because that API exists
+    /// precisely for untrusted code.
+    pub(crate) host_262: bool,
+    /// `%ArrayIteratorPrototype%` — the prototype of Array entries/keys/values
+    /// iterators (and the default array `@@iterator`). 0 until set up.
+    array_iter_proto: u32,
+    /// `%MapIteratorPrototype%` / `%SetIteratorPrototype%` — distinct prototypes so
+    /// `getPrototypeOf(map.entries())` differs from a Set/Array iterator's.
+    map_iter_proto: u32,
+    set_iter_proto: u32,
+    string_iter_proto: u32,
+    /// The `globalThis` object (an empty Object at this heap index); property
+    /// access on it is routed to the global slots by name. 0 until `setup_globals`.
+    global_this: u32,
+    /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
+    /// program's random sequence is reproducible run-to-run (and JIT-on == off).
+    rng_state: u64,
+    /// Native JIT tier (`feature = "jit"`): the mature x86-64 multi-tier backend
+    /// and the guarded ARM64 integer baseline. Both share this VM's register
+    /// window and bail to the interpreter at an exact bytecode ip.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    jit: crate::codegen::Jit,
+    /// JIT on/off (set from `ZIPP_NOJIT` env var at construction) — lets a
+    /// single binary A/B the JIT against the pure interpreter for honest
+    /// measurement.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    jit_enabled: bool,
+    /// Current native self-recursion depth (guards `jit_self_call`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_recurse_depth: u32,
+    /// Current nesting of region call helpers (`jit_call_method_ic` /
+    /// `jit_call_ic`): each level nests `run_loop` on the Rust stack, so it is
+    /// capped at `JIT_REGION_CALL_MAX` (past it the call deopts to the
+    /// interpreter's flat frames). Unlike `jit_recurse_depth`, a non-zero value
+    /// does NOT close the JIT gates: nested execution may compile/enter
+    /// functions and regions (the calling region re-derives its movable pinned
+    /// pointers after every call helper).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_call_depth: u32,
+    /// Exact root identities for the current Tier-C native activation. Every
+    /// nested activation saves the complete prior state below: frame-free
+    /// callable identity must survive GC while native callers are suspended.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_tierc_activation: TiercActivationState,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_tierc_activation_stack: ActivationRootStack,
+    /// One-shot flag a region call helper sets when its bail is NOT a
+    /// region-quality signal (depth-cap deopt, or a throw the call legitimately
+    /// produced): `try_run_osr` consumes it and skips the deopt-eviction count
+    /// for that exit, so legal recursion / caught throws don't evict hot regions.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    osr_deopt_exempt: bool,
+    /// Heap strings interned AT REGION-COMPILE TIME for the region's multi-char
+    /// string `LoadConst`s (their bits are embedded in the native code as
+    /// immediates). A GC ROOT: compiled code is not traced, so without this the
+    /// embedded strings could be swept and their slots reused while the region
+    /// still materializes them. Grows only at compile time; bounded by the
+    /// number of string constants across compiled regions.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_const_strings: Vec<Value>,
+    /// Method-inlining (MI) eligibility memo, indexed by unified `func_id`:
+    /// `i32::MIN` = not yet computed; `-1` = ineligible (the off-frame evaluator
+    /// declines this body's SHAPE — fall to the frame call); `≥ 0` = the
+    /// straight-line body length to evaluate. Filled once per fid by
+    /// `method_body_inlinable`, so the hot per-call path skips the body re-scan.
+    /// Sound because a FuncProto's code is immutable for the program's life.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    mi_cache: Vec<i32>,
+    /// B82 `%Function.prototype%` SLOT memo for the `f.call`/`f.apply` target
+    /// splice: `(fn_proto version when computed, own "call" slot, own "apply"
+    /// slot)`, `u32::MAX` = no such own key. Slot INDEXES are version-guarded
+    /// (a key add/remove/descriptor change bumps `version_of(fn_proto)`), so
+    /// the memo skips the per-call key scan; the slot's VALUE is re-read on
+    /// every call (an in-place overwrite bumps nothing — the fn-bits re-read
+    /// precedent), so `Function.prototype.call = g` falls back immediately.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    ci_pristine: (u32, u32, u32),
+    /// The PROTOTYPE half of the pristine `ta.length` proof
+    /// (`ta_length_is_intrinsic`), memoized in two parts. The shared part,
+    /// `ta_len_base`, is `(version of %TypedArray%.prototype%, its own
+    /// "length" slot, the built-in getter's Value bits)`; zero bits = not
+    /// proven. The per-kind part is the version of that kind's prototype
+    /// when it was last proved to carry no own `length` and to inherit from
+    /// %TypedArray%.prototype%, valid while its bit in `ta_len_kinds` is
+    /// set. The versions cover everything that can re-point or shadow the
+    /// chain (a key add, delete or redefinition, and `setPrototypeOf`, each
+    /// advance one); the getter is re-read from its slot on every use,
+    /// because an in-place accessor swap advances nothing. The receiver half
+    /// (own shadow, the instance's [[Prototype]]) is not memoized. See
+    /// `Vm::ta_length_fast`.
+    ta_len_base: (u32, u32, u64),
+    ta_len_kind_ver: [u32; 12],
+    ta_len_kinds: u16,
+    /// Pinned register-file capacity: `self.regs` is reserved to this at startup
+    /// and NEVER allowed to grow past it (every call/recursion site checks),
+    /// so the Vec never reallocates while native JIT code holds a raw pointer
+    /// into it. 0 until `reserve_jit_regs` runs (interpreter-only builds ignore
+    /// it). Exceeding it throws RangeError — a tighter bound than MAX_FRAMES.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    reg_capacity: usize,
+    /// High-water mark: the largest `regs.len()` ever reached (and thus
+    /// initialized). A native self-call window at or below this can be exposed
+    /// with `set_len` instead of a zero-filling `resize` — its slots already hold
+    /// valid `Value` bits (stale, but the compiled code defs-before-use). This
+    /// avoids re-zeroing the callee window on every recursive call once the
+    /// recursion has reached its deepest native level. Backing buffer is pinned
+    /// (`reserve_jit_regs`) so initialized slots stay valid for the VM's life.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    regs_hw: usize,
+    /// Mark-sweep GC. `gc_floor` is the first collectable slot: everything below
+    /// it (the interned strings + all built-ins allocated during setup) is pinned
+    /// and never freed. `gc_lock` > 0 disables collection during native built-ins
+    /// that hold un-rooted `Vec<Value>` working sets across a callback re-entry
+    /// (array iteration, sort, iterate_to_vec, …). `gc_stress` (ZIPP_GC_STRESS)
+    /// forces a collection at every safe point to flush out missed roots/edges.
+    gc_floor: u32,
+    #[cfg(not(feature = "safe-sandbox"))]
+    gc_lock: u32,
+    #[cfg(feature = "safe-sandbox")]
+    gc_lock: std::rc::Rc<std::cell::Cell<u32>>,
+    gc_stress: bool,
+    /// Heap slots currently occupied by WeakMap/WeakSet/WeakRef/registry
+    /// objects. This is an index only, never a root; the weak phase validates
+    /// each slot's current variant and prunes dead/reused entries.
+    weak_containers: std::collections::HashSet<u32>,
+    /// WeakRef targets kept through the current ECMAScript job by
+    /// AddToKeptObjects (constructor and successful deref). Cleared only at a
+    /// main-script or microtask boundary.
+    kept_alive: std::collections::HashSet<u64>,
+    /// Values a call or embedding entry owns only in Rust locals: arguments before
+    /// the callee's frame exists, and results across rendering or a microtask
+    /// drain after it is gone. The collector traces this stack while guest
+    /// getters and queued jobs run (ZA-05 and the 12 September input-root
+    /// regression). Nested entries preserve their caller's stack prefix.
+    /// Native built-ins also park their working sets here (getter and trap
+    /// results collected across later guest re-entry — spread, rest,
+    /// Object.values/entries, CreateListFromArrayLike; 15 September audit).
+    host_result_roots: Vec<Value>,
+    /// The first exception a `setTimeout` callback let escape. It ends the
+    /// event loop and becomes the program's error when the main job itself
+    /// completed normally (Node's uncaught-exception exit). Rooted.
+    uncaught_timer_throw: Option<Value>,
+}
+
+/// B191 memo widths (hot names; anything else takes the full per-call proof).
+pub(crate) const STR_MEMO_NAMES: usize = 16;
+pub(crate) const ARR_MEMO_NAMES: usize = 8;
+
+/// Method-name arity of [`Vm::coll_intrinsic_memo`]: get/set/has/add/delete/clear.
+pub(crate) const COLL_MEMO_NAMES: usize = 6;
+
+/// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
+#[derive(Debug)]
+pub struct Thrown(pub String);
+
+impl Thrown {
+    /// Share allocation of fixed error messages in WASM instead of repeating
+    /// the String allocation/copy sequence in every interpreter error branch.
+    /// Native and Lite builds retain their existing inlined construction.
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm-lite")),
+        cold
+    )]
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm-lite")),
+        inline(never)
+    )]
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm-lite"))),
+        inline(always)
+    )]
+    pub(crate) fn from_static(message: &'static str) -> Self {
+        Self(message.to_owned())
+    }
+}
+
+impl<'p> Vm<'p> {
+    /// Heap-ceiling re-check inside a native iterator drain; see the
+    /// instrumented twin in `instrument.rs`. Nothing to check without a
+    /// recorder.
+    #[cfg(not(feature = "instrument"))]
+    #[inline(always)]
+    pub(crate) fn instrument_drain_heap_check(&mut self, _steps: usize) -> Result<(), Thrown> {
+        Ok(())
+    }
+}
+
+impl<'p> Vm<'p> {
+    /// Execute one guest-controlled native recursion edge under the shared
+    /// stack budget. Keeping the increment/decrement in this closure wrapper is
+    /// deliberate: both `Ok` and ordinary abrupt completion (`Err`) restore the
+    /// counter before control returns to JavaScript, so a caught RangeError does
+    /// not poison later operations in the same VM.
+    pub(crate) fn with_native_recursion_guard<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, Thrown>,
+    ) -> Result<T, Thrown> {
+        if self.native_recursion_depth >= MAX_NATIVE_RECURSION_DEPTH {
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
+        }
+        self.native_recursion_depth += 1;
+        let result = f(self);
+        self.native_recursion_depth -= 1;
+        result
+    }
+}
+
+// submodules (split from the former monolithic vm.rs)
+mod access;
+mod async_runtime;
+mod builtins;
+pub(crate) mod clock;
+mod dispatch;
+mod engine;
+pub(crate) mod host_api;
+mod indexing_date;
+/// Step budget, cooperative abort, and the optional execution trace. Off by
+/// default: the hook it adds to the inner dispatch loop is not something a
+/// `zipp js file.js` run should pay for.
+#[cfg(feature = "instrument")]
+pub mod instrument;
+mod mathjson;
+mod natives;
+mod props;
+mod setup;
+pub(crate) use builtins::builtin_stats;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use dispatch::interp_stats;
+mod agents;
+mod array_ops;
+pub(crate) mod bigint;
+mod cldr_alias;
+mod cldr_alias_data;
+mod cldr_ar_eg;
+mod cldr_de;
+mod cldr_dtf_en;
+mod cldr_en;
+mod cldr_ja;
+mod cldr_zh;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod closure_make_jit;
+mod coerce;
+mod collections;
+mod const_cache;
+mod construct;
+#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+mod counted_loop;
+mod dtf_locale;
+mod dtf_pattern;
+mod enum_stream;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod field_stream;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod function_literal_jit;
+mod gc;
+mod helpers_datetime;
+mod helpers_json;
+mod helpers_misc;
+pub(crate) mod helpers_num2;
+pub(crate) mod helpers_numeric;
+mod intl;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod iter_jit;
+mod iterhelpers;
+mod locale_tag;
+mod misc_methods;
+pub(crate) mod native;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod object_literal_jit;
+#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+mod object_loop;
+mod proxy_regexp;
+mod segmenter;
+mod special_casing;
+mod string_ops;
+pub(crate) mod temporal;
+pub(crate) mod typedarray;
+mod values;
+
+pub(crate) use access::htmldda_membership_stats;
+pub(crate) use async_runtime::async_inline_await_stats;
+pub(crate) use async_runtime::async_stats;
+pub(crate) use coerce::concat_pair_stats;
+pub(crate) use coerce::pad2_concat_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use coerce::pad2_concat_stats_enabled;
+pub(crate) use coerce::pad2_conditional_stats;
+pub(crate) use coerce::SMALL_CONCAT_FLAT_UNITS;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use coerce::{
+    jit_str_append_cursor_begin, jit_str_append_cursor_commit, STR_APPEND_CURSOR_ACC_BITS_OFF,
+    STR_APPEND_CURSOR_ACTIVE_OFF, STR_APPEND_CURSOR_FRAME_BYTES,
+    STR_APPEND_CURSOR_OUT_CAPACITY_OFF, STR_APPEND_CURSOR_OUT_LEN_OFF,
+    STR_APPEND_CURSOR_OUT_PTR_OFF, STR_APPEND_CURSOR_SOURCE_BITS_OFF,
+    STR_APPEND_CURSOR_SOURCE_LEN_OFF, STR_APPEND_CURSOR_SOURCE_PTR_OFF,
+    STR_APPEND_CURSOR_SOURCE_VERSION_OFF,
+};
+pub(crate) use gc::gc_gen_stats;
+pub(crate) use gc::gc_nursery_stats;
+pub(crate) use gc::gc_stats;
+pub(crate) use gc::gc_young_budget_stats;
+pub(crate) use helpers_misc::call_inline_stats;
+pub(crate) use helpers_misc::computed_call_stats;
+pub(crate) use helpers_misc::concat_set_stats;
+pub(crate) use helpers_misc::cross_decline_stats;
+pub(crate) use helpers_misc::cross_fill_stats;
+pub(crate) use helpers_misc::hasprop_pin_absent_stats;
+pub(crate) use helpers_misc::ic_stats;
+pub(crate) use helpers_misc::iter_region_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_math_bare_is_intrinsic;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_shape_set_barrier;
+pub(crate) use proxy_regexp::regexp_call_direct_enabled;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use proxy_regexp::rx_scalar_exec_enabled;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use proxy_regexp::rx_scalar_matchall_enabled;
+pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
+pub(crate) use proxy_regexp::rxstats::dump_call_direct as regexp_call_direct_stats;
+pub(crate) use proxy_regexp::rxstats::dump_scalar_exec as regexp_scalar_exec_stats;
+pub(crate) use proxy_regexp::rxstats::dump_scalar_matchall as regexp_scalar_matchall_stats;
+pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_call_direct_stats;
+pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
+mod handler_pool;
+pub(crate) mod prof;
+#[cfg(feature = "python")]
+pub(crate) mod prof_py;
+#[cfg(feature = "python")]
+mod py_attr;
+#[cfg(feature = "python")]
+mod py_ops;
+#[cfg(feature = "python")]
+mod py_rt;
+#[cfg(feature = "python")]
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(unused_imports))]
+pub(crate) use py_rt::py_frame_guard_start;
+#[cfg(feature = "python")]
+mod py_gen;
+#[cfg(feature = "python")]
+mod py_in;
+#[cfg(feature = "python")]
+mod py_json;
+#[cfg(feature = "python")]
+mod py_lazy;
+#[cfg(feature = "python")]
+mod py_str;
+#[cfg(feature = "python")]
+pub(crate) mod py_table;
+#[cfg(feature = "python")]
+mod py_tensor;
+pub(crate) use prof::dump as prof_stats;
+pub(crate) use temporal::tzdb_version;
+pub(crate) mod decorators;
+mod ic;
+
+pub(crate) use bigint::*;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use closure_make_jit::*;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use field_stream::*;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use function_literal_jit::*;
+pub(crate) use helpers_datetime::*;
+pub(crate) use helpers_json::*;
+pub(crate) use helpers_misc::*;
+pub(crate) use helpers_num2::*;
+pub(crate) use helpers_numeric::*;
+pub(crate) use ic::{GetAct, SetAct, RET_DISCARD};
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use iter_jit::*;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use object_literal_jit::*;
+
+impl<'p> Vm<'p> {
+    /// Append one console line to its stream, recording the order so
+    /// `ScriptState::take_console` can merge the streams chronologically, or
+    /// hand it straight to the embedder's console sink when one is set.
+    /// Every console emission goes through here.
+    #[inline]
+    pub(crate) fn push_console_line(&mut self, line: String, to_stderr: bool) {
+        if let Some(sink) = self.console_sink.as_mut() {
+            let stream = if to_stderr {
+                ConsoleStream::Stderr
+            } else {
+                ConsoleStream::Stdout
+            };
+            sink(stream, &line);
+            return;
+        }
+        if to_stderr {
+            self.console_order.push(ConsoleStream::Stderr);
+            self.errput.push(line);
+        } else {
+            self.console_order.push(ConsoleStream::Stdout);
+            self.output.push(line);
+        }
+    }
+}

@@ -1,0 +1,37 @@
+# zipp-rb
+
+A Ruby binding for the [Zipp](https://github.com/f2i-com/zipp.org) JavaScript
+engine. The engine is built from source with the gem (Rust stable required).
+The API follows quickjs.rb where the two overlap.
+
+```ruby
+require "zipp_rb"
+
+vm = ZippRb::VM.new(timeout_msec: 1_000)
+vm.eval("[1, 2.5, 'x', { a: null }]")   # => [1, 2.5, "x", { "a" => nil }]
+
+vm.define_function("add") { |a, b| a + b }
+vm.eval("add(2, 3)")                     # => 5
+
+vm.eval("function greet(name) { return `hi ${name}` }")
+vm.call("greet", "zipp")                 # => "hi zipp"
+
+vm.dispose
+```
+
+- `undefined` and `NaN` read as `:undefined` / `:NaN`; functions and other
+  non-plain objects read as `nil` (hold them with `VM#handle`).
+- A JS error raises `ZippRb::Error` or a subclass named after it
+  (`ZippRb::TypeError`, …) with `#js_name`. A Ruby exception raised in a
+  callback and not caught by JS is re-raised as itself.
+- `timeout_msec:`, `memory_limit:` and `step_limit:` bound each evaluation
+  (`ZippRb::InterruptedError` / `ZippRb::RangeError`). A bounded VM can also
+  be interrupted from Ruby (`Thread#raise`, `Timeout`, signals); an unbounded
+  one cannot, so give untrusted or long-running code a `timeout_msec`.
+- A VM belongs to the thread that created it. A VM without Ruby callbacks
+  releases the GVL while it runs.
+
+Other API: `VM#load` (run for side effects), `#eval_async` (top-level
+`await`; with `features: [ZippRb::FEATURE_TIMEOUT]` for timers), `#handle`,
+`#set_module_provider` / `#import`, `#on_log`, `#on_unhandled_rejection`,
+`#drain_jobs!`, `#gc!`, `#memory_usage`.

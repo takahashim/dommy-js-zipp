@@ -1,0 +1,417 @@
+// Split out of the former monolithic parent file by tools/split_rs.py.
+// Pure code move: `use super::*` keeps the parent module's imports in
+// scope, and items are widened to pub(crate) so the pieces still see
+// each other. No logic changed.
+#![allow(unused_imports)]
+use super::*;
+
+// NOTE (port): this file is UNCHANGED by the oxc -> zipp_ast retarget, and that
+// is a fact about it rather than an omission — it never referenced `ox::` at
+// all. Everything here works in the currency the emitter already speaks:
+// registers, `Instr`, `Binding`, and identifier spellings as `&str`. The AST
+// swap does not reach it. Identifiers stay `&str` (not `StrVal`): `ast::Name`
+// is `Box<str>`, which deref-coerces at every call site below, so a caller
+// holding a `&Name` needs no conversion. `StrVal` is for string *literals* —
+// no with-chain helper takes one.
+
+impl<'a> FnCompiler<'a> {
+    /// The active `with`-object registers that can shadow `name`, innermost
+    /// first. Empty (the common case) when no `with` is active or the name is
+    /// bound by a declaration INSIDE the innermost applicable `with` body —
+    /// in which case the binding resolves statically with no dynamic probe.
+    pub(crate) fn with_objs_for(&self, name: &str) -> Vec<Reg> {
+        if self.with_stack.is_empty() {
+            return Vec::new();
+        }
+        // Depth of the innermost lexical scope that declares `name` (-1 if the
+        // name is free here → a global/upvalue/unresolved, shadowable by all).
+        let mut depth: isize = -1;
+        for (i, scope) in self.scopes.iter().enumerate() {
+            if scope.iter().any(|(n, _)| n == name) {
+                depth = i as isize;
+            }
+        }
+        // A with entered ABOVE the binding's scope (floor > depth) can shadow it.
+        self.with_stack
+            .iter()
+            .rev()
+            .filter(|w| w.floor as isize > depth)
+            .map(|w| w.obj_reg)
+            .collect()
+    }
+
+    /// Like `with_objs_for` but yields each shadowing with-object's hidden
+    /// BINDING NAME (for a nested function to capture as an upvalue).
+    pub(crate) fn with_names_for(&self, name: &str) -> Vec<String> {
+        if self.with_stack.is_empty() {
+            return Vec::new();
+        }
+        let mut depth: isize = -1;
+        for (i, scope) in self.scopes.iter().enumerate() {
+            if scope.iter().any(|(n, _)| n == name) {
+                depth = i as isize;
+            }
+        }
+        self.with_stack
+            .iter()
+            .rev()
+            .filter(|w| w.floor as isize > depth)
+            .filter_map(|w| {
+                self.scopes
+                    .iter()
+                    .flatten()
+                    .find(|(_, r)| *r == w.obj_reg)
+                    .map(|(n, _)| n.clone())
+            })
+            .collect()
+    }
+
+    /// EVERY with-object that can shadow `name` here — this function's own
+    /// `with` scopes (innermost first) followed by ENCLOSING functions' with
+    /// scopes (via `inherited_with_shadows`) — each materialized into a plain
+    /// register for the probe chain (own cells unwrapped with CellGet,
+    /// inherited ones loaded as upvalues). The with-aware identifier paths all
+    /// route through this; it returns empty on the common no-`with` path.
+    pub(crate) fn with_obj_regs(&mut self, name: &str) -> Vec<Reg> {
+        let mut out: Vec<Reg> = Vec::new();
+        for reg in self.with_objs_for(name) {
+            if self.cell_regs.contains(&reg) {
+                let t = self.temp();
+                self.emit(Instr::CellGet { dst: t, cell: reg });
+                out.push(t);
+            } else {
+                out.push(reg);
+            }
+        }
+        // Enclosing-function withs apply only to names this function does not
+        // bind itself (a local/param/self-name is never shadowed from outside).
+        let bound_here =
+            self.bound_anywhere(name) || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
+        if !bound_here {
+            if let Some(chain) = self.inherited_with_shadows.get(name).cloned() {
+                for wname in chain {
+                    if let Some(idx) = self.resolve_upvalue(&wname) {
+                        let t = self.temp();
+                        self.emit(Instr::UpvalGet { dst: t, idx });
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Emit the per-with-object probe+read chain for a READ of `nidx`: for each
+    /// object innermost-first, `WithHas` → on hit `GetProp` into `dst` then jump
+    /// past the fallback. Returns the "jump to end" ips for the caller to patch
+    /// AFTER it emits its own fallback (the static binding, or a literal).
+    pub(crate) fn emit_with_get_chain(&mut self, nidx: u32, objs: &[Reg], dst: Reg) -> Vec<u32> {
+        let mut end_jumps = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
+            self.dec_next_reg(1); // reclaim the flag temp (dead after the branch)
+                                // GetBindingValue re-checks HasProperty (the WithHas @@unscopables
+                                // getter may delete the binding); strictness is the REFERENCE
+                                // site's, not the with statement's.
+            self.emit(Instr::WithGet {
+                dst,
+                obj,
+                name: nidx,
+                strict: self.cx.in_strict,
+            });
+            let je = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            end_jumps.push(je);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        end_jumps
+    }
+
+    /// Emit the callee-resolution chain for a bare-identifier CALL inside a
+    /// `with`: probe each with-object (innermost first); the first hit reads
+    /// the callee via the GetBindingValue protocol (`WithGet`: HasProperty +
+    /// Get) and records the with-object as `this` (WithBaseObject); the
+    /// fall-through resolves the static binding with `this` = undefined.
+    /// Returns `(callee_reg, this_reg)` — two freshly-allocated registers the
+    /// caller must keep live across argument evaluation.
+    pub(crate) fn emit_with_callee_chain(&mut self, name: &str, objs: &[Reg]) -> (Reg, Reg) {
+        let nidx = self.string_name(name);
+        let callee_reg = self.alloc_reg();
+        let this_reg = self.alloc_reg();
+        let mut chain_done = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
+            self.dec_next_reg(1); // reclaim the flag temp
+            self.emit(Instr::WithGet {
+                dst: callee_reg,
+                obj,
+                name: nidx,
+                strict: self.cx.in_strict,
+            });
+            self.emit(Instr::Move {
+                dst: this_reg,
+                src: obj,
+            });
+            let jd = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            chain_done.push(jd);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        // Fallback: the static binding, this = undefined.
+        let b = self.resolve(name);
+        let r = self.load_binding(&b, callee_reg);
+        if r != callee_reg {
+            self.emit(Instr::Move {
+                dst: callee_reg,
+                src: r,
+            });
+        }
+        self.emit(Instr::LoadUndefined { dst: this_reg });
+        let end = self.here();
+        for j in chain_done {
+            self.patch_jump(j, end);
+        }
+        (callee_reg, this_reg)
+    }
+
+    /// Emit a `with`-aware read of `name` into `dst`: probe each with-object
+    /// (innermost first) and read from the first that has the binding; otherwise
+    /// fall back to the static (lexical/global) binding. Returns `dst`.
+    pub(crate) fn load_with(&mut self, name: &str, objs: &[Reg], dst: Reg) -> Reg {
+        let nidx = self.string_name(name);
+        let end_jumps = self.emit_with_get_chain(nidx, objs, dst);
+        // Fallback: the static binding.
+        let b = self.resolve(name);
+        let r = self.load_binding(&b, dst);
+        if r != dst {
+            self.emit(Instr::Move { dst, src: r });
+        }
+        let end = self.here();
+        for je in end_jumps {
+            self.patch_jump(je, end);
+        }
+        dst
+    }
+
+    /// Emit a `with`-aware write of `src` to `name`: store into the first
+    /// with-object (innermost first) that has the binding; otherwise fall back
+    /// to the static (lexical/global) binding.
+    pub(crate) fn store_with(&mut self, name: &str, objs: &[Reg], src: Reg) {
+        let nidx = self.string_name(name);
+        let mut end_jumps = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
+            self.dec_next_reg(1);
+            self.emit(Instr::WithSet {
+                obj,
+                name: nidx,
+                val: src,
+                strict: self.cx.in_strict,
+            });
+            let je = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            end_jumps.push(je);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        let b = self.resolve(name);
+        self.store_binding(&b, src);
+        let end = self.here();
+        for je in end_jumps {
+            self.patch_jump(je, end);
+        }
+    }
+
+    /// Phase 1 of a reference-record-style with-aware assignment: probe each
+    /// with-object (innermost first) and capture the FIRST that has the binding
+    /// into a fresh register — `undefined` when none does (→ the static
+    /// binding). ResolveBinding's HasProperty probes (observable through a
+    /// Proxy `has` trap) run NOW, BEFORE the caller evaluates the initializer/
+    /// RHS; `with_store_resolved` then writes to the base captured here even if
+    /// the property was deleted in between (`var x = delete o.x` inside
+    /// `with (o)` re-creates `o.x`). The register stays live until the store —
+    /// callers reclaim it with their surrounding `next_reg` reset.
+    pub(crate) fn with_resolve_target(&mut self, name: &str, objs: &[Reg]) -> Reg {
+        let nidx = self.string_name(name);
+        let target = self.alloc_reg();
+        self.emit(Instr::LoadUndefined { dst: target });
+        let mut end_jumps = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
+            self.dec_next_reg(1);
+            self.emit(Instr::Move {
+                dst: target,
+                src: obj,
+            });
+            let je = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            end_jumps.push(je);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        let end = self.here();
+        for je in end_jumps {
+            self.patch_jump(je, end);
+        }
+        target
+    }
+
+    /// Phase 2: PutValue to the base `with_resolve_target` picked — the captured
+    /// with-object (`WithSet` = the spec's object-env SetMutableBinding:
+    /// re-HasProperty + strict check + Set) or, when the register holds
+    /// `undefined` (objects are always truthy, so the test is unambiguous),
+    /// the static binding.
+    pub(crate) fn with_store_resolved(&mut self, name: &str, target: Reg, src: Reg) {
+        let nidx = self.string_name(name);
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse {
+            cond: target,
+            target: 0,
+        });
+        self.emit(Instr::WithSet {
+            obj: target,
+            name: nidx,
+            val: src,
+            strict: self.cx.in_strict,
+        });
+        let je = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let stat = self.here();
+        self.patch_jump(jf, stat);
+        let b = self.resolve(name);
+        self.store_binding(&b, src);
+        let end = self.here();
+        self.patch_jump(je, end);
+    }
+
+    /// `delete <identifier>` with NO with-object in scope (or none carrying the
+    /// name): the static-binding delete semantics, shared by `delete_expr`'s
+    /// identifier arm and `delete_with`'s fall-through. A local/param/`let`/
+    /// `const`/function binding (or an enclosing function's) is non-configurable
+    /// → `false`; a global defers to the runtime DeleteGlobal, which checks the
+    /// PROGRAM's decl lists (an eval-compiled `delete x` must see the program's
+    /// `var x` as non-configurable, and an eval-introduced var as deletable —
+    /// this compilation's own cx lists can't tell) and actually REMOVES a
+    /// configurable binding (an implicit `x = 1` global, an eval var, a caller
+    /// activation's EvalScope entry). Runtime resolution is intentional even for
+    /// `NaN`/`Infinity`/`undefined`: an EvalScope binding of the same name wins;
+    /// only its fall-through immutable global property is non-configurable.
+    pub(crate) fn emit_static_delete(&mut self, n: &str, dst: Reg) {
+        match self.resolve_existing(n) {
+            Some(Binding::Local(_))
+            | Some(Binding::LocalCell(_))
+            | Some(Binding::Upvalue(_))
+            | Some(Binding::ClassName(_)) => {
+                self.emit(Instr::LoadBool { dst, val: false });
+            }
+            Some(Binding::Global(slot)) => {
+                self.emit(Instr::DeleteGlobal { dst, slot });
+            }
+            // A binding of an ENCLOSING function is a declarative record
+            // binding, so `delete` is false — but `resolve_existing` reports it
+            // as unresolved (it does not thread upvalues), which would send it
+            // to the global fallback below and answer `true`. Costs one
+            // non-threading scan of the enclosing chain, only on this arm.
+            None if self.bound_in_enclosing(n) => {
+                self.emit(Instr::LoadBool { dst, val: false });
+            }
+            None => {
+                // Unreferenced-so-far name: allocate its global slot (like an
+                // identifier reference would) so the runtime check sees the
+                // LIVE binding — crucial for an eval'd `delete x` whose `x`
+                // only exists in the outer program, and for a `with`-masked
+                // name (an @@unscopables-hidden property, or a sloppy
+                // eval-introduced var in this activation's EvalScope) the
+                // compile-time scope knows nothing about. A never-declared
+                // name's fresh slot is UNINITIALIZED, so DeleteGlobal is a
+                // true no-op.
+                let slot = self.cx.global_slot(n) as u32;
+                self.emit(Instr::DeleteGlobal { dst, slot });
+            }
+        }
+    }
+
+    /// Emit a `with`-aware `delete name` into `dst`: delete from the first
+    /// with-object (innermost first) that has the binding, else fall back to the
+    /// static-binding delete semantics (mirrors `delete_expr`'s identifier arm).
+    pub(crate) fn delete_with(&mut self, name: &str, objs: &[Reg], dst: Reg) -> Reg {
+        let nidx = self.string_name(name);
+        let mut end_jumps = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
+            self.dec_next_reg(1);
+            self.emit(Instr::DeleteProp {
+                dst,
+                obj,
+                name: nidx,
+                strict: false,
+            });
+            let je = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            end_jumps.push(je);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        // Fallback: the static binding's delete result (no with-object had it —
+        // an @@unscopables-hidden name reaches here too, and its OUTER binding
+        // is the delete target).
+        self.emit_static_delete(name, dst);
+        let end = self.here();
+        for je in end_jumps {
+            self.patch_jump(je, end);
+        }
+        dst
+    }
+}

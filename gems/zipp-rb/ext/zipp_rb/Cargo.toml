@@ -1,0 +1,21 @@
+[package]
+name = "zipp_rb"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Ruby native extension: a Rust cdylib that embeds the Zipp engine and exposes
+# it as ZippRb::VM. `zipp-vm` is the in-tree engine under engine/ (upstream
+# Zipp plus engine/LOCAL_CHANGES.md); `instrument` is enabled so the
+# resource-limit surface is compiled in.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# `rb-sys`: `magnus::rb_sys::protect` (deliver pending interrupts without a
+# longjmp through Rust frames) and raw VALUE access (cycle detection).
+magnus = { version = "0.8", features = ["rb-sys"] }
+rb-sys = "0.9"
+# The in-tree engine. The gem ships engine/, so this path resolves in an
+# installed gem as it does in the checkout.
+zipp-vm = { path = "../../engine/crates/zipp-vm", features = ["instrument"] }
