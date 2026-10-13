@@ -10,19 +10,18 @@ Rake::ExtensionTask.new("zipp_rb", gemspec) do |ext|
   ext.lib_dir = "lib/zipp_rb"
 end
 
-# Materialise the vendored engine (vendor/engine) from the vendor/zipp submodule
-# before compiling or packaging, so the extension's path dependency exists and a
-# built .gem is self-contained.
-task :vendor_engine do
-  sh "scripts/vendor-engine.sh"
-end
-Rake::Task[:compile].enhance([:vendor_engine]) if Rake::Task.task_defined?(:compile)
-Rake::Task[:build].enhance([:vendor_engine]) if Rake::Task.task_defined?(:build)
-task test: :vendor_engine
-
 Rake::TestTask.new(:test) do |t|
   t.libs << "test" << "lib"
   t.test_files = FileList["test/**/*_test.rb"]
+end
+
+# The engine's own Rust unit tests, with the feature set the extension builds.
+# `no_core_float_parse_in_engine_sources` reads crates/zipp-wasm, which is not
+# vendored (see engine/UPSTREAM), so it is skipped rather than patched.
+desc "Run the Zipp engine's Rust unit tests"
+task "engine:test" do
+  sh "cargo test --manifest-path engine/Cargo.toml -p zipp-vm --lib --features instrument " \
+     "-- --skip num_parse::tests::no_core_float_parse_in_engine_sources"
 end
 
 task default: %i[compile test]

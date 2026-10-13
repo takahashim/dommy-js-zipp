@@ -1,0 +1,97 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Import an upstream Zipp revision into the in-tree engine
+# (gems/zipp-rb/engine/crates) through the vendor branch.
+#
+#   bin/engine-import [REF]        # REF defaults to origin/main
+#
+# The branch `vendor/zipp-upstream` holds pristine upstream imports only. This
+# script commits REF's crates there; you then merge that branch into your
+# working branch, so upstream changes and the local engine changes meet in an
+# ordinary 3-way merge (see gems/zipp-rb/engine/LOCAL_CHANGES.md when a
+# conflict needs a decision). Importing the revision already imported is a
+# no-op.
+
+require "fileutils"
+require "open3"
+require "tmpdir"
+
+ROOT = File.expand_path("..", __dir__)
+ENGINE_REL = "gems/zipp-rb/engine"
+UPSTREAM_REL = "#{ENGINE_REL}/UPSTREAM"
+BRANCH = "vendor/zipp-upstream"
+CACHE = File.join(ENV.fetch("XDG_CACHE_HOME", File.join(Dir.home, ".cache")), "dommy-js-zipp", "zipp.org")
+
+def run(*cmd, chdir: ROOT)
+  out, status = Open3.capture2e(*cmd, chdir: chdir)
+  abort "engine-import: `#{cmd.join(" ")}` failed:\n#{out}" unless status.success?
+  out
+end
+
+def git(*args, chdir: ROOT) = run("git", *args, chdir: chdir)
+
+# UPSTREAM is a small "key: value" file maintained by this script.
+def read_upstream(text)
+  text.lines.to_h { |l| l.chomp.split(": ", 2) }
+end
+
+ref = ARGV[0] || "origin/main"
+upstream = read_upstream(git("show", "#{BRANCH}:#{UPSTREAM_REL}"))
+repo = upstream.fetch("repository")
+crates = upstream.fetch("crates").split
+
+# A local clone of upstream, kept outside the repository and reused.
+unless File.directory?(CACHE)
+  FileUtils.mkdir_p(File.dirname(CACHE))
+  run("git", "clone", "--no-checkout", repo, CACHE, chdir: Dir.home)
+end
+git("fetch", "--quiet", "origin", chdir: CACHE)
+sha = git("rev-parse", "--verify", "#{ref}^{commit}", chdir: CACHE).strip
+
+Dir.mktmpdir("engine-import") do |tmp|
+  worktree = File.join(tmp, "wt")
+  git("worktree", "add", "--quiet", worktree, BRANCH)
+  begin
+    dest = File.join(worktree, ENGINE_REL)
+    FileUtils.rm_rf(File.join(dest, "crates"))
+    FileUtils.mkdir_p(dest)
+    archive = run("git", "archive", "--format=tar", sha, *crates.map { "crates/#{_1}" }, chdir: CACHE)
+    Open3.capture2("tar", "-x", "-C", dest, stdin_data: archive, binmode: true)
+    File.write(File.join(worktree, UPSTREAM_REL),
+               "repository: #{repo}\ncommit: #{sha}\ncrates: #{crates.join(" ")}\n")
+    git("add", "-A", ENGINE_REL, chdir: worktree)
+    if git("status", "--porcelain", chdir: worktree).strip.empty?
+      puts "#{BRANCH} already holds #{sha[0, 8]}; nothing to import."
+      exit
+    end
+    git("commit", "--quiet", "-m", "Import zipp upstream #{sha[0, 8]}\n\n" \
+        "Pristine crates/{#{crates.join(",")}} from #{repo} at #{sha}.", chdir: worktree)
+  ensure
+    git("worktree", "remove", "--force", worktree)
+  end
+end
+
+# Things the merge will not tell you about.
+warnings = []
+crates.each do |crate|
+  manifest = run("git", "show", "#{sha}:crates/#{crate}/Cargo.toml", chdir: CACHE)
+  manifest.scan(%r{path\s*=\s*"\.\./([^"/]+)"}).flatten.uniq.each do |dep|
+    warnings << "crates/#{crate} path-depends on crates/#{dep}, which is not imported (add it to UPSTREAM's crates:)" unless crates.include?(dep)
+  end
+end
+upstream_ws = run("git", "show", "#{sha}:Cargo.toml", chdir: CACHE)
+%w[workspace.package workspace.dependencies].each do |section|
+  theirs = upstream_ws[/^\[#{Regexp.escape(section)}\]\n(.*?)(?=^\[|\z)/m, 1].to_s.lines.grep(/\A\w/).sort
+  ours = File.read(File.join(ROOT, ENGINE_REL, "Cargo.toml"))[/^\[#{Regexp.escape(section)}\]\n(.*?)(?=^\[|\z)/m, 1].to_s.lines.grep(/\A\w/).sort
+  next if (theirs - ours).empty?
+
+  warnings << "upstream [#{section}] has entries #{ENGINE_REL}/Cargo.toml lacks:\n    " + (theirs - ours).map(&:strip).join("\n    ")
+end
+
+puts <<~MSG
+  Committed upstream #{sha[0, 8]} on #{BRANCH}. Next:
+    git merge #{BRANCH}        # resolve conflicts; see #{ENGINE_REL}/LOCAL_CHANGES.md
+    bundle exec rake engine:test test
+MSG
+puts "Also check:", warnings.map { "  - #{_1}" } unless warnings.empty?

@@ -1,3 +1,0 @@
-[submodule "vendor/zipp"]
-	path = vendor/zipp
-	url = git@github.com:f2i-com/zipp.org.git
