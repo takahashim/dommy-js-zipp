@@ -26,6 +26,9 @@ module Dommy
         # `this` (ZippRb::VM#call takes a global name only); `__dommyZippParses`
         # is the syntax check behind Runtime#evaluate. The engine's own
         # `performance` goes, so the window's is the one the page finds.
+        # `__rbEvalP` (Runtime#evaluate's result slot) is the global's from the
+        # start, so setting it never asks a window below the global (see
+        # Runtime's unified_global) whether the host has the name.
         BOOT_JS = <<~JS
           globalThis.__dommyZippCall = function (path, args) {
             var parts = path.split("."), owner = globalThis;
@@ -33,6 +36,7 @@ module Dommy
             return owner[parts[parts.length - 1]].apply(owner, args);
           };
           delete globalThis.performance; // real-clock; the window's runs on Dommy's scheduler
+          Object.defineProperty(globalThis, "__rbEvalP", { value: undefined, writable: true, enumerable: false, configurable: true });
           globalThis.__dommyZippParses = function (source) {
             try {
               new Function(source);

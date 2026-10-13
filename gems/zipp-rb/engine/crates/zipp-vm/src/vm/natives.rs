@@ -313,6 +313,18 @@ impl<'p> Vm<'p> {
                         fell_back = true;
                         break;
                     }
+                    // A binding that lives only in a global SLOT (a builtin, a
+                    // script `var`) is an own data property of the global
+                    // object (see `global_slot_binding_descriptor`), so it
+                    // governs the write before anything on the global's
+                    // prototype chain — a Proxy there must not see
+                    // `globalThis.Math = m`.
+                    if cur.heap_index() == self.global_this {
+                        if let Some((_, a)) = self.global_slot_binding_descriptor(&key) {
+                            governing = Some((false, a.writable, Value::UNDEFINED));
+                            break;
+                        }
+                    }
                 }
                 // A TypedArray on the prototype chain ABSORBS canonical
                 // numeric keys (its [[Set]] governs); handled below.

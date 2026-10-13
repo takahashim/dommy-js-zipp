@@ -122,6 +122,17 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   difference is unobservable, except that `$262.agent.broadcast` refuses such
   a buffer. Test: `test/engine_fixes_test.rb`.
 
+## Global object (crates/zipp-vm/src/vm/natives.rs, vm/access.rs)
+
+- **Global slot bindings govern a [[Set]]** — a builtin or script `var` lives
+  in a global slot, not the global object's `ObjMap`, so `Reflect.set` and a
+  member assignment (`globalThis.JSON = j`) walked past it to the global's
+  prototype chain, and a Proxy there saw the write (and swallowed it).
+  `ordinary_set_with_receiver` and `set_prop`'s prototype walk now treat a
+  binding `global_slot_binding_descriptor` reports as the own data property
+  it is. dommy-js-zipp's unified window keeps the window proxy on the
+  global's chain. Test: `test/engine_fixes_test.rb`.
+
 ## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, compile/*, vm/dispatch.rs)
 
 - **JIT mirrors only for the x86-64 JIT** — the per-slot `hot_mirror`,

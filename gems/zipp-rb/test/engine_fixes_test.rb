@@ -12,6 +12,29 @@ class EngineFixesTest < Minitest::Test
     @vm.dispose
   end
 
+  # A builtin or script `var` is an own data property of the global object, so
+  # assigning it never consults the global's prototype chain — where dommy's
+  # unified window keeps a Proxy — while a new name does, and an unresolvable
+  # bare name asks that Proxy's `has` and throws a ReferenceError.
+  def test_global_bindings_govern_writes_before_a_proxy_on_the_global_chain
+    result = @vm.eval(<<~JS)
+      var trapped = [];
+      var declared = 1;
+      Object.setPrototypeOf(globalThis, new Proxy({}, {
+        set(t, k, v, r) { trapped.push(String(k)); return true; },
+        has(t, k) { return false; },
+      }));
+      Reflect.set(globalThis, "Math", Math);
+      globalThis.JSON = JSON;
+      globalThis.declared = 2;
+      globalThis.brandNew = 3;
+      let error = null;
+      try { notDeclaredAnywhere; } catch (e) { error = e.name; }
+      [trapped.join(","), declared, error];
+    JS
+    assert_equal ["brandNew", 2, "ReferenceError"], result
+  end
+
   # The extension builds the engine's safe profile (no `unsafe`), where a
   # SharedArrayBuffer keeps agent-local bytes; with one agent per VM it still
   # behaves as one: brand, growth, Atomics, and a waiter notified in-agent.

@@ -9,8 +9,9 @@ gem "dommy-js-zipp", path: "gems/dommy-js-zipp"
 
 # dommy-js-zipp tracks dommy's main (the bridge's wire protocol runs ahead of
 # the released gem). A sibling checkout of the dommy monorepo is used when
-# present; otherwise dommy's main on GitHub.
-dommy_gems = File.expand_path("../dommy/gems", __dir__)
+# present (DOMMY_GEMS names another checkout's gems/ directory, a worktree on
+# a dommy branch, say); otherwise dommy's main on GitHub.
+dommy_gems = File.expand_path(ENV.fetch("DOMMY_GEMS", "../dommy/gems"), __dir__)
 if File.directory?(dommy_gems)
   gem "dommy", path: "#{dommy_gems}/dommy"
   # dommy-js-zipp's Rack and Capybara integrations (and their tests).

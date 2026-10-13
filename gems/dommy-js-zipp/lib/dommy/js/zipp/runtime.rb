@@ -37,13 +37,15 @@ module Dommy
         # `preload_modules:` names registered modules (see .register_module)
         # this Runtime finds by name before asking its module loader; a loader
         # answer of `{as: name}` lands on one too. A name not registered raises
-        # ArgumentError. Other options go to the VM (timeout_msec:,
-        # memory_limit:, step_limit:).
-        def initialize(preload_modules: [], **vm_opts)
+        # ArgumentError. `unified_global:` makes the window the engine's global
+        # object (Config.unified_global). Other options go to the VM
+        # (timeout_msec:, memory_limit:, step_limit:).
+        def initialize(preload_modules: [], unified_global: Config.unified_global, **vm_opts)
           preloaded = ModuleRegistry.sources_for(preload_modules)
           @backend = Backend.new(**vm_opts)
           @backend.preload_modules(preloaded) unless preloaded.empty?
           @bridge = Dommy::Js::HostBridge.new(@backend)
+          @unified_global = unified_global && @bridge.respond_to?(:unify_global_window)
           @environment = BrowserEnvironment.new(@backend)
           @errors = ErrorTranslator.new(@backend, @bridge)
           @environment.install_error_rebuilder
@@ -57,13 +59,20 @@ module Dommy
           @bridge.define_host_object(name, obj)
         end
 
+        # Whether the window is the engine's global object (see #initialize).
+        def unified_global? = @unified_global
+
         # Inject the Dommy window: seed it as the JS global, give the bridge the
         # realm it belongs to, and alias the bare timer globals onto it (so
         # `setTimeout(fn, ms)` runs through Dommy's deterministic scheduler —
         # drive it with `win.scheduler.advance_time(ms)`).
         def install_window(win)
           @window = win
-          define_host_object("window", win)
+          if @unified_global
+            @bridge.unify_global_window(win)
+          else
+            define_host_object("window", win)
+          end
           @bridge.window = win
           install_promise_rejection_hook
           wire_scheduler(win)
@@ -81,7 +90,7 @@ module Dommy
         # history / navigator / storages / CSS / fetch / addEventListener / …),
         # aliased onto the installed window. Call after install_window.
         def install_browser_globals
-          @environment.install_globals
+          @environment.install_globals(unified: @unified_global)
           self
         end
 
