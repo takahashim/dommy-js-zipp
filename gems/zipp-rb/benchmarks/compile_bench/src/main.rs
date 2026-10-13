@@ -3,7 +3,7 @@
 //! `eval_in_context_structured` on a warm VM. This attributes the "load is Nx
 //! slower" number to the engine vs the binding.
 //!
-//!   cargo run --release --bin zipp_compile_bench -- /path/to/react.umd.js
+//!   cargo run --release --manifest-path benchmarks/compile_bench/Cargo.toml -- benchmarks/fixtures/react.umd.js
 
 use std::time::Instant;
 use zipp_vm::embed::{compile_script, HostValueBudget, ScriptState};

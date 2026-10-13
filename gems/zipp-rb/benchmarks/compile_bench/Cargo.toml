@@ -1,0 +1,14 @@
+[package]
+name = "zipp_compile_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Engine-only cost breakdown for one source file (compile, run, warm eval,
+# structured marshalling), with no Ruby involved:
+#
+#   cargo run --release --manifest-path benchmarks/compile_bench/Cargo.toml -- benchmarks/fixtures/react.umd.js
+[workspace]
+
+[dependencies]
+zipp-vm = { path = "../../engine/crates/zipp-vm", features = ["instrument"] }

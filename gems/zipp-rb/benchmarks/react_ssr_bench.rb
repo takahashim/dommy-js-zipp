@@ -12,7 +12,7 @@
 require "quickjs"
 require "zipp_rb"
 
-FIXTURES = "/Users/maki/git/dommy-js-quickjs/test/fixtures"
+FIXTURES = File.expand_path("fixtures", __dir__)
 REACT = File.read(File.join(FIXTURES, "react.umd.js"))
 REACT_DOM_SERVER = File.read(File.join(FIXTURES, "react-dom-server.umd.js"))
 BOOT = "globalThis.self = globalThis; globalThis.process = { env: {} };"

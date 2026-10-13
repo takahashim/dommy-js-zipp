@@ -11,7 +11,7 @@ require "json"
 require "zipp_rb" if engine == "zipp"
 require "quickjs" if engine == "quickjs"
 
-FIXTURES = "/Users/maki/git/dommy-js-quickjs/test/fixtures"
+FIXTURES = File.expand_path("fixtures", __dir__)
 BOOT = "globalThis.self = globalThis; globalThis.process = { env: {} };"
 REACT = File.read(File.join(FIXTURES, "react.umd.js"))
 REACT_DOM_SERVER = File.read(File.join(FIXTURES, "react-dom-server.umd.js"))
