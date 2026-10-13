@@ -1,0 +1,131 @@
+# frozen_string_literal: true
+
+require "json"
+require "zipp_rb"
+
+module Dommy
+  module Js
+    module Zipp
+      # Binds HostBridge's abstract backend contract (eval / define_host_function
+      # / call_js / run_bundle) to a ZippRb::VM, plus what Runtime asks of an
+      # engine beyond that.
+      #
+      # Zipp has no bytecode cache, so #run_bundle parses its source on every
+      # VM; Zipp's parser is fast enough that the bridge's runtime bundles take
+      # a few tens of milliseconds per VM.
+      class Backend
+        # A console line, shaped like quickjs.rb's log object so a host's
+        # `on_log` block works with either backend.
+        Log = Struct.new(:severity, :message) do
+          def to_s = message.to_s
+          def raw = [message]
+        end
+
+        # Run on every VM before anything else. `__dommyZippCall` resolves a
+        # dotted path (`__rbHost.defineGlobal`) and calls it with its owner as
+        # `this` (ZippRb::VM#call takes a global name only); `__dommyZippParses`
+        # is the syntax check behind Runtime#evaluate. The engine's own
+        # `performance` goes, so the window's is the one the page finds.
+        BOOT_JS = <<~JS
+          globalThis.__dommyZippCall = function (path, args) {
+            var parts = path.split("."), owner = globalThis;
+            for (var i = 0; i < parts.length - 1; i++) owner = owner[parts[i]];
+            return owner[parts[parts.length - 1]].apply(owner, args);
+          };
+          delete globalThis.performance; // real-clock; the window's runs on Dommy's scheduler
+          globalThis.__dommyZippParses = function (source) {
+            try {
+              new Function(source);
+              return true;
+            } catch (error) {
+              if (error instanceof SyntaxError) return false;
+              throw error;
+            }
+          };
+        JS
+        private_constant :BOOT_JS
+
+        def initialize(timeout_msec: Config.timeout_msec, memory_limit: Config.memory_limit, **vm_opts)
+          @vm = ::ZippRb::VM.new(timeout_msec: timeout_msec, memory_limit: memory_limit, **vm_opts)
+          @vm.load(BOOT_JS)
+        end
+
+        # True once the VM can no longer run JS: it was discarded after an engine
+        # panic, or disposed. (Zipp does not poison a VM on out-of-memory.)
+        def poisoned?
+          @vm.disposed? || @vm.poisoned?
+        end
+
+        # Every entry point that runs JS goes through #guarded, so a dead VM
+        # answers nil whichever one a host reached for.
+        def eval(js) = guarded { @vm.eval(js) }
+
+        # Run `js` in global scope for its side effects; the completion value is
+        # not converted (a UMD bundle's last statement can be a large object).
+        def load(js) = guarded { @vm.load(js) }
+
+        def run_bundle(_cache_key, source) = load(source)
+
+        # Run `body` as an async function body, awaiting its result for at most
+        # `max_ms`.
+        def eval_awaited(body, max_ms: 5000) = guarded { @vm.eval_async(body, max_ms: max_ms) }
+
+        # Whether `source` parses as a function body. Nothing runs.
+        def parses?(source) = guarded { @vm.call("__dommyZippParses", source) }
+
+        # Install the ESM resolver: `(specifier, importer) -> source | {code:,
+        # as:} | {as:} | nil`, consulted for every static and dynamic import.
+        def module_loader=(callable)
+          @vm.module_loader = callable
+        end
+
+        # Evaluate the module named `url` (resolved and fetched by the module
+        # loader) for its side effects, awaiting a top-level await.
+        def import_module_url(url)
+          guarded { @vm.eval_async("await import(#{JSON.generate(url.to_s)});") }
+        end
+
+        def define_host_function(name, &block)
+          @vm.define_function(name, &block)
+        end
+
+        # Microtasks the call queues are left for the event loop's checkpoint
+        # (rAF callbacks of one frame share one), as with quickjs.rb's call.
+        def call_js(path, *args) = guarded { @vm.invoke("__dommyZippCall", path.to_s, args) }
+
+        def drain_microtasks = guarded { @vm.drain_jobs! }
+
+        # The block receives a ZippRb::Error carrying the rejection's message
+        # (zipp-rb reports the message only, not the reason itself).
+        def on_unhandled_rejection(&block)
+          @vm.on_unhandled_rejection { |message| block.call(::ZippRb::Error.new(message.to_s)) }
+        end
+
+        # Point the engine's promise-rejection hook at a JS function, named by
+        # an expression evaluated once in global scope.
+        def promise_rejection_hook=(expression)
+          @vm.promise_rejection_hook = expression
+        end
+
+        # The block receives a Log (#severity / #to_s / #raw).
+        def on_log(&block)
+          @vm.on_log { |severity, message| block.call(Log.new(severity, message)) }
+        end
+
+        def run_gc = guarded { @vm.gc! }
+
+        def dispose
+          @vm.dispose
+        end
+
+        private
+
+        def guarded
+          return if poisoned?
+
+          yield
+        end
+      end
+    end
+  end
+end

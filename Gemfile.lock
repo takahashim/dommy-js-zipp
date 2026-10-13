@@ -1,4 +1,18 @@
 PATH
+  remote: /Users/maki/git/dommy/gems/dommy
+  specs:
+    dommy (0.16.0)
+      base64
+      makiri (>= 0.16.0)
+
+PATH
+  remote: gems/dommy-js-zipp
+  specs:
+    dommy-js-zipp (0.1.0)
+      dommy (>= 0.16.0, < 0.17)
+      zipp-rb
+
+PATH
   remote: gems/zipp-rb
   specs:
     zipp-rb (0.0.0)
@@ -7,7 +21,11 @@ PATH
 GEM
   remote: https://rubygems.org/
   specs:
+    base64 (0.3.0)
     drb (2.2.3)
+    makiri (0.16.0)
+      rb_sys (~> 0.9)
+    makiri (0.16.0-arm64-darwin)
     minitest (6.0.6)
       drb (~> 2.0)
       prism (~> 1.5)
@@ -24,14 +42,21 @@ PLATFORMS
   ruby
 
 DEPENDENCIES
+  dommy!
+  dommy-js-zipp!
   minitest
   rake
   rake-compiler
   zipp-rb!
 
 CHECKSUMS
+  base64 (0.3.0) sha256=27337aeabad6ffae05c265c450490628ef3ebd4b67be58257393227588f5a97b
   bundler (4.0.16) sha256=d6ca5dd440c24f9abce9844cf44cc8e18c6a553de65a47efb4544137af92c47d
+  dommy (0.16.0)
+  dommy-js-zipp (0.1.0)
   drb (2.2.3) sha256=0b00d6fdb50995fe4a45dea13663493c841112e4068656854646f418fda13373
+  makiri (0.16.0) sha256=d6f10cb0315d9d34ad4741da08bd4624b451de8bb9d8ae87eb13204b46ad022e
+  makiri (0.16.0-arm64-darwin) sha256=2e39cc0635d4979a3dacf2e0b169f0e8af0351d55279ce720d76ea482abbb0a1
   minitest (6.0.6) sha256=153ea36d1d987a62942382b61075745042a2b3123b1cd48f4c3675af9cc7d6f1
   prism (1.9.0) sha256=7b530c6a9f92c24300014919c9dcbc055bf4cdf51ec30aed099b06cd6674ef85
   rake (13.4.2) sha256=cb825b2bd5f1f8e91ca37bddb4b9aaf345551b4731da62949be002fa89283701

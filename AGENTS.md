@@ -5,7 +5,7 @@ JavaScript engine in Rust):
 
 - `gems/zipp-rb` — the Ruby binding (`ZippRb::VM`): a Magnus/rb-sys native
   extension over the in-tree engine.
-- `gems/dommy-js-zipp` — (planned) a [Dommy](https://github.com/takahashim/dommy)
+- `gems/dommy-js-zipp` — a [Dommy](https://github.com/takahashim/dommy)
   JavaScript backend on zipp-rb, the counterpart of dommy-js-quickjs.
 
 ## Layout
@@ -30,10 +30,15 @@ gems/zipp-rb/
     src/event_loop.rs     # timers, eval_async, import, drain_jobs
     src/handles.rs        # durable JS handles held by Ruby
     src/limits.rs         # step / heap / deadline limits, interruption
-    src/modules.rs        # in-memory ES module provider
+    src/modules.rs        # in-memory ES modules; module resolver / import.meta.url
   lib/zipp_rb.rb          # ZippRb module, errors, constants
-  lib/zipp_rb/{vm,handle}.rb  # ZippRb::VM, ZippRb::Handle
+  lib/zipp_rb/{vm,handle,module_paths}.rb  # ZippRb::VM, ZippRb::Handle, module names <-> paths
   test/                   # minitest
+gems/dommy-js-zipp/
+  lib/dommy/js/zipp.rb    # entry point; registers the :zipp runtime
+  lib/dommy/js/zipp/      # Backend (zipp-rb), Runtime, EventLoop, ErrorTranslator,
+                          # BrowserEnvironment; js/ payloads shared with dommy-js-quickjs
+  test/                   # minitest, ported from dommy-js-quickjs; fixtures/ = framework bundles
 notes/                    # local design notes; git-ignored, not shipped
 ```
 
@@ -50,7 +55,14 @@ cd gems/zipp-rb
 bundle exec rake compile         # build the extension into lib/zipp_rb/
 bundle exec rake test
 bundle exec ruby -Ilib -Itest test/limits_test.rb -n test_timeout_interrupts_an_infinite_loop
+
+cd gems/dommy-js-zipp           # uses the zipp-rb built above
+bundle exec rake test
+bundle exec ruby -Ilib -Itest test/dommy/js/test_turbo_integration.rb
 ```
+
+dommy-js-zipp resolves `dommy` from a sibling checkout of the dommy monorepo
+(`../dommy/gems`) when there is one, else from dommy's main on GitHub.
 
 The first compile builds the engine in release mode (about a minute); later
 ones are incremental. `rake test` does not rebuild: run `rake compile` after a
