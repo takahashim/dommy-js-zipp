@@ -23,4 +23,9 @@ rb-sys = "0.9"
 # the aarch64 JIT, and page scripts are eval programs the JIT never compiles.
 # Without it the heap also drops the x86-64 JIT's per-slot mirrors (32 bytes
 # a slot; see engine/LOCAL_CHANGES.md).
-zipp-vm = { path = "../../engine/crates/zipp-vm", default-features = false, features = ["instrument"] }
+#
+# With `safe-sandbox`: the engine (and its regex engine) is built with
+# `forbid(unsafe_code)`, so an engine bug is a panic — which poisons that VM —
+# rather than memory corruption. A SharedArrayBuffer is agent-local there
+# (engine/LOCAL_CHANGES.md); a VM has one agent, so nothing can tell.
+zipp-vm = { path = "../../engine/crates/zipp-vm", default-features = false, features = ["instrument", "safe-sandbox"] }

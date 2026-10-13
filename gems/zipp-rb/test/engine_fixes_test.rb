@@ -12,6 +12,23 @@ class EngineFixesTest < Minitest::Test
     @vm.dispose
   end
 
+  # The extension builds the engine's safe profile (no `unsafe`), where a
+  # SharedArrayBuffer keeps agent-local bytes; with one agent per VM it still
+  # behaves as one: brand, growth, Atomics, and a waiter notified in-agent.
+  def test_shared_array_buffer_and_atomics_work_in_the_safe_profile
+    result = @vm.eval(<<~JS)
+      const sab = new SharedArrayBuffer(8, { maxByteLength: 16 });
+      const ia = new Int32Array(sab);
+      Atomics.add(ia, 0, 5);
+      sab.grow(16);
+      const waiter = Atomics.waitAsync(ia, 0, 5, 1000);
+      [Object.prototype.toString.call(sab), sab instanceof SharedArrayBuffer, sab.growable,
+       sab.byteLength, ia.length, Atomics.load(ia, 0), Atomics.wait(ia, 0, 5, 1),
+       Atomics.wait(ia, 0, 4), waiter.async, Atomics.notify(ia, 0)]
+    JS
+    assert_equal ["[object SharedArrayBuffer]", true, true, 16, 4, 5, "timed-out", "not-equal", true, 1], result
+  end
+
   # A promise's resolving functions inherit call/apply/bind like any function;
   # dommy's bridge settles a host promise with `resolve.apply(…)`.
   def test_promise_resolving_functions_inherit_function_prototype

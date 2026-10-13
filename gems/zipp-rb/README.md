@@ -34,6 +34,10 @@ vm.dispose
   replaced by U+FFFD.
 - A VM belongs to the thread that created it. A VM without Ruby callbacks
   releases the GVL while it runs.
+- The engine is built without `unsafe` code (its `safe-sandbox` profile, no
+  JIT): an engine bug is a panic, after which that VM is discarded
+  (`VM#poisoned?`), not memory corruption. A `SharedArrayBuffer` is local to
+  its VM.
 
 `VM#eval` and `#load` run their source as a classic script, as a browser
 runs `<script>`: top-level declarations (strict code's included, and

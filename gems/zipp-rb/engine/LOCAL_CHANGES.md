@@ -99,6 +99,22 @@ candidate to propose upstream.
   deadline); the interpreter fast path defers to the slow path when a deadline
   is set. zipp-rb's `timeout_msec` uses this instead of a timer thread.
 
+## Safe profile (crates/zipp-vm/src/vm/typedarray.rs, vm/setup.rs)
+
+zipp-rb builds the engine with `safe-sandbox` (`forbid(unsafe_code)` in
+zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
+`SharedArrayBuffer` and `Atomics` from the global, as truly-shared bytes need
+`unsafe`; pages and WPT's `common/sab.js` (through dommy-js-zipp's
+`WebAssembly.Memory({shared: true})` stub) want them.
+
+- **Agent-local SharedArrayBuffer** — under `safe-sandbox`,
+  `alloc_shared_array_buffer` gives a SharedArrayBuffer `AbData::Local` bytes
+  instead of an `Arc<SharedMem>`, and both globals stay installed. The brand
+  (`shared_buffers`), growth (`ab_max`, `AbData::grow_bytes`) and Atomics
+  already handle local bytes; with one agent (no `$262.agent` workers) the
+  difference is unobservable, except that `$262.agent.broadcast` refuses such
+  a buffer. Test: `test/engine_fixes_test.rb`.
+
 ## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, compile/*, vm/dispatch.rs)
 
 - **JIT mirrors only for the x86-64 JIT** — the per-slot `hot_mirror`,
