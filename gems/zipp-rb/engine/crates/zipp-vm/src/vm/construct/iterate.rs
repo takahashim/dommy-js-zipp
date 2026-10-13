@@ -1,0 +1,2315 @@
+// Split out of the former monolithic parent file by tools/split_rs.py.
+// Pure code move: `use super::*` keeps the parent module's imports in
+// scope, and items are widened to pub(crate) so the pieces still see
+// each other. No logic changed.
+#![allow(unused_imports)]
+use super::*;
+
+/// One `Vm::iter_proto_memo` entry: the last proof that the built-in
+/// iterator prototype `proto`'s `next` is the pristine native (`proto_ver` is
+/// its heap version + 1, 0 = no proof; `next_slot`/`next_bits` the value
+/// proven) and, when `chain_len > 0`, that no `return` is reachable from it
+/// (`chain` holds the ancestors examined and their heap versions).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IterProtoProof {
+    proto: u32,
+    proto_ver: u32,
+    next_slot: u32,
+    next_bits: u64,
+    chain: [(u32, u32); 3],
+    chain_len: u8,
+}
+
+impl<'p> Vm<'p> {
+    /// `Object.assign(target, ...sources)`: copy each source's own enumerable
+    /// keys (object keys, or an array's index strings) onto `target`; returns
+    /// `target`. Primitive (incl. null/undefined) sources contribute nothing.
+    pub(crate) fn object_assign(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        // target = ToObject(arg0): a primitive boxes (so `Object.assign("x")`
+        // returns a String wrapper), null/undefined throw.
+        self.require_object_coercible(arg0)?;
+        let target = self.to_object(arg0)?;
+        if let Some(r) = self.native_callee_realm {
+            self.realm_box_proto(target, r);
+        }
+        // `target` can be a fresh wrapper (`Object.assign(1, src)`) and the
+        // sources can be Values a caller holds only in Rust (an apply argument
+        // list): keep them all traced while getters and traps run below.
+        self.with_host_roots(&args[1..], |vm| {
+            vm.push_host_root(target);
+            vm.object_assign_into(target, &args[1..])
+        })
+    }
+
+    /// The per-source loop of [`Vm::object_assign`]. Each property is written
+    /// to `target` as soon as it is read — Object.assign step 3.a.iii.2 does
+    /// Get then Set per key — so a getter-produced value is reachable from the
+    /// (rooted) target before the next getter or trap can allocate.
+    fn object_assign_into(&mut self, target: Value, sources: &[Value]) -> Result<Value, Thrown> {
+        let tidx = target.heap_index();
+        // A heap slot's KIND never changes under a rooted value, so the String
+        // wrapper's read-only index/length rule is decided once, not per key.
+        let string_target = matches!(self.heap.get(tidx), HeapObj::Boxed { kind: 0, .. });
+        let mut added_any = false;
+        for &src in sources {
+            if !src.is_heap() {
+                continue;
+            }
+            // A string source spreads as index→1-UNIT string, like an array —
+            // the String exotic's own keys are unit positions; a surrogate half
+            // is a REAL 1-unit lone-surrogate string.
+            let str_units: Option<Vec<u16>> = match self.heap.get(src.heap_index()) {
+                HeapObj::Str(_) | HeapObj::Cons { .. } => Some(
+                    crate::heap::wtf8_units_iter(
+                        &self.heap.str_wtf8_cow(src.heap_index()).unwrap(),
+                    )
+                    .collect(),
+                ),
+                _ => None,
+            };
+            if let Some(units) = str_units {
+                for (i, u) in units.into_iter().enumerate() {
+                    let k = i.to_string();
+                    let v = self.str_from_unit(u);
+                    self.object_assign_set(target, tidx, string_target, &k, v)?;
+                    added_any = true;
+                }
+                continue;
+            }
+            // CopyDataProperties: ? from.[[OwnPropertyKeys]]() (integer, string,
+            // THEN symbol — symbols INCLUDED), and per key ? [[GetOwnProperty]]
+            // (skip absent / non-enumerable) then ? [[Get]]. object_own_keys +
+            // proxy_gopd route through a Proxy's ownKeys/gopd traps and a getter
+            // fires (its abrupt propagates), so a snapshot can't swallow them.
+            let keys_v = self.object_own_keys(src)?;
+            // The key Array keeps trap-made key strings (and the Symbols the
+            // `@@` key spellings name) traced across the traps below.
+            self.push_host_root(keys_v);
+            let keys: Vec<Value> = match self.heap.get(keys_v.heap_index()) {
+                HeapObj::Array(a) => a.clone(),
+                _ => Vec::new(),
+            };
+            for k in keys {
+                let ks = self.key_of(k);
+                let desc = match self.proxy_gopd(src, &ks)? {
+                    Some(d) => d,
+                    None => self.object_get_own_property_descriptor(src, &ks),
+                };
+                if desc.is_undefined() {
+                    continue;
+                }
+                let en = self.get_prop(desc, "enumerable")?;
+                if !self.truthy(en) {
+                    continue;
+                }
+                let v = self.get_member(src, &ks, src)?;
+                self.object_assign_set(target, tidx, string_target, &ks, v)?;
+                added_any = true;
+            }
+        }
+        if added_any {
+            self.heap.bump_version(tidx);
+        }
+        Ok(target)
+    }
+
+    /// Set(to, key, value, true) — STRICT, per CopyDataProperties: a setter is
+    /// invoked (and a throwing setter propagates), and a write rejected by the
+    /// target's descriptor (non-writable data, setter-less accessor) or a
+    /// frozen / sealed / non-extensible target throws a TypeError rather than
+    /// silently no-op'ing.
+    #[inline]
+    fn object_assign_set(
+        &mut self,
+        target: Value,
+        tidx: u32,
+        string_target: bool,
+        k: &str,
+        v: Value,
+    ) -> Result<(), Thrown> {
+        if string_target {
+            if let HeapObj::Boxed { kind: 0, value } = self.heap.get(tidx) {
+                // A String wrapper's canonical index properties (and "length")
+                // are read-only.
+                let slen = self.heap_str_units(value.heap_index());
+                let readonly = k == "length"
+                    || k.parse::<usize>()
+                        .ok()
+                        .filter(|n| n.to_string() == k)
+                        .map_or(false, |n| n < slen);
+                if readonly {
+                    return Err(Thrown(format!(
+                        "TypeError: Cannot assign to read-only property '{k}' of a String"
+                    )));
+                }
+            }
+        }
+        self.set_prop(target, k, v, true)?;
+        Ok(())
+    }
+
+    /// CopyDataProperties for an object REST pattern (`{a, ...rest} = src`):
+    /// trap-aware like `object_assign` (ownKeys → per-key [[GetOwnProperty]]
+    /// → enumerable → [[Get]]), but skipping the destructured sibling keys
+    /// WITHOUT calling gopd/get on them, collecting into a fresh map.
+    ///
+    /// The map is off-heap until the caller allocates it (with no safe point
+    /// in between), so every value read into it stays parked on the host-root
+    /// stack while the later getters and traps run.
+    pub(crate) fn copy_data_properties_rest(
+        &mut self,
+        src: Value,
+        excluded: &[String],
+    ) -> Result<ObjMap, Thrown> {
+        self.with_host_roots(&[src], |vm| vm.copy_data_properties_rest_inner(src, excluded))
+    }
+
+    fn copy_data_properties_rest_inner(
+        &mut self,
+        src: Value,
+        excluded: &[String],
+    ) -> Result<ObjMap, Thrown> {
+        let mut m = ObjMap::new();
+        if !src.is_heap() {
+            return Ok(m);
+        }
+        // A string source spreads as index → 1-UNIT string (unit-position keys;
+        // a surrogate half is a REAL 1-unit lone-surrogate string).
+        if matches!(
+            self.heap.get(src.heap_index()),
+            HeapObj::Str(_) | HeapObj::Cons { .. }
+        ) {
+            let units: Vec<u16> =
+                crate::heap::wtf8_units_iter(&self.heap.str_wtf8_cow(src.heap_index()).unwrap())
+                    .collect();
+            for (i, u) in units.into_iter().enumerate() {
+                let k = i.to_string();
+                if excluded.iter().any(|e| *e == k) {
+                    continue;
+                }
+                let v = self.str_from_unit(u);
+                m.set(&k, v);
+            }
+            return Ok(m);
+        }
+        let keys_v = self.object_own_keys(src)?;
+        self.push_host_root(keys_v);
+        let keys: Vec<Value> = match self.heap.get(keys_v.heap_index()) {
+            HeapObj::Array(a) => a.clone(),
+            _ => Vec::new(),
+        };
+        for k in keys {
+            let ks = self.key_of(k);
+            if excluded.iter().any(|e| *e == ks) {
+                continue;
+            }
+            let desc = match self.proxy_gopd(src, &ks)? {
+                Some(d) => d,
+                None => self.object_get_own_property_descriptor(src, &ks),
+            };
+            if desc.is_undefined() {
+                continue;
+            }
+            let en = self.get_prop(desc, "enumerable")?;
+            if !self.truthy(en) {
+                continue;
+            }
+            let v = self.get_member(src, &ks, src)?;
+            self.push_host_root(v);
+            m.set(&ks, v);
+        }
+        Ok(m)
+    }
+
+    /// The ordinary-object arm of `ObjectRest`/`ObjectRestDyn`: Get each
+    /// already-filtered own enumerable key (a getter's VALUE is copied, not
+    /// the accessor, and a throw propagates) into an off-heap map. Values stay
+    /// parked on the host-root stack until the caller's allocation, because a
+    /// later getter can collect. CopyDataProperties re-reads each key's own
+    /// descriptor at copy time, so a key an earlier getter deleted or made
+    /// non-enumerable is skipped.
+    pub(crate) fn object_rest_plain(
+        &mut self,
+        src: Value,
+        keys: Vec<String>,
+    ) -> Result<ObjMap, Thrown> {
+        self.with_host_roots(&[src], |vm| {
+            let mut m = ObjMap::new();
+            for k in keys {
+                if !vm.rest_key_still_enumerable(src, &k) {
+                    continue;
+                }
+                let v = vm.get_prop(src, &k)?;
+                vm.push_host_root(v);
+                m.set(&k, v);
+            }
+            Ok(m)
+        })
+    }
+
+    /// `Array.from(src[, mapFn])`: build an array from an array, a string's
+    /// chars, or an array-like (`{length, 0:…}`), applying `mapFn(value, index)`
+    /// when it is a function.
+    /// Materialize a value's iteration elements: an array or set → its items, a
+    /// string → its chars (as 1-char strings), a map → fresh `[key, value]` entry
+    /// arrays. Throws a TypeError for a non-iterable. Allocations happen after the
+    /// heap borrow is released (two phases).
+    /// Whether `v` is a user-callable value (function or closure).
+    /// A built-in constructor object invoked WITHOUT `new` — e.g. passed as a
+    /// `map`/`filter` callback or called via `.call`/`.apply`. String/Number/
+    /// Boolean coerce their argument to a primitive (matching the compiler's
+    /// lowered direct-call form); every other core constructor constructs.
+    pub(crate) fn call_ctor_as_function(
+        &mut self,
+        callee: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        // The dynamic-function constructors called WITHOUT `new` behave exactly
+        // like `new <Ctor>(...)` — both compile and return a fresh function.
+        let ci = callee.heap_index();
+        if ci == self.function_ctor && self.function_ctor != 0 {
+            return self.build_function(args);
+        }
+        if ci == self.gen_fn_ctor && self.gen_fn_ctor != 0 {
+            return self.build_function_kind(args, 1);
+        }
+        if ci == self.async_fn_ctor && self.async_fn_ctor != 0 {
+            return self.build_function_kind(args, 2);
+        }
+        if ci == self.asyncgen_fn_ctor && self.asyncgen_fn_ctor != 0 {
+            return self.build_function_kind(args, 3);
+        }
+        if ci == self.suppressederror_ctor && self.suppressederror_ctor != 0 {
+            return self.build_suppressed_error(args);
+        }
+        // `Symbol(desc)` / `BigInt(x)` reached as VALUES (a callback, `.call`, a
+        // bound target — the direct forms are compile-lowered to MakeSymbol /
+        // BigIntFrom): both call, neither constructs.
+        if ci == self.symbol_ctor && self.symbol_ctor != 0 {
+            let d = match args.first().copied() {
+                None => Value::UNDEFINED,
+                Some(v) if v == Value::UNDEFINED => Value::UNDEFINED,
+                Some(v) => self.to_str_value(v)?,
+            };
+            return Ok(self.make_symbol(d));
+        }
+        if ci == self.bigint_ctor && self.bigint_ctor != 0 {
+            let n = self.bigint_from(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+            return Ok(self.make_bigint_val(n));
+        }
+        // `RegExp(pattern)` WITHOUT `new` (22.2.4.1 steps 2-3): when
+        // IsRegExp(pattern) holds and flags is undefined, `pattern.constructor`
+        // SameValue the active function returns `pattern` itself. The direct
+        // `RegExp(x)` form used to be compile-lowered to `NewRegExp` with
+        // `is_construct: false`, which carries this step; since the lowering
+        // routes it through the plain call, the step lives here as well.
+        // (IsRegExp — a Get of `@@match` — precedes the `constructor` Get, as
+        // the spec orders them; `test262/built-ins/RegExp/S15.10.3.1_A1_T*`.)
+        if ci == self.regexp_ctor && self.regexp_ctor != 0 {
+            let pattern = args.first().copied().unwrap_or(Value::UNDEFINED);
+            let flags = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+            if self.is_regexp(pattern)? && flags == Value::UNDEFINED {
+                let c = self.get_prop(pattern, "constructor")?;
+                if self.same_value(c, callee) {
+                    return Ok(pattern);
+                }
+            }
+        }
+        let proto = match self.heap.get(callee.heap_index()) {
+            HeapObj::Object(m) => m
+                .get("prototype")
+                .filter(|p| p.is_heap())
+                .map(|p| p.heap_index()),
+            _ => None,
+        };
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        if let Some(p) = proto {
+            if p == self.str_proto && self.str_proto != 0 {
+                return if args.is_empty() {
+                    Ok(self.alloc_str(String::new()))
+                } else if a0.is_heap()
+                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Symbol { .. })
+                {
+                    // String(symbol) yields its "Symbol(desc)" text, not a TypeError.
+                    self.symbol_descriptive_value(a0)
+                } else {
+                    // The string VALUE, as the direct `String(x)` form gives it:
+                    // `['\uD800'].map(String)` keeps the surrogate.
+                    self.to_str_value(a0)
+                };
+            }
+            if p == self.num_proto && self.num_proto != 0 {
+                let n = if args.is_empty() {
+                    0.0
+                } else {
+                    self.to_number_coerce(a0)?
+                };
+                return Ok(Value::num(n));
+            }
+            if p == self.bool_proto && self.bool_proto != 0 {
+                return Ok(Value::bool(!args.is_empty() && self.truthy(a0)));
+            }
+            if p == self.date_proto && self.date_proto != 0 {
+                // Date() as a function ignores its args and returns the string
+                // form of the current time.
+                let now = self.construct(callee, &[])?;
+                let s = self.to_js_string(now)?;
+                return Ok(self.alloc_str(s));
+            }
+            // Array/Object/RegExp construct identically when called as a plain
+            // function: `Array(1,2)`===`new Array(1,2)`, `Object(x)`===ToObject(x),
+            // `RegExp(p,f)`===`new RegExp(p,f)`. (String/Number/Boolean above
+            // return PRIMITIVES, not wrappers, so they stay special-cased.)
+            if (p == self.arr_proto && self.arr_proto != 0)
+                || (p == self.obj_proto && self.obj_proto != 0)
+                || (p == self.regexp_proto && self.regexp_proto != 0)
+            {
+                return self.construct(callee, args);
+            }
+        }
+        // The error constructors also construct when called without `new`
+        // (`TypeError(msg)` === `new TypeError(msg)`).
+        if self.error_ctors.iter().any(|&c| c == ci && c != 0) {
+            return self.construct(callee, args);
+        }
+        // Other core constructors (Map/Set/Promise/Temporal/…) require `new`;
+        // calling them as a function is a TypeError. (Legacy call-without-new
+        // forms like Array()/Object()/Error() are compiler-lowered elsewhere and
+        // never reach here.)
+        let name = match self.heap.get(callee.heap_index()) {
+            HeapObj::Object(m) => m
+                .get("name")
+                .and_then(|n| self.heap.str_cow(n.heap_index()).map(|s| s.into_owned()))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        Err(Thrown(format!(
+            "TypeError: constructor {name} requires 'new'"
+        )))
+    }
+
+    /// GetWrappedValue: a primitive crosses the realm boundary as-is, a
+    /// callable crosses as a FRESH WrappedFunction (no identity or property
+    /// sharing), anything else is a TypeError.
+    pub(crate) fn wrap_realm_value(&mut self, v: Value) -> Result<Value, Thrown> {
+        if !v.is_heap() {
+            return Ok(v);
+        }
+        if matches!(
+            self.heap.get(v.heap_index()),
+            HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::Symbol { .. }
+                | HeapObj::BigInt(_)
+                | HeapObj::BigIntBig(_)
+        ) {
+            return Ok(v);
+        }
+        if self.is_callable(v) {
+            return self.wrapped_function_create(v);
+        }
+        Err(Thrown::from_static(
+            "TypeError: value crossing the ShadowRealm boundary is not a primitive or callable",
+        ))
+    }
+
+    /// WrappedFunctionCreate + CopyNameAndLength: snapshot the target's
+    /// `length` (own-property check, then Get; only a Number counts) and
+    /// `name` (Get; only a String counts) — ANY abrupt completion during the
+    /// copy (revoked-proxy HasProperty, throwing getter) is a TypeError. The
+    /// wrapper's prototype is the caller realm's %Function.prototype%.
+    pub(crate) fn wrapped_function_create(&mut self, target: Value) -> Result<Value, Thrown> {
+        // `target` lives only in this Rust frame while the CopyNameAndLength
+        // Gets below may run USER GETTERS (arbitrary allocating JS): suspend
+        // GC for the whole create so it cannot be collected mid-flight.
+        let _gc = self.gc_lock_guard();
+        // ANY abrupt completion (throwing getter, revoked-proxy probe) maps to
+        // a caller-realm TypeError — incl. dropping the realm-side pending
+        // error OBJECT, which must not cross the boundary.
+        macro_rules! copy_step {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.pending_throw.take();
+                        return Err(Thrown::from_static(
+                            "TypeError: WrappedFunction: copying target name/length failed",
+                        ));
+                    }
+                }
+            };
+        }
+        let mut length = 0.0;
+        let has_len = copy_step!(self.has_own_property_dyn(target, "length"));
+        if has_len {
+            let lv = copy_step!(self.get_prop(target, "length"));
+            if lv.is_number() {
+                let n = lv.as_f64();
+                // max(ToIntegerOrInfinity(targetLen), 0); +Inf stays.
+                length = if n.is_nan() { 0.0 } else { n.trunc().max(0.0) };
+            }
+        }
+        let nv = copy_step!(self.get_prop(target, "name"));
+        let name = if nv.is_heap() && self.heap.is_str_like(nv.heap_index()) {
+            self.display(nv)
+        } else {
+            String::new()
+        };
+        let idx = self.heap.alloc(HeapObj::Wrapped {
+            target,
+            name,
+            length,
+        });
+        // The wrapper is created in the CALLER realm — the realm of the
+        // `evaluate` function running now (a realm copy wraps with ITS realm's
+        // %Function.prototype%; the main realm's is the identity).
+        let home = self.native_home(self.fn_proto);
+        self.proto_of.insert(idx, Value::heap(home));
+        if let Some(r) = self.native_callee_realm {
+            self.obj_realm.insert(idx, r);
+        }
+        Ok(Value::heap(idx))
+    }
+
+    pub(crate) fn is_callable(&self, mut v: Value) -> bool {
+        loop {
+            // An [[IsHTMLDDA]] exotic (`document.all`) is callable (returns undefined).
+            if v.is_heap() && self.is_htmldda_index(v.heap_index()) {
+                return true;
+            }
+            if !v.is_heap() {
+                return false;
+            }
+            return match self.heap.get(v.heap_index()) {
+                HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. } => true,
+                // The native resolve/reject functions (new Promise executor args,
+                // capability functions) and combinator elements are functions.
+                HeapObj::BoundResolver { .. } | HeapObj::CombinatorResolver { .. } => true,
+                // A class constructor IS callable (typeof is "function"): it can be
+                // bound (`C.bind()`) and passed where a function is expected. Calling
+                // one without `new` still throws (the Call op / call_value route a
+                // Class to resolve_callable, which rejects it) — per spec that throw
+                // is "class constructor cannot be invoked without 'new'".
+                HeapObj::Class(_) => true,
+                // A built-in constructor object (String/Number/Array/…) is callable
+                // (typeof is "function"); so is %Function.prototype% itself (a
+                // built-in function that accepts any args and returns undefined).
+                HeapObj::Object(m) => {
+                    m.is_ctor || (self.fn_proto != 0 && v.heap_index() == self.fn_proto)
+                }
+                // A Proxy is callable iff its target is — the [[Call]] slot is
+                // fixed at creation, and REVOCATION does not change callability
+                // (the target field survives revocation behind the flag).
+                HeapObj::Proxy { target, .. } => {
+                    v = *target;
+                    continue;
+                }
+                _ => false,
+            };
+        }
+    }
+
+    /// `obj.hasOwnProperty(key)` — own data/accessor property, array index/length,
+    /// or string index/length.
+    /// `hasOwnProperty` for an ARRAY receiver with a NUMERIC key, answered
+    /// without ever spelling the index. `None` means "not this shape — use the
+    /// general path".
+    ///
+    /// The general path is `to_property_key` (which allocates a `String` for
+    /// the index) followed by `has_own_property` (which parses it straight
+    /// back), and that round trip IS the cost of the probe: a
+    /// `hasOwn.call(a, i)` loop over a 1000-element array measured 204ms
+    /// against node's 16ms, while `i in a` over the same array — which never
+    /// spells the key — was 17ms.
+    ///
+    /// Mirrors the `HeapObj::Array` arm of `has_own_property` exactly: a hole is
+    /// an absent element, and the `arr_props` side table can still carry an
+    /// index the dense storage does not.
+    pub(crate) fn has_own_index_fast(&self, obj: Value, key: Value) -> Option<bool> {
+        if !obj.is_heap() {
+            return None;
+        }
+        let idx = obj.heap_index();
+        let HeapObj::Array(items) = self.heap.get(idx) else {
+            return None;
+        };
+        // A non-integral or negative key spells something `has_own_property`'s
+        // `parse::<usize>()` would reject; leave those to the general path
+        // rather than duplicate the rejection.
+        let i = crate::vm::array_index(key)?;
+        if i < items.len() && !items[i].is_hole() {
+            return Some(true);
+        }
+        match self.arr_props.get(&idx) {
+            Some(m) => {
+                let mut buf = [0u8; 20];
+                Some(m.pos(crate::heap::index_key(&mut buf, i)).is_some())
+            }
+            None => Some(false),
+        }
+    }
+
+    pub(crate) fn has_own_property(&self, obj: Value, key: &str) -> bool {
+        // (Real private fields live in the side table and are invisible here;
+        // a PUBLIC computed "#..." string key is an ordinary reflectable prop.)
+        if !obj.is_heap() {
+            return false;
+        }
+        // %Array.prototype%'s exotic own length.
+        if key == "length" && self.arr_proto != 0 && obj.heap_index() == self.arr_proto {
+            return true;
+        }
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Object(m) => {
+                m.pos(key).is_some()
+                    // globalThis own properties are the reserved global bindings.
+                    || (obj.heap_index() == self.global_this
+                        && self.global_this != 0
+                        && self.global_by_name(key).is_some())
+            }
+            HeapObj::Array(items) => {
+                // An ARGUMENTS object's `length` is an ordinary (deletable)
+                // arr_props prop — covered by the arr_props clause below.
+                (key == "length" && !self.arguments_objs.contains_key(&obj.heap_index()))
+                    // A hole is an absent element — not an own property.
+                    || // A canonical index only: `"02"` parses to 2 but is an ordinary
+                    // string key, and no element answers it.
+                    canonical_index_str(key).is_some_and(|i| i < items.len() && !items[i].is_hole())
+                    || self.arr_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
+                    || self.regexp_result_prop(obj.heap_index(), key).is_some()
+            }
+            HeapObj::Str(s) => {
+                key == "length" || canonical_index_str(key).is_some_and(|i| i < s.units())
+            }
+            HeapObj::Cons { len, .. } => {
+                key == "length" || canonical_index_str(key).is_some_and(|i| i < *len)
+            }
+            // A class value: own statics (data + `static get`/`set`) + name/length
+            // + the synthesized `prototype` (a class always has one).
+            HeapObj::Class(c) => {
+                // Private STATICS live textually in the statics map but are
+                // not reflectable own properties.
+                !is_private_key(key)
+                    && (c.statics.pos(key).is_some()
+                        || c.static_getters.iter().any(|(n, _)| n == key)
+                        || c.static_setters.iter().any(|(n, _)| n == key)
+                        || self.callable_has_intrinsic(obj, key)
+                        || (key == "prototype" && self.callable_has_prototype(obj)))
+            }
+            // Functions/closures + the native resolve/reject + combinator element
+            // functions: assigned own props (`fn.x`) + the synthesized name/length.
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => {
+                self.fn_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
+                    || self.callable_has_intrinsic(obj, key)
+                    || (key == "prototype" && self.callable_has_prototype(obj))
+                    // A legacy sloppy function OWNS `caller`/`arguments`.
+                    || self.fn_has_legacy_caller_prop(obj.heap_index(), key)
+            }
+            // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*, …)
+            // keep their named own props in the arr_props side table; a boxed String
+            // also owns the wrapped string's chars + `length`.
+            _ => {
+                if self
+                    .arr_props
+                    .get(&obj.heap_index())
+                    .map_or(false, |m| m.pos(key).is_some())
+                {
+                    return true;
+                }
+                // A RegExp owns `lastIndex` (a writable data property).
+                if key == "lastIndex"
+                    && matches!(self.heap.get(obj.heap_index()), HeapObj::RegExp { .. })
+                {
+                    return true;
+                }
+                if let HeapObj::Boxed { kind: 0, value } = self.heap.get(obj.heap_index()) {
+                    let clen = match self.heap.get(value.heap_index()) {
+                        HeapObj::Str(s) => Some(s.units()),
+                        HeapObj::Cons { len, .. } => Some(*len),
+                        _ => None,
+                    };
+                    if let Some(n) = clen {
+                        if key == "length" {
+                            return true;
+                        }
+                        if let Ok(i) = key.parse::<usize>() {
+                            if i.to_string() == key && i < n {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// `[[GetOwnProperty]] is not undefined` honouring a Proxy — `Object.hasOwn` /
+    /// `Object.prototype.hasOwnProperty` on a Proxy consult its
+    /// `getOwnPropertyDescriptor` trap (or its target) rather than reporting `false`.
+    /// Non-proxies fall back to the ordinary own-property check.
+    pub(crate) fn has_own_property_dyn(&mut self, obj: Value, key: &str) -> Result<bool, Thrown> {
+        self.defer_check(obj, key)?;
+        // HasOwnProperty is [[GetOwnProperty]]-based: an uninitialized
+        // namespace export throws (unlike the `in` operator's [[HasProperty]]).
+        self.ns_tdz_check(obj, key)?;
+        if obj.is_heap() {
+            if let Some(desc) = self.proxy_gopd(obj, key)? {
+                return Ok(desc != Value::UNDEFINED);
+            }
+        }
+        Ok(self.has_own_property(obj, key))
+    }
+
+    /// `[[GetOwnProperty]](key).[[Enumerable]]` honouring a Proxy — the gopd trap
+    /// is user JS, so the infallible `own_is_enumerable` (&self) can't reach it.
+    /// A trap that reports the property absent (`undefined` descriptor) is `false`,
+    /// not a deref of nothing.
+    pub(crate) fn own_is_enumerable_dyn(&mut self, obj: Value, key: &str) -> Result<bool, Thrown> {
+        if obj.is_heap() && self.proxy_parts(obj.heap_index()).is_some() {
+            return Ok(match self.proxy_gopd(obj, key)? {
+                Some(desc) if desc != Value::UNDEFINED => {
+                    let e = self.get_prop(desc, "enumerable")?;
+                    self.truthy(e)
+                }
+                _ => false,
+            });
+        }
+        Ok(self.own_is_enumerable(obj, key))
+    }
+
+    /// `obj.propertyIsEnumerable(key)` — true if `key` is an own enumerable
+    /// property. Array indices are enumerable; `length` is not.
+    pub(crate) fn own_is_enumerable(&self, obj: Value, key: &str) -> bool {
+        if !obj.is_heap() {
+            return false;
+        }
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Object(m) => {
+                if let Some(i) = m.pos(key) {
+                    m.attr_at(i).enumerable
+                } else if obj.heap_index() == self.global_this && self.global_this != 0 {
+                    // Slot-backed SCRIPT-declared var/function globals are
+                    // enumerable bindings of the global object.
+                    self.program
+                        .global_names
+                        .iter()
+                        .position(|n| n == key)
+                        .is_some_and(|i| {
+                            (self.program.hoisted_globals.contains(&(i as u32))
+                                || self.program.decl_globals.contains(&(i as u32)))
+                                && !self.globals[i].is_uninitialized()
+                        })
+                } else {
+                    false
+                }
+            }
+            HeapObj::Array(items) => {
+                key.parse::<usize>().map_or(false, |i| i < items.len())
+                    || self
+                        .arr_props
+                        .get(&obj.heap_index())
+                        .and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
+                        .unwrap_or(false)
+                    || self.regexp_result_prop(obj.heap_index(), key).is_some()
+            }
+            // A TypedArray: a canonical in-bounds integer index is an own enumerable
+            // element; a non-canonical defineProperty'd key lives in arr_props.
+            HeapObj::TypedArray { .. } => {
+                self.ta_valid_index(obj.heap_index(), key).is_some()
+                    || self
+                        .arr_props
+                        .get(&obj.heap_index())
+                        .and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
+                        .unwrap_or(false)
+            }
+            // A function's assigned own properties live in `fn_props`.
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => self
+                .fn_props
+                .get(&obj.heap_index())
+                .and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
+                .unwrap_or(false),
+            // A class's own (static) properties live in `ClassData.statics`.
+            HeapObj::Class(c) => {
+                !is_private_key(key)
+                    && c.statics
+                        .pos(key)
+                        .map_or(false, |i| c.statics.attr_at(i).enumerable)
+            }
+            // A String wrapper's char indices are own ENUMERABLE props; `length` is
+            // non-enumerable; an assigned own prop lives in the arr_props side table.
+            // A raw string PRIMITIVE takes the same path — the callers ToObject it
+            // first, and ToObject("s") is a String exotic object with those indices.
+            HeapObj::Boxed { kind: 0, .. } | HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                if key == "length" {
+                    false
+                } else if self
+                    .string_exotic_chars(obj)
+                    .and_then(|(_, len)| canonical_index_str(key).map(|i| i < len))
+                    .unwrap_or(false)
+                {
+                    true
+                } else {
+                    self.arr_props
+                        .get(&obj.heap_index())
+                        .and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
+                        .unwrap_or(false)
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `proto.isPrototypeOf(obj)` — is `proto` anywhere in `obj`'s prototype chain?
+    pub(crate) fn is_prototype_of(&mut self, proto: Value, obj: Value) -> bool {
+        let mut cur = self.object_get_prototype_of(obj);
+        for _ in 0..10_000 {
+            if !cur.is_heap() {
+                return false;
+            }
+            if cur == proto {
+                return true;
+            }
+            cur = self.object_get_prototype_of(cur);
+        }
+        false
+    }
+
+    /// Resolve an iterable's iterator: a plain object with a `@@iterator` method
+    /// (a custom iterable) yields `obj[@@iterator]()`; everything else (arrays,
+    /// strings, Map/Set, generators) iterates directly and passes through.
+    /// May a built-in iterable `v` be walked positionally (IterNext, spread,
+    /// destructuring) instead of through its iterator? `m` is the `@@iterator`
+    /// method GetIterator already read — once, as the spec reads it. True when
+    /// the protocol would be unobservable: `m` is the kind's intrinsic default
+    /// method, the matching %XIteratorPrototype%.next is the pristine native,
+    /// and — when the consumer can stop early and IteratorClose (`closes`:
+    /// for-of, destructuring; a spread always drains) — no `return` method is
+    /// reachable from that prototype. Anything else takes the protocol.
+    pub(crate) fn builtin_iter_pristine(&self, v: Value, m: Value, closes: bool) -> bool {
+        if !v.is_heap() {
+            return false;
+        }
+        let (default, slot) = match self.heap.get(v.heap_index()) {
+            HeapObj::Array(_) => (self.default_array_iter, 0),
+            HeapObj::TypedArray { .. } => (self.default_ta_iter, 0),
+            HeapObj::Set(_) => (self.default_set_iter, 1),
+            HeapObj::Map { .. } => (self.default_map_iter, 2),
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Boxed { kind: 0, .. } => {
+                (self.default_string_iter, 3)
+            }
+            _ => return false,
+        };
+        if !m.is_heap() || m.bits() != default.bits() {
+            return false;
+        }
+        self.iter_proto_pristine(slot, closes)
+    }
+
+    /// The prototype half of [`Vm::builtin_iter_pristine`] for memo slot
+    /// `slot` (0 %ArrayIteratorPrototype%, 1 Set, 2 Map, 3 String): its `next`
+    /// is the pristine native and, with `closes`, no `return` is reachable
+    /// from it. Served from `iter_proto_memo` while every recorded heap
+    /// version and the live `next` bits still match — a key add, delete,
+    /// redefinition or prototype change bumps a version, and an in-place
+    /// overwrite of `next` changes its bits — else re-proven and re-recorded.
+    #[inline]
+    fn iter_proto_pristine(&self, slot: usize, closes: bool) -> bool {
+        let e = self.iter_proto_memo[slot].get();
+        let hit = e.proto_ver != 0
+            && e.proto_ver == self.heap.version_of(e.proto).wrapping_add(1)
+            && matches!(self.heap.get(e.proto), HeapObj::Object(p)
+                if (e.next_slot as usize) < p.keys.len()
+                    && p.val_at(e.next_slot as usize).bits() == e.next_bits)
+            && (!closes
+                || (e.chain_len > 0
+                    && e.chain[..e.chain_len as usize]
+                        .iter()
+                        .all(|&(i, ver)| self.heap.version_of(i) == ver)));
+        hit || self.iter_proto_prove(slot, closes)
+    }
+
+    /// The memo miss of [`Vm::iter_proto_pristine`]: prove the slot's
+    /// prototype from scratch and record the proof.
+    #[cold]
+    fn iter_proto_prove(&self, slot: usize, closes: bool) -> bool {
+        let proto = [
+            self.array_iter_proto,
+            self.set_iter_proto,
+            self.map_iter_proto,
+            self.string_iter_proto,
+        ][slot];
+        // Every %XIteratorPrototype%.next is an ITER_NEXT native (one per
+        // prototype, identical behaviour), so any of them counts as pristine.
+        let next_slot = match self.heap.get(proto) {
+            HeapObj::Object(p) => p.pos("next").filter(|&i| {
+                let n = p.val_at(i);
+                !p.attr_at(i).accessor
+                    && n.is_heap()
+                    && matches!(self.heap.get(n.heap_index()),
+                        HeapObj::Native(id) if *id == crate::vm::native::ITER_NEXT)
+            }),
+            _ => None,
+        };
+        let Some(next_slot) = next_slot else {
+            return false;
+        };
+        let mut proof = IterProtoProof {
+            proto,
+            proto_ver: self.heap.version_of(proto).wrapping_add(1),
+            next_slot: next_slot as u32,
+            next_bits: match self.heap.get(proto) {
+                HeapObj::Object(p) => p.val_at(next_slot).bits(),
+                _ => 0,
+            },
+            ..IterProtoProof::default()
+        };
+        let returnless = self.iter_proto_returnless(proto, &mut proof);
+        self.iter_proto_memo[slot].set(proof);
+        !closes || returnless
+    }
+
+    /// No `return` method is reachable from the built-in iterator prototype
+    /// `proto`, so IteratorClose on its iterators is a no-op: neither it nor
+    /// any object up its chain (%Iterator.prototype%, %Object.prototype%) has
+    /// an own `return`. An exotic or class-linked object in the chain answers
+    /// false — its lookup could be observable. A proof records the chain's
+    /// ancestors and their heap versions in `proof`.
+    fn iter_proto_returnless(&self, proto: u32, proof: &mut IterProtoProof) -> bool {
+        let mut cur = proto;
+        let mut chain = [(0u32, 0u32); 3];
+        let mut len = 0usize;
+        for depth in 0..=chain.len() {
+            match self.heap.get(cur) {
+                HeapObj::Object(m) if m.class.is_none() => {
+                    if m.pos("return").is_some() {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            if depth > 0 {
+                chain[len] = (cur, self.heap.version_of(cur));
+                len += 1;
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => break,
+                None if cur == self.obj_proto => break,
+                None => self.obj_proto,
+            };
+            if depth == chain.len() {
+                // Deeper than any built-in chain: not worth proving.
+                return false;
+            }
+        }
+        proof.chain = chain;
+        proof.chain_len = len as u8;
+        true
+    }
+
+    /// For-of's [`Vm::builtin_iter_pristine`] proof for an Array receiver
+    /// (the Tier-C GetIterator helper): %ArrayIteratorPrototype%'s `next` is
+    /// pristine and no `return` is reachable from it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn array_iter_proto_pristine(&self) -> bool {
+        self.iter_proto_pristine(0, true)
+    }
+
+    /// [`Vm::builtin_iter_pristine`] without running GetIterator's
+    /// `@@iterator` Get, for the cases where that Get cannot be observed: an
+    /// array, Map or Set with no own properties and its default
+    /// [[Prototype]], or a primitive string, whose intrinsic prototype still
+    /// holds the default method as a DATA property. True means the positional
+    /// walk may stand in for the iterator; false only that the caller must
+    /// read `@@iterator` and ask `builtin_iter_pristine` (always correct).
+    #[inline]
+    pub(crate) fn builtin_iter_fast(&self, v: Value, closes: bool) -> bool {
+        if !v.is_heap() || !self.realm_global_objs.is_empty() {
+            return false;
+        }
+        let idx = v.heap_index();
+        let (slot, holder, default) = match self.heap.get(idx) {
+            HeapObj::Array(_) => (0, self.arr_proto, self.default_array_iter),
+            HeapObj::Set(_) => (1, self.set_proto, self.default_set_iter),
+            HeapObj::Map { .. } => (2, self.map_proto, self.default_map_iter),
+            // A primitive has no own properties and always %String.prototype%.
+            HeapObj::Str(_) | HeapObj::Cons { .. } => (3, self.str_proto, self.default_string_iter),
+            _ => return false,
+        };
+        // An own property (an own `@@iterator`, or any the side table holds)
+        // or a replaced [[Prototype]] (a subclass instance) needs the real Get.
+        if slot != 3
+            && ((!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+                || self.proto_of.contains_key(&idx))
+        {
+            return false;
+        }
+        let (ver, at) = self.iter_method_memo[slot].get();
+        let hit = ver != 0
+            && ver == self.heap.version_of(holder).wrapping_add(1)
+            && matches!(self.heap.get(holder), HeapObj::Object(p)
+                if (at as usize) < p.keys.len() && p.val_at(at as usize).bits() == default.bits());
+        if !hit {
+            // Prove the holder's own `@@iterator` is the default DATA method;
+            // its slot then stays valid for as long as its version does.
+            let at = match self.heap.get(holder) {
+                HeapObj::Object(p) => p.pos("@@iterator").filter(|&i| {
+                    !p.attr_at(i).accessor && p.val_at(i).bits() == default.bits()
+                }),
+                _ => None,
+            };
+            let Some(at) = at else {
+                return false;
+            };
+            self.iter_method_memo[slot]
+                .set((self.heap.version_of(holder).wrapping_add(1), at as u32));
+        }
+        self.iter_proto_pristine(slot, closes)
+    }
+
+    /// The String iterator's values for the string (or String wrapper) `v`,
+    /// at most `max` of them: one string per code point — a surrogate pair is
+    /// one two-unit string, a lone surrogate its own one-unit string (never
+    /// U+FFFD), ASCII from the interned single-character table. `None` when
+    /// `v` is not a string.
+    pub(crate) fn string_iter_values(&mut self, v: Value, max: usize) -> Option<Vec<Value>> {
+        if !v.is_heap() {
+            return None;
+        }
+        let si = match self.heap.get(v.heap_index()) {
+            HeapObj::Str(_) | HeapObj::Cons { .. } => v.heap_index(),
+            HeapObj::Boxed { kind: 0, value } if value.is_heap() => value.heap_index(),
+            _ => return None,
+        };
+        let cps: Vec<u32> = {
+            let bytes = self.heap.str_wtf8_cow(si)?;
+            crate::heap::wtf8_code_points(&bytes).take(max).collect()
+        };
+        Some(cps.into_iter().map(|cp| self.str_from_cp(cp)).collect())
+    }
+
+    /// GetIterator that ALWAYS returns a real iterator OBJECT by invoking
+    /// `v[@@iterator]()` — unlike `get_iterator`, which fast-paths arrays/strings/
+    /// Map/Set to the raw value (driven positionally by `IterNext`). `yield*`
+    /// delegation needs a genuine iterator so it can call `.next`/`.throw`/`.return`
+    /// on it (an Array Iterator has `.next` but no `.throw`/`.return`, exactly as the
+    /// spec requires).
+    pub(crate) fn get_iterator_direct(&mut self, v: Value) -> Result<Value, Thrown> {
+        let m = self.get_prop(v, "@@iterator")?;
+        if !self.is_callable(m) {
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
+        }
+        let it = self.call_value(m, v, &[])?;
+        if !self.is_object_value(it) {
+            return Err(Thrown::from_static("TypeError: iterator is not an object"));
+        }
+        Ok(it)
+    }
+
+    /// GetIterator(obj, sync): `method = GetMethod(obj, @@iterator)`, then
+    /// `Call(method, obj)`. A missing / non-callable `@@iterator` is a TypeError
+    /// HERE, not later — the callers used to precede this with a separate
+    /// `CheckIterable` opcode, which performed a SECOND observable
+    /// `Get(@@iterator)` (sm/destructuring/order.js counts them).
+    pub(crate) fn get_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
+        if v.is_heap() {
+            let idx = v.heap_index();
+            // A %RegExpStringIterator% is only an identity iterator while its
+            // live @@iterator data method is the pristine ITER_SELF native.
+            // The scalar outer-region guard resumes at this operation on a
+            // miss, so the unchanged interpreter fallback must observe an own
+            // override, prototype accessor, replacement, or deletion exactly
+            // once rather than silently taking the generic Iterator shortcut.
+            if self.regexp_string_iters.contains_key(&idx)
+                && matches!(self.heap.get(idx), HeapObj::Iterator { .. })
+            {
+                if self
+                    .regexp_string_iter_intrinsic_method(
+                        v,
+                        "@@iterator",
+                        crate::vm::native::ITER_SELF,
+                    )
+                    .is_some()
+                {
+                    return Ok(v);
+                }
+                return self.get_iterator_direct(v);
+            }
+            match self.heap.get(v.heap_index()) {
+                // An array, string, TypedArray, Map or Set: IterNext walks the
+                // value itself (positionally) while that is unobservable — the
+                // @@iterator GetIterator reads is the kind's intrinsic, its
+                // %XIteratorPrototype%.next is pristine, and no `return` is
+                // reachable for a `break` to call. A replaced @@iterator (an own
+                // one, a subclass's, a patched prototype's) or a patched `next` /
+                // added `return` goes through the real protocol instead.
+                HeapObj::Array(_)
+                | HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::TypedArray { .. }
+                | HeapObj::Map { .. }
+                | HeapObj::Set(_) => {
+                    if self.builtin_iter_fast(v, true) {
+                        return Ok(v);
+                    }
+                    let m = self.get_prop(v, "@@iterator")?;
+                    if self.builtin_iter_pristine(v, m, true) {
+                        return Ok(v);
+                    }
+                    if self.is_callable(m) {
+                        let it = self.call_value(m, v, &[])?;
+                        if !self.is_object_value(it) {
+                            return Err(Thrown::from_static("TypeError: iterator is not an object"));
+                        }
+                        return Ok(it);
+                    }
+                    // @@iterator deleted/poisoned (undefined / non-callable):
+                    // GetIterator throws rather than falling back to the
+                    // positional walk.
+                    return Err(Thrown(format!(
+                        "TypeError: {} is not iterable",
+                        self.display(v)
+                    )));
+                }
+                // Iterator objects the engine drives directly.
+                HeapObj::Generator { .. }
+                | HeapObj::AsyncGenerator(_)
+                | HeapObj::Iterator { .. }
+                | HeapObj::IterHelper { .. } => return Ok(v),
+                // Everything else that is an object — a plain object, a Proxy, but
+                // also a Date / RegExp / Error / function / boxed primitive — goes
+                // through the real protocol. Restricting this to Object|Proxy left
+                // `for (c of new String("ab"))` reporting "not iterable" even though
+                // %String.prototype%[@@iterator] is right there.
+                _ => {
+                    if self.is_object_value(v) {
+                        let m = self.get_prop(v, "@@iterator")?;
+                        if self.is_callable(m) {
+                            let it = self.call_value(m, v, &[])?;
+                            // GetIterator step 5: a non-object iterator is a TypeError.
+                            if !self.is_object_value(it) {
+                                return Err(Thrown::from_static("TypeError: iterator is not an object"));
+                            }
+                            return Ok(it);
+                        }
+                    }
+                }
+            }
+        }
+        Err(Thrown(format!(
+            "TypeError: {} is not iterable",
+            self.display(v)
+        )))
+    }
+
+    /// `for await`: resolve the ASYNC iterator. An async generator is its own
+    /// iterator; a plain object uses `@@asyncIterator` (an async iterable) or, as
+    /// the spec's async-from-sync fallback, `@@iterator`; everything else (arrays,
+    /// strings, Map/Set, sync generators) passes through (ForAwaitNext drives it).
+    /// Returns the iterator and whether it is a SYNC one (the @@iterator
+    /// fallback or a raw array/string) — whose stepped VALUES get the
+    /// AsyncFromSyncIterator await-unwrap in async contexts.
+    pub(crate) fn get_async_iterator(&mut self, v: Value) -> Result<(Value, bool), Thrown> {
+        // An async generator is its OWN async iterator: its yielded values are
+        // already settled by the generator machinery — NOT sync (no extra
+        // value-await, which would shift promise interleaving by a tick).
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::AsyncGenerator(_)) {
+            return Ok((v, false));
+        }
+        if v.is_heap()
+            && matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Object(_) | HeapObj::Proxy { .. }
+            )
+        {
+            // GetMethod(@@asyncIterator): undefined/null ⇒ absent (fall back to the
+            // sync iterator); present-but-not-callable ⇒ TypeError (do NOT fall back —
+            // reading @@iterator could run a getter the spec must not trigger). A
+            // returned iterator must be an Object.
+            let am = self.get_prop(v, "@@asyncIterator")?;
+            if !am.is_nullish() {
+                if !self.is_callable(am) {
+                    return Err(Thrown::from_static(
+                        "TypeError: [Symbol.asyncIterator] is not a function",
+                    ));
+                }
+                let it = self.call_value(am, v, &[])?;
+                if !self.is_object_value(it) {
+                    return Err(Thrown::from_static(
+                        "TypeError: [Symbol.asyncIterator]() returned a non-object",
+                    ));
+                }
+                return Ok((it, false));
+            }
+            let sm = self.get_prop(v, "@@iterator")?;
+            if !sm.is_nullish() {
+                if !self.is_callable(sm) {
+                    return Err(Thrown::from_static(
+                        "TypeError: [Symbol.iterator] is not a function",
+                    ));
+                }
+                let it = self.call_value(sm, v, &[])?;
+                if !self.is_object_value(it) {
+                    return Err(Thrown::from_static(
+                        "TypeError: [Symbol.iterator]() returned a non-object",
+                    ));
+                }
+                return Ok((it, true));
+            }
+        }
+        Ok((v, true))
+    }
+
+    /// Normalize a destructuring source to a positionally-indexable value: a
+    /// generator or a custom iterable (object with `@@iterator`) is drained into a
+    /// fresh array — LAZILY, at most `max` elements (so `let [a,b] = infinite`
+    /// pulls 2, not forever); a string becomes an array of its first `max`
+    /// code points; an array / Map / Set / TypedArray whose iteration is
+    /// unobservable passes through unchanged. A value with no callable
+    /// `@@iterator` is a TypeError.
+    pub(crate) fn iter_to_array(&mut self, v: Value, max: u32) -> Result<Value, Thrown> {
+        // Array destructuring uses GetIterator(value), which first does
+        // RequireObjectCoercible — so null/undefined throw a TypeError even for an
+        // empty pattern (`[] = null`), before any element is read.
+        if v == Value::NULL || v == Value::UNDEFINED {
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
+        }
+        // A non-iterable PRIMITIVE — a number or boolean (non-heap), or a Symbol /
+        // BigInt (heap primitives) — has no `@@iterator`, so GetIterator throws.
+        // (Strings are heap and ARE iterable; see the built-in arm below.)
+        if !v.is_heap() {
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
+        }
+        if matches!(
+            self.heap.get(v.heap_index()),
+            HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+        ) {
+            return Err(Thrown::from_static("TypeError: value is not iterable"));
+        }
+        enum DestructureIter {
+            Positional,
+            /// A Map's or Set's entries, read off the backing store: `map[0]`
+            /// is the property "0", not the first entry, so the positional
+            /// walk cannot stand in for the iterator here.
+            Collection,
+            Existing,
+            Method(Value),
+        }
+        let drain = match self.heap.get(v.heap_index()) {
+            HeapObj::Generator { .. } => DestructureIter::Existing,
+            // An ITERATOR OBJECT is iterable through the protocol and nothing
+            // else — `%ArrayIteratorPrototype%[Symbol.iterator]` returns `this`.
+            // Without this arm it fell to the positional fast path below, which
+            // reads `it[0]`, `it[1]`, … off the ITERATOR, so
+            // `var [p, q] = [10, 20].values()` bound two `undefined`s. Arrays,
+            // Sets, strings and generators all worked, which is why it survived:
+            // the broken shape is the one nobody writes by hand.
+            HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => DestructureIter::Existing,
+            // An array, string (or String wrapper), Map, Set or TypedArray: the
+            // positional walk stands in for the iterator only while that is
+            // unobservable (`builtin_iter_pristine`, including "no `return` for
+            // the closing step to call"); otherwise drain through the method
+            // GetIterator already read. Destructuring a string walks CODE
+            // POINTS — indexing it by code unit split `const [a, b] = "😀"`
+            // into two lone surrogates — so a string becomes an array of its
+            // first `max` code points here.
+            HeapObj::Array(_)
+            | HeapObj::Str(_)
+            | HeapObj::Cons { .. }
+            | HeapObj::Boxed { kind: 0, .. }
+            | HeapObj::Map { .. }
+            | HeapObj::Set(_)
+            | HeapObj::TypedArray { .. } => {
+                let fast = self.builtin_iter_fast(v, true);
+                let it = if fast {
+                    Value::UNDEFINED // unread: the Get is unobservable
+                } else {
+                    self.get_prop(v, "@@iterator")?
+                };
+                if fast || self.builtin_iter_pristine(v, it, true) {
+                    if let Some(cps) = self.string_iter_values(v, max as usize) {
+                        return Ok(self.alloc_array_current_realm(cps));
+                    }
+                    // Array destructuring's GetIterator reaches
+                    // %TypedArray%.prototype.values, whose ValidateTypedArray
+                    // throws for a detached or out-of-bounds view (a
+                    // fixed-length view over a shrunk resizable buffer). The
+                    // positional walk must surface the same TypeError instead
+                    // of reading undefineds.
+                    if matches!(self.heap.get(v.heap_index()), HeapObj::TypedArray { .. })
+                        && self.ta_effective_len(v.heap_index()).is_none()
+                    {
+                        return Err(Thrown::from_static(
+                            "TypeError: TypedArray is detached or out of bounds",
+                        ));
+                    }
+                    if matches!(
+                        self.heap.get(v.heap_index()),
+                        HeapObj::Map { .. } | HeapObj::Set(_)
+                    ) {
+                        DestructureIter::Collection
+                    } else {
+                        DestructureIter::Positional
+                    }
+                } else if self.is_callable(it) {
+                    DestructureIter::Method(it) // call the already-observed method
+                } else {
+                    // @@iterator was deleted or poisoned (undefined / non-callable):
+                    // GetIterator throws a TypeError rather than silently falling
+                    // back to positional indexing.
+                    return Err(Thrown(format!(
+                        "TypeError: {} is not iterable",
+                        self.display(v)
+                    )));
+                }
+            }
+            // Every other object — a plain object, a Proxy, a function, a Date,
+            // … and the Intl %Segments% / %SegmentIterator% objects, which carry
+            // a `@@iterator` like an ordinary object — is iterable exactly when
+            // it has a callable `@@iterator`. A missing one is GetIterator's
+            // TypeError: `const [] = {}` and `const [a] = {0: 1, length: 1}`
+            // throw rather than reading indices off a non-iterable.
+            _ => {
+                let it = self.get_prop(v, "@@iterator")?;
+                if self.is_callable(it) {
+                    DestructureIter::Method(it)
+                } else {
+                    return Err(Thrown(format!(
+                        "TypeError: {} is not iterable",
+                        self.display(v)
+                    )));
+                }
+            }
+        };
+        // Hold the captured method, returned iterator, and not-yet-rooted
+        // drained values across the user re-entries below.
+        let _gc = self.gc_lock_guard();
+        let iter = match drain {
+            DestructureIter::Positional => return Ok(v),
+            // The [key, value] pairs of a Map or the values of a Set, in
+            // insertion order with deleted slots skipped, at most `max` of them.
+            DestructureIter::Collection => {
+                // One pass over the backing store; a Map's fresh [key, value]
+                // pairs are allocated after it, outside the heap borrow.
+                let lim = max as usize;
+                let (mut out, pairs): (Vec<Value>, Vec<(Value, Value)>) =
+                    match self.heap.get(v.heap_index()) {
+                        HeapObj::Set(items) => {
+                            let live = items.iter().copied().filter(|x| !x.is_hole());
+                            (live.take(lim).collect(), Vec::new())
+                        }
+                        HeapObj::Map { keys, vals } => {
+                            let live = keys.iter().copied().zip(vals.iter().copied());
+                            let live = live.filter(|(k, _)| !k.is_hole());
+                            (Vec::new(), live.take(lim).collect())
+                        }
+                        _ => (Vec::new(), Vec::new()),
+                    };
+                self.instrument_drain_heap_check(out.len())?;
+                for (k, val) in pairs {
+                    out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![k, val]))));
+                    self.instrument_drain_heap_check(out.len())?;
+                }
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+            }
+            DestructureIter::Existing => v,
+            // GetIterator reads @@iterator once and calls that captured method.
+            // Re-reading it here is observable when it is an accessor and can
+            // also select a different method from the one already validated.
+            DestructureIter::Method(method) => {
+                let iter = self.call_value(method, v, &[])?;
+                if !self.is_object_value(iter) {
+                    return Err(Thrown::from_static("TypeError: iterator is not an object"));
+                }
+                iter
+            }
+        };
+        let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. });
+        let lim = max as usize;
+        let mut out = Vec::new();
+        let mut iter_done = false;
+        while out.len() < lim {
+            let res = if is_gen {
+                self.generator_method(iter.heap_index(), "next", &[])?
+                    .unwrap_or(Value::UNDEFINED)
+            } else {
+                let next = self.get_prop(iter, "next")?;
+                if !self.is_callable(next) {
+                    iter_done = true;
+                    break;
+                }
+                self.call_value(next, iter, &[])?
+            };
+            // IteratorNext step 4: a non-Object result is a TypeError. Without it
+            // `done`/`value` were read off a primitive as undefined, so `var [a] =
+            // it` bound undefined instead of throwing — and with a `...rest` (no
+            // element bound) `max` is unbounded, so the never-done loop spun until
+            // it exhausted memory.
+            if !self.is_object_value(res) {
+                return Err(Thrown::from_static("TypeError: iterator result is not an object"));
+            }
+            let done = self.get_prop(res, "done")?;
+            if self.truthy(done) {
+                iter_done = true;
+                break;
+            }
+            out.push(self.get_prop(res, "value")?);
+            self.instrument_drain_heap_check(out.len())?;
+        }
+        // IteratorClose (normal completion): destructuring took the fixed number of
+        // elements it needed; if the iterator isn't exhausted, close it. With a
+        // `...rest` present `max` is unbounded so the loop ran to `done` and we skip.
+        let _ = is_gen;
+        if !iter_done {
+            // Lenient close: the eager drain runs before the pattern's per-element
+            // defaults/targets, so a non-callable `return` must not pre-empt a
+            // later default-expression throw (which is the value the spec keeps).
+            self.iterator_close_inner(iter, false)?;
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
+    /// IteratorClose(iterator, normal): call the iterator's `return()` once if it
+    /// has one, requiring an Object result (TypeError otherwise). Skips generators
+    /// (driven directly via generator_method, not a prototype `return`) and
+    /// non-objects. Shared by destructuring and `for-of` break.
+    /// GetIterator(iterable) via @@iterator — returns a REAL iterator object (not
+    /// `get_iterator`'s array fast-path, which can't be stepped by iterator_step).
+    /// Used by the Map/Set constructors' AddEntriesFromIterable.
+    pub(crate) fn get_iterator_object(&mut self, iterable: Value) -> Result<Value, Thrown> {
+        let m = self.get_prop(iterable, "@@iterator")?;
+        if !self.is_callable(m) {
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(iterable)
+            )));
+        }
+        self.call_value(m, iterable, &[])
+    }
+
+    pub(crate) fn iterator_close(&mut self, iter: Value) -> Result<(), Thrown> {
+        self.iterator_close_inner(iter, true)
+    }
+
+    /// IteratorClose on an ALREADY-failing path (IfAbruptCloseIterator): any
+    /// throw from `return()` is swallowed AND the original failure's
+    /// `pending_throw` VALUE is preserved, so the close's own error cannot
+    /// clobber the identity of the error being propagated.
+    pub(crate) fn iterator_close_quiet(&mut self, iter: Value) {
+        let saved = self.pending_throw.take();
+        // Once removed from pending_throw the original exception may have no
+        // traced owner. A return getter/callback can allocate before we restore it.
+        self.with_host_roots(&[iter, saved.unwrap_or(Value::UNDEFINED)], |vm| {
+            let _ = vm.iterator_close(iter);
+            vm.pending_throw = saved;
+        });
+    }
+
+    /// `Object.fromEntries(iterable)` = AddEntriesFromIterable: RequireObjectCoercible,
+    /// GetIterator, then step-by-step — per entry read [0]/[1] via [[Get]] and add the
+    /// property IMMEDIATELY. Any abrupt while processing an entry closes the iterator
+    /// (keeping the original thrown value), per IfAbruptCloseIterator.
+    pub(crate) fn object_from_entries(&mut self, src: Value) -> Result<Value, Thrown> {
+        self.require_object_coercible(src)?;
+        let _gc = self.gc_lock_guard();
+        // get_iterator_object (not get_iterator) so an array yields a real, steppable
+        // iterator object rather than the dense fast-path value.
+        let iter = self.get_iterator_object(src)?;
+        let mut map = ObjMap::new();
+        macro_rules! close_and_throw {
+            ($e:expr) => {{
+                let saved = self.pending_throw;
+                let _ = self.iterator_close(iter);
+                self.pending_throw = saved;
+                return Err($e);
+            }};
+        }
+        let mut native_work = 0u64;
+        loop {
+            let entry = match self.iterator_step(iter)? {
+                Some(e) => e,
+                None => break,
+            };
+            native_work = native_work.saturating_add(1);
+            if let Err(e) = self.preflight_native_iteration_work(native_work) {
+                close_and_throw!(e);
+            }
+            if !self.is_object_value(entry) {
+                let msg = self.alloc_str("Iterator value is not an entry object".to_string());
+                let te = self.make_error(1, Some(msg));
+                self.pending_throw = Some(te);
+                close_and_throw!(Thrown::from_static(
+                    "TypeError: Iterator value is not an entry object"
+                ));
+            }
+            let k = match self.get_index(entry, Value::int(0)) {
+                Ok(k) => k,
+                Err(e) => close_and_throw!(e),
+            };
+            let v = match self.get_index(entry, Value::int(1)) {
+                Ok(v) => v,
+                Err(e) => close_and_throw!(e),
+            };
+            let pk = match self.to_property_key(k) {
+                Ok(pk) => pk,
+                Err(e) => close_and_throw!(e),
+            };
+            map.set(&pk, v);
+        }
+        Ok(self.alloc_object_current_realm(map))
+    }
+
+    /// AddEntriesFromIterable using a collection's OBSERVABLE adder (Map/WeakMap
+    /// `set` for `pair`, Set/WeakSet `add` otherwise): the adder is read once and
+    /// called per entry, so a custom/overridden adder and its validation (e.g.
+    /// CanBeHeldWeakly for a WeakMap, which now accepts non-registered symbols) run,
+    /// and any abrupt closes the iterator keeping the original thrown value.
+    pub(crate) fn add_entries_via_adder(
+        &mut self,
+        coll: Value,
+        iterable: Value,
+        pair: bool,
+    ) -> Result<(), Thrown> {
+        let adder_name = if pair { "set" } else { "add" };
+        let adder = self.get_member(coll, adder_name, coll)?;
+        if !self.is_callable(adder) {
+            return Err(Thrown(format!("TypeError: {adder_name} is not a function")));
+        }
+        let _gc = self.gc_lock_guard();
+        let iter = self.get_iterator_object(iterable)?;
+        macro_rules! close_and_throw {
+            ($e:expr) => {{
+                let saved = self.pending_throw;
+                let _ = self.iterator_close(iter);
+                self.pending_throw = saved;
+                return Err($e);
+            }};
+        }
+        let mut native_work = 0u64;
+        loop {
+            let entry = match self.iterator_step(iter)? {
+                Some(e) => e,
+                None => break,
+            };
+            native_work = native_work.saturating_add(1);
+            if let Err(e) = self.preflight_native_iteration_work(native_work) {
+                close_and_throw!(e);
+            }
+            if pair {
+                if !self.is_object_value(entry) {
+                    let msg = self.alloc_str("Iterator value is not an entry object".to_string());
+                    let te = self.make_error(1, Some(msg));
+                    self.pending_throw = Some(te);
+                    close_and_throw!(Thrown::from_static(
+                        "TypeError: Iterator value is not an entry object"
+                    ));
+                }
+                let k = match self.get_index(entry, Value::int(0)) {
+                    Ok(k) => k,
+                    Err(e) => close_and_throw!(e),
+                };
+                let v = match self.get_index(entry, Value::int(1)) {
+                    Ok(v) => v,
+                    Err(e) => close_and_throw!(e),
+                };
+                if let Err(e) = self.call_value(adder, coll, &[k, v]) {
+                    close_and_throw!(e);
+                }
+            } else if let Err(e) = self.call_value(adder, coll, &[entry]) {
+                close_and_throw!(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// IteratorClose 7.4.x. `strict` selects GetMethod semantics for the `return`
+    /// method: when true (for-of/for-await break+normal, Iterator helpers), a
+    /// PRESENT but non-callable `return` is a TypeError; when false (the eager
+    /// destructuring drain in `iter_to_array`, which closes BEFORE the per-element
+    /// defaults/targets run — so it cannot know the spec completion type yet), a
+    /// non-callable `return` is skipped, preserving the original behaviour so a
+    /// later default-expression throw is the value that propagates (the spec's
+    /// "if completion is a throw completion, return completion").
+    pub(crate) fn iterator_close_inner(&mut self, iter: Value, strict: bool) -> Result<(), Thrown> {
+        if !iter.is_heap() {
+            return Ok(());
+        }
+        // A generator's `return` resumes the suspended body with a RETURN completion
+        // so any `finally` spanning the yield runs (GeneratorResume semantics) — not
+        // a no-op. The {value,done} result is discarded.
+        match self.heap.get(iter.heap_index()) {
+            HeapObj::Generator { .. } => {
+                self.generator_method(iter.heap_index(), "return", &[])?;
+                return Ok(());
+            }
+            // A built-in iterable GetIterator left as itself is walked
+            // positionally only after `builtin_iter_pristine` proved no
+            // `return` reachable from its %XIteratorPrototype%, so closing it
+            // is a no-op. Looking `return` up on the ITERABLE instead reached
+            // `Array.prototype.return` / `String.prototype.return`, which no
+            // real array or string iterator inherits.
+            // …but only for the ITERABLE itself. A user `@@iterator` may hand
+            // back an array (or string / TypedArray / Map / Set) carrying its
+            // own `next`/`return` as an iterator object, and that `return` is
+            // a real one a `break` must call.
+            HeapObj::Array(_)
+            | HeapObj::Str(_)
+            | HeapObj::Cons { .. }
+            | HeapObj::TypedArray { .. }
+            | HeapObj::Map { .. }
+            | HeapObj::Set(_)
+                if !self.has_own_property(iter, "return") =>
+            {
+                return Ok(())
+            }
+            _ => {}
+        }
+        let ret = self.get_prop(iter, "return")?;
+        if ret.is_nullish() {
+            return Ok(());
+        }
+        if !self.is_callable(ret) {
+            if strict {
+                return Err(Thrown::from_static(
+                    "TypeError: iterator return() is not callable",
+                ));
+            }
+            return Ok(());
+        }
+        let r = self.call_value(ret, iter, &[])?;
+        if !self.is_object_value(r) {
+            return Err(Thrown::from_static(
+                "TypeError: iterator return() result is not an object",
+            ));
+        }
+        Ok(())
+    }
+
+    /// An array's elements as ITERATION produces them, which is not the same as
+    /// its backing store.
+    ///
+    /// The array iterator reads each index with `Get`, so a hole is not carried
+    /// through as a hole: it resolves against the prototype chain (`undefined`
+    /// unless someone installed an indexed property on `Array.prototype`) and
+    /// the consumer stores it with CreateDataProperty. Cloning the dense store
+    /// verbatim instead propagates the hole SENTINEL, and the result is a sparse
+    /// array where the spec requires a dense one — observable through `in`,
+    /// `hasOwnProperty`, and every method that skips holes, which is why
+    /// `[...Array(3)].map((_, i) => i)` returned three holes rather than
+    /// `[0,1,2]`.
+    ///
+    /// The scan is the whole cost in the common case: a dense array (no hole
+    /// anywhere) clones and returns, exactly as before.
+    pub(crate) fn spread_array_elements(&mut self, arr_idx: u32) -> Result<Vec<Value>, Thrown> {
+        // A VIRTUAL array's store is only a prefix of it: iterate its JS
+        // length, each index by Get (an overlay element, a hole's inherited
+        // value, or `undefined`). Cloning the store spread `new Array(2e6)` as
+        // an empty array.
+        if self.array_is_virtual(arr_idx) {
+            let len = self.js_array_len(arr_idx);
+            self.preflight_materialized_array(len)?;
+            let _gc = self.gc_lock_guard();
+            let arr = Value::heap(arr_idx);
+            let mut out = Vec::with_capacity(len.min(4096));
+            for i in 0..len {
+                out.push(self.get_index(arr, Value::num(i as f64))?);
+            }
+            return Ok(out);
+        }
+        let items = match self.heap.get(arr_idx) {
+            HeapObj::Array(items) => items.clone(),
+            _ => return Ok(Vec::new()),
+        };
+        if !items.iter().any(|x| x.is_hole()) {
+            return Ok(items);
+        }
+        // Resolving a hole can run a getter installed on `Array.prototype`, i.e.
+        // user code that re-enters the VM while `out` holds values no root can
+        // reach yet.
+        let _gc = self.gc_lock_guard();
+        let arr = Value::heap(arr_idx);
+        let mut out = Vec::with_capacity(items.len());
+        for (i, x) in items.iter().enumerate() {
+            out.push(if x.is_hole() {
+                self.get_index(arr, Value::num(i as f64))?
+            } else {
+                *x
+            });
+        }
+        Ok(out)
+    }
+
+    /// Drain an iterator with collection RUNNING: the values collected so far
+    /// live in a rooted internal accumulator array, the iterator and its
+    /// `next` in root slots, and each step's result object in a scratch slot
+    /// while its `done` and `value` are read (either may be a getter). Holding
+    /// the GC lock for the drain instead kept every step's result object alive
+    /// until the drain ended — gigabytes for a drain near the materialization
+    /// cap. `next` is `None` for a generator, which is resumed directly.
+    fn drain_iterator_rooted(&mut self, iter: Value, next: Option<Value>) -> Result<Vec<Value>, Thrown> {
+        let acc = self.heap.alloc(HeapObj::Array(Vec::new()));
+        let base = self.host_result_roots.len();
+        self.host_result_roots.extend_from_slice(&[
+            iter,
+            next.unwrap_or(Value::UNDEFINED),
+            Value::heap(acc),
+            Value::UNDEFINED,
+        ]);
+        let r = self.drain_iterator_steps(iter, next, acc, base + 3);
+        let out = match self.heap.get_mut(acc) {
+            HeapObj::Array(items) => std::mem::take(items),
+            _ => Vec::new(),
+        };
+        self.host_result_roots.truncate(base);
+        r.map(|()| out)
+    }
+
+    fn drain_iterator_steps(
+        &mut self,
+        iter: Value,
+        next: Option<Value>,
+        acc: u32,
+        scratch: usize,
+    ) -> Result<(), Thrown> {
+        let mut n = 0usize;
+        loop {
+            let res = match next {
+                Some(f) => {
+                    let res = self.call_value(f, iter, &[])?;
+                    // IteratorNext step 3: a non-object result is a TypeError.
+                    if !self.is_object_value(res) {
+                        return Err(Thrown::from_static(
+                            "TypeError: iterator.next() returned a non-object",
+                        ));
+                    }
+                    res
+                }
+                None => self
+                    .generator_method(iter.heap_index(), "next", &[])?
+                    .unwrap_or(Value::UNDEFINED),
+            };
+            self.host_result_roots[scratch] = res;
+            let done = self.get_prop(res, "done")?;
+            if self.truthy(done) {
+                return Ok(());
+            }
+            let value = self.get_prop(res, "value")?;
+            if let HeapObj::Array(items) = self.heap.get_mut(acc) {
+                items.push(value);
+            }
+            self.heap.write_barrier_val(acc, value);
+            n += 1;
+            if n > crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
+                return Err(Thrown::from_static(
+                    "RangeError: iterator produced more values than the engine's limit",
+                ));
+            }
+            self.instrument_drain_heap_check(n)?;
+        }
+    }
+
+    pub(crate) fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        // No GC lock here: the drains root their working set, and the
+        // positional plans take the lock for the span of their Rust Vec.
+        // GetIterator hands back the value itself only for a built-in iterable
+        // whose iteration is unobservable; everything else is an iterator.
+        let it = self.get_iterator(v)?;
+        self.iterator_to_vec(it)
+    }
+
+    /// IterableToList with the `@@iterator` method `m` already read — a
+    /// spread site reads it once to choose between its inline built-in paths
+    /// and this protocol drain, and GetIterator must not read it again.
+    pub(crate) fn iterate_with_method(&mut self, v: Value, m: Value) -> Result<Vec<Value>, Thrown> {
+        let gc = self.gc_lock_guard();
+        if !self.is_callable(m) {
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
+        }
+        let it = self.call_value(m, v, &[])?;
+        if !self.is_object_value(it) {
+            return Err(Thrown::from_static("TypeError: iterator is not an object"));
+        }
+        if matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. }) {
+            return self.iterator_to_vec(it);
+        }
+        // A method's result is always stepped through its `next` — even one
+        // that happens to be an array or another built-in iterable.
+        let next = self.get_prop(it, "next")?;
+        if !self.is_callable(next) {
+            return Err(Thrown::from_static("TypeError: iterator.next is not a function"));
+        }
+        // The drain roots its working set instead of holding the lock (a
+        // 2^20-element drain kept every step result alive with GC suspended).
+        drop(gc);
+        self.drain_via_next(it, next)
+    }
+
+    /// IteratorStep/IteratorValue until done, with the iterator record's
+    /// `next` already read. Callers must NOT hold the GC lock: the drain
+    /// accumulates into a rooted array so a long iteration stays collectable.
+    fn drain_via_next(&mut self, it: Value, next: Value) -> Result<Vec<Value>, Thrown> {
+        self.drain_iterator_rooted(it, Some(next))
+    }
+
+    /// Drain `v` — an iterator, or a built-in iterable GetIterator left as
+    /// itself — into a Vec. The `next()` drains root their accumulator; the
+    /// positional walk takes the GC lock for the span of its Rust Vec.
+    fn iterator_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        // A generator is drained eagerly via repeated next() (spread / Array.from
+        // produce a buffer; an infinite generator hangs here, matching V8).
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. }) {
+            return self.drain_iterator_rooted(v, None);
+        }
+        // A user iterator object (one with a `next()` method) or a built-in
+        // Iterator: drain it. `HeapObj::Intl` is in the list for
+        // %SegmentIterator% — the same reason `IterNext` carries it — because
+        // without it `[...segmenter.segment(s)]` fell past this drain to the
+        // positional plan below and reported the iterator "not iterable", even
+        // though `for-of` over the same object worked.
+        if v.is_heap()
+            && matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Object(_)
+                    | HeapObj::Proxy { .. }
+                    | HeapObj::Iterator { .. }
+                    | HeapObj::IterHelper { .. }
+                    | HeapObj::Intl { .. }
+            )
+        {
+            let next = self.get_prop(v, "next")?;
+            if self.is_callable(next) {
+                return self.drain_via_next(v, next);
+            }
+        }
+        // The positional plans hold values in Rust Vecs that are not GC roots.
+        let _gc = self.gc_lock_guard();
+        self.builtin_positional_elements(v)
+    }
+
+    /// `...rest` of a binding array pattern: every element of the value
+    /// `iter_to_array` normalized — a fresh array, or a built-in whose
+    /// iteration it already proved unobservable. That GetIterator is the
+    /// pattern's one (a default initializer that patched the iterator
+    /// prototype since must not be seen), so no `@@iterator` is read here.
+    pub(crate) fn destructure_rest(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        self.positional_iteration_elements(v)
+    }
+
+    /// The elements of a built-in iterable whose pristine protocol the caller
+    /// has ALREADY proven, walked positionally — no second `@@iterator` read
+    /// (which a getter would see). A detached or out-of-bounds TypedArray view
+    /// still raises the TypeError its iterator would.
+    pub(crate) fn positional_iteration_elements(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        // A hole's inherited value can be a getter: keep the partial list alive.
+        let _gc = self.gc_lock_guard();
+        self.builtin_positional_elements(v)
+    }
+
+    /// The elements a built-in iterable yields through its pristine iterator,
+    /// read positionally. Runs under the caller's GC lock.
+    fn builtin_positional_elements(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        // A string splits by CODE POINT, exactly — a lone surrogate is its own
+        // one-unit string, as the String iterator yields it, not the U+FFFD
+        // the lossy `char` view substituted.
+        if let Some(cps) = self.string_iter_values(v, usize::MAX) {
+            return Ok(cps);
+        }
+        enum Plan {
+            Vals(Vec<Value>),
+            Pairs(Vec<(Value, Value)>),
+            /// Deferred: materializing an array's elements can run a prototype
+            /// getter for a hole, so it must happen outside the heap borrow.
+            ArrayAt(u32),
+            /// %ArrayIteratorPrototype%.next over a TypedArray: its CURRENT
+            /// length (a length-tracking view follows its resizable buffer),
+            /// and a TypeError once detached or out of bounds.
+            TypedAt(u32),
+        }
+        if v.is_heap() {
+            // A rope's code points are read off its flattened WTF-8 bytes.
+            self.heap.flatten(v.heap_index());
+        }
+        let plan = if v.is_heap() {
+            match self.heap.get(v.heap_index()) {
+                HeapObj::Array(_) => Plan::ArrayAt(v.heap_index()),
+                HeapObj::TypedArray { .. } => Plan::TypedAt(v.heap_index()),
+                // A Set's tombstoned (deleted) slots are skipped.
+                HeapObj::Set(items) => {
+                    Plan::Vals(items.iter().copied().filter(|v| !v.is_hole()).collect())
+                }
+                HeapObj::Map { keys, vals } => Plan::Pairs(
+                    keys.iter()
+                        .copied()
+                        .zip(vals.iter().copied())
+                        .filter(|(k, _)| !k.is_hole())
+                        .collect(),
+                ),
+                _ => {
+                    return Err(Thrown(format!(
+                        "TypeError: {} is not iterable",
+                        self.display(v)
+                    )))
+                }
+            }
+        } else {
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
+        };
+        Ok(match plan {
+            Plan::Vals(v) => v,
+            Plan::ArrayAt(idx) => self.spread_array_elements(idx)?,
+            Plan::TypedAt(ta) => {
+                let Some(n) = self.ta_effective_len(ta) else {
+                    return Err(Thrown::from_static(
+                        "TypeError: TypedArray is detached or out of bounds",
+                    ));
+                };
+                self.preflight_native_iteration_work(n as u64)?;
+                (0..n).map(|i| self.ta_element_get(ta, i)).collect()
+            }
+            Plan::Pairs(ps) => ps
+                .into_iter()
+                .map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))))
+                .collect(),
+        })
+    }
+
+    pub(crate) fn array_from(
+        &mut self,
+        this_ctor: Value,
+        src: Value,
+        mapfn: Value,
+        this_arg: Value,
+    ) -> Result<Value, Thrown> {
+        // The array-like path holds un-rooted Values while the mapfn and
+        // getters re-enter the interpreter — suspend GC for it. The iterator
+        // path releases the lock and roots its working set instead.
+        let gc = self.gc_lock_guard();
+        // A given (non-undefined) mapfn must be callable; null/undefined source is
+        // not coercible to an object (ToObject throws).
+        if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
+            return Err(Thrown::from_static(
+                "TypeError: Array.from mapfn is not a function",
+            ));
+        }
+        if src.is_nullish() {
+            return Err(Thrown::from_static(
+                "TypeError: Array.from requires an array-like or iterable object",
+            ));
+        }
+        // usingIterator = GetMethod(items, @@iterator): one observable Get; a
+        // non-callable non-nullish @@iterator is a TypeError.
+        let using_iter = self.get_prop(src, "@@iterator")?;
+        if !using_iter.is_nullish() && !self.is_callable(using_iter) {
+            return Err(Thrown::from_static("TypeError: @@iterator is not a function"));
+        }
+        let mapping = mapfn != Value::UNDEFINED;
+        // The %Array% intrinsic (or a non-constructor receiver) builds a plain
+        // dense Array; any OTHER constructor receiver is constructed and
+        // receives its elements via CreateDataPropertyOrThrow.
+        // "%Array%" means THIS built-in's realm's — `other.Array.from.call(Array,…)`
+        // must really `Construct` the main-realm Array, because the dense shortcut
+        // creates the array in the RUNNING built-in's realm (`from_realms.js`).
+        let arr_proto_here = self.native_home(self.arr_proto);
+        let is_array_global = this_ctor.is_heap()
+            && matches!(self.heap.get(this_ctor.heap_index()), HeapObj::Object(m)
+                if m.get("prototype").is_some_and(|p| p.is_heap() && p.heap_index() == arr_proto_here));
+        let custom_ctor = !is_array_global && self.is_constructor(this_ctor);
+        if self.is_callable(using_iter) {
+            // Iterator path, in spec order: A = Construct(C) — NO arguments —
+            // BEFORE the iterator is obtained; then drive next() manually with
+            // mapfn interleaved per element (its mutations of the source are
+            // observed) and IteratorClose on an abrupt mapfn/define.
+            let dest = if custom_ctor {
+                Some(self.construct(this_ctor, &[])?)
+            } else {
+                None
+            };
+            if dest.is_none() && self.array_from_steps_itself(src, using_iter) {
+                drop(gc);
+                return self.array_from_dense(src.heap_index(), mapfn, this_arg);
+            }
+            let iter = self.call_value(using_iter, src, &[])?;
+            if !self.is_object_value(iter) {
+                return Err(Thrown::from_static("TypeError: iterator is not an object"));
+            }
+            let next_fn = self.get_prop(iter, "next")?;
+            drop(gc);
+            return self.array_from_iterator(dest, iter, next_fn, mapfn, this_arg);
+        }
+        // NOTE: reaching here means GetMethod(items, @@iterator) was UNDEFINED, so
+        // the array-like path below is the only one the spec allows — even for a
+        // String/Set/Map/TypedArray/generator. There used to be an internal
+        // positional drain here for those kinds, from a time when their prototypes
+        // carried no visible @@iterator; they all expose a real one now, so the
+        // drain could only ever fire once a test had DELETED @@iterator, which is
+        // precisely when it must not:
+        //   delete String.prototype[Symbol.iterator];
+        //   Array.from("𝄞")   // ["\uD834","\uDD1E"], not ["\u{1D11E}"]
+        //   Array.from(new Set([1,2]))   // [] — a Set has no `length`
+        // (staging/sm/Array/from_string.js).
+        //
+        // Array-like path: arrayLike = ToObject(items); len = ToLength(Get(O,
+        // 'length')); elements are read live and DEFINED on the result
+        // (CreateDataPropertyOrThrow — a non-extensible receiver or a
+        // non-configurable index throws; a writable:false one is redefined).
+        let obj = self.to_object(src)?;
+        let len_v = self.get_prop(obj, "length")?;
+        let n_i = self.to_integer_or_zero(len_v)?;
+        let n = if n_i > 0 {
+            (n_i as u64).min((1u64 << 53) - 1)
+        } else {
+            0
+        };
+        // A custom Array.from constructor may return an ordinary object, so
+        // neither the dense-array ceiling nor the VM heap poll bounds the
+        // property-by-property loop below.  Reject hostile array-like lengths
+        // before they become one uninterruptible native operation.  Keep the
+        // value as u64 until after this check: narrowing first would wrap on
+        // wasm32 and could turn 2^32 into a zero-length operation.
+        self.preflight_native_iteration_work(n)?;
+        let n = usize::try_from(n)
+            .map_err(|_| Thrown::from_static("RangeError: array-like length exceeds the engine limit"))?;
+        if custom_ctor {
+            let a = self.construct(this_ctor, &[Value::num(n as f64)])?;
+            for i in 0..n {
+                let v = self.get_index(obj, Value::num(i as f64))?;
+                let mapped = if mapping {
+                    self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
+                } else {
+                    v
+                };
+                self.create_data_property_or_throw(a, i, mapped)?;
+            }
+            self.set_prop(a, "length", Value::num(n as f64), true)?;
+            return Ok(a);
+        }
+        self.preflight_materialized_array(n)?;
+        let mut out = Vec::with_capacity(n.min(4096));
+        // A compiled mapping function runs over one reused window, as an
+        // array builtin's callback does (`Array.from({ length: n }, f)`).
+        let (native, win) = if mapping {
+            self.open_cb_window(mapfn, this_arg)
+        } else {
+            (None, self.regs.len())
+        };
+        let mut failed = None;
+        for i in 0..n {
+            let step = self.get_index(obj, Value::num(i as f64)).and_then(|v| {
+                if mapping {
+                    self.run_cb_elem(&native, win, mapfn, &[v, Value::num(i as f64)], this_arg)
+                } else {
+                    Ok(v)
+                }
+            });
+            match step {
+                Ok(mapped) => out.push(mapped),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        self.regs.truncate(win);
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(self.alloc_array_current_realm(out)),
+        }
+    }
+
+    /// Whether `Array.from(src)` can step `src` itself instead of driving an
+    /// iterator object: a real Array with no element overlay, no mapped
+    /// `arguments` and no virtual length, whose `@@iterator` Get yielded the
+    /// intrinsic and whose iterator prototype still has the intrinsic `next`
+    /// (read once, when the iterator would be made). The same proof
+    /// `Promise.all` steps an array under.
+    fn array_from_steps_itself(&self, src: Value, using_iter: Value) -> bool {
+        src.is_heap()
+            && matches!(self.heap.get(src.heap_index()), HeapObj::Array(_))
+            && self.array_steps_dense(src.heap_index())
+            && using_iter.bits() == self.default_array_iter.bits()
+            && match self.heap.get(self.array_iter_proto) {
+                HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
+                _ => false,
+            }
+    }
+
+    /// Whether the Array at `idx` answers an index read from its dense store
+    /// alone, right now.
+    #[inline]
+    fn array_steps_dense(&self, idx: u32) -> bool {
+        !self.array_elements_overlaid(idx)
+            && !self.arguments_objs.contains_key(&idx)
+            && !self.array_js_len.contains_key(&idx)
+    }
+
+    /// `Array.from(array[, mapfn])` for a source [`Self::array_from_steps_itself`]
+    /// admits, building a plain Array: the intrinsic array iterator's steps
+    /// taken here, on the live array, with no iterator object, no result
+    /// object per step and no `next` call.
+    ///
+    /// Each step is the iterator's: past the live length it is done;
+    /// otherwise the element is read with [[Get]] (a hole, or an array the
+    /// mapping function has since given an accessor or a virtual length,
+    /// takes the generic read). The iterator object is unobservable until
+    /// the mapping function throws, when `IteratorClose` looks `return` up
+    /// on it: a real one is made then and closed, so a `return` someone put
+    /// on the iterator prototypes is still found and called.
+    ///
+    /// The driven protocol cost a `next` call, a result object and two
+    /// property reads per element: eight times what Node pays for
+    /// `Array.from(arr, f)`.
+    fn array_from_dense(&mut self, src: u32, mapfn: Value, this_arg: Value) -> Result<Value, Thrown> {
+        let mapping = mapfn != Value::UNDEFINED;
+        let acc = self.heap.alloc(HeapObj::Array(Vec::new()));
+        // Collection runs: the source, the function and its `this`, the
+        // accumulator and the current element are roots.
+        let base = self.host_result_roots.len();
+        self.host_result_roots.extend_from_slice(&[
+            Value::heap(src),
+            mapfn,
+            this_arg,
+            Value::heap(acc),
+            Value::UNDEFINED,
+        ]);
+        let (native, win) = if mapping {
+            self.open_cb_window(mapfn, this_arg)
+        } else {
+            (None, self.regs.len())
+        };
+        let mut k: usize = 0;
+        let outcome = loop {
+            let direct = match self.heap.get(src) {
+                HeapObj::Array(items) if self.array_steps_dense(src) => {
+                    if k >= items.len() {
+                        break Ok(());
+                    }
+                    Some(items[k]).filter(|v| !v.is_hole())
+                }
+                _ => None,
+            };
+            let value = match direct {
+                Some(v) => v,
+                None => {
+                    if k >= self.js_array_len(src) {
+                        break Ok(());
+                    }
+                    // The iterator's own Get: its throw is `next`'s, which
+                    // leaves the iterator done, so nothing is closed.
+                    match self.get_index(Value::heap(src), Value::num(k as f64)) {
+                        Ok(v) => v,
+                        Err(e) => break Err(e),
+                    }
+                }
+            };
+            self.host_result_roots[base + 4] = value;
+            // An abrupt step after the element was produced closes the
+            // iterator: made now, since nothing could see it before.
+            macro_rules! close_and_throw {
+                ($e:expr) => {{
+                    let saved = self.pending_throw;
+                    let iter = Value::heap(self.heap.alloc(HeapObj::Iterator {
+                        items: Vec::new(),
+                        index: k + 1,
+                        proto: self.array_iter_proto,
+                        live: Some((src, 1)),
+                    }));
+                    self.host_result_roots[base + 4] = iter;
+                    let _ = self.iterator_close(iter);
+                    self.pending_throw = saved;
+                    break Err($e);
+                }};
+            }
+            let mapped = if mapping {
+                match self.run_cb_elem(&native, win, mapfn, &[value, Value::num(k as f64)], this_arg) {
+                    Ok(v) => v,
+                    Err(e) => close_and_throw!(e),
+                }
+            } else {
+                value
+            };
+            if k >= crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
+                break Err(Thrown::from_static(
+                    "RangeError: iterator produced more values than the engine's limit",
+                ));
+            }
+            if let HeapObj::Array(items) = self.heap.get_mut(acc) {
+                items.push(mapped);
+            }
+            self.heap.write_barrier_val(acc, mapped);
+            if let Err(e) = self.instrument_drain_heap_check(k + 1) {
+                close_and_throw!(e);
+            }
+            k += 1;
+        };
+        self.regs.truncate(win);
+        let result = outcome.map(|()| {
+            let out = match self.heap.get_mut(acc) {
+                HeapObj::Array(items) => std::mem::take(items),
+                _ => Vec::new(),
+            };
+            self.alloc_array_current_realm(out)
+        });
+        self.host_result_roots.truncate(base);
+        result
+    }
+
+    /// `Array.from`'s iterator loop, with collection running: the
+    /// receiver-constructed `dest`, the iterator, `next`, the mapping function
+    /// and its `this`, the dense accumulator and the current step's result and
+    /// value live in root slots (see `drain_iterator_rooted`).
+    fn array_from_iterator(
+        &mut self,
+        dest: Option<Value>,
+        iter: Value,
+        next_fn: Value,
+        mapfn: Value,
+        this_arg: Value,
+    ) -> Result<Value, Thrown> {
+        let acc = self.heap.alloc(HeapObj::Array(Vec::new()));
+        let base = self.host_result_roots.len();
+        self.host_result_roots.extend_from_slice(&[
+            dest.unwrap_or(Value::UNDEFINED),
+            iter,
+            next_fn,
+            mapfn,
+            this_arg,
+            Value::heap(acc),
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+        ]);
+        let r = self
+            .array_from_iterator_steps(dest, iter, next_fn, mapfn, this_arg, acc, base + 6)
+            .and_then(|k| match dest {
+                Some(a) => {
+                    self.set_prop(a, "length", Value::num(k as f64), true)?;
+                    Ok(a)
+                }
+                // No constructor receiver → ArrayCreate(0) in the realm of the
+                // `from` built-in running now: `var f = other.Array.from; f([1])`
+                // yields an array whose prototype is the OTHER realm's.
+                None => {
+                    let out = match self.heap.get_mut(acc) {
+                        HeapObj::Array(items) => std::mem::take(items),
+                        _ => Vec::new(),
+                    };
+                    Ok(self.alloc_array_current_realm(out))
+                }
+            });
+        self.host_result_roots.truncate(base);
+        r
+    }
+
+    /// The steps of [`Self::array_from_iterator`]; returns the element count.
+    #[allow(clippy::too_many_arguments)]
+    fn array_from_iterator_steps(
+        &mut self,
+        dest: Option<Value>,
+        iter: Value,
+        next_fn: Value,
+        mapfn: Value,
+        this_arg: Value,
+        acc: u32,
+        scratch: usize,
+    ) -> Result<usize, Thrown> {
+        let mapping = mapfn != Value::UNDEFINED;
+        let mut k: usize = 0;
+        loop {
+            let result = self.call_value(next_fn, iter, &[])?;
+            if !self.is_object_value(result) {
+                return Err(Thrown::from_static("TypeError: iterator result is not an object"));
+            }
+            self.host_result_roots[scratch] = result;
+            let done = self.get_prop(result, "done")?;
+            if self.truthy(done) {
+                return Ok(k);
+            }
+            let k_value = self.get_prop(result, "value")?;
+            self.host_result_roots[scratch + 1] = k_value;
+            // IteratorClose(iteratorRecord, throwCompletion) discards ANY
+            // completion the close produces — including the one from
+            // GetMethod(iterator, "return") — and rethrows the original. The
+            // thrown VALUE lives in `pending_throw`, so it has to be banked
+            // across the close: without that, a `return` accessor that itself
+            // throws overwrote it and `Array.from` reported "return getter
+            // throws" instead of the defineProperty failure that actually
+            // aborted the loop (staging/sm/Array/from-iterator-close.js).
+            macro_rules! close_and_throw {
+                ($e:expr) => {{
+                    let saved = self.pending_throw;
+                    let _ = self.iterator_close(iter);
+                    self.pending_throw = saved;
+                    return Err($e);
+                }};
+            }
+            let mapped = if mapping {
+                match self.call_value(mapfn, this_arg, &[k_value, Value::num(k as f64)]) {
+                    Ok(v) => v,
+                    Err(e) => close_and_throw!(e),
+                }
+            } else {
+                k_value
+            };
+            self.host_result_roots[scratch + 1] = mapped;
+            match dest {
+                Some(a) => {
+                    if let Err(e) =
+                        self.preflight_native_iteration_work((k as u64).saturating_add(1))
+                    {
+                        close_and_throw!(e);
+                    }
+                    if let Err(e) = self.create_data_property_or_throw(a, k, mapped) {
+                        close_and_throw!(e);
+                    }
+                }
+                None => {
+                    if k >= crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
+                        return Err(Thrown::from_static(
+                            "RangeError: iterator produced more values than the engine's limit",
+                        ));
+                    }
+                    if let HeapObj::Array(items) = self.heap.get_mut(acc) {
+                        items.push(mapped);
+                    }
+                    self.heap.write_barrier_val(acc, mapped);
+                    if let Err(e) = self.instrument_drain_heap_check(k + 1) {
+                        close_and_throw!(e);
+                    }
+                }
+            }
+            k += 1;
+        }
+    }
+}

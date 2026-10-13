@@ -1,0 +1,2025 @@
+// Split out of the former monolithic parent file by tools/split_rs.py.
+// Pure code move: `use super::*` keeps the parent module's imports in
+// scope, and items are widened to pub(crate) so the pieces still see
+// each other. No logic changed.
+#![allow(unused_imports)]
+use super::*;
+use crate::bytecode::{BitwiseOp, Reg};
+
+/// Top-16 bits of the canonical bool tag (`0x7FFA`). The five tag patterns
+/// 0x7FF9..=0x7FFD are: Int, Bool, Null, Undefined, Heap — only Int is a number.
+pub(crate) const BOOL_TAG: u64 = INT_TAG + (1u64 << 48);
+
+env_off_switch! {
+    /// Is the region `IterNext`/finally-bracket admission on? Default ON;
+    /// `ZIPP_NO_ITER_REGION=1` restores the decline (the whole for-of region
+    /// blacklists and the loop runs interpreted, the pre-change behaviour), so the
+    /// mechanism can be A/B'd with `tools/bench.py --ab-env` on ONE binary.
+    fn iter_region_enabled() = "ZIPP_NO_ITER_REGION"
+}
+
+/// Proof token for the deliberately tiny matchAll scalarization V1. The
+/// detector accepts only the compiler's exact 36-op outer-loop shape used by
+/// regex-log-scan; every skipped publication/consumer is named here so the
+/// emitter cannot accidentally scalarize a merely similar loop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RxScalarMatchallPlan {
+    pub(crate) get_iterator_ip: usize,
+    pub(crate) iter_prime_ip: usize,
+    pub(crate) iter_next_ip: usize,
+    pub(crate) result_store_ip: usize,
+    pub(crate) result_load_ip: usize,
+    pub(crate) capture_get_ip: usize,
+    pub(crate) capture_tonum_ip: usize,
+    pub(crate) add_ip: usize,
+    pub(crate) close_ip: usize,
+    pub(crate) end_finally_ip: usize,
+    pub(crate) callee_reg: Reg,
+    pub(crate) iter_reg: Reg,
+    pub(crate) i_global: u32,
+    pub(crate) n_global: u32,
+    pub(crate) lines_global: u32,
+    pub(crate) re_global: u32,
+    pub(crate) result_global: u32,
+    pub(crate) count_global: u32,
+    pub(crate) sum_global: u32,
+    pub(crate) capture: u32,
+    pub(crate) tonum_dst: Reg,
+}
+
+/// Proof token for the exact non-global `RegExp.prototype.exec` loop used by
+/// regex-log-scan.  Unlike the matchAll token above this shape is already an
+/// ordinary MEM region; the token only permits eliding the result publication
+/// and its four fixed `GetIndex -> ToNum` consumers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RxScalarExecPlan {
+    pub(crate) input_get_ip: usize,
+    pub(crate) call_ip: usize,
+    pub(crate) result_store_ip: usize,
+    pub(crate) result_reload_ip: usize,
+    pub(crate) capture_load_ips: [usize; 4],
+    pub(crate) capture_key_ips: [usize; 4],
+    pub(crate) capture_get_ips: [usize; 4],
+    pub(crate) capture_tonum_ips: [usize; 4],
+    pub(crate) add_ips: [usize; 4],
+    pub(crate) input_pin_slot: usize,
+    pub(crate) callee_reg: Reg,
+    pub(crate) re_reg: Reg,
+    pub(crate) input_reg: Reg,
+    pub(crate) call_result_reg: Reg,
+    pub(crate) result_test_reg: Reg,
+    pub(crate) result_global: u32,
+    pub(crate) tonum_dsts: [Reg; 4],
+}
+
+impl RxScalarExecPlan {
+    #[inline]
+    pub(crate) fn elides_capture_ip(&self, ip: usize) -> bool {
+        self.capture_load_ips.contains(&ip)
+            || self.capture_key_ips.contains(&ip)
+            || self.capture_get_ips.contains(&ip)
+            || self.capture_tonum_ips.contains(&ip)
+    }
+}
+
+/// Recognize exactly:
+///
+/// `for (i<N) { m=re.exec(lines[i]); if(m) { count++;` followed by four
+/// `sum += +m[k]` additions and `|0`; then `i++`.  The dense input pin is a
+/// load-bearing part of the proof: while the previous result is pending, a
+/// hole/proxy/accessor-capable `GetIndex` must exit and materialize before the
+/// interpreter performs any observable lookup.
+pub(crate) fn rx_scalar_exec_plan(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+) -> Option<RxScalarExecPlan> {
+    if !crate::vm::rx_scalar_exec_enabled() || end != start.checked_add(42)? {
+        return None;
+    }
+    let s = start as usize;
+    let code = &proto.code;
+    if end as usize >= code.len() {
+        return None;
+    }
+
+    let (i0, i_global) = match code[s] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let (n, n_global) = match code[s + 1] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    if !matches!(code[s + 2], Instr::JumpIfNotLt { a, b, target }
+        if a == i0 && b == n && target == end + 1)
+    {
+        return None;
+    }
+    let (re_reg, re_global) = match code[s + 3] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let callee_reg = match code[s + 4] {
+        Instr::GetProp { dst, obj, name }
+            if obj == re_reg
+                && proto
+                    .string_constants
+                    .get(name as usize)
+                    .map(String::as_str)
+                    == Some("exec") =>
+        {
+            dst
+        }
+        _ => return None,
+    };
+    let (lines, lines_global) = match code[s + 5] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let i1 = match code[s + 6] {
+        Instr::LoadGlobal { dst, idx } if idx == i_global => dst,
+        _ => return None,
+    };
+    let input_reg = match code[s + 7] {
+        Instr::GetIndex { dst, obj, key } if obj == lines && key == i1 => dst,
+        _ => return None,
+    };
+    let input_pin_slot = ta_plan.access.get(&(s + 7)).copied()? as usize;
+    if !ta_plan
+        .pins
+        .get(input_pin_slot)
+        .is_some_and(|p| is_arr_pin(p.kind))
+    {
+        return None;
+    }
+    let call_result_reg = match code[s + 8] {
+        Instr::RegExpMethod {
+            dst,
+            op: crate::bytecode::RegExpMethod::Exec,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+        } if callee == callee_reg && this_v == re_reg && arg_base == input_reg && argc == 1 => dst,
+        _ => return None,
+    };
+    let result_global = match code[s + 9] {
+        Instr::StoreGlobal { idx, src }
+        | Instr::StoreGlobalStrict { idx, src }
+        | Instr::StoreGlobalResolved { idx, src }
+            if src == call_result_reg =>
+        {
+            idx
+        }
+        _ => return None,
+    };
+    let result_test_reg = match code[s + 10] {
+        Instr::LoadGlobal { dst, idx } if idx == result_global => dst,
+        _ => return None,
+    };
+    if !matches!(code[s + 11], Instr::JumpIfFalse { cond, target }
+            if cond == result_test_reg && target == start + 39)
+    {
+        return None;
+    }
+    let (count, count_global) = match code[s + 12] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    if !matches!(code[s + 13], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if dst == count && a == count)
+        || !matches!(code[s + 14],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == count_global && src == count)
+    {
+        return None;
+    }
+    let (sum, sum_global) = match code[s + 15] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    // Suppressing result_global's per-iteration store is sound only when no
+    // other source load/store can alias it before the pending result is flushed.
+    if [
+        i_global,
+        n_global,
+        re_global,
+        lines_global,
+        count_global,
+        sum_global,
+    ]
+    .contains(&result_global)
+    {
+        return None;
+    }
+
+    let mut capture_load_ips = [0usize; 4];
+    let mut capture_key_ips = [0usize; 4];
+    let mut capture_get_ips = [0usize; 4];
+    let mut capture_tonum_ips = [0usize; 4];
+    let mut add_ips = [0usize; 4];
+    let mut tonum_dsts = [0u16; 4];
+    let mut accum = sum;
+    for g in 0..4 {
+        let base = s + 16 + 5 * g;
+        let result_obj = match code[base] {
+            Instr::LoadGlobal { dst, idx } if idx == result_global => dst,
+            _ => return None,
+        };
+        let key = match code[base + 1] {
+            Instr::LoadInt { dst, val } if val == (g + 1) as i32 => dst,
+            _ => return None,
+        };
+        let capture = match code[base + 2] {
+            Instr::GetIndex { dst, obj, key: k } if obj == result_obj && k == key => dst,
+            _ => return None,
+        };
+        let num = match code[base + 3] {
+            Instr::ToNum { dst, a } if a == capture => dst,
+            _ => return None,
+        };
+        let next = match code[base + 4] {
+            Instr::Add { dst, a, b } if a == accum && b == num => dst,
+            _ => return None,
+        };
+        capture_load_ips[g] = base;
+        capture_key_ips[g] = base + 1;
+        capture_get_ips[g] = base + 2;
+        capture_tonum_ips[g] = base + 3;
+        add_ips[g] = base + 4;
+        tonum_dsts[g] = num;
+        accum = next;
+    }
+    let zero = match code[s + 36] {
+        Instr::LoadInt { dst, val: 0 } => dst,
+        _ => return None,
+    };
+    let final_sum = match code[s + 37] {
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        } if a == accum && b == zero => dst,
+        _ => return None,
+    };
+    let i2 = match code[s + 39] {
+        Instr::LoadGlobal { dst, idx } if idx == i_global => dst,
+        _ => return None,
+    };
+    if !matches!(code[s + 38],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == sum_global && src == final_sum)
+        || !matches!(code[s + 40], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if dst == i2 && a == i2)
+        || !matches!(code[s + 41],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == i_global && src == i2)
+        || !matches!(code[s + 42], Instr::Jump { target } if target == start)
+    {
+        return None;
+    }
+
+    Some(RxScalarExecPlan {
+        input_get_ip: s + 7,
+        call_ip: s + 8,
+        result_store_ip: s + 9,
+        result_reload_ip: s + 10,
+        capture_load_ips,
+        capture_key_ips,
+        capture_get_ips,
+        capture_tonum_ips,
+        add_ips,
+        input_pin_slot,
+        callee_reg,
+        re_reg,
+        input_reg,
+        call_result_reg,
+        result_test_reg,
+        result_global,
+        tonum_dsts,
+    })
+}
+
+/// Recognize exactly:
+///
+/// `for (i<N) for (km of lines[i].matchAll(re)) { count++; sum=(sum+(+km[k]))|0 }`
+///
+/// including the compiler's for-of finally bracket. The plan is only exposed
+/// on the MEM path and only while every prerequisite switch is enabled.
+pub(crate) fn rx_scalar_matchall_plan(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+) -> Option<RxScalarMatchallPlan> {
+    if !crate::vm::rx_scalar_matchall_enabled() || end != start.checked_add(35)? {
+        return None;
+    }
+    let s = start as usize;
+    let code = &proto.code;
+    if end as usize >= code.len() {
+        return None;
+    }
+
+    let (i0, i_global) = match code[s] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let (n, n_global) = match code[s + 1] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    if !matches!(code[s + 2], Instr::JumpIfNotLt { a, b, target }
+        if a == i0 && b == n && target == end + 1)
+    {
+        return None;
+    }
+    let (lines, lines_global) = match code[s + 3] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let i1 = match code[s + 4] {
+        Instr::LoadGlobal { dst, idx } if idx == i_global => dst,
+        _ => return None,
+    };
+    let line = match code[s + 5] {
+        Instr::GetIndex { dst, obj, key } if obj == lines && key == i1 => dst,
+        _ => return None,
+    };
+    let callee_reg = match code[s + 6] {
+        Instr::GetProp { dst, obj, name }
+            if obj == line
+                && proto
+                    .string_constants
+                    .get(name as usize)
+                    .map(String::as_str)
+                    == Some("matchAll") =>
+        {
+            dst
+        }
+        _ => return None,
+    };
+    let (re, re_global) = match code[s + 7] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let iter = match code[s + 8] {
+        Instr::RegExpMethod {
+            dst,
+            op: crate::bytecode::RegExpMethod::MatchAll,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+        } if callee == callee_reg && this_v == line && arg_base == re && argc == 1 => dst,
+        _ => return None,
+    };
+    if !matches!(code[s + 9], Instr::GetIterator { dst, src } if dst == iter && src == iter) {
+        return None;
+    }
+    let next = match code[s + 10] {
+        Instr::IterPrime { dst, iter: it } if it == iter => dst,
+        _ => return None,
+    };
+    let cursor = match code[s + 11] {
+        Instr::LoadInt { dst, val: 0 } => dst,
+        _ => return None,
+    };
+    let (result, done) = match code[s + 12] {
+        Instr::IterNext {
+            value_dst,
+            done_dst,
+            iter: it,
+            idx,
+            next: nx,
+        } if it == iter && idx == cursor && nx == next => (value_dst, done_dst),
+        _ => return None,
+    };
+    if !matches!(code[s + 13], Instr::JumpIfTrue { cond, target }
+        if cond == done && target == start + 32)
+    {
+        return None;
+    }
+    let (kind, completion) = match code[s + 14] {
+        Instr::PushFinally {
+            target,
+            kind_reg,
+            val_reg,
+        } if target == start + 30 => (kind_reg, val_reg),
+        _ => return None,
+    };
+    let result_global = match code[s + 15] {
+        Instr::StoreGlobal { idx, src }
+        | Instr::StoreGlobalStrict { idx, src }
+        | Instr::StoreGlobalResolved { idx, src }
+            if src == result =>
+        {
+            idx
+        }
+        _ => return None,
+    };
+    let (count, count_global) = match code[s + 16] {
+        Instr::LoadGlobal { dst, idx } if dst == done => (dst, idx),
+        _ => return None,
+    };
+    if !matches!(code[s + 17], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if dst == count && a == count)
+        || !matches!(code[s + 18],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == count_global && src == count)
+    {
+        return None;
+    }
+    let (sum, sum_global) = match code[s + 19] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    // The outer reducer publishes count/sum only after the remaining dense
+    // array is scanned. Require every template binding to be distinct so its
+    // combined update and deferred result store cannot alter a source read.
+    let globals = [
+        i_global,
+        n_global,
+        lines_global,
+        re_global,
+        result_global,
+        count_global,
+        sum_global,
+    ];
+    for (idx, global) in globals.iter().enumerate() {
+        if globals[idx + 1..].contains(global) {
+            return None;
+        }
+    }
+    // The Win64 scalar-step helper carries the eight compile-time operands in
+    // two packed u64s (the sole stack-argument slot is shared with every MEM
+    // region call). A program with more than 65K globals is valid, but stays
+    // on the ordinary path rather than truncating a binding index.
+    if globals.iter().any(|&global| global > u16::MAX as u32) {
+        return None;
+    }
+    let result_obj = match code[s + 20] {
+        Instr::LoadGlobal { dst, idx } if idx == result_global => dst,
+        _ => return None,
+    };
+    let (capture_key, capture) = match code[s + 21] {
+        Instr::LoadInt { dst, val } if (1..=4).contains(&val) => (dst, val as u32),
+        _ => return None,
+    };
+    let capture_value = match code[s + 22] {
+        Instr::GetIndex { dst, obj, key } if obj == result_obj && key == capture_key => dst,
+        _ => return None,
+    };
+    let capture_num = match code[s + 23] {
+        Instr::ToNum { dst, a } if a == capture_value => dst,
+        _ => return None,
+    };
+    let added = match code[s + 24] {
+        Instr::Add { dst, a, b } if a == sum && b == capture_num => dst,
+        _ => return None,
+    };
+    let zero = match code[s + 25] {
+        Instr::LoadInt { dst, val: 0 } => dst,
+        _ => return None,
+    };
+    if !matches!(code[s + 26], Instr::Bitwise { dst, a, b, op: BitwiseOp::Or }
+            if dst == result && a == added && b == zero)
+        || !matches!(code[s + 27],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == sum_global && src == result)
+        || !matches!(code[s + 28], Instr::PopFinally)
+        || !matches!(code[s + 29], Instr::Jump { target } if target == start + 12)
+        || !matches!(code[s + 30], Instr::IterCloseFinally { iter: it, kind_reg }
+            if it == iter && kind_reg == kind)
+        || !matches!(code[s + 31], Instr::EndFinally { kind_reg, val_reg }
+            if kind_reg == kind && val_reg == completion)
+        || !matches!(code[s + 32], Instr::LoadGlobal { dst, idx }
+            if dst == cursor && idx == i_global)
+        || !matches!(code[s + 33], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if dst == cursor && a == cursor)
+        || !matches!(code[s + 34],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == i_global && src == cursor)
+        || !matches!(code[s + 35], Instr::Jump { target } if target == start)
+    {
+        return None;
+    }
+
+    Some(RxScalarMatchallPlan {
+        get_iterator_ip: s + 9,
+        iter_prime_ip: s + 10,
+        iter_next_ip: s + 12,
+        result_store_ip: s + 15,
+        result_load_ip: s + 20,
+        capture_get_ip: s + 22,
+        capture_tonum_ip: s + 23,
+        add_ip: s + 24,
+        close_ip: s + 30,
+        end_finally_ip: s + 31,
+        callee_reg,
+        iter_reg: iter,
+        i_global,
+        n_global,
+        lines_global,
+        re_global,
+        result_global,
+        count_global,
+        sum_global,
+        capture,
+        tonum_dst: capture_num,
+    })
+}
+
+/// Can the loop region `[start, end]` be compiled in the double subset? Every op
+/// in range must be numeric/control-flow with no closure op, and any `LoadConst`
+/// must reference a numeric constant, a single-ASCII-char string, or (MEM path
+/// only — `const_strs` is `Some`) a string constant pre-interned at compile time
+/// whose bits the emitter embeds (`const_strs` maps constant index → bits).
+pub(crate) fn region_can_compile(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    const_strs: Option<&FxHashMap<u32, u64>>,
+) -> bool {
+    let code = &proto.code;
+    let (s, e) = (start as usize, end as usize);
+    if e <= s || e >= code.len() {
+        return false;
+    }
+    // Scalar matchAll is MEM-only: numeric/register callers pass `None` and
+    // retain the historical rejection for the four otherwise unsupported
+    // protocol/finally ops.
+    let scalar_matchall = const_strs
+        .is_some()
+        .then(|| rx_scalar_matchall_plan(proto, start, end))
+        .flatten();
+    // Under `ZIPP_JITDUMP` the scan runs to completion and reports EVERY op it
+    // has no arm for, rather than stopping at the first. The first-only report
+    // was actively misleading when prioritising admission work: it names one op,
+    // that op gets admitted, and the region is still declined by the next one —
+    // so a change that looked like it would unblock a region unblocked nothing.
+    // Behaviour is unchanged when the flag is off (`dump` is false, and every
+    // rejection returns immediately exactly as before).
+    let dump = std::env::var_os("ZIPP_JITDUMP").is_some();
+    let mut ok = true;
+    // The back-edge must be an unconditional jump to the header (canonical
+    // while/for shape). This guarantees no fall-through past `end`, so the only
+    // out-of-region control transfers are explicit jump targets (loop exit /
+    // break), which become exit stubs.
+    match code[e] {
+        Instr::Jump { target } if target == start => {}
+        _ => return false,
+    }
+    // A Python loop (see `codegen::py`): the fused instructions and the
+    // Python body ops, on the MEMORY path only (the register tiers pass no
+    // `const_strs` and keep rejecting them through the catch-all).
+    let py = const_strs.is_some() && has_py_ops(&code[s..=e]);
+    for (ip, instr) in code[s..=e].iter().enumerate() {
+        let ip = s + ip;
+        if py && (py_op_edges(instr).is_some() || py_body_op(instr)) {
+            continue;
+        }
+        if !region_op_admitted(proto, ip, instr, start, end, const_strs, scalar_matchall.as_ref(), dump) {
+            if dump {
+                ok = false;
+            } else {
+                return false;
+            }
+        }
+    }
+    if !ok {
+        return false;
+    }
+    // NOTE: helpers that can allocate (`StrConcat`/`StrAppendInPlace`) or run
+    // user code (`Call`/`CallMethod`) USED to be forbidden alongside
+    // GetProp/SetProp because the inline cache pins the heap version-array
+    // pointer (r13) and the IC table pointer (r14), which an allocation /
+    // a nested region compile can move. The memory path now RE-FETCHES those
+    // pinned pointers after every such helper call instead (see
+    // `emit_refetch_pinned`), so the mix is allowed.
+    true
+}
+
+/// One instruction of a candidate MEM/register region: whether the region
+/// tiers admit it (see [`region_can_compile`], which calls this for every
+/// op of `[start, end]`). A rejection is printed under `ZIPP_JITDUMP`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn region_op_admitted(
+    proto: &FuncProto,
+    ip: usize,
+    instr: &Instr,
+    start: u32,
+    end: u32,
+    const_strs: Option<&FxHashMap<u32, u64>>,
+    scalar_matchall: Option<&RxScalarMatchallPlan>,
+    dump: bool,
+) -> bool {
+    let _ = ip;
+    macro_rules! reject {
+        ($($arg:tt)*) => {{
+            if dump {
+                eprintln!($($arg)*);
+            }
+            return false;
+        }};
+    }
+    match *instr {
+        Instr::LoadInt { .. }
+        | Instr::Move { .. }
+        | Instr::LoadGlobal { .. }
+        | Instr::StoreGlobal { .. }
+        // A `let`/`const` global write (TDZ-checked); inside a hot loop region the
+        // binding is already initialized, so the JIT treats it like StoreGlobal.
+        | Instr::StoreGlobalStrict { .. }
+        | Instr::StoreGlobalResolved { .. }
+        | Instr::Add { .. }
+        | Instr::Sub { .. }
+        | Instr::Mul { .. }
+        | Instr::Div { .. }
+        | Instr::Mod { .. }
+        | Instr::AddInt { .. }
+        | Instr::Neg { .. }
+        // Bitwise ops (`|`/`&`/`^`/`<<`/`>>`/`>>>`) — handled by the MEMORY
+        // path (Int or exactly-integral-double operands; anything else
+        // bails). The `(x + y) | 0` / `i & 7` idioms gate most real
+        // object/method loops, so regions must admit them.
+        | Instr::Bitwise { .. }
+        | Instr::Lt { .. }
+        | Instr::Le { .. }
+        | Instr::Gt { .. }
+        | Instr::Ge { .. }
+        | Instr::Eq { .. }
+        | Instr::Ne { .. }
+        | Instr::Jump { .. }
+        | Instr::JumpIfFalse { .. }
+        | Instr::JumpIfTrue { .. }
+        | Instr::JumpIfNotLt { .. }
+        | Instr::JumpIfNotLe { .. }
+        // Heap property ops — handled by the MEMORY path via win64 helper
+        // calls (the int/regalloc paths decline, so heap regions take the
+        // mem path). A `Print`/etc. anywhere still rejects the region.
+        // A strict-FORCED SetProp (a strict ClassTail region inside a
+        // sloppy function) declines: the JIT slow path derives strictness
+        // from the proto flag, which cannot see that region.
+        | Instr::GetProp { .. }
+        | Instr::SetProp { strict: false, .. }
+        // Dense-array element read/write `a[i]` / `a[i]=v` — handled by the
+        // MEMORY path via win64 helpers (the int/regalloc paths decline).
+        | Instr::GetIndex { .. }
+        | Instr::SetIndex { .. }
+        // Read-modify-write key coercion (`o[k] += v`, `o[k]++`): a NUMBER
+        // key on a non-nullish base is a plain move (the MEMORY path's
+        // inline case); anything else bails to the interpreter.
+        | Instr::ToPropKey { .. }
+        // String concat (`s += …`) — handled by the MEMORY path via the
+        // `jit_concat` / `jit_str_append` win64 helpers (the numeric
+        // int/regalloc paths don't list them, so they decline → mem path).
+        | Instr::StrConcat { .. }
+        | Instr::StrAppendInPlace { .. }
+        | Instr::StrAppendIndex { .. }
+        | Instr::AddRightPair { .. }
+        | Instr::Pad2Concat { .. }
+        | Instr::Pad2Conditional { .. }
+        // W11 (B124) fused chain link — MEM path via `jit_concat_chain`
+        // (same decline-to-mem shape as the two ops above). LOAD-BEARING:
+        // without this the fused gen-loop regions (regex-log-scan) would
+        // DECLINE outright and the whole row regresses.
+        | Instr::StrConcatChain { .. }
+        | Instr::Return { .. }
+        | Instr::ReturnUndefined => {}
+        // Method calls — handled by the MEMORY path. `arr.push(x)` /
+        // `str.charCodeAt(i)` keep their dedicated win64 helpers; every
+        // other `obj.m(…)` compiles to a `jit_call_method_ic` helper call
+        // that consults the interpreter's per-site inline cache and
+        // frame-calls the resolved plain user function (IC miss /
+        // megamorphic / native callee → deopt to the interpreter at this
+        // op; repeated deopts evict the region).
+        Instr::CallMethod { .. } => {}
+        // Computed calls are MEMORY-only. The helper is deliberately a
+        // pure prefix: it claims only a plain callable stored in a present
+        // own dense-Array slot, preserving `this = receiver`; every exotic
+        // or observable lookup returns to the interpreter untouched.
+        Instr::CallMethodComputed { .. } => {
+            if !crate::codegen::computed_call_dense_enabled() {
+                reject!("[decline] CallMethodComputed (dense helper disabled) at region [{start},{end}]");
+            }
+        }
+        // Plain calls `f(…)`, plus calls carrying a previously captured
+        // receiver/reference — same completion/deopt protocol via their
+        // respective exact-call helpers.
+        Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
+        // `new F(…)`: the construct helper, with the call protocol.
+        Instr::New { .. } => {}
+        // Logical `!` — MEM path (Bool flips natively; anything else goes
+        // through the `jit_truthy` helper).
+        Instr::Not { .. } => {}
+        // `Math.<op>(args…)` — MEM path. A 1-arg unary op (`abs`/`sqrt`/
+        // `floor`/`sin`/…) loads its arg as a number (bails to the
+        // interpreter — which runs ToNumber coercion — if not) and calls the
+        // PURE `jit_math_unary` helper (the interpreter's exact `math_unary`,
+        // so every JS quirk matches). A 2-arg op (`pow`/`atan2`/`imul`/
+        // `min`/`max`/`hypot` with EXACTLY two args) uses `jit_math_two`.
+        // Any other arity (variadic min/max/hypot, a 0-arg call) declines —
+        // the interpreter handles it. The helpers run no user code and never
+        // allocate (a non-numeric arg already bailed), so no pinned-pointer
+        // re-fetch is needed.
+        Instr::MathOp { op, argc, .. } => {
+            // Exactly what `emit_math_op` implements — shared with Tier C's
+            // check so the two admission lists cannot drift apart again.
+            if !math_op_emittable(op, argc) {
+                reject!("[decline] MathOp arity {argc} op {op:?} at region [{start},{end}]");
+            }
+        }
+        // `LoadBool` — materialise the boolean Value bits inline (a single
+        // store; call-free, pure). Unblocks loops carrying a bool literal
+        // (parser flags, `done=false`).
+        Instr::LoadBool { .. } => {}
+        // `undefined` / `null` as constants — one store of the canonical
+        // bits each, the same shape as `LoadBool` above and call-free. Both
+        // were simply absent, and the cost of that is not proportional to
+        // how trivial they are: a single `LoadUndefined` declines the WHOLE
+        // region, so map-set-heavy's largest loop ([39,110], 71 ops) ran
+        // interpreted for want of three of them. The int/regalloc planners
+        // still reject the region through their own catch-alls — these bits
+        // are not an i64 or an f64 — so it takes the MEM path, exactly as
+        // `LoadBool` does.
+        Instr::LoadUndefined { .. } | Instr::LoadNull { .. } => {}
+        // Fused `typeof` comparisons — MEM paths via PURE classifier
+        // helpers. They allocate nothing, run no user code and are total.
+        // helper (no alloc, no user code, total). The UNFUSED `TypeOf` is
+        // still not admitted here: it allocates its result string, and after
+        // this fusion the bare form is rare enough not to be worth the
+        // refetch plumbing.
+        Instr::TypeOfIs { .. } | Instr::TypeOfSame { .. } => {}
+        // `Promise.resolve(x)` / `Number.is*(x)` at exactly one argument —
+        // MEM path via `jit_static_fn`. `Promise.resolve` was async-
+        // promise-chain's fill-loop's ONLY blocker (`a[j] =
+        // Promise.resolve(j)` blacklisted the whole region, B38/B42); the
+        // helper handles the non-heap-argument fast path (no user code, no
+        // microtask) and deopts a heap argument to the interpreter's
+        // identity/thenable protocol. Every other StaticFn keeps declining.
+        Instr::StaticFn { op, argc, .. } => {
+            use crate::bytecode::StaticFn as S;
+            let ok = argc == 1
+                && matches!(
+                    op,
+                    S::PromiseResolve
+                        | S::NumberIsInteger
+                        | S::NumberIsNaN
+                        | S::NumberIsFinite
+                        | S::NumberIsSafeInteger
+                );
+            if !ok {
+                reject!("[decline] StaticFn {op:?}/{argc} at region [{start},{end}]");
+            }
+        }
+        // `CheckCoercible` — RequireObjectCoercible before a member access
+        // (`objs[i&3].area()` emits one). MEM path: a null/undefined operand
+        // bails to the interpreter (which throws the TypeError); any other
+        // value is a pure no-op. Pure, call-free, no alloc — unblocks the
+        // class-method-call loops (the GetIndex'd receiver is coerced before
+        // the CallMethod).
+        Instr::CheckCoercible { .. } => {}
+        // Closure-cell / upvalue READS — MEM path via the pure `jit_cell_get`
+        // / `jit_upval_get` helpers (a single heap LOAD of the cell's inner
+        // Value; a TDZ cell → deopt sentinel → interpreter throws). Emitted
+        // PER-OP (never hoisted across a Call/CallMethod), so a value an inner
+        // closure mutated via a call in the SAME region is re-read on the next
+        // execution. The helpers allocate nothing and run no user code, so no
+        // pinned-pointer (r13/r14/TA) re-fetch is needed.
+        Instr::CellGet { .. } | Instr::UpvalGet { .. } => {}
+        // Closure-cell / upvalue WRITES. `CellSet` is the declaring scope's
+        // unconditional store. `UpvalSet` is different: its helper first
+        // declines captured const / named-function / TDZ cells, so the
+        // interpreter replays the op and applies PutValue's throw/no-op
+        // semantics. Both hit paths are allocation- and user-code-free.
+        Instr::CellSet { .. } | Instr::UpvalSet { .. } => {}
+        // `+x` — a NUMBER passes straight through (the interpreter returns
+        // the Value verbatim); anything else needs observable ToNumber
+        // coercion and bails. It was simply absent from this list, which
+        // declined sparse-array's for-in `keyFold` region outright.
+        Instr::ToNum { .. } => {}
+        // `obj["name" + i]` — the fused computed key. MEM path via
+        // `jit_get_index_concat`, which handles only the own-DATA hit (no
+        // alloc, no user code) and deopts otherwise.
+        Instr::GetIndexConcat { .. } => {}
+        // The fused computed-key WRITE and its evaluation-order shim.
+        // Both MUST be admitted together with the fusion in
+        // `compile/assign.rs`, or every loop that previously compiled its
+        // `o["k" + i] = v` as Add+SetIndex would now DECLINE. ToConcatKey
+        // is identity for primitives/strings (pure helper, deopts a real
+        // coercion to the interpreter); SetIndexConcat handles the own
+        // writable data-slot hit in place (scratch-formatted key, no
+        // alloc, no version bump) and deopts a NEW key / exotic / string
+        // key — exactly the cases the old Add+SetIndex pair also failed
+        // to compile.
+        Instr::ToConcatKey { .. } | Instr::SetIndexConcat { .. } => {}
+        // The fused computed-key DELETE (W19 M3). `region_mem.rs` had no
+        // `Delete` arm of any kind, so ONE opcode blacklisted the whole
+        // `delete obj["prop_" + p]` loop of `polymorphic-objects`
+        // (`[145,155]`) and it ran 100% interpreted. The MEM emitter calls
+        // `jit_delete_index_concat`, a thin wrapper over the SAME
+        // `Vm::delete_index_concat` the interpreter arm calls — so there is
+        // no re-derived semantics to get wrong, and no deopt sentinel:
+        // every receiver shape (Proxy, global, array, frozen) is served by
+        // the shared waterfall. It CAN allocate and CAN run user code, and a
+        // successful delete shifts slots and bumps the receiver version, so
+        // the emitter owes the full `CALL_THREW` + `emit_refetch_pinned`
+        // protocol — the `SetIndexConcat` treatment, for stronger reasons.
+        // Only the MEM tier gets it; `region_int.rs` keeps its own list.
+        Instr::DeleteIndexConcat { .. } if crate::codegen::jit_delete_enabled() => {}
+        // Ordinary computed delete, but only through the fail-closed helper:
+        // exact Array + non-negative tagged Int + no descriptor/arguments
+        // side table. Every rejected shape bails before mutation and lets
+        // the interpreter perform ToPropertyKey, strict failure and exotic
+        // semantics. The admission-time switch restores the historical
+        // blacklist when disabled.
+        Instr::DeleteIndex { .. } if crate::codegen::jit_array_delete_enabled() => {}
+        // `ForInLive` — the per-iteration for-in liveness check — MEM path via
+        // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
+        // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
+        // point — and it is GC-locked internally for belt-and-suspenders).
+        // Emitted per-op (re-derives the live shape each execution). Lets
+        // `for (k in obj)` loops over plain objects compile.
+        Instr::ForInLive { .. } => {}
+        // `HasProp` — the `in` operator — MEM path via the `jit_has_property`
+        // helper (read-only `Vm::has_property_jit`, byte-identical to the
+        // interpreter's `has_property_dyn` on a non-Proxy chain). Only a plain
+        // `in` (`brand: false`) is admitted; the `#x in obj` ergonomic brand
+        // check needs the private machinery → keeps declining. The helper runs
+        // no user code and never allocates on the VM heap (a Proxy/exotic/
+        // throwing case returns the deopt sentinel and the interpreter takes
+        // over), so no r13/r14/TA refetch. Unblocks sparse-array's 8M
+        // hole-aware `if (i in packed)` loops.
+        Instr::HasProp { brand: false, .. } => {}
+        Instr::HasProp { brand: true, .. } => {
+            reject!("[decline] HasProp brand-check at region [{start},{end}]");
+        }
+        // `IterNext` with a PRIMED next register — the for-of step — MEM
+        // path via `jit_iter_next`, which serves ONLY the three intrinsic
+        // iterator kinds the interpreter's own fast path steps inline
+        // (%RegExpStringIterator% / live %ArrayIterator% / Map-Set
+        // collection iterators, all behind the pristine `ITER_NEXT`
+        // native check) and deopts everything else BEFORE touching state.
+        // This was `regex-log-scan`'s matchAll-loop blocker: the whole
+        // 450k-step for-of region blacklisted for want of this one op
+        // (plus the Push/PopFinally pair below) and ran interpreted.
+        // An UNPRIMED next (u16::MAX — destructuring sites) keeps
+        // declining: its per-step `Get(it,"next")` is observable.
+        Instr::IterNext { next, .. } => {
+            if !iter_region_enabled() || next == u16::MAX {
+                reject!("[decline] IterNext at region [{start},{end}]");
+            }
+        }
+        Instr::GetIterator { .. }
+            if scalar_matchall.is_some_and(|p| p.get_iterator_ip == ip) => {}
+        Instr::IterPrime { .. }
+            if scalar_matchall.is_some_and(|p| p.iter_prime_ip == ip) => {}
+        Instr::IterCloseFinally { .. }
+            if scalar_matchall.is_some_and(|p| p.close_ip == ip) => {}
+        Instr::EndFinally { .. }
+            if scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) => {}
+        // The for-of close-handler bracket around each iteration. Both
+        // are ONE Vec push/pop on the current frame's handler stack via
+        // helpers that mirror the interpreter arms exactly, keeping the
+        // unwind state identical whichever engine executes the loop body
+        // (a throwing helper exits the region with `pending_throw` set
+        // and the interpreter unwinds using these handlers). `EndFinally`
+        // — the handler BODY's terminator — is not admitted; it lives
+        // outside the loop region.
+        Instr::PushFinally { .. } | Instr::PopFinally => {
+            if !iter_region_enabled() {
+                reject!("[decline] finally bracket at region [{start},{end}]");
+            }
+        }
+        Instr::LoadConst { idx, .. } => {
+            // Numeric constants run in the f64 region; a single-ASCII-char
+            // string constant is resolvable to its interned slot (for
+            // `s[i] === "x"` scans); a multi-char string constant is
+            // accepted on the MEM path when its pre-interned bits are in
+            // `const_strs`. Anything else rejects the region.
+            //
+            // BOTH string arms require `const_strs`, i.e. the MEM path. The
+            // register paths (int/regalloc, which pass None) home values in
+            // i64/f64 registers and have no way to hold a string: their
+            // `emit_load_const` writes `v.bits()` straight into an xmm home,
+            // and for a not-yet-interned constant those bits are the
+            // `STRING_CONST_BIT | idx` SENTINEL, not a heap value. Admitting
+            // a single-char literal there put that sentinel in a float
+            // register, where it escaped on flush and was indexed as a heap
+            // slot (`for (var s,i=0;i<20;i++) s="a"` aborted the process at
+            // heap.rs), read as a NaN by arithmetic (so `1 < "2"` inside a
+            // hot loop was always false), or flushed as a bogus value
+            // (`typeof s` becoming "number"). MEM resolves it properly.
+            match proto.constants.get(idx as usize) {
+                Some(c) if c.is_number() => {}
+                Some(&c)
+                    if const_strs.is_some() && single_char_const_bits(proto, c).is_some() => {}
+                Some(_) if const_strs.is_some_and(|m| m.contains_key(&idx)) => {}
+                _ => {
+                    reject!("[decline] non-region LoadConst at region [{start},{end}]");
+                }
+            }
+        }
+        ref other => {
+            reject!("[decline] {other:?} at region [{start},{end}]");
+        }
+    }
+    true
+}
+
+/// Max callee register count an inlined leaf may use (its body runs over a
+/// scratch window carved above the caller frame; `jit_regs_fits` validates the
+/// real window at host entry, so this compile-time cap only bounds the window).
+pub(crate) const LEAF_MAX_REGS: u16 = 32;
+
+/// A modestly wider scratch window admits compiler-expanded numeric kernels
+/// whose live set is still tiny but whose SSA-style temporary numbering crosses
+/// the legacy 32-register cutoff. Runtime headroom remains guarded by
+/// `jit_regs_fits`; nested splices separately cap their combined window at the
+/// 64-bit analysis-mask limit.
+const WIDE_LEAF_MAX_REGS: u16 = 40;
+
+env_off_switch! {
+    /// `ZIPP_NO_WIDE_LEAF=1` restores the legacy 32-register leaf-inline cap.
+    /// Default-on widening is plan-time only and does not alter the emitted
+    /// fallback: every identity/type/headroom miss still performs the real call.
+    fn wide_leaf_enabled() = "ZIPP_NO_WIDE_LEAF"
+}
+
+/// Q4 leaf-call inlining eligibility: is `callee`'s body a leaf the region/Tier-C
+/// emitter can inline over a scratch window? Returns the body ops to inline, or
+/// `None` to decline (the Call keeps the per-call helper). v2 admits FORWARD
+/// in-body branches (a converging diamond like `a && b && c`), dense-array reads,
+/// `charCodeAt`, and comparisons — not just straight-line bodies.
+///
+/// Requirements (all NON-NEGOTIABLE for soundness — see `LeafInlinePlan`):
+/// * Not a generator/async; reg_count ≤ 16; no rest/`arguments`; simple_params
+///   (so arg binding is a plain positional copy, no defaults/destructuring).
+/// * Body ops ⊂ a SAFE SUBSET of the region-admissible value/global ops, minus
+///   anything that calls (`Call`/`CallMethod`/`Super*`), allocates on the VM
+///   heap, reads a closure cell / upvalue (`Cell*`/`Upval*`), or touches the
+///   `arguments`/heap property machinery. The subset below is exactly what the
+///   inline emitter implements; any other op declines.
+/// * Exactly ONE trailing `Return`/`ReturnUndefined`, reached by fall-through —
+///   NO internal jump (straight-line; the inline emitter has no branch labels).
+/// * NO deopt-capable op may appear AFTER an effect (`StoreGlobal*`): if an
+///   inlined op bails, the interpreter re-runs the WHOLE call from the call ip,
+///   so an effect that already ran would double-apply. (For v1 the only effect
+///   admitted is `StoreGlobal*`; `SetProp`/`SetIndex` are NOT in the subset.)
+pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
+    leaf_ok_impl(callee, false).map(|(body, _)| body)
+}
+
+/// Call-site specialization for ordinary default parameters. A non-simple
+/// parameter list is accepted only when its bytecode starts with the compiler's
+/// exact default prologue and this call supplies every guarded parameter. The
+/// emitter checks those live caller arguments are not `undefined`; a miss runs
+/// the unchanged call, which evaluates the default initializer normally.
+///
+/// This deliberately does not generalize destructuring/rest parameters. Any
+/// residual binding opcode remains in the specialized suffix and is rejected by
+/// `leaf_ok_impl`, while rest/`arguments` are rejected before the scan.
+pub fn callee_leaf_ok_for_call(callee: &FuncProto, argc: u16) -> Option<(Vec<Instr>, u64)> {
+    if callee.simple_params {
+        return callee_leaf_ok(callee).map(|body| (body, 0));
+    }
+    if callee.rest_reg.is_some() || callee.arguments_reg.is_some() {
+        return None;
+    }
+
+    let mut at = 0usize;
+    let mut arg_mask = 0u64;
+    loop {
+        let Some(
+            [Instr::LoadUndefined { dst: undef }, Instr::Eq {
+                dst: cond,
+                a: eq_a,
+                b: eq_b,
+            }, Instr::JumpIfFalse {
+                cond: branch_cond,
+                target,
+            }, ..],
+        ) = callee.code.get(at..)
+        else {
+            break;
+        };
+        if branch_cond != cond {
+            break;
+        }
+        let param = if eq_a == undef {
+            *eq_b
+        } else if eq_b == undef {
+            *eq_a
+        } else {
+            break;
+        };
+        if param == 0
+            || param > callee.param_count
+            || param > argc
+            || param > 64
+            || (arg_mask & (1u64 << (param - 1))) != 0
+        {
+            break;
+        }
+        let target = *target as usize;
+        if target <= at + 3 || target > callee.code.len() {
+            break;
+        }
+        arg_mask |= 1u64 << (param - 1);
+        at = target;
+    }
+    if arg_mask == 0 || at >= callee.code.len() {
+        return None;
+    }
+
+    let mut specialized = callee.clone();
+    specialized.simple_params = true;
+    specialized.code = callee.code[at..].to_vec();
+    // Inline-body labels are local to the returned suffix. A branch back into a
+    // removed default initializer would make the specialization invalid.
+    for instr in &mut specialized.code {
+        let target = match instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => target,
+            _ => continue,
+        };
+        if (*target as usize) < at {
+            return None;
+        }
+        *target -= at as u32;
+    }
+    leaf_ok_impl(&specialized, false).map(|(body, _)| (body, arg_mask))
+}
+
+/// Like `callee_leaf_ok`, but admits ONE `Call` in the body and reports its
+/// index. Used for the nested (wrapper) inline: a one-line forwarder such as
+///
+/// ```text
+/// function ri(n){ return (rnd() * n) | 0; }
+/// ```
+///
+/// is not leaf-eligible — its body contains a `Call` — so a hot loop calling it
+/// paid a real call per iteration even once `rnd` itself became inlinable. The
+/// planner splices the inner callee's body in at that index behind its own
+/// identity guard.
+///
+/// The admitted `Call` must precede any committed effect, so that a guard miss
+/// can jump to the outer fallback (which re-runs the whole call) with nothing
+/// applied yet. The body must also be branch-free: the splice renumbers ops, and
+/// v1 does not remap branch targets.
+pub fn callee_leaf_ok_one_call(callee: &FuncProto) -> Option<(Vec<Instr>, usize)> {
+    let (body, call_at) = leaf_ok_impl(callee, true)?;
+    Some((body, call_at?))
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LEAF_GETPROP=1` drops `GetProp` back out of the leaf whitelist, so the
+    /// change can be A/B'd with `tools/bench.py --ab-env` against ONE binary — which
+    /// removes the fat-LTO code-layout confound that §2 warns about and that B70 had to
+    /// reason around.
+    fn leaf_getprop_enabled() = "ZIPP_NO_LEAF_GETPROP"
+}
+
+fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>, Option<usize>)> {
+    if callee.is_generator || callee.is_async {
+        return None;
+    }
+    if callee.rest_reg.is_some() || callee.arguments_reg.is_some() {
+        return None;
+    }
+    if !callee.simple_params {
+        return None;
+    }
+    // The inlined body runs over a scratch window carved above the caller frame;
+    // `jit_regs_fits` validates `reg_window + callee_reg_count` at host entry (a
+    // tight window → fallback), so a generous compile-time cap is sound. 32 covers
+    // a CFG-ish leaf like `tokIs` (22 regs) plus headroom.
+    let max_regs = if wide_leaf_enabled() {
+        WIDE_LEAF_MAX_REGS
+    } else {
+        LEAF_MAX_REGS
+    };
+    if callee.reg_count > max_regs {
+        return None;
+    }
+    let full = &callee.code;
+    if full.is_empty() {
+        return None;
+    }
+    // The body ends at the FIRST `Return`/`ReturnUndefined`: it is the UNIQUE exit
+    // (forward in-body branches may skip ahead, but all converge here), and any op
+    // after it is dead (the compiler appends a `ReturnUndefined` after an explicit
+    // `Return`). Truncate there; `term == code.len()-1` is the single terminator.
+    let term = full
+        .iter()
+        .position(|i| matches!(i, Instr::Return { .. } | Instr::ReturnUndefined))?;
+    let code: Vec<Instr> = full[..=term].to_vec();
+    // Every op except the terminator must be in the inline emitter's subset.
+    // `seen_effect` enforces the side-effect-freedom-before-deopt ordering rule:
+    // a deopt-capable op that bails re-runs the WHOLE call from the call ip, so no
+    // such op may follow a committed effect (`StoreGlobal*`). The newly admitted
+    // GetIndex / charCodeAt / Eq/Ne/Lt/Le/Gt/Ge are ALSO deopt-capable (they bail
+    // via a helper deopt sentinel / a non-numeric operand), so they join that rule
+    // — which keeps an effectful leaf like `mix` (a trailing `h = …`) sound while
+    // admitting a pure CFG leaf like `tokIs`. Internal jumps must be FORWARD and
+    // stay within the body (a back-edge = a loop, breaking deopt-idempotency and
+    // the no-safepoint invariant).
+    // An upvalue WRITE is admitted only in a BRANCH-FREE body, because the inline
+    // emitter buffers it: `UpvalSet` emits nothing, later `UpvalGet`s of the same
+    // index read the buffered register, and the cell is written ONCE after the
+    // last op. That keeps a mid-body bail idempotent (nothing is committed yet,
+    // so re-running the whole call is correct) — which is what lets a body like
+    // mulberry32's `a = (a + K)|0; …imul…` inline at all, since its write comes
+    // FIRST and is followed by deopt-capable arithmetic. Buffering is only valid
+    // if the write is unconditional, hence no branches. Nothing can observe the
+    // cell mid-body: the subset admits no calls.
+    let branchy = code.iter().any(|i| {
+        matches!(
+            i,
+            Instr::Jump { .. }
+                | Instr::JumpIfFalse { .. }
+                | Instr::JumpIfTrue { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpIfNotLe { .. }
+        )
+    });
+    let mut seen_effect = false;
+    let mut call_at: Option<usize> = None;
+    for (i, instr) in code.iter().enumerate() {
+        let is_last = i == code.len() - 1;
+        match *instr {
+            // The single trailing return — IS the last op (by construction above).
+            Instr::Return { .. } | Instr::ReturnUndefined => {
+                debug_assert!(is_last);
+            }
+            _ if is_last => return None, // unreachable: last op is the terminator
+            // ── deopt-capable value ops (may bail mid-body) ── forbidden AFTER
+            // an effect (a bail would re-run the call and re-apply the effect).
+            // The comparisons + dense-array read bail the same way (non-numeric
+            // operand / a deopt sentinel from `jit_get_index`), so they join here.
+            Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            | Instr::Bitwise { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::GetIndex { .. }
+            // An upvalue READ. Deopt-capable (a TDZ cell returns the deopt
+            // sentinel), so it joins the effect-ordering rule. Reads only: an
+            // upvalue WRITE is an effect that a mid-body bail would re-apply
+            // when the call re-runs, and every remaining op after it would have
+            // to be bail-free — `_ => return None` below still rejects
+            // `UpvalSet`/`CellSet`/`StoreUpvalDyn`.
+            | Instr::UpvalGet { .. } => {
+                if seen_effect {
+                    return None;
+                }
+            }
+            // A NAMED property read, through the site-free `jit_get_prop_leaf`. Its
+            // absence from this list is why a plain `f(o)` whose body reads `o.k`
+            // was `(not leaf-eligible)`, so a hot loop calling it paid a full frame
+            // call per iteration — 30.1ns against 7.0ns for the identical body
+            // written as a METHOD, which the method inliner does inline (B73).
+            //
+            // Its own arm rather than joining the group above, because it carries an
+            // env guard: `ZIPP_NO_LEAF_GETPROP=1` drops it back out so the change
+            // can be measured with `--ab-env` on ONE binary. Deopt-capable (the
+            // helper defers accessors, class chains and exotic receivers), so it
+            // obeys the same effect-ordering rule.
+            Instr::GetProp { .. } if leaf_getprop_enabled() => {
+                if seen_effect {
+                    return None;
+                }
+            }
+            // ── the ONE nested call (wrapper inlining) ── admitted only for
+            // `callee_leaf_ok_one_call`. Deopt-capable (the identity guard can
+            // miss, and the spliced body can bail), so it obeys the effect rule;
+            // branch-free because the splice renumbers ops without remapping
+            // branch targets.
+            Instr::Call { .. } if allow_one_call && !branchy && !seen_effect && call_at.is_none() => {
+                call_at = Some(i);
+            }
+            // A `Call` that fails the splice guard: under ZIPP_JITDECLINE, say WHICH
+            // constraint, because "Call" alone (B75) cannot choose between the two
+            // possible generalisations — N splices vs branch-target remapping.
+            Instr::Call { .. } => {
+                if crate::jitdecline_enabled() {
+                    let why = if !allow_one_call {
+                        "outer-context-disallows-call"
+                    } else if call_at.is_some() {
+                        "second-call"
+                    } else if branchy {
+                        "branchy-body"
+                    } else {
+                        "after-effect"
+                    };
+                    eprintln!("[leaf-reject] Call ({why})");
+                }
+                return None;
+            }
+            // Buffered upvalue write — see `branchy` above. Deliberately does NOT
+            // set `seen_effect`: nothing is committed to the cell until after the
+            // body's last op, so deopt-capable ops may still follow it.
+            Instr::UpvalSet { .. } => {
+                if branchy || seen_effect {
+                    return None;
+                }
+            }
+            // `str.charCodeAt(i)` only — a read-only, alloc-free, no-user-code 1-arg
+            // builtin (the inline emitter routes it through the `jit_char_code_at`
+            // helper). Any other method call declines. Also deopt-capable.
+            Instr::CallMethod { name, argc, .. } => {
+                if argc != 1
+                    || callee.string_constants.get(name as usize).map(|s| s.as_str())
+                        != Some("charCodeAt")
+                {
+                    return None;
+                }
+                if seen_effect {
+                    return None;
+                }
+            }
+            // ── forward, in-body control flow ── a `Jump`/`JumpIf*` whose target
+            // is strictly AHEAD of it and within the body (`> i && <= term`). A
+            // backward edge would make the inlined body a loop over the caller
+            // scratch window, breaking deopt-idempotency and the no-safepoint
+            // invariant; an out-of-body target would escape the inline. Branches
+            // do not bail, so the `seen_effect` rule does not gate them.
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. } => {
+                let t = target as usize;
+                if t <= i || t > term {
+                    return None;
+                }
+            }
+            // A fused compare-and-branch is BOTH a deopt-capable comparison (a
+            // non-numeric operand bails, so it obeys the effect-ordering rule
+            // like `Lt`/`Le` above) and a forward branch (same target rule as
+            // the plain jumps).
+            Instr::JumpIfNotLt { target, .. } | Instr::JumpIfNotLe { target, .. } => {
+                if seen_effect {
+                    return None;
+                }
+                let t = target as usize;
+                if t <= i || t > term {
+                    return None;
+                }
+            }
+            // The inline emitter only implements the MathOp arities the region
+            // path does (1-arg, or a fixed 2-arg op set).
+            Instr::MathOp { op, argc, .. } => {
+                if seen_effect {
+                    return None;
+                }
+                let ok = match argc {
+                    // See region_can_compile: `Math.imul(x)` (one arg) diverges
+                    // (unary helper → NaN, interpreter → 0). Decline this leaf.
+                    1 => !matches!(op, MathFn::Imul),
+                    2 => matches!(
+                        op,
+                        MathFn::Pow
+                            | MathFn::Atan2
+                            | MathFn::Imul
+                            | MathFn::Min
+                            | MathFn::Max
+                            | MathFn::Hypot
+                    ),
+                    _ => false,
+                };
+                if !ok {
+                    return None;
+                }
+            }
+            // ── pure, never-bail value/load ops ── safe anywhere.
+            Instr::LoadInt { .. }
+            | Instr::LoadConst { .. }
+            | Instr::LoadBool { .. }
+            | Instr::Move { .. }
+            | Instr::LoadGlobal { .. } => {}
+            // ── the one admitted effect ── a global write. Must be the only
+            // kind of effect; after it, no deopt-capable op may follow.
+            Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. } => {
+                seen_effect = true;
+            }
+            // Anything else (calls, heap writes, closures, throw, …) declines —
+            // the inline emitter doesn't implement it. Under `ZIPP_JITDECLINE=1`,
+            // name the op: B74 found that a decline COUNT without the disqualifying
+            // opcode makes the next whitelist candidate a guess, and guessing is
+            // exactly what the flag exists to prevent.
+            _ => {
+                if crate::jitdecline_enabled() {
+                    eprintln!("[leaf-reject] {instr:?}");
+                }
+                return None;
+            }
+        }
+    }
+    // A `LoadConst` must be a NUMERIC constant (the inline emitter materialises
+    // it as raw bits; a string/heap constant needs interning we don't do here).
+    for instr in &code {
+        if let Instr::LoadConst { idx, .. } = *instr {
+            match callee.constants.get(idx as usize) {
+                Some(c) if c.is_number() => {}
+                _ => return None,
+            }
+        }
+    }
+    // `callee_leaf_ok_one_call` requires the call it was asked to find.
+    if allow_one_call && call_at.is_none() {
+        return None;
+    }
+    Some((code, call_at))
+}
+
+/// Detect a loop-invariant `g.length` to hoist out of a memory-path region: a
+/// `GetProp{obj, name:"length"}` whose object is loaded from a global `g` that the
+/// region never mutates (no `StoreGlobal(g)`, and no length-changing op anywhere —
+/// `push`, `SetIndex`, `SetProp`). Then `g.length` is the same every iteration, so
+/// it can be computed ONCE in the prologue rather than re-read (a helper call) per
+/// iteration — the `for (i < s.length)` / `for (i < a.length)` idiom. Returns
+/// `(get_ip, dst_reg, global_slot, name_idx)`, or `None` if no single such GetProp
+/// qualifies (only the unique-GetProp case is hoisted, to keep it simple/safe).
+pub(crate) fn hoistable_length(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+) -> Option<(usize, u16, u32, u32)> {
+    let code = &proto.code;
+    let (s, e) = (start as usize, end as usize);
+    // The region must not change any container's length, and must not run
+    // ANY user code (which could mutate the container or reassign the global
+    // holding it).
+    //
+    // B217: this is a FAIL-CLOSED WHITELIST, and must be. It used to be a
+    // blacklist of four ops (`SetIndex`, `SetProp`, `Call`, and `CallMethod`
+    // other than `charCodeAt`), which silently went stale as
+    // `region_can_compile` admitted more: `CallMethodComputed`
+    // (`fns[i & 1]()` calling `arr.push`), `DeleteIndex`/`DeleteIndexConcat`
+    // (a Proxy `deleteProperty` trap is user code), `SetIndexConcat`,
+    // `CellSet`/`UpvalSet`, `IterNext`, `ForInLive`, `StaticFn`. Each of
+    // those admitted a hoist over a loop that DOES change the length —
+    // four independently-minimised live wrong answers, the loudest reading
+    // 1999972 where node and the interpreter both say 1300000.
+    //
+    // A blacklist is the wrong shape for this question: every future op
+    // added to region admission would silently re-open it. With a whitelist
+    // a new op costs at most a missed optimisation (the per-iteration
+    // miss-helper read stays correct), never a wrong answer — the same
+    // fail-closed discipline `cross_ud` uses.
+    for instr in &code[s..=e] {
+        match instr {
+            // Pure register/immediate producers.
+            Instr::LoadConst { .. }
+            | Instr::LoadInt { .. }
+            | Instr::LoadUndefined { .. }
+            | Instr::LoadNull { .. }
+            | Instr::LoadBool { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::Move { .. } => {}
+            // Global stores: they cannot run user code. A store to the
+            // hoisted global itself is rejected by the two-pass check below
+            // (B216); a store to any OTHER global is harmless here.
+            Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. } => {}
+            // Arithmetic / bitwise / comparison on the region's values. The
+            // MEM tier reaches these with unknown operand types, and no arm
+            // here runs user code natively: the numeric ones BAIL on a
+            // non-number, `Eq`/`Ne` compare strictly, and `Not`/`TypeOf*`/
+            // `IsArray` only inspect the value.
+            //
+            // `Add` and the string-building ops (`AddRightPair`,
+            // `StrConcatChain`, `StrAppendInPlace`, `Pad2Concat`,
+            // `Pad2Conditional`) are deliberately absent: their helpers run
+            // ToPrimitive in place, calling an object's `valueOf`/`toString`
+            // without leaving the region. The object need not be something
+            // the region built — a `LoadGlobal` hands it any closure over
+            // the hoisted global, which could then push to the array or
+            // rebind the global while the loop kept comparing against the
+            // entry length (`s = s + o` with a pushing `valueOf` stopped
+            // after 99 of 5000 iterations). No real13/hostile row hoists a
+            // region that contains one of them, so this costs nothing
+            // measured; the per-iteration `.length` read stays correct.
+            Instr::AddInt { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::Bitwise { .. }
+            | Instr::Neg { .. }
+            | Instr::Not { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::TypeOf { .. }
+            | Instr::TypeOfIs { .. }
+            | Instr::TypeOfSame { .. }
+            | Instr::IsArray { .. } => {}
+            // Control flow inside the region.
+            Instr::Jump { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. } => {}
+            // Reads. `GetIndex` reads an element and `LenOf` a length; both
+            // deopt instead of running an accessor, a Proxy trap or a user
+            // `charCodeAt`. `GetProp` is admitted ONLY as a `length` read —
+            // the hoisted read itself, which the uniqueness check below pins
+            // to one. Any other named read may hit a getter (an object
+            // literal's, a class's, via the accessor-way or PROP_VIA_IC arm)
+            // that the MEM tier frame-calls in place, with the same effect
+            // as a `valueOf` above.
+            Instr::GetIndex { .. } | Instr::LenOf { .. } => {}
+            Instr::GetProp { name, .. }
+                if proto
+                    .string_constants
+                    .get(*name as usize)
+                    .map(|s| s.as_str())
+                    == Some("length") => {}
+            // The ONE call form proven read-only and length-preserving.
+            Instr::CallMethod { name, .. }
+                if proto
+                    .string_constants
+                    .get(*name as usize)
+                    .map(|s| s.as_str())
+                    == Some("charCodeAt") => {}
+            // Everything else — including every op a future wave admits to
+            // region compilation — declines the hoist.
+            _ => return None,
+        }
+    }
+    // Exactly one `GetProp(_, "length")` in the region.
+    let mut found: Option<(usize, u16, u16)> = None; // (ip, dst, obj)
+    for ip in s..=e {
+        if let Instr::GetProp { dst, obj, name } = code[ip] {
+            if proto
+                .string_constants
+                .get(name as usize)
+                .map(|s| s.as_str())
+                == Some("length")
+            {
+                if found.is_some() {
+                    return None; // more than one — bail
+                }
+                found = Some((ip, dst, obj));
+            }
+        }
+    }
+    let (get_ip, dst, obj) = found?;
+    // The prologue writes `dst` DIRECTLY into the register file and then elides
+    // the body `GetProp`, so the load must actually run on every pass. Without
+    // this, `if (never) { n = arr.length; }` had `n` overwritten with the length
+    // by a loop that never took the branch. Same requirement, and same argument,
+    // as constant hoisting in `plan_region::runs_every_iteration`.
+    if !runs_every_iteration(code, s, e, get_ip) {
+        return None;
+    }
+    // ...and the prologue's write must not be visible on a path where the
+    // interpreter never ran the read. A `while` loop whose `continue` jumps back
+    // to the header before the read enters the region without ever assigning
+    // `dst`, and can leave through the header's exit before reaching it:
+    // `while (i < n) { i++; if (k !== needle) continue; size = table.length; }`
+    // returned the table size for a needle that was never found. Only a reader
+    // outside `(get_ip, e]` — after the region, or ahead of the read inside it —
+    // can observe that write.
+    if !def_runs_before_region_entry(code, s, get_ip)
+        && code
+            .iter()
+            .enumerate()
+            .any(|(ip, ins)| !(ip > get_ip && ip <= e) && instr_uses(ins).contains(&dst))
+    {
+        return None;
+    }
+    // `dst` must be written ONLY by this GetProp in the region.
+    for ip in s..=e {
+        if ip != get_ip && writes_reg(&code[ip]) == Some(dst) {
+            return None;
+        }
+    }
+    // `obj` must be defined in the region only by `LoadGlobal(g)` (same `g`), and
+    // `g` never stored in the region.
+    //
+    // B216: this runs as TWO passes, and must. A single forward pass that
+    // compared each `StoreGlobal` against the `g` discovered so far was
+    // ORDER-DEPENDENT: in `g = expr; … g.length` the store is examined while
+    // `g` is still `None`, so the mutation went unseen and the hoist was
+    // admitted for a global the loop reassigns EVERY iteration — the region
+    // then served the entry value's length forever (a live wrong answer:
+    // `s = "prop_" + p; acc += s.length` summed 1229600 where the
+    // interpreter and node both say 1230000).
+    let mut g: Option<u32> = None;
+    for ip in s..=e {
+        match code[ip] {
+            Instr::LoadGlobal { dst: ld, idx } if ld == obj => {
+                if g.is_some() && g != Some(idx) {
+                    return None; // obj loaded from two different globals
+                }
+                g = Some(idx);
+            }
+            Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. } => {}
+            _ => {
+                // `obj` defined by something other than LoadGlobal → not a global.
+                if writes_reg(&code[ip]) == Some(obj) {
+                    return None;
+                }
+            }
+        }
+    }
+    let g_slot = g?;
+    // Pass two: ANY store to `g` anywhere in the region kills the hoist,
+    // whatever its position relative to the load.
+    for ip in s..=e {
+        match code[ip] {
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } => {
+                if idx == g_slot {
+                    return None; // g mutated in the loop
+                }
+            }
+            _ => {}
+        }
+    }
+    let name_idx = match code[get_ip] {
+        Instr::GetProp { name, .. } => name,
+        _ => return None,
+    };
+    Some((get_ip, dst, g_slot, name_idx))
+}
+
+/// Addresses of the win64 heap helpers (vm.rs), the COMPILING function's id, and
+/// the inline-cache base site index — threaded to the memory path so `GetProp`/
+/// `SetProp` emit a call-free monomorphic inline cache (miss → helper).
+#[derive(Clone, Copy)]
+pub(crate) struct HeapHelpers {
+    pub(crate) func_id: u32,
+    pub(crate) get_prop_miss: usize,
+    pub(crate) set_prop_miss: usize,
+    /// Helper returning `vm.heap.versions_ptr()` (pinned in r13).
+    pub(crate) versions_base: usize,
+    /// Helper returning `vm.jit.ic_base_ptr()` (pinned in r14).
+    pub(crate) ic_base: usize,
+    /// Helper for a dense-array `GetIndex` (`a[i]`).
+    pub(crate) get_index: usize,
+    /// Helper for a dense-array `SetIndex` (`a[i] = v`).
+    pub(crate) set_index: usize,
+    /// Helper for `arr.push(x)`.
+    pub(crate) array_push: usize,
+    /// Helper for `str.charCodeAt(i)`.
+    pub(crate) char_code_at: usize,
+    /// Helper for `a + b` (`StrConcat`).
+    pub(crate) concat: usize,
+    /// Helper for in-place `a + b` (`StrAppendInPlace`).
+    pub(crate) str_append: usize,
+    /// Pure ASCII prefix for fused `a += obj[key]`.
+    pub(crate) str_append_index: usize,
+    /// Helper for a generic `obj.m(args…)` via the interpreter's per-site IC.
+    pub(crate) call_method_ic: usize,
+    /// Guarded dense-Array helper for `obj[key](args...)`.
+    pub(crate) call_method_computed_dense: usize,
+    /// Guarded direct `RegExp.prototype.test` / `exec` CallMethod helper.
+    pub(crate) regexp_call_direct: usize,
+    /// Guarded primitive-string `matchAll` / regex `replace` helper.
+    pub(crate) string_regexp_call_direct: usize,
+    /// Guarded `hasOwnProperty.call(array, numeric_key)` intrinsic.
+    pub(crate) has_own_call: usize,
+    /// Helper for a generic `f(args…)` via the interpreter's per-site IC.
+    pub(crate) call_ic: usize,
+    /// Tier C native→native cross-call fast path (B83); falls back to `call_ic`.
+    pub(crate) cross_call: usize,
+    /// Same-prototype lexical-arrow/two-argument cross-call specialization.
+    pub(crate) cross_call_same_proto2: usize,
+    /// B190a quick `.length` prefix (Str/Cons/dense-Array in one match).
+    pub(crate) quick_len: usize,
+    /// B189b emitted-lane enter (window + activation install), close, the
+    /// root-stack unduplicate, and the mid-body-bail completion.
+    pub(crate) cross3_enter: usize,
+    pub(crate) window_close: usize,
+    pub(crate) cross3_unroot: usize,
+    pub(crate) cross3_finish: usize,
+    /// Boot `Array.prototype.push` / `String.prototype.charCodeAt` bits (0 =
+    /// none) — see `HeapHelperAddrs::push_intrinsic_bits`.
+    pub(crate) push_intrinsic_bits: u64,
+    pub(crate) char_code_at_intrinsic_bits: u64,
+    /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).
+    pub(crate) get_prop_slow: usize,
+    /// `PROP_VIA_IC` continuation for SetProp.
+    pub(crate) set_prop_slow: usize,
+    /// ACCESSOR-way hit dispatch for GetProp (B114; way ptr as 5th arg).
+    pub(crate) get_prop_acc: usize,
+    /// ACCESSOR-way hit dispatch for SetProp (B114).
+    pub(crate) set_prop_acc: usize,
+    /// Full `===` for non-interned heap operands (read-only, 0/1).
+    pub(crate) strict_eq: usize,
+    /// Full truthiness for non-Int/Bool conditions (read-only, 0/1).
+    pub(crate) truthy: usize,
+    /// TypedArray pin snapshot helper (see `HeapHelperAddrs::ta_snapshot`).
+    pub(crate) ta_snapshot: usize,
+    /// Uint8Clamped double-store helper (pure).
+    pub(crate) ta_clamp_store: usize,
+    /// Whitelisted DataView `get*` helper.
+    pub(crate) dv_get: usize,
+    /// Pure unary `Math.<op>` helper (MathFn code, f64 bits → f64 bits).
+    pub(crate) math_unary: usize,
+    /// Pure two-arg `Math.<op>` helper (MathFn code, f64 bits, f64 bits → f64 bits).
+    pub(crate) math_two: usize,
+    /// Exact main-realm `Math.imul` identity + heap-generation guard.
+    pub(crate) math_imul_guard: Option<MathIntrinsicGuard>,
+    /// B264: whether the inline dense-array store lane may be emitted.
+    pub(crate) inline_store_lane_ok: bool,
+    /// Pure `CellGet` helper (cell bits → inner Value bits / TDZ-deopt sentinel).
+    pub(crate) cell_get: usize,
+    /// `jit_str_index_of` intrinsic.
+    pub(crate) str_index_of: usize,
+    /// `jit_str_substring` intrinsic (substring/slice).
+    pub(crate) str_substring: usize,
+    /// `jit_coll_lookup` intrinsic (Map.get/has, Set.has).
+    pub(crate) coll_lookup: usize,
+    /// Guarded Tier-C `Map.set`/`Map.clear` helper.
+    pub(crate) coll_mutate: usize,
+    /// Guarded primitive-string `toUpperCase()` helper.
+    pub(crate) str_upper_case: usize,
+    /// `UpvalGet` helper (upvalue idx → inner Value bits / TDZ-deopt sentinel).
+    pub(crate) upval_get: usize,
+    pub(crate) cell_set: usize,
+    pub(crate) upval_set: usize,
+    /// Tier-C-only captured accessors; these use the frame-free activation's
+    /// explicitly installed closure rather than the interpreter frame stack.
+    pub(crate) tierc_upval_get: usize,
+    pub(crate) tierc_upval_set: usize,
+    /// Exact captured `x = (x + 1) | 0` Int fast prefix (Tier C only).
+    pub(crate) tierc_upval_inc_i32: usize,
+    pub(crate) get_index_concat: usize,
+    /// `ForInLive` helper (obj bits, key bits → Bool Value bits).
+    pub(crate) forin_live: usize,
+    /// `IterNext` helper (regs base + packed reg numbers → 0 / deopt / threw).
+    pub(crate) iter_next: usize,
+    pub(crate) regexp_scalar_get_iterator: usize,
+    pub(crate) regexp_scalar_iter_prime: usize,
+    pub(crate) regexp_scalar_step: usize,
+    pub(crate) regexp_scalar_capture_num: usize,
+    pub(crate) regexp_scalar_flush: usize,
+    pub(crate) regexp_scalar_exec: usize,
+    pub(crate) regexp_scalar_exec_flush: usize,
+    /// `PushFinally` helper (packed target/kind_reg/val_reg; total).
+    pub(crate) push_finally: usize,
+    /// `PopFinally` helper (no args; total).
+    pub(crate) pop_finally: usize,
+    /// `ToNum` string-operand helper (value bits → number bits / deopt).
+    pub(crate) to_num: usize,
+    /// `HasProp` (`in`) helper (key bits, obj bits → Bool Value bits / deopt).
+    pub(crate) has_property: usize,
+    /// Q4 leaf-inline entry headroom check (`jit_regs_fits`).
+    pub(crate) regs_fits: usize,
+    /// Tier C `TypeOf` helper (v bits → heap-string Value bits).
+    pub(crate) typeof_str: usize,
+    pub(crate) typeof_is: usize,
+    pub(crate) typeof_same: usize,
+    pub(crate) static_fn: usize,
+    pub(crate) to_concat_key: usize,
+    /// Selected historical or pure-success helper entry.
+    pub(crate) set_index_concat: usize,
+    /// True only when `set_index_concat` can return `CONCAT_SET_PURE`; controls
+    /// the conditional no-refetch branch in the memory emitter.
+    pub(crate) concat_pure_append: bool,
+    /// Narrow ordinary `DeleteIndex` helper (true bits / deopt sentinel).
+    pub(crate) delete_index: usize,
+    /// W19 M3 -- `DeleteIndexConcat` helper (result bits / `CALL_THREW`).
+    pub(crate) delete_index_concat: usize,
+    /// Tier C `IsArray` helper (v bits → Bool bits / deopt sentinel).
+    pub(crate) is_array: usize,
+    /// Tier C `LenOf` helper (obj bits → length Value bits).
+    pub(crate) len_of: usize,
+    /// Tier C `ForInKeys` helper (obj bits → key-Array bits / deopt / threw).
+    pub(crate) forin_keys: usize,
+    /// First global inline-cache site id for this region; the k-th heap op uses
+    /// `ic_base_idx + k`.
+    pub(crate) ic_base_idx: u32,
+}
+
+/// W21 fallback-plan correction. `build_ta_pin_plan` deliberately adds a
+/// snapshot for an `arr.push(x)` receiver so the INTEGER tier can inline the
+/// append. If that tier later declines, however, the memory emitter cannot use
+/// that push-only snapshot: it still calls the generic push helper, then used to
+/// re-snapshot every pin in the region after every append. On tokenizer-shaped
+/// loops that turned a failed INTEGER offer into substantial boxed-tier work.
+///
+/// Keep the switch local to planning so one binary can reproduce the old
+/// fallback byte stream. The full push-inclusive plan has already been consumed
+/// by the INTEGER attempt before this module is called; this filter affects only
+/// REGALLOC/MEM fallback compilation.
+fn push_pin_filter_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PUSH_PIN_FILTER").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+#[derive(Default)]
+struct PushPinFilterStats {
+    push_accesses: usize,
+    dropped_push_only: usize,
+    retained_shared: usize,
+}
+
+/// Compact `plan` for a non-INTEGER fallback. A pin is dropped iff every access
+/// mapped to it is an exact one-argument `.push` site. Pins shared by push and a
+/// real fallback consumer (`GetIndex`, `GetProp length`, `charCodeAt`, DataView,
+/// …) keep both the pin and all of their access metadata. Unknown/orphaned plan
+/// entries are retained fail-closed.
+fn filter_push_only_pins(proto: &FuncProto, plan: &TaPinPlan) -> (TaPinPlan, PushPinFilterStats) {
+    let mut push_use = vec![false; plan.pins.len()];
+    let mut nonpush_use = vec![false; plan.pins.len()];
+    let mut stats = PushPinFilterStats::default();
+
+    // `arr_push_pin` recognises both the legacy CallMethod and both endpoints
+    // of the exact capture-first GetProp/CallWithThis pair.  Treating the
+    // saved-callee GetProp as a real fallback consumer would retain every
+    // push-only pin after the compiler lowering changed shape.
+    let is_push = |ip: usize| arr_push_pin(proto, ip, plan).is_some();
+    for (&ip, &slot) in &plan.access {
+        let Some(used) = ((slot as usize) < plan.pins.len()).then_some(slot as usize) else {
+            continue;
+        };
+        if is_push(ip) {
+            push_use[used] = true;
+            stats.push_accesses += 1;
+        } else {
+            nonpush_use[used] = true;
+        }
+    }
+
+    let mut remap = vec![u8::MAX; plan.pins.len()];
+    let mut filtered = TaPinPlan::default();
+    for (old, pin) in plan.pins.iter().copied().enumerate() {
+        let push_only = push_use[old] && !nonpush_use[old];
+        if push_only {
+            stats.dropped_push_only += 1;
+            continue;
+        }
+        if push_use[old] && nonpush_use[old] {
+            stats.retained_shared += 1;
+        }
+        let new = filtered.pins.len();
+        debug_assert!(new < u8::MAX as usize);
+        filtered.pins.push(pin);
+        remap[old] = new as u8;
+    }
+    for (&ip, &old) in &plan.access {
+        if let Some(&new) = remap.get(old as usize) {
+            if new != u8::MAX {
+                filtered.access.insert(ip, new);
+            }
+        }
+    }
+    (filtered, stats)
+}
+
+/// Compile the loop region `[start, end]` (entered at `start`). Tries the
+/// register-promoting path first (values live in xmm/gpr across the loop, no
+/// per-op memory traffic — competitive with V8) and falls back to the simpler
+/// memory-based path if the region's shape is outside the register allocator's
+/// subset (e.g. it contains heap property ops). Returns `None` only if even the
+/// fallback can't handle it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_region(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    globals_base_helper: usize,
+    heap: HeapHelpers,
+    const_strs: &FxHashMap<u32, u64>,
+    ta_plan: &TaPinPlan,
+    leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+    method_plan: &FxHashMap<usize, MethodInlinePlan>,
+    cross_plan: &CrossCallPlan,
+    ic_emit: &[IcSiteEmit],
+    // W20: may the register path admit the boxed heap arms here? Cleared for a
+    // region whose BOXREF compile already evicted once.
+    boxref_ok: bool,
+    meter: Option<crate::codegen::meter::Meter>,
+    // `(code, is_mem, engaged_boxref)`.
+) -> Option<(JitFn, bool, bool)> {
+    // The register/SROA paths decline any region containing a Call/CallMethod, so
+    // leaf and method-call inlining remain reachable only through the memory path.
+    // The register path does consume one accessor-plan shape: an exact, call-free
+    // own getter (`return this.field`) in front of a BOXREF GetProp probe.
+    //
+    // The returned flag is `is_mem` — true when the register-homed path declined
+    // and this region runs out of `[rbx + dreg(r)]`. It exists so the sampling
+    // profiler can charge time to `jit-mem` rather than `jit-fast`: B92 showed the
+    // two tiers differ by ~4x on the same loop, so a single `jit-native` bucket
+    // cannot say whether a row that is 99% native is fast or slow.
+    // `Jit::compile_region` has already tried `compile_region_int` with the
+    // original, push-inclusive plan. From here onward a pin used solely to make
+    // `push` INTEGER-admissible is dead metadata: neither fallback tier has a
+    // pinned-push arm. Compact it before either fallback planner sees it.
+    let filtered_plan;
+    let fallback_plan = if push_pin_filter_enabled() {
+        let (plan, stats) = filter_push_only_pins(proto, ta_plan);
+        if crate::jitlog_enabled() && stats.push_accesses != 0 {
+            eprintln!(
+                "[jit] fallback push-pin filter fn{} [{start},{end}] pins={}->{} accesses={}->{} push_accesses={} dropped_push_only={} retained_shared={} remaining_push_only=0",
+                heap.func_id,
+                ta_plan.pins.len(),
+                plan.pins.len(),
+                ta_plan.access.len(),
+                plan.access.len(),
+                stats.push_accesses,
+                stats.dropped_push_only,
+                stats.retained_shared,
+            );
+        }
+        filtered_plan = plan;
+        &filtered_plan
+    } else {
+        ta_plan
+    };
+
+    if let Some((f, bx)) = compile_region_regalloc(
+        proto,
+        start,
+        end,
+        globals_base_helper,
+        fallback_plan,
+        heap.ta_snapshot,
+        Some(&heap),
+        Some(method_plan),
+        ic_emit,
+        boxref_ok,
+        None,
+        meter,
+    ) {
+        return Some((f, false, bx));
+    }
+    compile_region_mem(
+        proto,
+        start,
+        end,
+        globals_base_helper,
+        heap,
+        const_strs,
+        fallback_plan,
+        leaf_plan,
+        method_plan,
+        cross_plan,
+        ic_emit,
+        meter,
+        None,
+    )
+    .map(|f| (f, true, false))
+}
+
+/// Compile a (rewritten, purely-numeric) field-promoted region via the integer or
+/// double register path; returns `(code, is_int)`. Deliberately NOT the memory
+/// path — the rewrite removed all heap ops, so if the register paths decline
+/// (e.g. register pressure even with reuse), SROA is abandoned and the caller
+/// falls back to the inline-cache mem path on the ORIGINAL bytecode.
+pub(crate) fn compile_region_numeric(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    gh: usize,
+    sroa_obj_global: u32,
+    meter: Option<crate::codegen::meter::Meter>,
+) -> Option<(JitFn, bool)> {
+    // SROA-rewritten code has no index ops, so an empty TA plan (no snapshot) is correct.
+    if let Some(f) = compile_region_int(
+        proto,
+        start,
+        end,
+        gh,
+        &TaPinPlan::default(),
+        0,
+        None,
+        &IntEntry::default(),
+        Some(sroa_obj_global),
+        meter,
+    ) {
+        return Some((f, true));
+    }
+    // SROA-rewritten code has no index ops, so an empty TA plan is correct here.
+    // No heap helpers: the SROA rewrite left no heap op, so the W20 boxed arms
+    // are unreachable here by construction.
+    compile_region_regalloc(
+        proto,
+        start,
+        end,
+        gh,
+        &TaPinPlan::default(),
+        0,
+        None,
+        None,
+        &[],
+        false,
+        Some(sroa_obj_global),
+        meter,
+    )
+    .map(|(f, _)| (f, false))
+}
+
+/// Clone `proto` and rewrite the region's heap ops to scratch field-globals so
+/// the register paths can compile it: `GetProp(o.name) → LoadGlobal(dst, slot)`,
+/// `SetProp(o.name, val) → StoreGlobal(slot, val)`, where `slot = pool_base + i`
+/// and `i` is the field's index in `fp.fields`. The interpreter syncs each pool
+/// slot ↔ the object's field around the native run (see `FieldSyncPlan`).
+pub(crate) fn rewrite_for_field_promotion(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    fp: &FieldPromotePlan,
+    pool_base: u32,
+) -> FuncProto {
+    let mut p = proto.clone();
+    // Map a name-constant index to its pool slot BY FIELD STRING (fp.fields holds
+    // one representative index per distinct field string).
+    let slot_of = |name: u32| -> u32 {
+        let s = &proto.string_constants[name as usize];
+        let i = fp
+            .fields
+            .iter()
+            .position(|&n| proto.string_constants[n as usize] == *s)
+            .unwrap();
+        pool_base + i as u32
+    };
+    for ip in start as usize..=end as usize {
+        match p.code[ip] {
+            Instr::GetProp { dst, name, .. } => {
+                p.code[ip] = Instr::LoadGlobal {
+                    dst,
+                    idx: slot_of(name),
+                };
+            }
+            Instr::SetProp { name, val, .. } => {
+                p.code[ip] = Instr::StoreGlobal {
+                    idx: slot_of(name),
+                    src: val,
+                };
+            }
+            // The object-ref loads (`LoadGlobal o → r`) are LEFT EXACTLY AS THEY
+            // ARE. The rewrite above removed their only in-region consumers, so
+            // `r` is now a `LoadGlobal` whose dst the region never reads — the
+            // shape `plan_region` recognises as a PINNED RECEIVER (`ta_recv_regs`):
+            // no numeric home for `r`, no global home for `o`, and the load lowers
+            // to `emit_recv_slot_store`, two `mov`s that keep `r`'s FRAME SLOT
+            // exactly what the interpreted `LoadGlobal` would have left it. That
+            // is the whole contract this rewrite needs, and it needs no claim
+            // about liveness to hold.
+            //
+            // It used to neutralise these to `LoadInt 0` and rely on the region
+            // planner's dead-code pass to delete the register — whose licence is
+            // `!read_outside`, a fact that was only ever true because `instr_uses`
+            // was blind to 185 of 221 opcodes. W17 made that table exhaustive, the
+            // licence started being (correctly) refused for any register the
+            // enclosing function reuses, and the fake `LoadInt` then pinned an xmm
+            // home entry-loaded from a slot holding the OBJECT: entry bail on every
+            // OSR entry, eviction, recompile at MEM (bench/object.js 0.89ms →
+            // 3.84ms). Worse than slow: had the entry guard ever passed, the exit
+            // flush would have written `0` over the object in a slot the
+            // interpreter reads back at the heap op a deopt resumes on.
+            _ => {}
+        }
+    }
+    p
+}

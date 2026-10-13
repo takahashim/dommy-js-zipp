@@ -1,0 +1,5593 @@
+//! Native x86-64 JIT (dynasm) for hot integer functions.
+//!
+//! This is the first JIT stage, built correctness-first. It compiles a
+//! `FuncProto` to native code **only** when the whole function is expressible
+//! as pure integer register computation with no calls (a "leaf int function"):
+//! a hot numeric loop is the canonical case. Anything outside that set causes
+//! the function to be REJECTED at compile time (it keeps running on the
+//! interpreter), so a compiled function can never contain an op it doesn't
+//! understand.
+//!
+//! ## Why this can't produce a wrong answer
+//!
+//! * Compile-time gating: `can_compile` walks the bytecode and refuses any op
+//!   that isn't in the integer subset, or any `Call`. So the native code only
+//!   ever runs ops it fully implements.
+//! * Runtime type guard → bail: every arithmetic/compare op first checks that
+//!   its operands are tagged `Int`. If not (a value became a double, string,
+//!   etc.), the native code stops and returns a BAIL signal carrying the
+//!   instruction index, and the interpreter resumes at exactly that ip with the
+//!   register file already consistent (native code and interpreter share the
+//!   same `regs` window). No silent fallthrough — the old engine's bug.
+//! * Overflow → bail: integer add/sub/mul use the overflow flag; on overflow
+//!   the op bails so the interpreter redoes it in the f64 domain. We NEVER
+//!   truncate or wrap silently.
+//!
+//! ## ABI
+//!
+//! `extern "win64" fn(regs: *mut u64, bail_ip: *mut u32) -> u64`
+//! * `rcx = regs` — pointer to this frame's register window (`Value` bits).
+//! * `rdx = bail_ip` — out-param. Native writes `u32::MAX` here on a normal
+//!   `Return` (and returns the result Value bits in rax), or the instruction
+//!   index to resume at on a bail (rax is then ignored).
+//!
+//! Only `feature = "jit"` + `target_arch = "x86_64"` compiles this; other
+//! configs fall back to the pure interpreter.
+
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
+use std::mem;
+
+use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, ExecutableBuffer};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::bytecode::{FuncProto, Instr, MathFn};
+use crate::value::Value;
+
+/// Declare a same-binary kill switch (`ZIPP_NO_<X>=1` turns the mechanism off)
+/// whose environment read is LATCHED on first use.
+///
+/// Use this for any switch consulted more than once per compile. The two in
+/// `region_admit` are read from inside the per-instruction admission walk, so
+/// an unlatched `env::var_os` there costs a Win32 environment lookup on every
+/// bytecode op examined, on every region compile. The latch itself was already
+/// hand-written at 34 sites and simply omitted at 8 — the same "a fact
+/// maintained by hand in several places" shape behind every silent wrong answer
+/// this engine has had. Declaring a switch is now one line, so there is no copy
+/// to forget.
+///
+/// Latching on FIRST CALL rather than at process start is what keeps the
+/// `--ab-env` ablation idiom honest: every benchmark launch is a fresh process
+/// and the environment is fixed long before any region compiles, so the first
+/// read already sees the ablation's value. In-process mutation of these
+/// variables is deliberately NOT supported — the switch tests all spawn a child
+/// process, which is why latching is safe.
+///
+/// Not applied wholesale: converting the six switches that are read once per
+/// region-compile measured a reproducible +4.3% on `property-ic-shapes` for no
+/// gain anywhere (B-entry below), so they keep their unlatched reads.
+macro_rules! env_off_switch {
+    ($(#[$attr:meta])* fn $name:ident() = $var:literal) => {
+        $(#[$attr])*
+        pub(crate) fn $name() -> bool {
+            use std::sync::atomic::{AtomicU8, Ordering};
+            static STATE: AtomicU8 = AtomicU8::new(0);
+            match STATE.load(Ordering::Relaxed) {
+                1 => true,
+                2 => false,
+                _ => {
+                    let on = std::env::var_os($var).is_none();
+                    STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                    on
+                }
+            }
+        }
+    };
+}
+// Declared above every `mod` in this file, so textual macro scope carries it
+// into the codegen submodules; moving it below them is a hard compile error,
+// not a silent regression.
+
+/// Number of interpreter calls before a function is offered to the JIT.
+pub const JIT_THRESHOLD: u32 = 8;
+
+/// Number of times a loop back-edge must fire before the loop region is offered
+/// to the OSR (on-stack-replacement) compiler. Low so hot loops promote fast.
+pub const OSR_THRESHOLD: u32 = 8;
+
+/// `Jit::interp_only` flags: the function never compiles whole.
+const INTERP_NO_FN: u8 = 1;
+/// `Jit::interp_only` flags: the function's loops never compile.
+const INTERP_NO_REGIONS: u8 = 2;
+
+/// [`OSR_THRESHOLD`] for a Python program's loops. A Python loop's compile
+/// (an extended region, its slow paths included) costs more than a
+/// JavaScript loop's and its per-iteration saving is smaller (most of its
+/// work is out-of-line steps either way), so only a loop that has run long
+/// enough to repay it compiles: measured on the bundled torch's training
+/// steps, whose many short library loops compiled at 8 back-edges cost more
+/// than they saved, while every long-running loop still compiles within its
+/// first thousand iterations.
+pub const PY_OSR_THRESHOLD: u32 = 1024;
+
+/// How many times a compiled region may "deopt" (a native run that resumes
+/// INSIDE the region — a type guard bailed — rather than exiting cleanly) before
+/// it is evicted and blacklisted. Prevents a livelock where the interpreter
+/// re-enters native every back-edge only for it to bail at the same guard.
+/// Bails tolerated before a region is evicted.
+///
+/// Was 4, which is a LIFETIME total and far too tight: a single call running a
+/// 3M-iteration loop over a Float64Array containing four fractional values bails
+/// four times and is then blacklisted for the rest of the process — measured as
+/// 4.00 ns/op -> 18.00 ns/op, a 4.5x cliff at a 0.00003% event rate, and three of
+/// the ten benches hit it. A failed entry costs one guard check and an immediate
+/// exit, so tolerating more of them is cheap; a region that really is wrong (it
+/// bails on EVERY entry) still evicts, just after 64 cheap attempts instead of 4.
+pub const OSR_DEOPT_LIMIT: u32 = 64;
+
+/// Clean region exits that forgive one accumulated deopt. Makes `OSR_DEOPT_LIMIT`
+/// a RATE ("bails without good runs between them") instead of a lifetime total.
+///
+/// One, not more: a clean exit means the region ran its loop all the way to the
+/// loop's own exit, which is a whole unit of productive work — very different
+/// from a bail. Note this alone does NOT rescue the case above, where a single
+/// long-running loop bails several times and only ever cleanly exits once at the
+/// very end; that is what the raised limit is for. The decay covers the other
+/// shape: a short loop inside a function called many times.
+pub const DEOPT_DECAY_RUNS: u32 = 1;
+
+/// Is the one-argument `substring` / `slice` intrinsic enabled? ON by default;
+/// `ZIPP_NO_SUBSTRING1_INTRINSIC=1` restores the generic method-call path for a
+/// same-binary performance comparison. Read only while deciding which native
+/// body to compile, never on the generated hot path.
+/// B228 latch: `ZIPP_NO_CROSS3_WIDE=1` declines a >64-register callee even
+/// when its wide fill mask is entirely empty.
+pub(crate) fn cross3_wide_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS3_WIDE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B229 latch: `ZIPP_NO_CROSS_REBAKE=1` stops re-planning callers whose baked
+/// lane was invalidated by a callee's mask-generation bump (they stay on the
+/// helper route for the rest of the run, the pre-B229 behaviour).
+pub(crate) fn cross_rebake_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS_REBAKE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B227 latch: `ZIPP_NO_CROSS3_MONO=1` restores the same-proto-only cross3
+/// admission (monomorphic sites back on the helper route).
+pub(crate) fn cross3_mono_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS3_MONO").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B270 latch: `ZIPP_NO_CROSS_DEF_CALLEE=1` stops the cross-call planner from
+/// resolving an EMPTY-IC `Call` site's callee through the callee register's
+/// `UpvalGet` / `LoadGlobal` definition read in the live exemplar frame. Such a
+/// site (the second recursive call of a function compiling during its first
+/// descent is the classic one) then keeps today's framed helper route.
+pub(crate) fn cross_def_callee_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS_DEF_CALLEE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B272 latch: `ZIPP_NO_CROSS_FRAMED_ENTRY=1` restores the rule that a body
+/// containing handler ops (`try`, and the iterator-close bracket every
+/// `for...of` carries) never receives a cross entry, so every call to such a
+/// function takes the framed interpreter route.
+pub(crate) fn cross_framed_entry_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS_FRAMED_ENTRY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B270 latch: `ZIPP_NO_CROSS3_SELF=1` stops a Tier-C body from baking a CROSS3
+/// arm against ITSELF — the entry this very compile is about to install — so
+/// a self-recursive site reached through a captured cell or a global goes back
+/// to the generic helper (and, with an empty IC, the framed route).
+pub(crate) fn cross3_self_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS3_SELF").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// A body containing handler ops mutates the ACTIVE FRAME's handler stack; a
+/// frame-free cross call has no frame to hold them, so such a function can
+/// NEVER hold a cross entry (the compile-complete path clears it). B213: the
+/// caller-side planners consult the same predicate so a call site whose
+/// exemplar callee is handler-excluded emits the ordinary framed path
+/// directly — the specialized attempt would decline on EVERY call (react's
+/// diff: 130k futile enter-helper prefixes + generic re-dispatches per run),
+/// and its missing entry would sit in the B199 pending set forever.
+pub(crate) fn proto_has_handler_ops(proto: &crate::bytecode::FuncProto) -> bool {
+    proto
+        .code
+        .iter()
+        .any(|i| matches!(i, Instr::PushHandler { .. } | Instr::PushFinally { .. }))
+}
+
+/// B213 latch: `ZIPP_NO_HANDLER_CALLEE_SKIP=1` restores the pre-B213
+/// planners (specialized attempts planned even for handler-excluded callees,
+/// declining on every call) — the pricing comparator.
+pub(crate) fn handler_callee_skip_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HANDLER_CALLEE_SKIP").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+pub(crate) fn substring1_intrinsic_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_SUBSTRING1_INTRINSIC").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Same-binary A/B switch for the B82 `f.call(…)`/`f.apply(…)` target splice
+/// (`try_fn_call_apply_inline`). Read by the region-call helper per call and by
+/// the call-mix admission gate; never on generated code's hot path.
+#[allow(dead_code)]
+pub(crate) fn call_inline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CALL_INLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Compile `obj[key](args...)` loop sites through the guarded dense-Array
+/// helper. ON by default; `ZIPP_NO_COMPUTED_CALL_DENSE=1` restores the former
+/// region rejection for a same-binary A/B. Read only while selecting a tier,
+/// never by generated hot code.
+pub(crate) fn computed_call_dense_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_COMPUTED_CALL_DENSE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Admit captured-cell reads/writes to the Tier-C whole-function memory path.
+/// The Tier-C-specific helpers resolve the closure activation supplied by the
+/// native entry (not `frames.last()`, because a cross-call is frame-free) and
+/// preserve const / named-function / TDZ PutValue semantics by declining before
+/// a write. `ZIPP_NO_TIERC_UPVAL=1` restores the former blacklist for a
+/// same-binary A/B.
+pub(crate) fn tierc_upval_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_TIERC_UPVAL").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// B189: minimum count of NON-upval ops a body must rescue from dispatch for
+/// the Tier-C upval admission. B50 set 12 when every `UpvalGet` cost a helper
+/// round-trip on entry-heavy tiny closures; the cross-call lane has since made
+/// native entry the cheap direction, and the blacklisting it caused was the
+/// calls-closures floor (a 5-op capturing body interpreted 8M times).
+/// `ZIPP_TIERC_UPVAL_MIN=<n>` restores a floor for A/B.
+pub(crate) fn tierc_upval_min_other_ops() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+    match MIN.load(Ordering::Relaxed) {
+        usize::MAX => {
+            let v = std::env::var("ZIPP_TIERC_UPVAL_MIN")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            MIN.store(v, Ordering::Relaxed);
+            v
+        }
+        v => v,
+    }
+}
+
+/// Allow a Tier-C cross-call attempt at a call site whose filled IC ways are
+/// multiple closure identities sharing one FuncProto. The runtime helper still
+/// resolves the live callee on every invocation, so a later different/native/
+/// exotic value falls through untouched. `ZIPP_NO_POLY_CROSSCALL=1` restores
+/// monomorphic-only planting.
+pub(crate) fn poly_crosscall_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_POLY_CROSSCALL").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Plant the exact rotating lexical-arrow two-argument cross-call lane. The
+/// planner bakes only immutable integer metadata; the runtime helper still
+/// resolves the live closure and live Tier-C entry on every invocation.
+/// `ZIPP_NO_SAME_PROTO_CROSS2=1` restores the generic cross-call helper for a
+/// same-binary A/B.
+pub(crate) fn undef_admit_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_UNDEF_ADMIT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+pub(crate) fn quick_len_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_QUICK_LEN").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+pub(crate) fn cross3m_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CROSS3M").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_CROSS_RETRY=1` keeps compile-order "no entry yet" declines
+/// permanent (the pre-B199 behavior) — the single-binary A/B for the retry.
+/// `ZIPP_NO_RANDOM_FUSE=1` keeps the `Math.random()*k|0` window on its
+/// ordinary ops (the B205 fused lane off) — the single-binary A/B.
+pub(crate) fn random_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_RANDOM_FUSE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// `ZIPP_NO_YIELD_ENTRY=1` restores the W9 pure decline (a fn with live
+/// reg-homed regions gets NO whole-fn body at all) — the single-binary A/B
+/// for B206's yield-with-entry compile.
+pub(crate) fn yield_entry_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_YIELD_ENTRY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+env_off_switch!(
+    /// Allow a genuinely different-FuncProto plain-call IC to carry one emitted
+    /// CROSS3 guard arm for each eligible fid it has already observed. The arms
+    /// are bounded by the IC's fixed way count and chain into the incumbent
+    /// generic live-resolution helper on any miss. This is independent of
+    /// `ZIPP_NO_POLY_FID_CROSSCALL`, which removes the whole generic route.
+    /// `ZIPP_NO_CROSS3_POLY_FID=1` restores helper-only routing.
+    fn cross3_poly_fid_enabled() = "ZIPP_NO_CROSS3_POLY_FID"
+);
+
+pub(crate) fn cross_retry_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS_RETRY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+pub(crate) fn cross3_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CROSS3").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// B243 latch: `ZIPP_NO_CROSS3_INLINE=1` makes the emitted cross-call lane
+/// open/close its window and root the prior activation through the three
+/// helpers again (`jit_cross3_enter`, `jit_cross3_unroot`,
+/// `jit_window_close`), byte for byte the pre-B243 lane. Emit-time.
+pub(crate) fn cross3_inline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CROSS3_INLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+pub(crate) fn same_proto_cross2_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_SAME_PROTO_CROSS2").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+env_off_switch! {
+    /// Scalar-replace fresh, non-escaping object/array literals in the narrow
+    /// straight-line local loop lane. Default ON; `ZIPP_NO_LOCAL_SROA=1`
+    /// restores ordinary allocation and interpreter/MEM admission for a
+    /// same-binary A/B. Instrumented and GC-stress VMs decline separately so
+    /// resource accounting and collector torture retain literal allocations.
+    fn local_sroa_enabled() = "ZIPP_NO_LOCAL_SROA"
+}
+
+env_off_switch! {
+    /// Within LOCAL-SROA, virtualize an exact ASCII-string-plus-bounded-int
+    /// field whose sole observation is `.length`. Default ON;
+    /// `ZIPP_NO_LOCAL_CONCAT_LEN=1` retains aggregate scalar replacement while
+    /// restoring the real concat and length helper for an independent A/B.
+    fn local_concat_len_enabled() = "ZIPP_NO_LOCAL_CONCAT_LEN"
+}
+
+/// Sentinel in `bail_ip` meaning the native code completed via `Return` (the
+/// result is in the returned `u64`). Any other value is the ip to resume at.
+pub const NO_BAIL: u32 = u32::MAX;
+
+/// Tag bits for an `Int` value, matching `value.rs` (`0x7FF9 << 48`). A boxed
+/// i32 is `INT_TAG | (i32 as u32 as u64)`.
+const INT_TAG: u64 = 0x7FF9_0000_0000_0000;
+/// Top-16 pattern that identifies an Int (the high 16 bits of `INT_TAG`).
+const INT_TAG_HI: u32 = 0x7FF9;
+
+/// NaN-box tag range for the polymorphic region `===` (mirror of value.rs):
+/// a Value's high-16 in `[TAG_LO, TAG_HI]` is a tagged form (Int/Bool/Null/
+/// Undefined/Heap); anything else is a double. `TAG_HEAP_HI` is the Heap tag.
+const TAG_LO: u32 = 0x7FF9;
+const TAG_HI: u32 = 0x7FFD;
+const TAG_HEAP_HI: u32 = 0x7FFD;
+/// Full Heap Value tag, for direct construction of immutable prefix strings.
+const HEAP_TAG: u64 = 0x7FFD_0000_0000_0000;
+/// Low 48 bits of a Value = a heap index (when the tag is Heap).
+const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+/// First non-interned heap index: the prefix holds single-ASCII chars, empty,
+/// and the immutable `"00".."99"` Pad2 table. Every prefix slot has unique
+/// contents, so bits equality is exact between two prefix Values. A heap value
+/// at/above this boundary needs full `strict_eq` (equal-content dynamic strings
+/// and object identity).
+const USER_OBJ_START: i32 = (crate::heap::INTERN_PINNED_END + 1) as i32;
+
+/// Canonical NaN bits (`Value::num` canonicalises every NaN to this pattern so
+/// raw TypedArray bytes can never alias a NaN-box tag). Mirror of value.rs QNAN.
+const QNAN_BITS: u64 = 0x7FF8_0000_0000_0000;
+
+/// The internal array-HOLE sentinel bits — `Value::HOLE` = `TAG_UNDEFINED | 2`
+/// = `QNAN | (4 << 48) | 2`. A pinned dense-Array element load compares against
+/// this to route an absent index to the generic helper (prototype walk), never
+/// returning the sentinel to user code. Mirror of value.rs `Value::HOLE`.
+const ARR_HOLE_BITS: u64 = 0x7FFC_0000_0000_0002;
+
+/// `Value::TRUE` bits — `TAG_BOOL | 1` = `QNAN | (2 << 48) | 1`. The pinned
+/// dense-Array `HasProp` (`i in arr`) inline writes this for an in-range,
+/// non-HOLE element (an own property → unconditionally present). Mirror of
+/// value.rs `Value::TRUE`.
+const BOOL_TRUE_BITS: u64 = 0x7FFA_0000_0000_0001;
+
+/// `Value::FALSE` bits, used by the pinned dense-Array `HasProp` absent lane.
+/// Kept beside `BOOL_TRUE_BITS` so the two raw stores cannot drift apart.
+const BOOL_FALSE_BITS: u64 = 0x7FFA_0000_0000_0000;
+
+/// Where a pinned TypedArray's live Value is RE-READ from at region entry and
+/// after every user-code helper: a global slot (`g` never stored in the region)
+/// or a frame register (never written in the region). The static choice is only
+/// a HINT — every fast-path access re-checks object identity at runtime.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaPinSrc {
+    Global(u32),
+    Reg(u16),
+}
+
+/// One pinned TypedArray: its live-Value source and the element kind the inline
+/// code was specialised for (the snapshot helper re-validates the kind).
+/// `kind == DV_PIN_KIND` pins a DataView instead (snapshot: `base = data +
+/// byteOffset`, `len = byteLength`) for the whitelisted `get*` methods.
+#[derive(Clone, Copy)]
+pub struct TaPin {
+    pub src: TaPinSrc,
+    pub kind: u8,
+    /// Intrinsic method slots whose direct, call-free access this snapshot
+    /// licenses.  Bits index `DV_PROTO_METHODS`; string bit zero denotes
+    /// `charCodeAt`.  Element/length-only pins leave the mask empty.
+    pub method_mask: u32,
+}
+
+impl TaPin {
+    /// Pack the pin kind and its method proof into the existing `u32` snapshot
+    /// argument.  Keeping this in one ABI word avoids growing every region
+    /// prologue with a fifth Win64 call argument.
+    pub(crate) fn snapshot_tag(self) -> u32 {
+        (self.method_mask << 8) | self.kind as u32
+    }
+}
+
+/// `TaPin::kind` marker for a pinned DataView receiver (not a TA element kind).
+pub const DV_PIN_KIND: u8 = 255;
+
+/// `TaPin::kind` marker for a pinned flat-ASCII STRING receiver (not a TA element
+/// kind). Snapshot: `base = bytes.as_ptr()`, `len = units` (== byte len for ASCII),
+/// for inlining `str.charCodeAt(i)` as a direct byte load. A non-ASCII / rope /
+/// non-string snapshots all-zero (the per-access identity guard then misses and the
+/// access takes the generic `jit_char_code_at` helper — full flatten/surrogate
+/// semantics). ASCII-only is the correctness gate: byte i == UTF-16 unit i.
+pub const STR_PIN_KIND: u8 = 254;
+
+/// First `TaPin::kind` marker for a **length-only** TypedArray receiver.  The
+/// marker encodes the live TypedArray's element kind as
+/// `TA_LEN_PIN_BASE + kind`, but it is deliberately disjoint from the raw
+/// element-kind namespace (`0..9`) and from every other synthetic pin kind.
+///
+/// This separation is a soundness boundary, not just bookkeeping.  A
+/// `Uint32Array.length` may safely inhabit an INTEGER home even though a
+/// `Uint32Array` *element* cannot yet use that tier (the full element range is
+/// not proven through its lazy-sign-extension paths).  Giving the length read
+/// the raw dtype kind would accidentally make an unrelated `GetIndex` look
+/// pinned for an element load.  Only `Recv::Len` in `build_ta_pin_plan` creates
+/// one of these markers, and only a `GetProp "length"` consumes it.
+///
+/// Kinds 0..=8 are the existing non-BigInt fixed-width TypedArray family.  The
+/// authoritative `TA_KINDS` table is checked by both encoder and decoder so a
+/// future reorder/extension fails closed.  BigInt and the later Float16 kind
+/// stay on the generic property path for this contained first widening.
+pub const TA_LEN_PIN_BASE: u8 = 240;
+const TA_LEN_PIN_COUNT: u8 = 9;
+
+env_off_switch!(
+    /// Default-on kill switch for the INTEGER-tier TypedArray `.length` pin.
+    fn int_ta_length_enabled() = "ZIPP_NO_INT_TA_LENGTH"
+);
+
+env_off_switch!(
+    /// Default-on kill switch for the DOUBLE tier's TypedArray `.length` pin:
+    /// off, a double-typed loop that reads `ta.length` declines to the memory
+    /// tier again, as it did before the arm existed.
+    fn double_ta_length_enabled() = "ZIPP_NO_DOUBLE_TA_LENGTH"
+);
+
+env_off_switch!(
+    /// Default-on kill switch for the BAKED `FinalizeObject` form (B182):
+    /// a site whose plan resolves at compile time calls a slim helper with
+    /// the plan address and the emit-time shape fold baked in, skipping the
+    /// per-call table walk, validation and shape-memo probe. Off restores
+    /// the general helper call at every site.
+    fn finalize_baked_enabled() = "ZIPP_NO_FINALIZE_BAKED"
+);
+
+env_off_switch!(
+    /// B257 sub-latch: `ZIPP_NO_MAKEFUNC_PLAIN=1` keeps every Tier-C
+    /// `MakeFunc` site on the full activation-validating helper (the plain
+    /// lane is also off under `ZIPP_NO_THIN_ALLOC`).
+    fn makefunc_plain_enabled() = "ZIPP_NO_MAKEFUNC_PLAIN"
+);
+
+env_off_switch!(
+    /// Default-on kill switch for NATIVE SHAPE WAYS at direct-miss `GetProp`
+    /// sites (B178): guard the receiver's live shape mirror, read
+    /// `vals[slot]` through the vals mirror, no helper call. Off restores
+    /// the helper-only direct-miss form byte-identically, and the miss
+    /// helper stops filling shape ways (both sides latch this one value —
+    /// a way under a way-blind probe is dead weight, a probe over unfilled
+    /// ways always misses; neither is unsound, but A/B demands symmetry).
+    fn shape_ways_enabled() = "ZIPP_NO_SHAPE_WAYS"
+);
+
+/// Encode a live non-BigInt TypedArray kind as a length-only pin marker.
+pub(crate) fn ta_len_pin_kind(kind: u8) -> Option<u8> {
+    if !int_ta_length_enabled() || kind >= TA_LEN_PIN_COUNT {
+        return None;
+    }
+    let &(_, _, is_bigint, _) = crate::vm::native::TA_KINDS.get(kind as usize)?;
+    if is_bigint {
+        return None;
+    }
+    TA_LEN_PIN_BASE.checked_add(kind)
+}
+
+/// Decode a length-only pin marker back to its expected TypedArray kind.
+/// Unknown/reserved marker bytes return `None`; snapshotting then writes the
+/// all-zero fail-closed record used by every pin guard.
+pub(crate) fn ta_len_base_kind(marker: u8) -> Option<u8> {
+    let kind = marker.checked_sub(TA_LEN_PIN_BASE)?;
+    if kind >= TA_LEN_PIN_COUNT {
+        return None;
+    }
+    let &(_, _, is_bigint, _) = crate::vm::native::TA_KINDS.get(kind as usize)?;
+    (!is_bigint).then_some(kind)
+}
+
+pub(crate) fn is_ta_len_pin(kind: u8) -> bool {
+    ta_len_base_kind(kind).is_some()
+}
+
+#[cfg(test)]
+mod ta_len_pin_tests {
+    use super::*;
+
+    #[test]
+    fn length_pin_markers_are_disjoint_and_malformed_values_fail_closed() {
+        for kind in 0..TA_LEN_PIN_COUNT {
+            // Structural decoder coverage is independent of the process-latched
+            // off switch (this unit test also runs in explicit ablation jobs).
+            let marker = TA_LEN_PIN_BASE + kind;
+            assert_eq!(ta_len_base_kind(marker), Some(kind));
+            assert!(marker > TA_LEN_PIN_BASE.saturating_sub(1));
+            assert!(marker < ARR_NUM_PIN_KIND);
+        }
+        for malformed in [0, 8, 9, 239, 249, 250, 251, 252, 253, 254, 255] {
+            assert_eq!(ta_len_base_kind(malformed), None, "marker {malformed}");
+        }
+        assert_eq!(ta_len_pin_kind(9), None); // BigInt64Array
+        assert_eq!(ta_len_pin_kind(10), None); // BigUint64Array
+        assert_eq!(ta_len_pin_kind(11), None); // Float16Array (contained lane)
+    }
+}
+
+/// `TaPin::kind` marker for a pinned dense `HeapObj::Array` receiver (not a TA
+/// element kind). Snapshot: `base = items.as_ptr()` (the `Vec<Value>` storage),
+/// `len = items.len()`, for inlining `arr[i]` (`GetIndex`) and `i in arr`
+/// (`HasProp`) as a direct `Value` load. ⚠️ Unlike a TypedArray's fixed buffer,
+/// an Array's `Vec` REALLOCATES on growth (push / SetIndex extend / splice /
+/// length=), so the pinned base is re-derived (`emit_refetch_ta`) after every
+/// op that can grow/replace it — exactly the same discipline as a detach/resize
+/// for a TA. A snapshot DECLINES (all-zero → identity guard misses → generic
+/// helper) when the array carries an `arr_props` overlay (a defineProperty'd /
+/// sparse-overlay index, whose value/accessor lives off the dense Vec) or is a
+/// mapped-`arguments` object (a live index reads the formal's register). The
+/// inline answers only the in-range, non-HOLE case; a HOLE / out-of-range /
+/// non-int key routes to the generic `jit_get_index` / `jit_has_property`
+/// helper (full prototype-walk / `in` semantics) — never a new answer.
+pub const ARR_PIN_KIND: u8 = 253;
+
+/// `TaPin::kind` for a dense Array **observed to hold only Int-tagged elements**
+/// at OSR compile time. Identical to `ARR_PIN_KIND` in layout, snapshotting and
+/// every memory-path use — the separate kind exists ONLY so the INTEGER tier can
+/// admit `arr[i]` (`region_is_int`), unboxing the element straight into an i64
+/// home instead of demoting the whole loop to the boxed memory path. That demotion
+/// is what made `for (i…) s += a[i]` — the single most common hot loop in JS —
+/// run at 12 ns/element against V8's 0.5 ns.
+///
+/// The observation is a HEURISTIC (a bounded prefix+stride sample, and the array
+/// can hold a double a moment later); it decides only whether the integer tier is
+/// worth ATTEMPTING. Soundness rests entirely on the per-access guard, which
+/// re-checks the Int tag of the actual element loaded and deopts on any miss —
+/// so a double, a HOLE, a heap value or a shrunk array is always correct, merely
+/// slow. Sampling keeps a known-double array from compiling INT and then
+/// deopt-thrashing to eviction.
+pub const ARR_INT_PIN_KIND: u8 = 252;
+
+/// `TaPin::kind` for a dense Array **observed to hold only NUMBERS** (Int-tagged
+/// or double) at OSR compile time. Identical to `ARR_PIN_KIND` in layout,
+/// snapshotting and every memory-path use; the separate kind exists so the
+/// DOUBLE tier can admit `arr[i]`, unboxing the element into an f64 home.
+///
+/// It is the middle of three deliberately: `ARR_INT_PIN_KIND` excludes arrays of
+/// doubles (an i64 home cannot hold one), and `ARR_PIN_KIND` includes arrays of
+/// OBJECTS. B95 admitted the latter to the double tier and the element's numeric
+/// home was then ENTRY-LOADED from the previous iteration's object, so the region
+/// `entry_bail`ed on every OSR entry, self-evicted, displaced the memory compile
+/// that was working, and the loop ran interpreted — **181ms → 2349ms**.
+///
+/// Same contract as its siblings: the sample is a HEURISTIC deciding only whether
+/// the tier is worth attempting, and soundness rests on the per-access tag guard
+/// that re-checks the element actually loaded.
+pub const ARR_NUM_PIN_KIND: u8 = 251;
+
+/// All three dense-Array pin kinds — same snapshot and same memory-path treatment.
+pub fn is_arr_pin(kind: u8) -> bool {
+    kind == ARR_PIN_KIND || kind == ARR_INT_PIN_KIND || kind == ARR_NUM_PIN_KIND
+}
+
+/// Compile-time plan for inline TypedArray element access in a memory-path
+/// region: the pins (each gets a 32-byte stack snapshot slot `{obj_bits, base,
+/// len}` filled by `jit_ta_snapshot`) and, per GetIndex/SetIndex ip, which pin
+/// it should guard against. Built in dispatch.rs from LIVE VM state at OSR
+/// compile time; empty for non-TA regions.
+#[derive(Default)]
+pub struct TaPinPlan {
+    pub pins: Vec<TaPin>,
+    pub access: FxHashMap<usize, u8>,
+    /// Spec-order member calls are lowered as `GetProp; <args>;
+    /// CallWithThis`.  Register tiers need the pairing both to keep the boxed
+    /// receiver/callee out of numeric homes and to materialise the exact
+    /// captured callable before emitting the old call-free intrinsic lane.
+    /// Keyed by the `CallWithThis` ip; `access` contains both member ips.
+    pub captured_calls: FxHashMap<usize, CapturedPinCall>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CapturedPinCall {
+    pub get_ip: usize,
+    pub call_ip: usize,
+    pub obj: u16,
+    pub callee: u16,
+    pub dst: u16,
+    pub name: u32,
+    pub arg_base: u16,
+    pub argc: u16,
+    pub callee_bits: u64,
+}
+
+impl TaPinPlan {
+    pub(crate) fn captured_call(&self, ip: usize) -> Option<CapturedPinCall> {
+        self.captured_calls.get(&ip).copied()
+    }
+
+    pub(crate) fn captured_get(&self, ip: usize) -> Option<CapturedPinCall> {
+        self.captured_calls
+            .values()
+            .find(|site| site.get_ip == ip)
+            .copied()
+    }
+}
+
+/// One exact, side-effect-free leaf predicate that can be evaluated as a
+/// single live-global helper call instead of four boxed access helpers.  The
+/// packed u16 fields are, low to high: tag-array, end-array, start-array, and
+/// source-string global slots.  Every non-pristine runtime shape returns the
+/// deopt sentinel before observable work and the ordinary call runs unchanged.
+#[derive(Clone, Copy)]
+pub struct SpanCodeUnitPredPlan {
+    pub packed_globals: u64,
+    pub helper: usize,
+    /// Exact adjacent `pred(i, a) || pred(i, b)` caller shape.  A hit can
+    /// evaluate both alternatives in one read-only helper and resume at the
+    /// shared branch; a helper deopt still replays the first ordinary call.
+    pub pair: Option<SpanCodeUnitPairPlan>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SpanCodeUnitPairPlan {
+    /// Two sign-preserving i32 `LoadInt` operands (low/high halves).
+    pub packed_units: u64,
+    /// Caller ip of the shared branch immediately after the second call.
+    pub resume_ip: u32,
+    pub helper: usize,
+}
+
+/// One call site selected for Tier-C native cross-call dispatch.
+pub type CrossCallPlan = FxHashMap<usize, CrossCallSitePlan>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrossCallSitePlan {
+    pub same_proto2: Option<SameProtoCross2Plan>,
+    /// B189b: the fully-emitted native call lanes for this site. Mono and
+    /// same-proto sites carry one arm; a bounded different-fid site may carry
+    /// one arm per eligible filled IC way. An empty set keeps the helper-only
+    /// route, and every arm miss falls through to the next arm and ultimately
+    /// that unchanged helper.
+    pub cross3: Cross3CallPlan,
+    /// B193: the emitted lane for a `CallMethod` site (rotating same-shape
+    /// receivers, one method fid). Keyed in the same per-ip map — Call and
+    /// CallMethod ips never collide.
+    pub cross3m: Option<Cross3MethodPlan>,
+}
+
+/// Fixed-size emitted-call guard chain. Keeping this `Copy` preserves the
+/// plan maps' cheap by-value lookups while making the machine-code expansion
+/// impossible to exceed the call IC's own eight-way bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cross3CallPlan {
+    arms: [Option<SameProtoCross3Plan>; JIT_IC_WAYS],
+    len: u8,
+}
+
+impl Default for Cross3CallPlan {
+    fn default() -> Self {
+        Self {
+            arms: [None; JIT_IC_WAYS],
+            len: 0,
+        }
+    }
+}
+
+impl Cross3CallPlan {
+    pub(crate) fn push(&mut self, arm: SameProtoCross3Plan) -> bool {
+        if self.iter().any(|old| old.fid == arm.fid) {
+            return true;
+        }
+        let len = usize::from(self.len);
+        let Some(slot) = self.arms.get_mut(len) else {
+            return false;
+        };
+        *slot = Some(arm);
+        self.len += 1;
+        true
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn len(self) -> usize {
+        usize::from(self.len)
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = SameProtoCross3Plan> {
+        self.arms.into_iter().take(usize::from(self.len)).flatten()
+    }
+}
+
+/// B189b: everything the emitted same-proto call lane bakes. All of it is
+/// validated at runtime by cheap guards: the callee by `fid_mirror`, the
+/// entry/mask pair by `Jit::cross_code_epoch`, the environment by the three
+/// nonempty bytes, GC/depth/route by their scalars — any mismatch falls back
+/// to the unchanged cross-call helper, a pure prefix.
+/// B193: the emitted cross call at a `CallMethod` site over rotating
+/// same-SHAPE receivers — the method loads natively through the B178
+/// mirrors (`shape_mirror[obj] == shape` proves the baked layout settled
+/// since the receiver's last version bump; any bump — including accessor
+/// flips and method redefinitions — pins the mirror to DICT until the miss
+/// path re-settles it), and the loaded value takes the same fid guard as a
+/// plain callee. Everything else is revalidated exactly as
+/// [`SameProtoCross3Plan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cross3MethodPlan {
+    pub shape: u32,
+    pub slot: u32,
+    pub fid: u32,
+    pub callee_regs: u16,
+    pub argc: u16,
+    pub arrow_this: bool,
+    pub mask_gen: u32,
+    pub uninit_mask: u64,
+}
+
+/// B199: one live cross-entry record — `entry` (0 = none) and the mask
+/// generation the emitted lanes guard. `#[repr(C)]`, 16 bytes, addressed
+/// as `table_base + fid*16` (constant displacement — the fid is baked).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CrossEntryRec {
+    pub entry: u64,
+    pub mask_gen: u32,
+    pub _pad: u32,
+}
+
+/// B205: the fused `Math.random() * k | 0` window against a recognized
+/// seeded-xorshift override. Everything baked is revalidated per run:
+/// the Math binding by VALUE bits, its settled shape, the `random` own
+/// data slot by VALUE bits, and the state slot's Int tag — any miss takes
+/// the ordinary ops as a pure prefix (the window's first op is the bail
+/// ip and the state store happens only after every guard passed).
+#[derive(Clone, Copy, Debug)]
+pub struct RandomScaleFusePlan {
+    pub math_slot: u32,
+    pub math_bits: u64,
+    pub math_shape: u32,
+    /// B207: heap versions of the Math object and the random-closure slot,
+    /// guarded through the VM-mirrored versions base (`versions_raw`, read
+    /// per access — NOT the pinned r13, which a fuse-only Tier-C body never
+    /// pins and a cross3-entered body inherits from its caller) — a recycled
+    /// heap index bumps its version at reuse, so bits-equality can never
+    /// resurrect a stale plan against a DIFFERENT occupant (the review's ABA
+    /// finding).
+    pub math_ver: u32,
+    pub random_ver: u32,
+    pub random_slot: u32,
+    pub random_bits: u64,
+    pub state_slot: u32,
+    /// Three (kind, amount) xorshift steps: kind 0 = Shl, 2 = Ushr.
+    pub shifts: [(u8, u8); 3],
+    pub k: i32,
+    pub dst_math: u16,
+    pub dst_random: u16,
+    pub dst_k: u16,
+    pub dst_prod: u16,
+    pub dst_zero: u16,
+    pub dst_res: u16,
+    /// B205 stage 2 (the dynamic-length variant): the scale came from
+    /// `alphabet.length` on a CAPTURED alphabet — guard the closure's upval
+    /// cell (index `upval_idx`) against `alph_bits` through the cell-mirror
+    /// authority, and materialize the two UpvalGet destinations with those
+    /// bits. `None` = the static-k variant (k was a literal).
+    pub upval_alph: Option<UpvalAlphabet>,
+}
+
+/// B205 stage 2: the captured-alphabet identity for the dynamic-length fuse.
+#[derive(Clone, Copy, Debug)]
+pub struct UpvalAlphabet {
+    pub upval_idx: u16,
+    pub alph_bits: u64,
+    /// B207: the alphabet string's heap version (the ABA guard's third leg).
+    pub alph_ver: u32,
+    /// The SECOND UpvalGet's destination (the first sits before the fused
+    /// window and runs as an ordinary op).
+    pub dst_alph_b: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SameProtoCross3Plan {
+    pub fid: u32,
+    /// Callee frame size (`reg_count.max(1)`).
+    pub callee_regs: u16,
+    /// Site argc — admitted only when it equals the callee's `param_count`.
+    pub argc: u16,
+    /// `this` policy: true = arrow (captured `this` via the heap's
+    /// this-mirror); false = strict plain function (`this = undefined`).
+    pub arrow_this: bool,
+    /// The may-read-before-write register mask, valid while the callee's
+    /// live `CrossEntryRec::mask_gen` equals `mask_gen`; the entry itself
+    /// is loaded from the live table per call (B199), never baked.
+    pub mask_gen: u32,
+    pub uninit_mask: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SameProtoCross2Plan {
+    pub fid: u32,
+    pub callee_regs: u16,
+}
+
+/// Q4 leaf-call inlining (v1). One inlinable monomorphic PLAIN-LEAF callee for a
+/// `Call` site in a memory-path region. Built in dispatch.rs from LIVE VM state
+/// (the resolved Callee IC entry) at OSR compile time; the emitted code guards
+/// the callee register's identity against `callee_bits` and, on a hit, runs the
+/// callee body INLINE (no frame push, no `setup_call`, no `run_loop`) over a
+/// scratch register window carved at offset `reg_window` above the caller frame.
+/// A guard MISS (callee reassigned / a different callee shape appears) falls
+/// through to the UNCHANGED `emit_region_call_ic` helper — a pure prefix that
+/// never deopts/evicts the region, so polymorphic / unknown callees degrade to
+/// today's per-call path.
+///
+/// SOUNDNESS: the body is verified `callee_leaf_ok` — a straight-line sequence of
+/// region-admissible value ops + global reads/writes, NO nested call / heap alloc
+/// / closure-cell / upvalue op, exactly one trailing `Return`/`ReturnUndefined`,
+/// and NO deopt-capable op after any effect (so an inlined-op bail — which
+/// resumes the interpreter AT THE CALL IP and re-runs the whole call — can never
+/// double-apply a `StoreGlobal`/`SetProp`). The body touches only the scratch
+/// window (its own regs, offset by `reg_window`) and globals (`r12`); a pure leaf
+/// runs no GC safepoint, so the carved window needs no zero-fill and the pinned
+/// pointers (r12/r13/r14) stay valid across it.
+pub struct LeafInlinePlan {
+    /// Guard: the caller's callee register must hold exactly these Value bits.
+    pub callee_bits: u64,
+    /// Guard: the callee heap slot's live VERSION must still equal this baked
+    /// value. Heap Value bits are pure `TAG_HEAP|idx`; the parallel `versions[]`
+    /// array is the only ABA discriminator. A GC'd + reused slot keeps identical
+    /// bits but bumps its version, so the bits-only guard would pass and run the
+    /// STALE old callee body. The emitter checks `versions[idx] == callee_ver`
+    /// AFTER the bits compare — restoring the exact `(bits, version)` tuple the
+    /// interpreter's `ic_call` checks.
+    pub callee_ver: u32,
+    /// Polymorphic same-prototype guard. `Some(fid)` replaces the exact
+    /// identity/version check with a read-only runtime check that the live
+    /// callee is a plain function/empty closure for this FuncProto. Admitted
+    /// only for capture-free, non-arrow leaves, so instance identity has no
+    /// remaining call semantics.
+    pub same_proto_fid: Option<u32>,
+    pub same_proto_guard: usize,
+    /// Offset (in registers) of the carved callee scratch window above the
+    /// caller frame's window: callee reg `r` lives at caller reg `reg_window+r`.
+    pub reg_window: u16,
+    /// Callee register-window size (validated to fit the reserved capacity).
+    pub callee_reg_count: u16,
+    /// The Value bits to write into the callee window's `this` (reg 0).
+    ///
+    /// The inline site is a plain `Call`, so `thisArg` is undefined — and
+    /// `OrdinaryCallBindThis` then does one of two things depending on the
+    /// CALLEE: a strict function keeps `undefined`, a sloppy one substitutes its
+    /// realm's global object. Baking the answer here is what lets an ordinary
+    /// sloppy `function f(a,b){ return a+b; }` inline at all. Hard-coding
+    /// `undefined` meant declining every non-strict callee, which measured 26.7ns
+    /// per call against 3.6ns for the equivalent method — the single commonest
+    /// call shape in the language taking the slowest path.
+    pub this_bits: u64,
+    /// Callee formal parameter count (args 0..min(argc,param_count) are copied
+    /// into scratch regs `reg_window+1 ..` ; reg `reg_window+0` is `this`).
+    pub param_count: u16,
+    /// Zero-based caller arguments whose default-parameter prologues were
+    /// removed from `body`. Every bit is guarded non-`undefined` before the
+    /// inline; a miss falls back to the real call and evaluates defaults.
+    pub default_arg_mask: u64,
+    /// The callee body ops to emit inline (with their OWN register numbers).
+    pub body: Vec<Instr>,
+    /// Resolved numeric-constant bits the body's `LoadConst` ops reference,
+    /// keyed by the constant index (the callee's own constant pool index).
+    pub consts: FxHashMap<u32, u64>,
+    /// Callee-local property names used when a raw INT splice copies a guarded
+    /// captured member prefix into the caller's synthetic FuncProto.
+    pub string_constants: Vec<String>,
+    /// Baked CELL for each upvalue index the body READS, as Value bits.
+    ///
+    /// An inlined body has no frame of its own, so the interpreter's
+    /// `jit_upval_get` — which resolves the running closure from the TOP frame —
+    /// would read the CALLER's closure. It cannot be used here. The identity
+    /// guard above pins the exact closure instance, and a closure's upvalue cells
+    /// are fixed for its lifetime, so each cell is resolved once at plan time and
+    /// read through `jit_cell_get` at runtime (the cell's CONTENTS still change,
+    /// which is why it is a load and not a constant). Empty for a plain function
+    /// or a closure with no captures.
+    pub upvals: FxHashMap<u16, u64>,
+    /// `jit_cell_get` / `jit_cell_set` — carried in the plan rather than as more
+    /// positional parameters to `emit_inline_leaf_call`, whose argument order is
+    /// documented as load-bearing.
+    pub cell_get: usize,
+    pub cell_set: usize,
+    /// `jit_get_prop_leaf`, and the CALLEE's func id so the emitter can bake
+    /// `(callee_fid << 32) | name_idx` for a body `GetProp` — the body's operands
+    /// carry the callee's own numbering, so the caller's id would resolve the wrong
+    /// string constant. Carried here rather than as more positional parameters, for
+    /// the reason above.
+    pub prop_get: usize,
+    pub callee_fid: u32,
+    /// Nested (wrapper) inline: body index of the spliced-in `Call` → the guard
+    /// that must hold for the spliced body to be the right one. See
+    /// `callee_leaf_ok_one_call`.
+    pub nested: FxHashMap<usize, NestedGuard>,
+    /// W11 (B124): may-read-before-write over the body — the ONLY local regs
+    /// the splice must zero-fill per execution (`splice_uninit_mask`; bit r =
+    /// callee reg r). `u64::MAX` = fill everything (the pre-W11 behaviour,
+    /// pinned by `ZIPP_NO_SPLICE_FILL=1` or any unmodelled body op). tokIs'
+    /// 19-stores-per-execution fill measured ~25-30ms of parse-large-js.
+    pub uninit_mask: u64,
+    /// W11 (B124): bit i set ⇒ callee param i is ALIASED to the caller's
+    /// `arg_base+i` slot instead of copied — sound because the plan proved no
+    /// body op writes callee reg `1+i` (fail-closed: unknown defs ⇒ 0) and
+    /// the site passes at least i+1 args. `0` under `ZIPP_NO_SPLICE_ALIAS=1`.
+    pub alias_params: u64,
+    /// W12: slot-generation guard — `Some((abs addr of global_gens[g], baked
+    /// gen))` replaces the per-execution callee bits+version re-check with one
+    /// 32-bit generation compare. Keyed only when the planner proved the
+    /// callee register holds global slot g's value at the call and no write
+    /// to g can escape a `bump_global_gen` (see `build_leaf_inline_plan`'s
+    /// keying conditions). `None` = today's identity+version guard,
+    /// byte-identical emission (pinned by `ZIPP_NO_SPLICE_SLOTGEN=1`).
+    pub slot_guard: Option<(u64, u32)>,
+    /// VM-relative global-route epoch for a body containing direct raw global
+    /// loads/stores. `Some(0)` means the planner proved every referenced slot
+    /// directly routable and mutable as required, in the root realm, before
+    /// any route change. Generic MEM splices compare this per call; the INT
+    /// splice hoists the same proof to region entry. A global-using body is not
+    /// admitted into this plan at all when the proof is unavailable.
+    pub direct_global_route_epoch: Option<u32>,
+    /// Typed splice lane: a fully scheduled register-resident emission for a
+    /// proven-numeric straight-line body (see `build_typed_lane`). `Some` ⇒
+    /// `emit_inline_leaf_call` emits the lane INSTEAD of the boxed per-op
+    /// loop; any entry tag-guard miss or range bail jumps to the per-call
+    /// helper fallback as a pure prefix (nothing committed — upval writes are
+    /// buffered in registers until the exit commit). `None` (any untypeable
+    /// op, an unprovable magnitude bound, a blown register budget, or
+    /// `ZIPP_NO_TYPED_SPLICE=1`) keeps the generic loop, byte-identical.
+    pub typed_lane: Option<TypedLanePlan>,
+    /// Exact dense-array span / string-code-unit predicate fusion. `None`
+    /// preserves the generic boxed leaf expansion byte-for-byte.
+    pub span_code_unit_pred: Option<SpanCodeUnitPredPlan>,
+}
+
+/// A bounded `array[key](args...)` whose live dense own elements are exact,
+/// capture-free numeric leaves. The INTEGER splice validates the receiver,
+/// its ABA version, and every element's `(bits, version)` tuple once at native
+/// entry, then dispatches on the live integer key without a per-iteration call.
+/// Any mismatch occurs before the region has executed and returns to the
+/// interpreter; an unmatched key leaves at the original pure call prefix.
+pub struct DenseComputedLeafPlan {
+    /// Stable source that produces the receiver copied into the call's `obj`
+    /// register. It is re-read by the entry guard, never trusted as a constant.
+    pub recv_src: TaPinSrc,
+    pub recv_bits: u64,
+    pub recv_ver: u32,
+    /// Earliest instruction in the pure receiver/key/argument prefix. A
+    /// runtime key outside the bounded arms resumes here so the real call sees
+    /// every operand exactly as the interpreter would have produced it.
+    pub fallback_ip: u32,
+    /// The sole in-region definition that copies/loads the receiver into the
+    /// call's transient `obj` register. The synthetic success path does not use
+    /// that register, so this pure dead def is omitted; an interpreter fallback
+    /// resumes no later than it and recreates the exact slot.
+    pub drop_obj_def: Option<u32>,
+    /// Arm `i` is valid only for canonical dense index `i`.
+    pub variants: Vec<LeafInlinePlan>,
+    /// Read-only Win64 validator for one `(receiver, index, callee)` tuple.
+    pub guard_helper: usize,
+}
+
+/// Identity guard for a nested inline. Same `(bits, version)` tuple the outer
+/// call guards, checked against the register the WRAPPER loaded its callee into.
+/// A miss jumps to the outer fallback, which re-runs the whole outer call — sound
+/// because the admitted nested call precedes any committed effect.
+#[derive(Clone, Copy)]
+pub struct NestedGuard {
+    /// The wrapper's OWN callee register number (the emitter maps it into the
+    /// scratch window, like every other body operand).
+    pub callee_reg: u16,
+    pub bits: u64,
+    pub ver: u32,
+}
+
+impl LeafInlinePlan {
+    /// Boxed bits for a body `LoadConst` constant (numeric — `callee_leaf_ok`
+    /// rejected any non-numeric constant, and the planner pre-resolved them).
+    fn const_bits(&self, idx: u32) -> u64 {
+        self.consts.get(&idx).copied().unwrap_or(0)
+    }
+}
+
+/// Q7 method-call inlining (v1): an in-region `CallMethod` whose receiver (the
+/// `obj` reg) is a known class instance with a trivial straight-line method body
+/// (own-`this` field reads + numeric arithmetic; NO `super` in v1) is emitted
+/// INLINE behind a per-receiver identity+version guard, with a fallback to the
+/// unchanged `jit_call_method_ic` helper on ANY miss (a pure prefix — it never
+/// deopts/evicts the region, so a non-baked / mutated / reassigned receiver
+/// degrades to today's per-call path).
+///
+/// SOUNDNESS: the guard re-checks the receiver's Value bits AND its live heap
+/// slot version (read from r13), exactly the `(bits, version)` tuple the
+/// interpreter's IC checks. The version bumps on every own-key add/delete/
+/// redefine, freeze/seal, and setPrototypeOf — so a method-name OWN SHADOW (the
+/// G3b hazard, which would make `recv.m()` resolve to the own prop, not the
+/// class method) AND any `vals` reallocation both MISS the guard. Behind it the
+/// baked `vals_ptr` + field `slot`s are therefore valid, and each `this.<field>`
+/// is a direct `vals_ptr[slot]` load (no call, no IC slot). The body is a
+/// no-`super` subset of `method_body_inlinable_scan`: a straight-line prefix of
+/// own-`this` GetProp + numeric ops ending at the first `Return`, with NO side
+/// effect — so any arithmetic op's mid-body number-guard bail can re-run the
+/// WHOLE call cleanly (nothing committed). A pure body runs no GC safepoint /
+/// alloc / call, so r12/r13/r14 stay valid and the scratch window (zero-filled
+/// like `setup_call`) needs no re-fetch.
+/// One inlined `super.m()` body (Stage 3), emitted over a sub-window above the
+/// outer method's window, over the SAME receiver (reg 0 = recv). v1: the super
+/// target is itself a NO-`super`, 0-arg trivial method (e.g. `Shape.area(){return
+/// this._v+1}`). Resolution is baked from the live `SuperData` IC entry; the hop
+/// version guards re-check the prototype chain each call (a `setPrototypeOf` /
+/// method reassignment on the chain bumps a hop version → fall to the helper).
+pub struct SuperInline {
+    /// Class-redefinition guard: the `mi_class_epoch` value baked at compile
+    /// time. Emitted code reads the live field relative to its VM argument;
+    /// `ScriptState` may move between persistent entries. A re-executed class declaration swaps
+    /// `class_values[home_class_id]` to a new class WITHOUT mutating the old
+    /// prototype objects the hop guards watch, so a changed epoch is
+    /// the discriminator that catches it (→ fall to the helper, which resolves
+    /// super against the live `class_values[id]`). Mirrors the interpreter's
+    /// `ic_super_method` `home == class_values[home_class_id]` check.
+    pub epoch_val: u32,
+    /// Super-chain hop version guards `(heap_idx, version)`, anchor..holder.
+    pub hops: Vec<(u32, u32)>,
+    /// Holder's `vals` base + the method's slot + its baked function Value bits:
+    /// a same-slot REASSIGNMENT guard (`Shape.prototype.area = fn`). The
+    /// interpreter's super path re-reads the holder slot each call, so the inline
+    /// must too — re-check `holder_vals_ptr[holder_slot] == fn_bits` (a chain
+    /// realloc is already caught by the hop version guards before this deref).
+    pub holder_vals_ptr: u64,
+    pub holder_slot: u32,
+    pub fn_bits: u64,
+    /// Super body `this.<field>` -> own data slot on the SAME receiver.
+    pub field_slots: FxHashMap<u32, u32>,
+    /// Numeric-constant bits for the super body's `LoadConst` ops.
+    pub consts: FxHashMap<u32, u64>,
+    /// The super body ops (the super method's own register numbers).
+    pub body: Vec<Instr>,
+    /// Super body register-window size.
+    pub callee_reg_count: u16,
+    /// Sub-window base for the super body's registers (above the outer window).
+    pub win_off: u16,
+}
+
+/// The extra guards a PROTOTYPE-CHAIN method arm needs (B78).
+///
+/// `build_method_shape` originally admitted two receiver shapes — a class
+/// instance, and a plain object holding the function in an OWN slot — and
+/// declined everything else. So `Object.create(proto)` and the classic
+/// `Ctor.prototype.m = function …` shape, which is most of the JavaScript
+/// written before 2015 and most of what transpilers still emit, inlined NEVER:
+/// measured 29.5ns/call at ONE receiver against 5.5ns for the identical method
+/// on an ES class, and 1.0ns in node. This closes that arm.
+///
+/// The receiver's own identity+version guard (already emitted for every arm)
+/// carries more weight here than it looks: the version bumps on an own-key ADD
+/// (so a later `recv.m = …` SHADOW misses) and inside `ordinary_set_prototype_of`
+/// (so a re-pointed first link misses). That leaves exactly two things for this
+/// struct: the rest of the chain, and the holder slot's value.
+pub struct ProtoMethodGuard {
+    /// `(heap_idx, version)` for every object from the receiver's prototype down
+    /// to the holder — the same hop set, checked the same way, as
+    /// [`SuperInline::hops`]. A `setPrototypeOf` or a key add/delete anywhere on
+    /// the chain bumps one of these.
+    pub hops: Vec<(u32, u32)>,
+    /// Holder's `vals` base + the method's slot + its baked function bits.
+    /// REQUIRED, not defensive, for the same reason
+    /// [`MethodInlineShape::method_slot`] is: `PROTO.m = other` overwrites an
+    /// existing slot in place and deliberately does not bump the holder's
+    /// version, so the hop guards alone would happily run the OLD body.
+    pub holder_vals_ptr: u64,
+    pub holder_slot: u32,
+    pub fn_bits: u64,
+}
+
+/// One receiver "shape" (arm) of a (possibly polymorphic) inlined CallMethod
+/// (Stage 4). Each arm guards a specific receiver instance's identity+version and
+/// runs that receiver's resolved class method inline; a miss tries the next arm,
+/// and all-miss falls to the helper. v1 enumerates the live receiver exemplar
+/// plus, when the receiver is `arr[idx]`, the array's dense elements (the bench's
+/// `objs[i&3]` shape) — so the ≤4 fixed instances each get an arm.
+pub struct MethodInlineShape {
+    /// Guard: the receiver reg must hold exactly these Value bits.
+    pub recv_bits: u64,
+    /// Guard: the receiver heap slot's live version (ABA + own-shadow +
+    /// vals-realloc discriminator).
+    pub recv_ver: u32,
+    /// Exact callable bits resolved while this method arm was planned. A
+    /// captured-reference plan compares the already-evaluated callee register
+    /// against this value before entering the body; this is independent of the
+    /// receiver/member guards below and is what preserves Get-before-arguments
+    /// replacement semantics.
+    pub captured_callee_bits: Option<u64>,
+    /// Class heap identity/version behind a class-method arm. A fused captured
+    /// GetProp prefix has not run the ordinary IC probe yet, so it rechecks the
+    /// same live class version that `IcEntry::ClassMethod` validates before it
+    /// may materialize `captured_callee_bits`. Own/prototype methods use their
+    /// explicit slot/hop guards instead.
+    pub class_method: Option<(u32, u32)>,
+    /// `Vm::class_proto_epoch` baked when a CLASS member (method or accessor)
+    /// was resolved through the class's member tables. Those tables answer only
+    /// while they still describe the live prototype objects; the epoch moves
+    /// when any class's stop doing so (`C.prototype.m = f`, a redefined or
+    /// deleted declared member, `setPrototypeOf` on a prototype or instance),
+    /// and the arm misses from then on — the interpreter's `Class*` IC ways
+    /// bake the same epoch. `None` for own/prototype-chain arms, whose slot
+    /// and hop guards already cover mutation.
+    pub class_epoch: Option<u32>,
+    /// Baked base pointer of this receiver's ObjMap `vals` (valid behind the
+    /// version guard); shared by the outer body AND its inlined super bodies.
+    pub vals_ptr: u64,
+    /// Per body `GetProp{obj:0,name}`: callee name index -> own DATA slot.
+    pub field_slots: FxHashMap<u32, u32>,
+    /// Callee register-window size.
+    pub callee_reg_count: u16,
+    /// Method formal parameter count.
+    pub param_count: u16,
+    /// The method body ops to emit inline.
+    pub body: Vec<Instr>,
+    /// Resolved numeric-constant bits for the body's `LoadConst` ops.
+    pub consts: FxHashMap<u32, u64>,
+    /// Inlined `super.m()` bodies keyed by their `SuperMethod` body index.
+    pub supers: FxHashMap<usize, SuperInline>,
+    /// For a PLAIN-OBJECT receiver (`{ m() {} }`, the module/callback shape),
+    /// the own `vals` slot the method was found at and the callee bits baked
+    /// from it — guarded as `vals_ptr[slot] == bits` before the body runs.
+    ///
+    /// `None` for a class instance, whose method comes from the class rather
+    /// than a property and is already covered by the receiver-version guard.
+    ///
+    /// This guard is REQUIRED, not defensive: `obj.m = other` overwrites an
+    /// existing slot in place and deliberately does NOT bump the version (the
+    /// ordinary-set fast path keeps the shape unchanged so JIT caches stay
+    /// valid), so identity+version alone would happily run the OLD body.
+    pub method_slot: Option<(u32, u64)>,
+    /// For a receiver that resolves `name` on its PROTOTYPE CHAIN (B78) — no
+    /// class, no own slot. Mutually exclusive with `method_slot`.
+    pub proto_method: Option<ProtoMethodGuard>,
+    /// W20 (M2): an OWN ACCESSOR arm — the getter/setter this arm inlined is
+    /// held in the RECEIVER's own property slot rather than resolved through a
+    /// class. Baked as the ABSOLUTE address of the `Value` that holds it
+    /// (`vals[slot]` for a getter, `attrs[slot].setter` for a setter) plus the
+    /// callee bits read from it, guarded as `*addr == bits` before the body
+    /// runs — the same shape as `method_slot`, which cannot simply be reused
+    /// because a SETTER does not live in `vals` at all.
+    ///
+    /// REQUIRED, not defensive: an accessor function can be replaced in place
+    /// (`Object.defineProperty` re-stating only the `get`, `set_setter_at`),
+    /// and a data/accessor FLIP that happened to leave the same bits behind
+    /// would otherwise run the old body. `None` for a class accessor, whose
+    /// resolution the receiver-version guard already covers.
+    pub own_acc: Option<(u64, u64)>,
+    /// W19 (MI-LANE): a register-resident schedule for this arm's body, the
+    /// same mechanism `LeafInlinePlan::typed_lane` carries — the reason it is
+    /// per-SHAPE and not per-plan is that the field slots, the receiver `vals`
+    /// base and the super chain it bakes are all per-receiver.
+    ///
+    /// `Some` ⇒ `emit_inline_method_call` / `emit_inline_accessor` emit the
+    /// lane INSTEAD of `emit_mi_body`, and with it drop the `this` bind, the
+    /// argument copy and the scratch-window zero-fill (a lane keeps no value
+    /// in the window). Any guard miss or range bail jumps to the arm's
+    /// existing fallback as a pure prefix — v1 schedules EFFECT-FREE bodies
+    /// only, so nothing can have committed. `None` (an untypeable op, a
+    /// non-numeric field, an unprovable magnitude bound, a blown register
+    /// budget, or `ZIPP_NO_MI_LANE=1`) keeps the boxed emission byte-identical.
+    pub typed_lane: Option<TypedLanePlan>,
+}
+
+pub struct MethodInlinePlan {
+    /// Carved callee scratch-window offset (callee reg `r` -> caller reg
+    /// `reg_window + r`).
+    pub reg_window: u16,
+    /// Highest scratch reg index used across all arms (outer window + super
+    /// sub-windows) — the headroom (`jit_regs_fits`) bound.
+    pub win_top: u16,
+    /// Callee register for a `GetProp; CallWithThis` plan. `None` is the legacy
+    /// fused `CallMethod`/accessor form. Every arm in a captured plan carries a
+    /// matching `captured_callee_bits` value and guards it before executing.
+    pub captured_callee: Option<u16>,
+    /// The receiver arms (1 = monomorphic; ≤ JIT_IC_WAYS). A guard tree.
+    pub shapes: Vec<MethodInlineShape>,
+}
+
+/// Win64 addresses of the heap helpers (vm.rs), passed from the interpreter into
+/// `Jit::compile_region`. The inline-cache base site index is assigned inside
+/// `compile_region` (not here), then bundled into `HeapHelpers` for codegen.
+#[derive(Clone, Copy)]
+pub struct MathIntrinsicGuard {
+    /// Exact main-realm `Math` receiver captured when this code is compiled.
+    pub receiver_bits: u64,
+    /// Heap generation of the receiver.  Structural changes (including a
+    /// values-vector relocation) invalidate the baked slot address below.
+    pub receiver_ver: u32,
+    /// Direct address and slot of the main-realm `Math.imul` data property.
+    /// Generated code first validates `receiver_ver`, then re-reads this slot;
+    /// the value comparison is required because an in-place overwrite does not
+    /// bump the object's generation.
+    pub receiver_vals: u64,
+    pub receiver_slot: u32,
+    /// Exact main-realm intrinsic `Math.imul` callable.
+    pub callee_bits: u64,
+    /// Heap-slot generation paired with `callee_bits`, defeating slot-reuse ABA.
+    pub callee_ver: u32,
+    /// Per-op twins of `callee_bits`/`callee_ver`, indexed by the `MathFn`
+    /// discriminant: the exact main-realm intrinsic callable of EVERY `Math.*`
+    /// method that was a plain intrinsic data property when this code was
+    /// compiled (`0` bits = not baked: the emitted guard falls back to the
+    /// `jit_math_is_intrinsic` helper call for that op). This is what lets an
+    /// emitted `MathOp` validate its captured callee/receiver with three inline
+    /// compares instead of a helper call per execution — the helper's namespace
+    /// lookup alone was a string hash per `Math.floor(x)`.
+    pub op_callee_bits: [u64; crate::bytecode::MATH_FN_COUNT],
+    pub op_callee_ver: [u32; crate::bytecode::MATH_FN_COUNT],
+    /// Own data slot of each baked `Math.<op>` in the receiver's values
+    /// vector (`u32::MAX` = not baked): what the BARE `MathOp` guard re-reads
+    /// through `receiver_vals` after validating `receiver_ver`.
+    pub op_slot: [u32; crate::bytecode::MATH_FN_COUNT],
+}
+
+#[derive(Clone, Copy)]
+pub struct HeapHelperAddrs {
+    pub get_prop_miss: usize,
+    pub set_prop_miss: usize,
+    pub versions_base: usize,
+    pub ic_base: usize,
+    /// Helper for a dense-array element read `a[i]` (`GetIndex`); returns the
+    /// element bits, `undefined` for out-of-range, or the deopt sentinel.
+    pub get_index: usize,
+    /// Helper for a dense-array element write `a[i] = v` (`SetIndex`); returns 0
+    /// on success (storing/growing) or the deopt sentinel.
+    pub set_index: usize,
+    /// Helper for `arr.push(x)` — returns the new length, or the deopt sentinel.
+    pub array_push: usize,
+    /// Helper for `str.charCodeAt(i)` — returns the char code / NaN, or deopt.
+    pub char_code_at: usize,
+    /// Helper for `a + b` (`StrConcat`) — returns the result bits, or deopt.
+    pub concat: usize,
+    /// Helper for in-place `a + b` (`StrAppendInPlace`) — returns the result bits.
+    pub str_append: usize,
+    /// Pure ASCII prefix for fused `a += obj[key]` — result bits or deopt.
+    pub str_append_index: usize,
+    /// Helper for a generic `obj.m(args…)` (`CallMethod`) in a region: consults
+    /// the interpreter's per-site inline cache and frame-calls the resolved
+    /// plain user function to completion. Returns the result bits,
+    /// `SELF_CALL_DEOPT` (IC miss / megamorphic / depth limit → re-execute the
+    /// op in the interpreter), or `CALL_THREW` (exception pending → the region
+    /// exits and the interpreter unwinds WITHOUT re-executing the call).
+    pub call_method_ic: usize,
+    /// Pure-prefix helper for `array[index](args...)`: accepts only an own,
+    /// non-hole dense element holding a plain Func/Closure, then frame-calls it
+    /// with `this = array`. Every other receiver/key/element deopts untouched.
+    pub call_method_computed_dense: usize,
+    /// Guarded direct `RegExp.prototype.test` / `exec` CallMethod helper.
+    pub regexp_call_direct: usize,
+    /// Guarded primitive-string `matchAll` / regex `replace` helper.
+    pub string_regexp_call_direct: usize,
+    /// Guarded intrinsic for
+    /// `Object.prototype.hasOwnProperty.call(array, numeric_key)`.
+    pub has_own_call: usize,
+    /// Helper for a generic `f(args…)` (`Call`) in a region (same protocol).
+    pub call_ic: usize,
+    /// Helper for the Tier C CROSS-CALL fast path (B83): a `Call` site whose
+    /// live callee is itself a Tier-C-compiled plain function is dispatched
+    /// native→native through this helper — no `ic_call` probe, no `setup_call`
+    /// frame push, no nested `run_loop` on the clean path. Returns the result
+    /// bits, `SELF_CALL_DEOPT` (not eligible — the emitted site falls through
+    /// to the unchanged `call_ic` helper, a pure prefix), or `CALL_THREW`.
+    pub cross_call: usize,
+    /// Exact rotating same-prototype lexical-arrow/two-argument sibling of
+    /// `cross_call`; it shares the same live-resolution and fallback protocol.
+    pub cross_call_same_proto2: usize,
+    pub quick_len: usize,
+    pub cross3_enter: usize,
+    pub window_close: usize,
+    pub cross3_unroot: usize,
+    pub cross3_finish: usize,
+    /// Value bits of the boot `%Array.prototype%.push` / `%String.prototype%.
+    /// charCodeAt` natives (0 = unavailable), for the split-member-call
+    /// intrinsic lane (`emit_captured_builtin_lane`): a `CallWithThis` whose
+    /// captured callee IS that native runs the dedicated helper.
+    pub push_intrinsic_bits: u64,
+    pub char_code_at_intrinsic_bits: u64,
+    /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
+    /// class-instance receiver): interpreter-IC resolution + getter frame
+    /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
+    pub get_prop_slow: usize,
+    /// The `SetProp` sibling of `get_prop_slow` (setter frame call; 0 = done).
+    pub set_prop_slow: usize,
+    /// Helper for a `GetProp` ACCESSOR-way hit (B114): dispatches the getter
+    /// directly from the matched way (5th arg = the way's address), skipping
+    /// the miss helper. Same return protocol as `get_prop_slow`.
+    pub get_prop_acc: usize,
+    /// The `SetProp` sibling of `get_prop_acc` (setter dispatch; 0 = done).
+    pub set_prop_acc: usize,
+    /// Helper for a region `===`/`!==` whose operands are non-interned heap
+    /// values: full `strict_eq` (read-only; returns 0/1, never deopts).
+    pub strict_eq: usize,
+    /// Helper for a region truthiness test on a non-Int/Bool value (`!x`,
+    /// `JumpIfFalse/True` conditions): full `truthy` (read-only; 0/1).
+    pub truthy: usize,
+    /// Helper that (re)derives a pinned TypedArray's `{obj_bits, base, len}`
+    /// snapshot into a region stack slot (no alloc, no user code).
+    pub ta_snapshot: usize,
+    /// Helper for a Uint8Clamped store of a DOUBLE value: round-half-even
+    /// clamp + byte store (pure — no vm, no alloc).
+    pub ta_clamp_store: usize,
+    /// Helper for a whitelisted `dv.get*(pos[, le])` DataView read (no alloc,
+    /// no user code; anything unusual returns the deopt sentinel).
+    pub dv_get: usize,
+    /// Helper for a UNARY `Math.<op>` over an already-numeric arg (pure: the
+    /// region guards the arg numeric and passes its raw f64 bits). Returns the
+    /// result's f64 bits. No vm, no alloc, no user code.
+    pub math_unary: usize,
+    /// Helper for a TWO-ARG `Math.<op>` (Pow/Atan2/Imul/Min/Max/Hypot) over
+    /// already-numeric args (pure, same constraints). Returns f64 bits.
+    pub math_two: usize,
+    /// Call-free exact-identity guard for the main-realm `Math.imul`, when it
+    /// was pristine at compile time. The emitted check still consumes the
+    /// per-call captured receiver/callee and their live heap-slot generation.
+    pub math_imul_guard: Option<MathIntrinsicGuard>,
+    /// B264: the heap can host the inline dense store lane (nursery on, GC
+    /// oracle off) -- read once per compile from the live heap.
+    pub inline_store_lane_ok: bool,
+    /// Helper for `CellGet` / `UpvalGet` reading a captured-local cell: a pure
+    /// heap LOAD of the cell's inner Value (no alloc, no user code). Returns the
+    /// inner Value bits, or `SELF_CALL_DEOPT` for a still-uninitialized (TDZ)
+    /// cell so the region bails and the interpreter throws.
+    pub cell_get: usize,
+    /// Helper for `UpvalGet` (resolves the running closure's k-th upvalue cell,
+    /// then loads it). Same purity/TDZ contract as `cell_get`.
+    pub upval_get: usize,
+    /// Tier-C variants resolve the frame-free native activation's closure from
+    /// its exact `Vm::jit_tierc_activation` state. Region code keeps using
+    /// `upval_get/set` above.
+    pub tierc_upval_get: usize,
+    pub tierc_upval_set: usize,
+    /// Exact captured `x = (x + 1) | 0` Int fast prefix (returns old bits).
+    pub tierc_upval_inc_i32: usize,
+    /// Intrinsic for `s.indexOf(t)` (ASCII/ASCII, 1 arg); deopts otherwise.
+    pub str_index_of: usize,
+    /// Intrinsic for `s.substring(a[,b])` / `s.slice(a[,b])` (ASCII,
+    /// integral Number args).
+    pub str_substring: usize,
+    /// Intrinsic for `Map.get`/`Map.has`/`Set.has` (op selects which).
+    pub coll_lookup: usize,
+    /// Guarded Tier-C `Map.set`/`Map.clear` mutation helper.
+    pub coll_mutate: usize,
+    /// Guarded primitive-string `toUpperCase()` helper.
+    pub str_upper_case: usize,
+    /// Helpers for `CellSet` / `UpvalSet` — a captured-cell WRITE. A plain heap
+    /// store: no TDZ check, no alloc, no user code, so no pinned refetch.
+    pub cell_set: usize,
+    pub upval_set: usize,
+    /// Helper for `GetIndexConcat` (`obj["name" + i]`) — the own-DATA fast path
+    /// only; a miss or an exotic receiver deopts to the interpreter.
+    pub get_index_concat: usize,
+    /// Helper for `ForInLive` (per-iteration for-in liveness). Delegates to the
+    /// shared `Vm::forin_live`, so it matches the interpreter byte-for-byte.
+    /// May allocate transiently (key re-derivation) — GC-guarded internally.
+    /// Returns the BOOL Value bits.
+    pub forin_live: usize,
+    /// Helper for a region `IterNext` (the for-of step) over the intrinsic
+    /// iterator kinds (%RegExpStringIterator% / live %ArrayIterator% /
+    /// collection iterators behind the pristine ITER_NEXT native). Writes
+    /// value/done straight into the frame window; returns 0 /
+    /// `SELF_CALL_DEOPT` / `CALL_THREW`. ALLOCATES (a match step builds the
+    /// result array) and carries the region loop's GC safe point.
+    pub iter_next: usize,
+    /// Exact matchAll outer-region scalar helpers: two pure protocol guards,
+    /// one allocation-free range step, direct capture StringToNumber, and the
+    /// materialize-before-exit/re-entry closure.
+    pub regexp_scalar_get_iterator: usize,
+    pub regexp_scalar_iter_prime: usize,
+    pub regexp_scalar_step: usize,
+    pub regexp_scalar_capture_num: usize,
+    pub regexp_scalar_flush: usize,
+    /// Exact non-global exec scalar step and materialize-before-exit closure.
+    pub regexp_scalar_exec: usize,
+    pub regexp_scalar_exec_flush: usize,
+    /// Helper for a region `PushFinally` (handler-stack push; total).
+    pub push_finally: usize,
+    /// Helper for a region `PopFinally` (handler-stack pop; total).
+    pub pop_finally: usize,
+    /// Helper for a region `ToNum` whose operand is a primitive string (the
+    /// pure StringToNumber grammar — no user code, no alloc); anything else
+    /// deopts. Bool/null/undefined keep bailing inline as before.
+    pub to_num: usize,
+    /// Helper for `HasProp` (the `in` operator, brand=false) over a non-Proxy
+    /// chain: read-only `Vm::has_property_jit`. Returns the BOOL Value bits, or
+    /// `SELF_CALL_DEOPT` when the op needs user code / a throw (interpreter only).
+    pub has_property: usize,
+    /// Helper for the Q4 leaf-inline ENTRY headroom check (`jit_regs_fits`):
+    /// returns 1 when a carved callee scratch window fits the pinned register
+    /// file. Called once per OSR entry when the region has any inlined call.
+    pub regs_fits: usize,
+    /// Tier C `TypeOf` — `vm.type_of(v)` interned/alloc'd to a heap string;
+    /// returns the result Value bits (a heap string; compared by content via
+    /// the `strict_eq` slow path). Allocates ⇒ post-call refetch when has_prop.
+    pub typeof_str: usize,
+    pub typeof_is: usize,
+    pub typeof_same: usize,
+    pub static_fn: usize,
+    pub to_concat_key: usize,
+    /// Historical delegated entry (selected by
+    /// `ZIPP_NO_CONCAT_PURE_APPEND=1`).
+    pub set_index_concat: usize,
+    /// Pure-success entry: returns `CONCAT_SET_PURE` only for an allocation-free
+    /// own hit or proven-clean append.
+    pub set_index_concat_pure: usize,
+    /// Narrow ordinary `DeleteIndex` helper: exact descriptor-free Array plus
+    /// non-negative tagged Int; returns true bits or the deopt sentinel.
+    pub delete_index: usize,
+    /// W19 M3 -- `DeleteIndexConcat` (`delete obj["k" + i]`) via the shared
+    /// `Vm::delete_index_concat`. Allocates and can run user code (Proxy
+    /// `deleteProperty`); returns the result Value bits or `CALL_THREW`.
+    pub delete_index_concat: usize,
+    /// Tier C `IsArray` — `Array.isArray(v)`; returns Bool bits, or the deopt
+    /// sentinel for the rare throwing case (revoked Proxy).
+    pub is_array: usize,
+    /// Tier C `LenOf` — for-in key-snapshot / array / string length; returns the
+    /// length Value bits (pure, total).
+    pub len_of: usize,
+    /// Tier C `ForInKeys` — materialises the for-in key snapshot Array (nullish →
+    /// empty). ALLOCATES; returns the Array bits / SELF_CALL_DEOPT / CALL_THREW.
+    pub forin_keys: usize,
+}
+
+/// Same-binary A/B switch for the allocation-free fused computed-write lane.
+/// Read while constructing the codegen helper bundle, never by generated code
+/// or on the helper hot path. OFF selects the historical helper entry and makes
+/// the emitter retain its unconditional post-call refetch byte stream.
+#[inline]
+fn concat_pure_append_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CONCAT_PURE_APPEND").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+impl HeapHelperAddrs {
+    /// Bundle these helper addresses with the COMPILING function's id and the
+    /// reserved inline-cache base into the codegen-internal `HeapHelpers`. Used
+    /// by both the OSR region path and Tier C (whole-function mem path).
+    fn to_heap_helpers(&self, func_id: u32, ic_base_idx: u32) -> HeapHelpers {
+        let concat_pure_append = concat_pure_append_enabled();
+        HeapHelpers {
+            func_id,
+            get_prop_miss: self.get_prop_miss,
+            set_prop_miss: self.set_prop_miss,
+            versions_base: self.versions_base,
+            ic_base: self.ic_base,
+            get_index: self.get_index,
+            set_index: self.set_index,
+            array_push: self.array_push,
+            char_code_at: self.char_code_at,
+            concat: self.concat,
+            str_append: self.str_append,
+            str_append_index: self.str_append_index,
+            call_method_ic: self.call_method_ic,
+            call_method_computed_dense: self.call_method_computed_dense,
+            regexp_call_direct: self.regexp_call_direct,
+            string_regexp_call_direct: self.string_regexp_call_direct,
+            has_own_call: self.has_own_call,
+            call_ic: self.call_ic,
+            cross_call: self.cross_call,
+            cross_call_same_proto2: self.cross_call_same_proto2,
+            quick_len: self.quick_len,
+            cross3_enter: self.cross3_enter,
+            window_close: self.window_close,
+            cross3_unroot: self.cross3_unroot,
+            cross3_finish: self.cross3_finish,
+            push_intrinsic_bits: self.push_intrinsic_bits,
+            char_code_at_intrinsic_bits: self.char_code_at_intrinsic_bits,
+            get_prop_slow: self.get_prop_slow,
+            set_prop_slow: self.set_prop_slow,
+            get_prop_acc: self.get_prop_acc,
+            set_prop_acc: self.set_prop_acc,
+            strict_eq: self.strict_eq,
+            truthy: self.truthy,
+            ta_snapshot: self.ta_snapshot,
+            ta_clamp_store: self.ta_clamp_store,
+            dv_get: self.dv_get,
+            math_unary: self.math_unary,
+            math_two: self.math_two,
+            math_imul_guard: self.math_imul_guard,
+            inline_store_lane_ok: self.inline_store_lane_ok,
+            cell_get: self.cell_get,
+            cell_set: self.cell_set,
+            upval_set: self.upval_set,
+            tierc_upval_get: self.tierc_upval_get,
+            tierc_upval_set: self.tierc_upval_set,
+            tierc_upval_inc_i32: self.tierc_upval_inc_i32,
+            get_index_concat: self.get_index_concat,
+            upval_get: self.upval_get,
+            str_index_of: self.str_index_of,
+            str_substring: self.str_substring,
+            coll_lookup: self.coll_lookup,
+            coll_mutate: self.coll_mutate,
+            str_upper_case: self.str_upper_case,
+            forin_live: self.forin_live,
+            iter_next: self.iter_next,
+            regexp_scalar_get_iterator: self.regexp_scalar_get_iterator,
+            regexp_scalar_iter_prime: self.regexp_scalar_iter_prime,
+            regexp_scalar_step: self.regexp_scalar_step,
+            regexp_scalar_capture_num: self.regexp_scalar_capture_num,
+            regexp_scalar_flush: self.regexp_scalar_flush,
+            regexp_scalar_exec: self.regexp_scalar_exec,
+            regexp_scalar_exec_flush: self.regexp_scalar_exec_flush,
+            push_finally: self.push_finally,
+            pop_finally: self.pop_finally,
+            to_num: self.to_num,
+            has_property: self.has_property,
+            regs_fits: self.regs_fits,
+            typeof_str: self.typeof_str,
+            typeof_is: self.typeof_is,
+            typeof_same: self.typeof_same,
+            static_fn: self.static_fn,
+            to_concat_key: self.to_concat_key,
+            set_index_concat: if concat_pure_append {
+                self.set_index_concat_pure
+            } else {
+                self.set_index_concat
+            },
+            concat_pure_append,
+            delete_index: self.delete_index,
+            delete_index_concat: self.delete_index_concat,
+            is_array: self.is_array,
+            len_of: self.len_of,
+            forin_keys: self.forin_keys,
+            ic_base_idx,
+        }
+    }
+}
+
+/// Is the Tier C whole-function memory-path JIT enabled? ON by default (validated
+/// against the full test262 sweep — JIT flag-on 48466/1 with zero new failures —
+/// and bench ALL_CORRECT); opt out with `ZIPP_NO_FNJIT_MEM` to fall back to the
+/// prior tiers only. (`ZIPP_NOJIT` disables the whole JIT upstream of here.) Read
+/// once per `Jit::compile` call (compiles are rare relative to execution).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn fnjit_mem_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_FNJIT_MEM").is_none()
+}
+
+/// Tier-C admission of the proper-tail-call PREFIX op (`TailCall`): the
+/// compiler always follows it with the ordinary `Call`+`Return` of the same
+/// site, so Tier C admits it and emits nothing — see the `mem_can_compile`
+/// arm. `ZIPP_NO_TIERC_TAILCALL=1` restores the blacklist. Read only inside
+/// `mem_can_compile` (per-compile, cold), never on generated code paths.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn tierc_tailcall_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_TAILCALL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W9 tier-selection yield (B121's "Tier C SHADOWS the region tier"): while a
+/// function owns a LIVE register-homed loop region (SROA/INT/DOUBLE — anything
+/// but MEM, whose per-op code equals Tier C's by construction, B107), the
+/// whole-function offer is DECLINED and an already-installed Tier C body is
+/// EVICTED when such a region lands. The interpreter's back-edge then keeps
+/// entering the region (fn-scoped fnv1a: 10.6 → 3.2 ns/iter measured) instead
+/// of Tier C's mem-homed loop shadowing it forever — Tier C's back-edge is a
+/// bare `jmp` that never checks for a region. Memoized: the decline check runs
+/// once per CALL of a shadowed function. `ZIPP_NO_TIERC_YIELD=1` restores the
+/// old behaviour.
+/// W11 (B124): masked splice zero-fill — `ZIPP_NO_SPLICE_FILL=1` pins every
+/// leaf-inline plan's `uninit_mask` to `u64::MAX` (the full per-execution
+/// local fill, byte-identical to pre-W11 emission).
+pub(crate) fn splice_fill_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SPLICE_FILL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W12: splice slot-generation guard — `ZIPP_NO_SPLICE_SLOTGEN=1` pins every
+/// leaf plan's `slot_guard` to `None` (the per-execution callee bits+version
+/// guard, byte-identical to pre-W12 emission). Read at plan time only.
+pub(crate) fn splice_slotgen_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SPLICE_SLOTGEN").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Splice-aware INT admission — `ZIPP_NO_INT_SPLICE=1` keeps every `Call` an
+/// INT-tier reject, so a region whose only disqualifier is a proven-splice leaf
+/// call falls to the memory emitter exactly as it did before. Read at plan time
+/// only. (Distinct from `ZIPP_NO_INT_SPLIT`, the B94 receiver split.)
+pub(crate) fn int_splice_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INT_SPLICE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// The truncation-aware Int add. `ZIPP_NO_INT32_TRUNC_ADD=1` keeps the i32
+/// overflow branch on every boxed-tier `Add`/`Sub`/`AddInt` — the exact
+/// pre-change emission (`trunc_only_arith_ips` then proves nothing). Read once
+/// per process, at plan time only; never on a generated code path.
+pub(crate) fn int32_trunc_add_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Bounded dense-array computed leaf splice. `ZIPP_NO_INT_COMPUTED_LEAF=1`
+/// restores the existing MEMORY `CallMethodComputed` helper on the same binary.
+/// Kept separate from `ZIPP_NO_INT_SPLICE`: the ordinary global-slot Call
+/// splice and this exact dense-array proof have independent A/B surfaces.
+pub(crate) fn int_computed_leaf_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INT_COMPUTED_LEAF").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Typed splice lanes — `ZIPP_NO_TYPED_SPLICE=1` pins every leaf plan's
+/// `typed_lane` to `None` (the boxed per-op splice loop, byte-identical to
+/// the prior emission). Read at plan time only.
+pub(crate) fn typed_splice_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TYPED_SPLICE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 M3 — `DeleteIndexConcat` in a MEM region. `ZIPP_NO_JIT_DELETE=1`
+/// restores the pre-wave state, where the op had no admission arm and every
+/// region containing a `delete obj["k" + i]` DECLINED and was blacklisted
+/// (`polymorphic-objects` region `[145,155]`, its 900k-delete loop). Read at
+/// ADMISSION time only, so OFF reproduces the old plan byte-identically.
+pub(crate) fn jit_delete_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JIT_DELETE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Ordinary `DeleteIndex` on the narrow allocation-free Array+Int MEM lane.
+/// `ZIPP_NO_JIT_ARRAY_DELETE=1` restores the historical admission failure, so
+/// a function/region containing the op generates no new native byte stream.
+/// Read only at admission time, never on the generated hot path.
+pub(crate) fn jit_array_delete_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JIT_ARRAY_DELETE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (MI-LANE): method-inline typed lanes — `ZIPP_NO_MI_LANE=1` pins every
+/// `MethodInlineShape::typed_lane` to `None`, so `emit_inline_method_call` and
+/// `emit_inline_accessor` emit the boxed `emit_mi_body` path (with its `this`
+/// bind, argument copy and window zero-fill) byte-identically to pre-wave
+/// builds. Read at PLAN time only — never on a hot path.
+pub(crate) fn mi_lane_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_MI_LANE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M1): absent-index fast answer in `array_iter_get` —
+/// `ZIPP_NO_HOLE_ABSENT_FAST=1` restores the pre-wave fall-through, where a
+/// hole or an out-of-range index inside a builtin's element walk (slice /
+/// concat / the change-by-copy snapshot / the hole-skipping callback arms)
+/// paid a full `has_property_dyn` prototype walk. OFF reproduces the prior
+/// behaviour exactly: the fast answer is `Ok(None)`, which is precisely what
+/// the walk it replaces returns for the same receiver shapes.
+pub(crate) fn hole_absent_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HOLE_ABSENT_FAST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M5): fused `HasProp` → `JumpIf` on the MEM tier —
+/// `ZIPP_NO_HASPROP_JUMPFUSE=1` restores the pre-wave emission, where the
+/// pinned-array `in` inline stored `true` and then let the next ip reload it,
+/// tag-dispatch it and test it. Independent of `ZIPP_NO_MEM_CMPJUMP`, which
+/// still gates the underlying `cmp_branch_pair` detector (both must be on).
+/// Read at region-compile time only.
+pub(crate) fn hasprop_jumpfuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HASPROP_JUMPFUSE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Pinned dense-Array `HasProp` absent answer. `jit_ta_snapshot` publishes a
+/// bit only while the receiver uses the default chain and the sticky indexed-
+/// prototype protector is still valid; the MEM emitter may then answer a hole
+/// or positive out-of-bounds Int key as `false` without crossing the helper.
+/// `ZIPP_NO_HASPROP_PIN_ABSENT=1` restores the old hole/OOB helper route.
+/// B264 inline pinned dense-Array `SetIndex` lane in MEM regions: identity
+/// guard, integer key, in-range, YOUNG holder (no barrier needed), present
+/// element or licensed hole-fill, then a direct 8-byte store -- no helper
+/// call, no snapshot refetch. `ZIPP_NO_INLINE_DENSE_STORE=1` restores the
+/// helper-only route.
+pub(crate) fn inline_dense_store_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INLINE_DENSE_STORE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B267: in Tier C, a truncation-only `Add`/`AddInt` (see
+/// `trunc_only_arith_ips`) followed by `LoadInt 0; Bitwise Or` -- the `x | 0`
+/// idiom -- writes its wrapped Int straight into the Or's destination on the
+/// Int path and skips both following ops (their registers are still written,
+/// so a later deopt sees the same frame). `ZIPP_NO_TRUNC_OR_FUSE=1` restores
+/// the three-op emission.
+pub(crate) fn trunc_or_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TRUNC_OR_FUSE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+pub(crate) fn hasprop_pin_absent_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HASPROP_PIN_ABSENT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M2): a HOLE reads `undefined` under the indexed-prototype protector —
+/// `ZIPP_NO_HOLE_UNDEF=1` restores the pre-wave pair, where the JIT helper
+/// `SELF_CALL_DEOPT`ed on every hole read (so a holey array was JIT-dead) and
+/// the interpreter spelled the index and walked the prototype chain for it.
+/// Read by the JIT helper and its interpreter twin, which must always agree.
+pub(crate) fn hole_undef_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HOLE_UNDEF").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M3): `has_property_jit`'s overlay arm — `ZIPP_NO_INDEX_IN_OVERLAY=1`
+/// restores the receiver-level refusal, where ANY array carrying an element
+/// overlay declined the whole `in` shortcut (so even a probe landing inside
+/// the dense prefix paid the generic walk).
+pub(crate) fn index_in_overlay_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INDEX_IN_OVERLAY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M4): `forin_live`'s Array arm — `ZIPP_NO_FORIN_ARR_OWN=1` restores the
+/// Object-only alloc-free own-hit probe, so an ARRAY receiver again fell to
+/// `has_property` plus a freshly allocated key `String` per iteration.
+pub(crate) fn forin_arr_own_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_FORIN_ARR_OWN").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Sparse rows: skip `ForInLive`'s per-key ownership/prototype lookup while the
+/// exact receiver + default Array/Object prototype versions captured beside the
+/// key snapshot still match. `ZIPP_NO_FORIN_VERSION_FAST=1` keeps the snapshot
+/// format but restores the old liveness lookup for every key, giving a clean
+/// same-binary comparator.
+pub(crate) fn forin_version_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_FORIN_VERSION_FAST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W14: multi-receiver B94 live-range splitting — `ZIPP_NO_MULTI_SPLIT=1`
+/// restores the hard budget of ONE non-DataView element split per region and
+/// the narrow `pin_obj` match that only ever recognised element and DataView
+/// receivers (so a recycled pinned-STRING receiver declined the whole region).
+/// Read at plan time only.
+pub(crate) fn multi_split_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_MULTI_SPLIT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W17: B97 write-through home sharing on a `share_homes` re-plan that the
+/// GPR emitter ALONE consumes — `ZIPP_NO_GPR_WT_SHARE=1` restores the pre-wave
+/// plans byte-for-byte. Read at plan time only.
+///
+/// THE CONTRACT, stated once here rather than restated at each retry site.
+/// `admit_wt_share` lets a register that is textually READ OUTSIDE the region
+/// share an xmm home instead of pinning a permanent one: its every def is
+/// written through to `[rbx + dreg(r)]` and `flush_exit` skips it, so the
+/// shared home is invisible in its frame slot. That is sound for a plan iff
+/// the emitter that consumes it implements the write-through. Two emitters do:
+/// REGALLOC (double), which has passed `admit_wt_share=true` since B97, and
+/// `compile_region_int_gpr`, def-complete since W9 (`gpr_home_map` refuses a
+/// plan carrying `write_through` unless `dv_gpr_enabled()`). The xmm INT
+/// emitter does NOT — admitting B97 there silently returned the WRONG ANSWER
+/// (a shareable register loses its entry load, so its home starts as garbage
+/// and the int flush wrote that garbage into the frame slot).
+///
+/// So the licence is not "which tier" but "does THIS plan reach only the GPR
+/// emitter". A `share_homes` re-plan does, at all three of `region_int`'s
+/// retry sites: each hands its plan to `compile_region_int_gpr` and to nothing
+/// else — the xmm fallback below them keeps the ORIGINAL distinct-homes plan.
+/// The DV retry already relied on exactly this (W9) and stays unconditional;
+/// this switch gates only the two sites the wave adds, so OFF reproduces
+/// today's plans exactly.
+///
+/// WHY IT PAYS: the `parse-large-js` mix loop runs at TOP LEVEL, where the
+/// bytecode compiler recycles registers across the script's phases, so three
+/// of the flattened body's temps (two copies of the loop counter `ti`, and one
+/// register that is a `ti` copy in one half of the body and a pinned receiver
+/// in the other) are "read outside" only by that recycling — and each pinned a
+/// whole-region home. Eleven mapped homes against a pool of 8 (+2 once the i53
+/// guard constants are inlined). Releasing those three lands the plan at 9, so
+/// the region reaches the GPR emitter instead of paying three xmm↔gpr
+/// transfers on each of its nine `Bitwise`/`Math.imul` ops per iteration.
+/// Measured: the row's mix phase 67ms -> 20ms, the row 412ms -> 363ms.
+///
+/// W17 shipped this DARK (opt-in, `ZIPP_GPR_WT_SHARE=1`) and W18 turned it on
+/// by default. The mechanism was sound in itself all along; what blocked it was
+/// that releasing those whole-region pins made a SEPARATE, pre-existing defect
+/// REACHABLE on programs that had not reached it before — a local whose only
+/// in-region definition sits on a conditional branch lost its entry load and
+/// read its home as garbage, because `shareable`/`first_seen` treated "the first
+/// occurrence is a def" as "a def dominates every use". Two soak programs that
+/// answered correctly without the flag answered WRONG with it, and all 62
+/// mode-cells were restored by turning it off, so it had to stay dark.
+///
+/// W18 closed that defect at its root: `plan_region::region_liveness` derives
+/// the region's true live-in set from the same backward walk that produces the
+/// live spans, and one `live_in(r)` predicate now answers `shareable` and
+/// `range` — a register reachable-with-no-def keeps a permanent home and an
+/// entry load whether or not it is `read_outside`. What made this mechanism
+/// dangerous was never the sharing; it was that sharing exposed an unfilled
+/// home, and an unfilled home is no longer possible.
+///
+/// Evidence for the flip, in the order it was required:
+///   * both `#[ignore]`d `open_conditional_def_loses_its_entry_load` specs, and
+///     `tests/conditional_def_live_in.rs` (9 non-dominating def shapes x
+///     read-after-loop x 2 tiers, re-run under 7 switch modes), pass — and
+///     fail with only the `live_in` hunk reverted;
+///   * the two soak programs W17's gate named (`W17_GATE_*.js` in the wave
+///     scratchpad) now answer correctly WITH the flag on. The `fnv1a`-shaped
+///     one is the sharp case: it answered `6add77f1` by default and `69dd7568`
+///     under the flag before the fix, and `6add77f1` in both positions after;
+///   * 72,000 generated programs over 12 unused seeds and all 37 modes, half
+///     with the flag on and half off, produced the SAME single divergence in
+///     both halves — a pre-existing negative-`%`-index defect that reproduces
+///     at the committed HEAD with no lane's work applied and is wrong with this
+///     flag OFF too, so it is not this mechanism's.
+///
+/// MEASURED ON THE DEFAULT BUILD (W18, 21 paired reps, one binary, the switch
+/// as the only difference): `parse-large-js` 420ms -> 370ms, **-11.6%
+/// [-12.6, -11.1]** — W17's -11.8% [-12.2, -11.3] reproduced now that the row
+/// is the default. `bench/w18_gprwtshare_default_2026-08-22.json`.
+///
+/// `ZIPP_NO_GPR_WT_SHARE=1` restores the pre-W17 plans byte-for-byte, matching
+/// every other perf mechanism in this file: a memoized latch, read at plan time,
+/// never on a hot path.
+pub(crate) fn gpr_wt_share_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_GPR_WT_SHARE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Stored-global live-range narrowing + mixed-role temp splitting on the
+/// INT-GPR region tier — `ZIPP_NO_GLOB_RANGE=1` pins every stored global to
+/// its B96 permanent whole-region home and every recycled temp to one
+/// contiguous interval (the pre-wave linear-scan allocation, byte-identical).
+/// Read at plan time only, and only for plans routed exclusively into the
+/// GPR emitter (`admit_dv || share_homes`).
+pub(crate) fn glob_range_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_GLOB_RANGE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Chain-link fast helper — `ZIPP_NO_CHAIN_FAST=1` keeps every
+/// `StrConcatChain` emission on `jit_concat_chain` with an unconditional
+/// pinned-pointer refetch (byte-identical to the prior emission). Read at
+/// emit time only.
+pub(crate) fn chain_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CHAIN_FAST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W11 (B124): splice arg aliasing — `ZIPP_NO_SPLICE_ALIAS=1` pins
+/// `alias_params` to 0 (params always copied, byte-identical to pre-W11).
+pub(crate) fn splice_alias_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SPLICE_ALIAS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+fn tierc_yield_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_YIELD").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Same-binary A/B switch for the W7 cross-call residual trim (the window-fill
+/// fast path): `ZIPP_NO_CROSSCALL2=1` pins every installed cross entry's
+/// uninit mask to `u64::MAX`, so the helper zero-fills the whole callee window
+/// per call exactly as before W7. Read once per `Jit::compile` (compiles are
+/// rare relative to execution) — zero per-call cost either way.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn crosscall2_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_CROSSCALL2").is_none()
+}
+
+/// Same-binary A/B switch for extending W7's selective callee-window fill to
+/// Tier-C functions whose register file spans more than one `u64` mask word.
+/// The wide analysis remains subordinate to `ZIPP_NO_CROSSCALL2`: disabling
+/// W7 still restores the pre-W7 full-fill path for every function.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn crosscall_wide_mask_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_CROSSCALL_WIDE_MASK").is_none()
+}
+
+/// A Tier-C function whose bytecode is the compiler's exact recursive
+/// JSON-tree counter shape.  The native cross-call helper may reduce one whole
+/// plain tree and commit these six globals once, instead of crossing the
+/// native boundary once per node.  This is metadata only: the runtime helper
+/// still validates the type-name constants, live self binding, counter types,
+/// and every traversed heap object before it performs any visible write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JsonWalkPlan {
+    pub(crate) nodes: u32,
+    pub(crate) nulls: u32,
+    pub(crate) sum2x: u32,
+    pub(crate) strings: u32,
+    pub(crate) string_len: u32,
+    pub(crate) bools: u32,
+    pub(crate) self_global: u32,
+    pub(crate) number_bits: u64,
+    pub(crate) string_bits: u64,
+    pub(crate) boolean_bits: u64,
+}
+
+/// A Tier-C function whose source and closed bytecode metadata are the exact
+/// hand-written Markdown inline scanner below. The cross-call helper may run
+/// its ASCII-only equivalent without materialising every one-character slice
+/// and intermediate rope. Runtime guards still re-read the live `escapeHtml`
+/// binding and both String prototype methods before accepting an argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MarkdownInlinePlan {
+    pub(crate) escape_html_global: u32,
+}
+
+const MARKDOWN_ESCAPE_HTML_SOURCE: &str = r#"function escapeHtml(s) {
+  // fast path: scan for chars needing escape
+  var out = "", last = 0;
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    if (c === 38) { out += s.substring(last, i) + "&amp;"; last = i + 1; }
+    else if (c === 60) { out += s.substring(last, i) + "&lt;"; last = i + 1; }
+    else if (c === 62) { out += s.substring(last, i) + "&gt;"; last = i + 1; }
+  }
+  return last === 0 ? s : out + s.substring(last);
+}"#;
+
+const MARKDOWN_INLINE_SOURCE: &str = r#"function renderInline(s) {
+  var out = "", i = 0, n = s.length;
+  var bold = false, ital = false;
+  while (i < n) {
+    var c = s.charCodeAt(i);
+    if (c === 42) { // '*'
+      if (i + 1 < n && s.charCodeAt(i + 1) === 42) {
+        out += bold ? "</strong>" : "<strong>";
+        bold = !bold;
+        i += 2;
+      } else {
+        out += ital ? "</em>" : "<em>";
+        ital = !ital;
+        i += 1;
+      }
+      continue;
+    }
+    if (c === 96) { // '`' code span: escape contents, no nesting
+      var j = i + 1;
+      while (j < n && s.charCodeAt(j) !== 96) j++;
+      out += "<code>" + escapeHtml(s.substring(i + 1, j)) + "</code>";
+      i = j + 1;
+      continue;
+    }
+    if (c === 91) { // '[' link: [text](url)
+      var ct = i + 1;
+      while (ct < n && s.charCodeAt(ct) !== 93) ct++;
+      if (ct + 1 < n && s.charCodeAt(ct + 1) === 40) {
+        var cu = ct + 2;
+        while (cu < n && s.charCodeAt(cu) !== 41) cu++;
+        out += '<a href="' + s.substring(ct + 2, cu) + '">' + escapeHtml(s.substring(i + 1, ct)) + "</a>";
+        i = cu + 1;
+        continue;
+      }
+    }
+    if (c === 38) { out += "&amp;"; i++; continue; }
+    if (c === 60) { out += "&lt;"; i++; continue; }
+    if (c === 62) { out += "&gt;"; i++; continue; }
+    out += s[i];
+    i++;
+  }
+  return out;
+}"#;
+
+#[inline]
+fn exact_function_source(source: &str, expected: &str) -> bool {
+    source == expected
+        || (source.as_bytes().contains(&b'\r') && source.replace("\r\n", "\n") == expected)
+}
+
+/// Runtime validation for the live helper binding used by
+/// [`MarkdownInlinePlan`]. This is intentionally just as exact as the caller
+/// recogniser: a lookalike helper can contain coercions or observable calls.
+/// Register allocation is deliberately not part of the licence: the exact
+/// source and semantic function metadata pin the behaviour, while register
+/// counts are a compiler-layout detail that changes under equivalent lowering.
+pub(crate) fn markdown_escape_html_proto(proto: &FuncProto) -> bool {
+    proto.name == "escapeHtml"
+        && proto.param_count == 1
+        && proto.length == 1
+        && proto.is_strict
+        && proto.simple_params
+        && proto.rest_reg.is_none()
+        && proto.arguments_reg.is_none()
+        && !proto.is_generator
+        && !proto.is_async
+        && !proto.non_constructable
+        && !proto.lexical_this
+        && !proto.super_static
+        && proto.upvalues.is_empty()
+        && proto.eval_sites.is_empty()
+        && exact_function_source(&proto.source, MARKDOWN_ESCAPE_HTML_SOURCE)
+}
+
+/// Recognise only the exact benchmark-independent inline Markdown scanner.
+/// Source identity pins comments, control flow and every emitted literal; the
+/// two equal `LoadGlobal`s recover the helper binding without baking a global
+/// slot number. As with the helper proof, register count is intentionally not a
+/// semantic gate. `ZIPP_NO_MARKDOWN_INLINE_REDUCE=1` omits the plan entirely.
+pub(crate) fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePlan> {
+    // The name first: it rejects every function but one, and the switch is a
+    // read of the process environment.
+    if proto.name != "renderInline"
+        || std::env::var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some()
+        || proto.param_count != 1
+        || proto.length != 1
+        || !proto.is_strict
+        || !proto.simple_params
+        || proto.rest_reg.is_some()
+        || proto.arguments_reg.is_some()
+        || proto.is_generator
+        || proto.is_async
+        || proto.non_constructable
+        || proto.lexical_this
+        || proto.super_static
+        || !proto.upvalues.is_empty()
+        || !proto.eval_sites.is_empty()
+        || !exact_function_source(&proto.source, MARKDOWN_INLINE_SOURCE)
+    {
+        return None;
+    }
+    let mut loads = proto.code.iter().filter_map(|ins| match ins {
+        Instr::LoadGlobal { idx, .. } => Some(*idx),
+        _ => None,
+    });
+    let escape_html_global = loads.next()?;
+    if loads.next() != Some(escape_html_global) || loads.next().is_some() {
+        return None;
+    }
+    if crate::jitlog_enabled() {
+        eprintln!("[jit] markdown-inline plan installed (escape_global={escape_html_global})");
+    }
+    Some(MarkdownInlinePlan { escape_html_global })
+}
+
+/// Recognise only the closed bytecode emitted for the benchmark-independent
+/// idiom below (register numbers are deliberately part of the licence):
+///
+/// ```text
+/// count++;
+/// null / number / string / boolean leaves update numeric globals;
+/// arrays recurse by dense index; objects recurse through for-in.
+/// ```
+///
+/// Keeping this exact is intentional.  A looser source-level resemblance can
+/// hide getters, coercions, a different visit order, or observable work between
+/// recursive calls. `ZIPP_NO_JSON_WALK_REDUCE=1` omits the plan entirely.
+fn json_walk_plan(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> Option<JsonWalkPlan> {
+    if proto.param_count != 1
+        || proto.reg_count != 43
+        || std::env::var_os("ZIPP_NO_JSON_WALK_REDUCE").is_some()
+        || !proto.is_strict
+        || !proto.simple_params
+        || proto.rest_reg.is_some()
+        || proto.arguments_reg.is_some()
+        || proto.is_generator
+        || proto.is_async
+        || proto.lexical_this
+        || !proto.upvalues.is_empty()
+        || proto.code.len() != 64
+        || proto.string_constants.get(2).map(String::as_str) != Some("length")
+        || proto.string_constants.get(4).map(String::as_str) != Some("length")
+    {
+        return None;
+    }
+    let c = &proto.code;
+    let nodes = match &c[0] {
+        Instr::LoadGlobal { dst: 6, idx } => *idx,
+        _ => return None,
+    };
+    let nulls = match &c[6] {
+        Instr::LoadGlobal { dst: 10, idx } => *idx,
+        _ => return None,
+    };
+    let sum2x = match &c[14] {
+        Instr::LoadGlobal { dst: 15, idx } => *idx,
+        _ => return None,
+    };
+    let strings = match &c[23] {
+        Instr::LoadGlobal { dst: 19, idx } => *idx,
+        _ => return None,
+    };
+    let string_len = match &c[26] {
+        Instr::LoadGlobal { dst: 20, idx } => *idx,
+        _ => return None,
+    };
+    let bools = match &c[34] {
+        Instr::LoadGlobal { dst: 24, idx } => *idx,
+        _ => return None,
+    };
+    let self_global = match &c[43] {
+        Instr::LoadGlobal { dst: 31, idx } => *idx,
+        _ => return None,
+    };
+    let number_const = match &c[11] {
+        Instr::LoadConst { dst: 14, idx } => *idx,
+        _ => return None,
+    };
+    let string_const = match &c[20] {
+        Instr::LoadConst { dst: 18, idx } => *idx,
+        _ => return None,
+    };
+    let boolean_const = match &c[31] {
+        Instr::LoadConst { dst: 23, idx } => *idx,
+        _ => return None,
+    };
+    // String constants in `FuncProto::constants` still carry their pre-intern
+    // placeholder indices. Tier-C's `const_strs` is the resolved, rooted Value
+    // table that generated LoadConst uses; retain those exact bits in the plan.
+    let number_bits = *const_strs.get(&number_const)?;
+    let string_bits = *const_strs.get(&string_const)?;
+    let boolean_bits = *const_strs.get(&boolean_const)?;
+    let globals = [nodes, nulls, sum2x, strings, string_len, bools, self_global];
+    if globals
+        .iter()
+        .enumerate()
+        .any(|(i, x)| globals[..i].contains(x))
+        || proto.name_global != Some(self_global)
+    {
+        return None;
+    }
+    macro_rules! op {
+        ($ip:literal, $pat:pat $(if $guard:expr)?) => {
+            if !matches!(&c[$ip], $pat $(if $guard)?) {
+                return None;
+            }
+        };
+    }
+    op!(
+        1,
+        Instr::AddInt {
+            dst: 6,
+            a: 6,
+            imm: 1,
+            upd: true
+        }
+    );
+    op!(2, Instr::StoreGlobalResolved { idx, src: 6 } if *idx == nodes);
+    op!(3, Instr::LoadNull { dst: 9 });
+    op!(4, Instr::Eq { dst: 7, a: 1, b: 9 });
+    op!(
+        5,
+        Instr::JumpIfFalse {
+            cond: 7,
+            target: 10
+        }
+    );
+    op!(
+        7,
+        Instr::AddInt {
+            dst: 10,
+            a: 10,
+            imm: 1,
+            upd: true
+        }
+    );
+    op!(8, Instr::StoreGlobalResolved { idx, src: 10 } if *idx == nulls);
+    op!(9, Instr::ReturnUndefined);
+    op!(10, Instr::TypeOf { dst: 5, a: 1 });
+    op!(
+        12,
+        Instr::Eq {
+            dst: 12,
+            a: 5,
+            b: 14
+        }
+    );
+    op!(
+        13,
+        Instr::JumpIfFalse {
+            cond: 12,
+            target: 20
+        }
+    );
+    op!(15, Instr::LoadInt { dst: 18, val: 2 });
+    op!(
+        16,
+        Instr::Mul {
+            dst: 16,
+            a: 1,
+            b: 18
+        }
+    );
+    op!(
+        17,
+        Instr::Add {
+            dst: 15,
+            a: 15,
+            b: 16
+        }
+    );
+    op!(18, Instr::StoreGlobalResolved { idx, src: 15 } if *idx == sum2x);
+    op!(19, Instr::ReturnUndefined);
+    op!(
+        21,
+        Instr::Eq {
+            dst: 16,
+            a: 5,
+            b: 18
+        }
+    );
+    op!(
+        22,
+        Instr::JumpIfFalse {
+            cond: 16,
+            target: 31
+        }
+    );
+    op!(
+        24,
+        Instr::AddInt {
+            dst: 19,
+            a: 19,
+            imm: 1,
+            upd: true
+        }
+    );
+    op!(25, Instr::StoreGlobalResolved { idx, src: 19 } if *idx == strings);
+    op!(
+        27,
+        Instr::GetProp {
+            dst: 21,
+            obj: 1,
+            name: 2
+        }
+    );
+    op!(
+        28,
+        Instr::Add {
+            dst: 20,
+            a: 20,
+            b: 21
+        }
+    );
+    op!(29, Instr::StoreGlobalResolved { idx, src: 20 } if *idx == string_len);
+    op!(30, Instr::ReturnUndefined);
+    op!(
+        32,
+        Instr::Eq {
+            dst: 21,
+            a: 5,
+            b: 23
+        }
+    );
+    op!(
+        33,
+        Instr::JumpIfFalse {
+            cond: 21,
+            target: 38
+        }
+    );
+    op!(
+        35,
+        Instr::AddInt {
+            dst: 24,
+            a: 24,
+            imm: 1,
+            upd: true
+        }
+    );
+    op!(36, Instr::StoreGlobalResolved { idx, src: 24 } if *idx == bools);
+    op!(37, Instr::ReturnUndefined);
+    op!(38, Instr::IsArray { dst: 25, a: 1, .. });
+    op!(
+        39,
+        Instr::JumpIfFalse {
+            cond: 25,
+            target: 50
+        }
+    );
+    op!(40, Instr::LoadInt { dst: 3, val: 0 });
+    op!(
+        41,
+        Instr::GetProp {
+            dst: 28,
+            obj: 1,
+            name: 4
+        }
+    );
+    op!(
+        42,
+        Instr::JumpIfNotLt {
+            a: 3,
+            b: 28,
+            target: 49
+        }
+    );
+    op!(
+        44,
+        Instr::GetIndex {
+            dst: 32,
+            obj: 1,
+            key: 3
+        }
+    );
+    op!(
+        45,
+        Instr::Call {
+            dst: 30,
+            callee: 31,
+            arg_base: 32,
+            argc: 1
+        }
+    );
+    op!(
+        46,
+        Instr::AddInt {
+            dst: 3,
+            a: 3,
+            imm: 1,
+            upd: true
+        }
+    );
+    op!(47, Instr::Move { dst: 33, src: 3 });
+    op!(48, Instr::Jump { target: 41 });
+    op!(49, Instr::ReturnUndefined);
+    op!(50, Instr::Move { dst: 34, src: 1 });
+    op!(51, Instr::ForInKeys { dst: 35, obj: 34 });
+    op!(52, Instr::LenOf { dst: 36, obj: 35 });
+    op!(53, Instr::LoadInt { dst: 37, val } if *val == crate::bytecode::FORIN_SNAPSHOT_PREFIX as i32);
+    op!(
+        54,
+        Instr::JumpIfNotLt {
+            a: 37,
+            b: 36,
+            target: 63
+        }
+    );
+    op!(
+        55,
+        Instr::GetIndex {
+            dst: 4,
+            obj: 35,
+            key: 37
+        }
+    );
+    op!(
+        56,
+        Instr::ForInLive {
+            dst: 38,
+            obj: 35,
+            key: 4
+        }
+    );
+    op!(
+        57,
+        Instr::JumpIfFalse {
+            cond: 38,
+            target: 61
+        }
+    );
+    op!(58, Instr::LoadGlobal { dst: 39, idx } if *idx == self_global);
+    op!(
+        59,
+        Instr::GetIndex {
+            dst: 40,
+            obj: 1,
+            key: 4
+        }
+    );
+    op!(
+        60,
+        Instr::Call {
+            dst: 38,
+            callee: 39,
+            arg_base: 40,
+            argc: 1
+        }
+    );
+    op!(
+        61,
+        Instr::AddInt {
+            dst: 37,
+            a: 37,
+            imm: 1,
+            upd: false
+        }
+    );
+    op!(62, Instr::Jump { target: 54 });
+    op!(63, Instr::ReturnUndefined);
+    Some(JsonWalkPlan {
+        nodes,
+        nulls,
+        sum2x,
+        strings,
+        string_len,
+        bools,
+        self_global,
+        number_bits,
+        string_bits,
+        boolean_bits,
+    })
+}
+
+/// One compiled native function plus the buffer backing it.
+pub struct JitFn {
+    _buf: ExecutableBuffer,
+    entry: *const u8,
+    /// `(global slot, the Value bits it held at compile time)` when this body
+    /// contains a SELF-CALL — Tier A's `emit_self_call`, which emits a direct
+    /// `call` to this function's own entry with no callee guard at all.
+    ///
+    /// That direct call is only equivalent to the bytecode `LoadGlobal(self_slot)
+    /// + Call` it replaces while the slot still holds THIS function. Rebind the
+    /// name (`fib = function (n) { return 0; }`) and the interpreter's every inner
+    /// `fib(n-1)` re-resolves to the new function, collapsing the recursion on the
+    /// first hop, while compiled code kept calling itself — B66's second open tier
+    /// divergence, and a wrong ANSWER, not a crash.
+    ///
+    /// `None` for a body with no self-call and for every Tier C / region / kernel
+    /// compile, which resolve callees the ordinary way.
+    self_binding: Option<(u32, u64)>,
+    /// The int tier (Tier A) compiled this whole-function body. Such a body
+    /// reads no captures and touches no frame's handler stack, so it can be
+    /// entered over a bare register window with no `Frame` and no activation
+    /// (the array builtins' callback window always has been); a Tier C body
+    /// says the same through its cross entry instead.
+    int_tier: bool,
+}
+
+impl JitFn {
+    /// B237: the emitted buffer's address range, for the PC profiler's
+    /// sample-to-body mapping. The buffer is mmap'd and never moves.
+    pub(crate) fn code_span(&self) -> (u64, usize) {
+        (self._buf.as_ptr() as u64, self._buf.len())
+    }
+
+    /// Raw native entry pointer (for self-recursive calls that re-enter the
+    /// same code through the win64 trampoline).
+    pub fn entry(&self) -> *const u8 {
+        self.entry
+    }
+
+    /// The compile-time self-binding assumption, if this body made one.
+    #[inline]
+    pub fn self_binding(&self) -> Option<(u32, u64)> {
+        self.self_binding
+    }
+
+    /// Whether the int tier compiled this whole-function body (see the field).
+    #[inline]
+    pub fn int_tier(&self) -> bool {
+        self.int_tier
+    }
+
+    /// Run the native code over `regs`. ABI: `(regs, bail_ip, vm) -> result`.
+    /// Returns `(result_bits, bail_ip)`: `bail_ip == NO_BAIL` means a normal
+    /// return with `result_bits`; otherwise the interpreter must resume at
+    /// `bail_ip` (result_bits is meaningless).
+    ///
+    /// # Safety
+    /// `regs` must point to at least the function's `reg_count` valid `Value`
+    /// slots; `vm` must be a valid `*mut Vm`; the buffer outlives the call.
+    pub unsafe fn run(&self, regs: *mut u64, vm: *mut core::ffi::c_void) -> (u64, u32) {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+        let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            mem::transmute(self.entry);
+        let mut bail: u32 = NO_BAIL;
+        let r = f(regs, &mut bail as *mut u32, vm);
+        (r, bail)
+    }
+}
+
+/// A compiled loop region (OSR): native code for the bytecode range
+/// `[start, end]`, entered at `start` (the loop header). `deopts` counts native
+/// runs that bailed back inside the region; past `OSR_DEOPT_LIMIT` the region is
+/// evicted. A native run returns the ip to resume interpreting at — a clean loop
+/// exit (ip outside `[start,end]`) or a guard bail (ip inside it).
+pub struct Region {
+    code: JitFn,
+    start: u32,
+    end: u32,
+    deopts: u32,
+    /// Successful (non-bailing) exits since the last decay. `deopts` is a RATE
+    /// budget, not a lifetime total — see `note_region_resume`.
+    ok_runs: u32,
+    /// True if compiled by the integer path. On eviction an int region falls
+    /// back to the double path (rather than full-blacklisting the loop).
+    is_int: bool,
+    /// True if compiled by the MEMORY path (`region_mem`) rather than one of the
+    /// register-homed paths. Purely diagnostic: `try_run_osr` uses it to pick the
+    /// profiler phase, so `ZIPP_PROF=1` can separate `jit-fast` from `jit-mem`.
+    is_mem: bool,
+    /// Set when this region was object-scalar-replaced (SROA): its GetProp/SetProp
+    /// were rewritten to scratch field-globals. The interpreter must sync the
+    /// object's fields ↔ the pool slots around each native run.
+    field_plan: Option<FieldSyncPlan>,
+    /// Fresh local aggregates elided from an index-preserving cloned proto.
+    /// On an internal guard bail the interpreter materializes the allocations
+    /// that have logically executed before resuming original bytecode.
+    local_sroa: Option<LocalSroaPlan>,
+    /// W20: the register-tier compile engaged the BOXREF arms (a boxed heap value
+    /// and an inline-cache probe inside a register-homed region). On eviction such
+    /// a region RETRIES without them instead of being blacklisted — a blacklisted
+    /// DOUBLE region leaves the loop INTERPRETED (B102 measured that shape at 11x),
+    /// and the memory tier that was working is exactly what the retry lands on.
+    is_boxref: bool,
+}
+
+/// How the interpreter syncs a scalar-replaced object around a native region run:
+/// for each accessed field, the pool global slot holding it during the run.
+#[derive(Clone)]
+pub struct FieldSyncPlan {
+    /// The global slot holding the promoted object.
+    pub obj_global: u32,
+    /// `(field name-constant index, pool global slot)` for each accessed field.
+    pub fields: Vec<(u32, u32)>,
+    /// The function id whose `string_constants` the name indices belong to.
+    pub func_id: u32,
+    /// Compile-time heap identity of the promoted object: a region-entry guard
+    /// bails (→ interpreter) if the global was reassigned to a different object.
+    pub obj_idx: u32,
+    /// Compile-time heap shape version: a region-entry guard bails if it changed
+    /// (a key add/remove/redefine, freeze, or `setPrototypeOf` could have turned
+    /// a promoted data field into an accessor / non-writable — see
+    /// sroa-accessor-miscompile). Normal stores to existing slots don't bump it.
+    pub obj_version: u32,
+}
+
+/// Ways per JIT inline-cache site (matches the interpreter's `IC_WAYS`): a
+/// region `GetProp`/`SetProp` probes up to this many entries natively before
+/// falling to the miss helper, so polymorphic shape-cycling loops stay call-free.
+pub const JIT_IC_WAYS: usize = 8;
+/// Byte stride of one [`IcEntry`] (`size_of`, kept explicit for the emitter).
+pub const JIT_IC_STRIDE: usize = 64;
+/// Maximum proto-chain hops one [`IcEntry`] can guard (the interpreter's
+/// `IC_MAX_HOPS` is 6; 5 fits the 64-byte entry and covers depth-5 chains —
+/// the deepest the real-world benches walk).
+pub const JIT_IC_MAX_HOPS: usize = 5;
+
+/// Empty marker for an IDENTITY inline-cache way. Tag selector 6 is outside
+/// the five Value tags and denotes a NaN bit pattern; every numeric boundary
+/// canonicalizes NaN to `QNAN_BITS`, so no script-visible Value can equal it.
+/// Direct SHAPE sites deliberately retain all-zero storage because their four
+/// packed pattern slots use zero as the free marker.
+pub(crate) const JIT_IC_EMPTY_BITS: u64 = 0x7FFE_0000_0000_0001;
+
+/// Element type of [`Jit::ic_rot`]. Aliased so that [`IC_ROT_PERIOD`] — the
+/// rotation-escape window a widening would silently stretch — is DERIVED from
+/// the cursor rather than written down beside it.
+type IcRotCursor = u8;
+/// Misses between two rotation-escape windows at a gated site: the wrap period
+/// of [`Jit::ic_rot`]. See that field for why the escape is load-bearing.
+pub const IC_ROT_PERIOD: u64 = 1u64 << (8 * std::mem::size_of::<IcRotCursor>() as u32);
+// A gated site re-samples its live receivers for JIT_IC_WAYS fills once every
+// IC_ROT_PERIOD suppressed misses. 256 is the number behind the measured
+// -25.7% on property-ic-shapes; a frozen site (an unbounded period) measured
+// -0.6%. Widening the cursor is therefore a silent decay, not a refactor.
+const _: () = assert!(IC_ROT_PERIOD == 256);
+/// Sustained-identity proof before one site may request direct-miss form.
+const DIRECT_MISS_EVICTION_THRESHOLD: IcRotCursor = 32;
+/// Maximum adaptive park/recompile events per Tier-C body or OSR region.
+const DIRECT_MISS_RECOMPILE_CAP: u8 = 4;
+
+/// One way of a JIT'd `GetProp`/`SetProp` site's inline cache. `repr(C)` with a
+/// fixed layout the native code indexes directly: `obj_bits @0`, `vals_ptr @8`,
+/// `version @16`, `slot|nhops<<24 @20`, then `nhops` pairs `(hop_idx @24+8k,
+/// hop_ver @28+8k)` (stride 64). The native probe checks `obj_bits` (receiver
+/// identity) AND the receiver's live `version` (read from the heap's parallel
+/// version array — catches own key add/remove/redefine, freeze, and
+/// setPrototypeOf, all of which bump it) — then, for a PROTO-CHAIN entry
+/// (`nhops > 0`), the live version of each chain hop down to the holder (whose
+/// `vals_ptr`/`slot` the hit reads); any chain mutation bumps a guarded hop.
+/// Writes only ever fill OWN entries (`nhops == 0`). On a full match it
+/// reads/writes `vals_ptr[slot]` with NO call (slots never move without a
+/// version bump). `obj_bits == JIT_IC_EMPTY_BITS` means an empty identity way.
+/// `slot` is packed into 24 bits (an ObjMap with 16M+ keys is unreachable —
+/// fills exceeding it are skipped defensively).
+///
+/// The `slot_nhops` byte above the slot is a TAG byte, not just a hop count:
+/// bit 31 ([`IC_ACC_TAG`]) marks an ACCESSOR way and bit 30 ([`IC_ACC_BAKED`])
+/// marks baked dispatch fields, so the hop count proper is `(slot_nhops >> 24)
+/// & 0x3F` (values 0..=[`JIT_IC_MAX_HOPS`]). Data entries never set the tag
+/// bits, which is what keeps the probe's own-data hit test (`tag byte == 0`)
+/// a single compare.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct IcEntry {
+    pub obj_bits: u64,
+    pub vals_ptr: u64,
+    pub version: u32,
+    pub slot_nhops: u32,
+    pub hops: [(u32, u32); JIT_IC_MAX_HOPS],
+}
+
+/// The emitter walks ways with `add r9, JIT_IC_STRIDE` and reads fields at
+/// literal displacements, so the constant and the struct MUST agree. Raising
+/// `JIT_IC_MAX_HOPS` from 5 to 6 makes `size_of` 72 while `JIT_IC_STRIDE` stays
+/// 64, and every probe then reads a way's fields from the middle of the previous
+/// one -- silently, with no type error anywhere. One line, checked at compile
+/// time.
+const _: () = assert!(
+    std::mem::size_of::<IcEntry>() == JIT_IC_STRIDE,
+    "IcEntry layout and JIT_IC_STRIDE disagree; the emitted probes index by the constant"
+);
+
+#[cfg(test)]
+mod identity_ic_marker_tests {
+    use super::*;
+
+    #[test]
+    fn empty_identity_marker_cannot_survive_numeric_boxing() {
+        let raw = f64::from_bits(JIT_IC_EMPTY_BITS);
+        assert!(raw.is_nan());
+        assert_eq!(Value::num(raw).bits(), QNAN_BITS);
+        assert_ne!(Value::num(raw).bits(), JIT_IC_EMPTY_BITS);
+        assert!(!Value::from_bits(JIT_IC_EMPTY_BITS).is_heap());
+    }
+}
+
+/// Bit 31 of [`IcEntry::slot_nhops`]: the way is an ACCESSOR resolution. A hit
+/// dispatches to the accessor helper (`jit_get_prop_acc` / `jit_set_prop_acc`)
+/// instead of reading/writing `vals_ptr[slot]` — `vals_ptr` is 0 and is never
+/// dereferenced natively. Guards are the SAME as a data way of the same shape:
+/// receiver identity + receiver version, plus every hop version for a chain
+/// accessor (B111 keeps accessors on identity/version guards on purpose — a
+/// receiver's own shape does not identify its prototype or its descriptors).
+pub const IC_ACC_TAG: u32 = 1 << 31;
+/// Bit 30 of [`IcEntry::slot_nhops`]: the accessor way carries BAKED dispatch
+/// fields — `hops[3]` holds the accessor fn's Value bits (lo, hi) and `hops[4]`
+/// holds its resolved `(fid, closure)`. Only set when the chain leaves those
+/// pairs free (`nhops <= 3`) and the fn is a plain user function without
+/// lexical `this`. The helper re-reads the LIVE fn from the guarded holder slot
+/// and compares it to the baked bits before trusting `(fid, closure)` — the
+/// B78-style value guard, required because swapping a getter/setter on an
+/// EXISTING accessor (`__defineGetter__` / object-literal accessor merge)
+/// writes `vals[slot]` / `attrs[slot].setter` with NO version bump.
+pub const IC_ACC_BAKED: u32 = 1 << 30;
+
+/// `ZIPP_NO_ACCESSOR_WAY=1` disables the ACCESSOR inline-cache way (B114):
+/// probes emit the pre-B114 byte stream and the miss helpers early-return on
+/// accessor resolutions without filling, exactly as before. One cached read for
+/// the process, SHARED by the emitters (probe shape) and the miss helpers
+/// (fills) — both sides seeing the same value is a soundness requirement, not a
+/// convenience: an accessor-tagged entry under a tag-blind probe would be
+/// data-hit by the store path (a write through `vals_ptr == 0`).
+#[inline]
+pub(crate) fn accessor_way_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ACCESSOR_WAY").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_ICGATE=1` restores the UNCONDITIONAL inline-cache refill: every
+/// data-fill path in the miss helpers writes a way even at a site that has
+/// already evicted a full round ([`Jit::ic_thrashing`]). That is a site cycling
+/// more receivers than it has ways, where each fill evicts the way about to be
+/// needed, so the site sits at 100% miss instead of the `(n-8)/n` an 8-way
+/// cache can deliver. Latched like the sibling switches — never read on a hot
+/// path, and only ever consulted AFTER `ic_thrashing` has already said yes, so
+/// a healthy site never touches it.
+#[inline]
+pub(crate) fn ic_refill_gate_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ICGATE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// W20 BOXREF — `ZIPP_NO_BOX_HOME=1` turns OFF the register tier's boxed
+/// heap-reference values: a dense-Array `GetIndex` whose elements are OBJECTS
+/// (`ARR_PIN_KIND`) declines the region to the memory tier again, exactly as it
+/// did before this wave, and `RegionPlan::box_regs` is empty for every plan.
+/// Latched once per process, read only while PLANNING a region — never on a hot
+/// path — so OFF reproduces the pre-wave byte stream by construction.
+#[inline]
+pub(crate) fn box_home_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_BOX_HOME").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// W20 — `ZIPP_NO_REGALLOC_GETPROP=1` turns OFF the register tier's `GetProp`
+/// arm for a READ-ONLY LIVE-IN receiver (the `o.p` in a loop whose `o` is a
+/// parameter/outer local the region never writes). Independent of
+/// [`box_home_enabled`]: BOXREF needs the arm and turns it on for its own
+/// receivers regardless, so this switch isolates the standalone half — the one
+/// the wave-20 map priced at −0.23% of the headline and told nobody to ship
+/// alone. Latched, plan-time only.
+#[inline]
+pub(crate) fn regalloc_getprop_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_REGALLOC_GETPROP").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// W20 — `ZIPP_BOXREF_MISS=deopt` makes the register tier's `GetProp` probe
+/// DEOPT on an all-ways miss instead of calling `jit_get_prop_miss`.
+///
+/// This exists to MEASURE the wave-20 map's mechanism, which specified exactly
+/// that ("the miss must deopt and not call") and gated it on a plan-time
+/// zero-miss check. It cannot work: `register_ic_sites` hands every identity
+/// probe eight empty-marker ways, and only the miss helpers reach `Jit::set_ic`
+/// to fill one. A probe that never calls the helper
+/// therefore never fills a way, misses on every access forever, and evicts the
+/// region. The default is the call form; this switch reproduces the deopt form
+/// so the claim is a measurement rather than an argument.
+#[inline]
+pub(crate) fn boxref_miss_deopts() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_BOXREF_MISS")
+                .is_some_and(|v| v.eq_ignore_ascii_case("deopt")) as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_ACC_ALWAYS_EMIT=1` restores wave-2's UNCONDITIONAL accessor-arm
+/// emission: every probe carries the accessor arms whenever the way itself is
+/// enabled, exactly as B115 landed it. The default is the SITE GATE — a probe
+/// only carries the arms once its `(func_id, op_ip)` has actually filled an
+/// accessor way (see [`Jit::acc_way_gate`]) — so this switch is the A/B
+/// comparator for the gate, on one binary. Latched like the sibling switches.
+#[inline]
+pub(crate) fn acc_always_emit() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_ACC_ALWAYS_EMIT").is_some() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Let a property site that has proved megamorphic by receiver identity
+/// recompile without its eight identity probes. The resulting native site
+/// enters the unchanged, shape-memoized Rust miss helper directly; no object
+/// layout pointer or cached Value bits are added. Default ON, with a process-
+/// local off switch for same-binary A/B and incident response.
+#[inline]
+pub(crate) fn direct_ic_miss_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_DIRECT_IC_MISS").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Test/diagnostic lever: compile every eligible property site in direct-miss
+/// form from its first native body. The helper still performs every live heap,
+/// shape, descriptor, prototype and exotic check; this only bypasses the
+/// identity-way probe prefix. Ignored when the off switch above is present.
+#[inline]
+fn force_direct_ic_miss() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_FORCE_DIRECT_IC_MISS").is_some() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Per-property-site native emission choices. Site ids are fresh per compile;
+/// these decisions come from the stable `(func_id, op_ip)` history recorded by
+/// [`Jit`]. A direct-miss site deliberately has no accessor probe arms: an
+/// accessor is rediscovered by the safe helper and routed through its existing
+/// slow path.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IcSiteEmit {
+    pub(crate) acc: bool,
+    pub(crate) direct_miss: bool,
+}
+
+/// What an accessor-resolving miss helper may do at a site — the answer of
+/// [`Jit::acc_way_gate`]. `Fill` = the probe has the arms, fill the way and
+/// return `PROP_VIA_IC` (wave-2's flow). `Slow` = never fill, stay on the
+/// `PROP_VIA_IC` slow path (the way is disabled, or the site is unknown).
+/// `Recompile` = the site-gate just flipped: the owning compile was evicted,
+/// so return `SELF_CALL_DEOPT` — the interpreter re-executes the op and its
+/// back-edge/call counting recompiles the code WITH the accessor arms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AccWayGate {
+    Fill,
+    Slow,
+    Recompile,
+}
+
+/// Result of asking whether a shape-memo hit should switch this site from the
+/// identity probe to the direct helper form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DirectMissGate {
+    /// Keep the current probe/fill behaviour (feature disabled or bad site).
+    Probe,
+    /// This compile already omitted the identity probes.
+    Direct,
+    /// The stable site was marked and its owning compile parked; deopt before
+    /// any observable read/write effect so the next compile emits direct form.
+    Recompile,
+}
+
+/// Per-site emission metadata, parallel to `ic_rot` (one per reserved site).
+/// Written by [`Jit::register_ic_sites`] when the sites are handed to a
+/// compile; read by [`Jit::acc_way_fill_ok`] when a miss helper wants to fill
+/// an ACCESSOR way. `acc_emitted` records whether the probe COMPILED for this
+/// site carries the accessor arms — the fill side must never tag a way that a
+/// tag-blind probe would then data-hit (a Set through `vals_ptr == 0`, or a
+/// Get walking `0x80 | nhops` phantom hops).
+#[derive(Clone, Copy, Default)]
+struct IcSiteMeta {
+    func_id: u32,
+    /// Bytecode ip of the owning `GetProp`/`SetProp` — the STABLE key for the
+    /// accessor-seen set (site ids themselves are fresh on every compile).
+    op_ip: u32,
+    /// Loop-header ip of the owning OSR region, or `u32::MAX` for a Tier C
+    /// whole-function body.
+    region_entry: u32,
+    /// True when this site's probe was emitted WITH the accessor arms.
+    acc_emitted: bool,
+    /// True when this site was emitted WITHOUT identity ways and enters the
+    /// shape-memoized miss helper directly.
+    direct_miss_emitted: bool,
+}
+
+impl IcEntry {
+    /// An OWN-property way (receiver == holder; no hop guards). `None` if the
+    /// slot doesn't fit the 24-bit packing (never in practice).
+    pub fn own(obj_bits: u64, vals_ptr: u64, version: u32, slot: u32) -> Option<IcEntry> {
+        if slot > 0x00FF_FFFF {
+            return None;
+        }
+        Some(IcEntry {
+            obj_bits,
+            vals_ptr,
+            version,
+            slot_nhops: slot,
+            hops: [(0, 0); JIT_IC_MAX_HOPS],
+        })
+    }
+
+    /// A PROTO-CHAIN way: the holder is `hops.len()` (1..=5) hops from the
+    /// receiver; every hop is version-guarded.
+    pub fn chain(
+        obj_bits: u64,
+        vals_ptr: u64,
+        version: u32,
+        slot: u32,
+        hops: &[(u32, u32)],
+    ) -> Option<IcEntry> {
+        if slot > 0x00FF_FFFF || hops.is_empty() || hops.len() > JIT_IC_MAX_HOPS {
+            return None;
+        }
+        let mut h = [(0u32, 0u32); JIT_IC_MAX_HOPS];
+        h[..hops.len()].copy_from_slice(hops);
+        Some(IcEntry {
+            obj_bits,
+            vals_ptr,
+            version,
+            slot_nhops: slot | ((hops.len() as u32) << 24),
+            hops: h,
+        })
+    }
+
+    /// An ACCESSOR way (B114): the site's resolution for this receiver is a
+    /// getter/setter at `slot` of the holder (the receiver itself when `hops`
+    /// is empty, else the last hop). A probe hit dispatches to the accessor
+    /// helper — skipping the miss helper's rediscovery walk — under the same
+    /// identity + version (+ hop versions) guards as the equivalent data way.
+    /// `baked = (fn_bits, fid, closure)` bakes direct dispatch for a plain
+    /// non-lexical-`this` user fn (dropped when the hop pairs it would occupy
+    /// are in use); the helper re-validates it against the live slot.
+    pub fn accessor(
+        obj_bits: u64,
+        version: u32,
+        slot: u32,
+        hops: &[(u32, u32)],
+        baked: Option<(u64, u32, u32)>,
+    ) -> Option<IcEntry> {
+        if slot > 0x00FF_FFFF || hops.len() > JIT_IC_MAX_HOPS {
+            return None;
+        }
+        let mut h = [(0u32, 0u32); JIT_IC_MAX_HOPS];
+        h[..hops.len()].copy_from_slice(hops);
+        let mut tag = IC_ACC_TAG | ((hops.len() as u32) << 24);
+        if let Some((fn_bits, fid, closure)) = baked {
+            // hops[3]/hops[4] double as the baked fields — only when the
+            // guarded chain leaves them free.
+            if hops.len() <= 3 {
+                h[3] = (fn_bits as u32, (fn_bits >> 32) as u32);
+                h[4] = (fid, closure);
+                tag |= IC_ACC_BAKED;
+            }
+        }
+        Some(IcEntry {
+            obj_bits,
+            // Never dereferenced: an accessor hit calls the helper, and the
+            // probe's tag test keeps the data hit (which would read/write
+            // through this) unreachable for a tagged way.
+            vals_ptr: 0,
+            version,
+            slot_nhops: slot | tag,
+            hops: h,
+        })
+    }
+}
+
+/// Dense function-tier states (see `Jit::fn_state`).
+pub const FN_COLD: u8 = 0;
+pub const FN_COMPILED: u8 = 1;
+pub const FN_DEAD: u8 = 2;
+
+/// Per-function JIT state: call counts, compiled code, and a blacklist of
+/// functions that aren't eligible (so we don't re-attempt them every tick).
+/// The `region_*` maps mirror this for OSR loop regions, keyed by
+/// `(func_id, loop_header_ip)`.
+#[derive(Default)]
+pub struct Jit {
+    /// `ZIPP_JIT_THRESHOLD=<n>` replaces BOTH [`JIT_THRESHOLD`] and
+    /// [`OSR_THRESHOLD`] for the process; `0` (the `Default`, and the absence of
+    /// the variable) means "use the constants". Read once in [`Jit::new`], so
+    /// the count paths stay a field compare.
+    ///
+    /// This exists because the standing gate cannot see a JIT-only bug. §2 runs
+    /// test262 under `ZIPP_NOJIT=1` to prove the interpreter, but the region JIT
+    /// only compiles hot LOOPS and test262 asserts once, straight-line — so
+    /// helpers like `jit_get_index` are never reached by 95,936 executions.
+    /// B63 found a real `arr[oob]` prototype-chain divergence there by hand,
+    /// while doing something else. With `ZIPP_JIT_THRESHOLD=1` the same suite
+    /// becomes a JIT gate at no authoring cost.
+    threshold_override: u32,
+    counts: FxHashMap<u32, u32>,
+    compiled: FxHashMap<u32, JitFn>,
+    blacklist: FxHashSet<u32>,
+    /// Dense per-func_id tier state ([`FN_COLD`]/[`FN_COMPILED`]/[`FN_DEAD`]),
+    /// grown on demand. One array read on EVERY interpreted frame entry
+    /// replaces the 2-3 hash probes (`compiled` miss + `blacklist` hit) that
+    /// otherwise tax each call to a never-compiled function.
+    fn_state: Vec<u8>,
+    regions: FxHashMap<(u32, u32), Region>,
+    /// B199: the JIT-facing live cross-entry table, parallel to
+    /// `cross_entries` — one 16-byte record per fid the emitted lanes read
+    /// THROUGH the VM on every call (`entry` null routes to the helper; a
+    /// recompiled callee is picked up with no eviction). `mask_gen` bumps
+    /// only when the callee's uninit mask CHANGES on a re-set, so the baked
+    /// mask a lane zeroes with stays provably current across same-shape
+    /// recompiles.
+    pub(crate) cross_table: Vec<CrossEntryRec>,
+    /// Raw base of `cross_table`, re-derived through the VM per access and
+    /// re-cached here on growth (the mirror discipline).
+    pub(crate) cross_table_raw: u64,
+    /// B199 retry: callers whose plan declined a site for "no entry yet",
+    /// keyed by the missing callee. Drained at that callee's first
+    /// `set_cross_entry`: the callers' compiled artifacts are parked and
+    /// their counters reset so the recompile bakes the lane. With the
+    /// live-table lanes the transient entry clear self-heals (null routes
+    /// to the helper; the same-mask re-set resumes dependents), so the
+    /// retry converges without stranding.
+    cross_pending: FxHashMap<u32, Vec<u32>>,
+    /// B229: callee fid -> callers that have BAKED a cross lane against its
+    /// entry. `cross_pending` covers a caller that planned while the entry was
+    /// MISSING; this covers the opposite and more damaging case — the caller
+    /// baked a good lane, then the callee was evicted and recompiled with a
+    /// different fill mask, bumping `mask_gen` and stranding that lane on the
+    /// helper route for the rest of the run.
+    cross_baked: FxHashMap<u32, Vec<u32>>,
+    /// B199: deferrals spent per region key waiting on a missing callee
+    /// entry — capped so a callee that never compiles (blacklisted) cannot
+    /// keep a region interpreting forever.
+    cross_defer_spent: FxHashMap<(u32, u32), u16>,
+    region_counts: FxHashMap<(u32, u32), u32>,
+    region_blacklist: FxHashSet<(u32, u32)>,
+    /// Loop headers where the INTEGER path was tried and deoptimised; the next
+    /// compile for the key skips int and uses the double path instead.
+    region_int_blacklist: FxHashSet<(u32, u32)>,
+    /// W20: `(func_id, region_start)` whose BOXREF compile evicted. The next
+    /// compile of that loop is offered without the boxed arms, so it settles on
+    /// the memory tier — see `Region::is_boxref`.
+    region_boxref_blacklist: FxHashSet<(u32, u32)>,
+    /// Dense per-func mirror of `region_blacklist` membership, indexed
+    /// `[func_id][loop_header_ip]` (1 = permanently blacklisted). The back-edge
+    /// fast path: a permanently-rejected loop pays two array reads per
+    /// iteration here instead of 2 hash probes (`get_region` miss +
+    /// `region_blacklist` hit) — the loop-region sibling of
+    /// `fn_state`/[`FN_DEAD`]. Never cleared: nothing ever removes a key from
+    /// `region_blacklist` (`compile_region` refuses blacklisted keys, and even
+    /// `set_meter` keeps the set), so a set byte cannot go stale. Inner vecs
+    /// grow lazily on first blacklist and are bounded by bytecode length.
+    region_dead: Vec<Vec<u8>>,
+    /// `ZIPP_NO_DENSE_BACKEDGE=1` restores the per-back-edge hash probes that
+    /// `region_dead` short-circuits, so the change is A/B-able and bisectable
+    /// on one binary. Read once in [`Jit::new`] (like `threshold_override`),
+    /// so the back-edge check stays a field compare.
+    dense_backedge: bool,
+    /// Inline-cache ways for heap-op JIT sites: site `k` owns the contiguous
+    /// entries `[k*JIT_IC_WAYS, (k+1)*JIT_IC_WAYS)`. Grows only at compile time
+    /// (never during a native run, EXCEPT through a region call helper — after
+    /// which the region re-derives its pinned base pointer); a `*_miss` helper
+    /// only UPDATES existing ways (no growth).
+    ic_table: Vec<IcEntry>,
+    /// Raw base of `ic_table`, loaded through the live VM by Tier-C entry
+    /// code. `reserve_ic_sites` is the only growth point and refreshes this
+    /// mirror immediately after every resize. Miss helpers only mutate ways.
+    pub(crate) ic_table_raw: u64,
+    /// Round-robin fill cursor per site (parallel to `ic_table` / JIT_IC_WAYS).
+    ///
+    /// Its WIDTH is load-bearing. A thrashing site's SUPPRESSED miss still
+    /// bumps this cursor ([`Jit::ic_rot_bump`]), so the wrap carries it back
+    /// below `JIT_IC_WAYS` every [`IC_ROT_PERIOD`] misses and the site refills
+    /// `JIT_IC_WAYS` ways from whatever is live NOW. Without that escape a site
+    /// freezes on whatever eight receivers happened to be resident when it
+    /// first tripped — which, at a site reused across several receiver-count
+    /// phases, is eight receivers already dead.
+    ic_rot: Vec<IcRotCursor>,
+    /// Per-site emission metadata (parallel to `ic_rot`) — see [`IcSiteMeta`].
+    ic_site_meta: Vec<IcSiteMeta>,
+    /// `(func_id, op_ip)` of every `GetProp`/`SetProp` that has EVER wanted to
+    /// fill an accessor way. Grows monotonically, never shrinks — the
+    /// termination argument for the site gate: once a key is in here, every
+    /// future compile covering that op emits the accessor arms
+    /// (`register_ic_sites`), so the evict-on-fill branch in
+    /// [`Jit::acc_way_fill_ok`] can fire at most once per key.
+    acc_sites: FxHashSet<(u32, u32)>,
+    /// Stable property ops whose identity IC has proved to thrash while the
+    /// `(site, shape) -> slot` memo kept hitting. Site ids are compile-local,
+    /// so the durable key is `(func_id, op_ip)`. Monotonic and bounded by the
+    /// number of property bytecodes loaded into this VM.
+    direct_miss_sites: FxHashSet<(u32, u32)>,
+    /// Adaptive direct-miss recompiles per owning native artifact
+    /// `(func_id, region_entry)`. A hostile function with many property ops
+    /// must not force one fresh O(n)-site IC reservation per op (O(n^2) table
+    /// growth, outside the JS heap limit). Sibling proven sites are batched and
+    /// the remaining number of parks is capped.
+    direct_miss_recompiles: FxHashMap<(u32, u32), u8>,
+    /// Tier C bodies evicted by the accessor site gate, parked for the same
+    /// reason as `retired`: the fill helper that evicts runs INSIDE the native
+    /// frame being evicted, so dropping the `ExecutableBuffer` would unmap the
+    /// code we return into. Freed when the VM drops.
+    retired_fns: Vec<JitFn>,
+    /// One-entry cache of the most recent self-call target `(func_id, native
+    /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
+    /// SAME `func_id`, so this hits on every call and skips the `compiled`
+    /// HashMap lookup that otherwise runs ~30M times for `fib(35)`. The cached
+    /// entry pointer stays valid even if `compiled` rehashes: it points into the
+    /// function's mmap'd `ExecutableBuffer`, which never moves, and a function's
+    /// entry is immutable once compiled.
+    self_cache: Option<(u32, *const u8)>,
+    /// Dense per-func_id native entry for the Tier C CROSS-CALL fast path
+    /// (B83): non-null iff the function is currently Tier-C compiled and
+    /// cross-callable (plain body, no self-binding assumption — Tier C never
+    /// bakes one). Grown on demand; cleared on eviction and on `set_meter`.
+    /// Entries point into mmap'd `ExecutableBuffer`s, which never move (and
+    /// evicted buffers are PARKED in `retired_fns`, so even a stale pointer
+    /// read racing an eviction within one helper call targets live code).
+    /// The second element is the W7 may-read-before-write register mask
+    /// (`cross_uninit_mask`): the ONLY callee-window registers the cross-call
+    /// helper must zero when it reuses an already-initialized window;
+    /// `u64::MAX` = analysis declined, W7 is disabled, or the callee is wide;
+    /// in the wide case `cross_wide_uninit` may supply the owned multi-word
+    /// mask, otherwise calls use the pre-W7 full zero-fill behaviour.
+    /// The third and fourth elements are the optional exact JSON-tree and
+    /// Bumped on EVERY cross-entry table mutation (install, replace, clear /
+    /// eviction, wholesale reset). The B189b emitted call lane bakes an entry
+    /// pointer at emission and guards `epoch == baked` per call through the
+    /// VM — any recompile, eviction, or plan attachment sends the call to the
+    /// helper, which re-resolves the live table. Wrapping is a non-issue: a
+    /// false match needs exactly 2^32 mutations between two executions of one
+    /// site.
+    pub(crate) cross_code_epoch: u32,
+    /// Markdown-inline plans described by [`JsonWalkPlan`] and
+    /// [`MarkdownInlinePlan`]. They never change native code generation; the
+    /// cross-call helper consumes each as a guarded prefix and otherwise runs
+    /// this entry.
+    cross_entries: Vec<(
+        *const u8,
+        u64,
+        Option<JsonWalkPlan>,
+        Option<MarkdownInlinePlan>,
+    )>,
+    /// Owned multi-word W7 masks for cross-callable functions with more than
+    /// 64 registers, indexed exactly like `cross_entries`. `None` means full
+    /// fill. Words contain register indices only — no bytecode, heap, or raw
+    /// pointers — and are dropped whenever the corresponding entry is cleared.
+    cross_wide_uninit: Vec<Option<Box<[u64]>>>,
+    /// B272: entries whose body carries handler ops. Such an entry is real
+    /// native code but may only be entered FRAME-BACKED: the generic cross
+    /// helper pushes the callee `Frame` first (the handler helpers write the
+    /// active frame's handler stack). `cross_entry` hides these from every
+    /// other reader and the native-visible `cross_table` slot stays null, so
+    /// no emitted lane can enter one frame-free.
+    cross_needs_frame: Vec<bool>,
+    /// Compiled fused `map` kernels, keyed by callback `func_id`. `None` =
+    /// tried and ineligible (so we don't recompile every `map` call). Keyed by
+    /// `func_id` alone: a given callback proto has fixed param_count/body.
+    map_kernels: FxHashMap<u32, Option<JitFn>>,
+    /// Compiled fused `reduce` kernels, keyed by callback `func_id` (as above).
+    reduce_kernels: FxHashMap<u32, Option<JitFn>>,
+    /// Compiled fused `filter` kernels, keyed by predicate `func_id` (as above).
+    filter_kernels: FxHashMap<u32, Option<JitFn>>,
+    /// Where compiled code charges the step budget, when this VM is metered.
+    /// Set once by `Vm::set_instrumentation`; `None` means every emitter is
+    /// byte-for-byte what an uninstrumented build produces.
+    meter: Option<meter::Meter>,
+    /// Evicted regions parked here instead of being dropped. A region can be
+    /// evicted REENTRANTLY (its `jit_call_*_ic` helper runs user code, which can
+    /// loop back into the SAME region and deopt it past the limit) while an
+    /// outer activation of that region is still executing on the native stack —
+    /// dropping the `ExecutableBuffer` then would unmap code we're inside.
+    /// Parked regions are freed only when the VM drops. Bounded: each loop key
+    /// evicts at most twice (int retry, then blacklist).
+    retired: Vec<Region>,
+    /// W9: per-func count of LIVE register-homed regions (`!is_mem` — SROA,
+    /// INT/GPR, DOUBLE). Non-zero declines the Tier C offer for that func
+    /// (see [`tierc_yield_enabled`]). Maintained at every `regions`
+    /// insert/remove/drain — see `note_reg_region_installed`/`_removed`; a
+    /// missed decrement would silently suppress Tier C forever, so both
+    /// helpers debug-assert against a recount.
+    fn_reg_region: Vec<u32>,
+    /// Funcs whose yield-decline was already logged (JITLOG only — keeps the
+    /// per-call decline from spamming one line per call).
+    yield_logged: FxHashSet<u32>,
+    /// A Python program (see `set_python_program`).
+    python_program: bool,
+    /// A Python program whose JavaScript runtime stays interpreted: only
+    /// Python-emitted bodies compile.
+    python_only: bool,
+    /// Per main-program function of a Python program: `INTERP_*` flags
+    /// (answered as dead by `fn_state` / `region_dead`).
+    interp_only: Vec<u8>,
+}
+
+impl Jit {
+    pub fn new() -> Jit {
+        let mut jit = Jit::default();
+        // Values below 1 are meaningless (a counter starts at 1, so `== 0` would
+        // never fire and would silently disable the tier — the opposite of what
+        // anyone setting this wants), so they are ignored.
+        jit.threshold_override = std::env::var("ZIPP_JIT_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(0);
+        jit.dense_backedge = std::env::var_os("ZIPP_NO_DENSE_BACKEDGE").is_none();
+        jit.ic_table_raw = jit.ic_table.as_ptr() as u64;
+        jit
+    }
+
+    /// Mark this VM as running a Python program (the Python frontend's
+    /// runtime plus the program's modules). Its JavaScript runtime functions
+    /// then stay interpreted: they are large, called with many shapes, and
+    /// measured slower compiled than interpreted (compile and planning cost
+    /// on short runs, helper-bound bodies on long ones), while the Python
+    /// program's own bodies (those holding fused Python instructions) still
+    /// compile. `ZIPP_PY_JIT_RUNTIME=1` compiles the runtime too.
+    pub fn set_python_program<'a>(
+        &mut self,
+        python: bool,
+        functions: impl IntoIterator<Item = &'a FuncProto>,
+    ) {
+        self.python_program = python;
+        self.python_only = python && std::env::var_os("ZIPP_PY_JIT_RUNTIME").is_none();
+        // Mark what never compiles up front (the runtime's functions: every
+        // body without a fused Python instruction; and, without Tier C, the
+        // Python functions' whole bodies), so a call or a loop there never
+        // even counts toward a compile (which would intern and root its
+        // string constants and build its plans before declining).
+        if python {
+            self.interp_only = functions.into_iter().map(|f| self.python_interp_flags(f)).collect();
+        }
+    }
+
+    /// A Python program's function's `INTERP_*` flags (see
+    /// [`Jit::set_python_program`]).
+    fn python_interp_flags(&self, f: &FuncProto) -> u8 {
+        let py = has_py_ops(&f.code);
+        // A runtime function: nothing compiles. A Python function:
+        // its loops compile; the whole body only under Tier C.
+        match (py, self.python_only) {
+            (false, true) => INTERP_NO_FN | INTERP_NO_REGIONS,
+            (true, _) if !py_tierc_enabled() => INTERP_NO_FN,
+            _ => 0,
+        }
+    }
+
+    /// A Python library module's functions, installed from id `first` on
+    /// when the module is first imported (`vm::py_lazy`): flagged exactly as
+    /// [`Jit::set_python_program`] flags the program's own functions.
+    #[cfg(feature = "python")]
+    pub fn python_functions_installed(&mut self, first: usize, functions: &[FuncProto]) {
+        if !self.python_program {
+            return;
+        }
+        if self.interp_only.len() < first {
+            self.interp_only.resize(first, 0);
+        }
+        self.interp_only.truncate(first);
+        for f in functions {
+            let flags = self.python_interp_flags(f);
+            self.interp_only.push(flags);
+        }
+    }
+
+    /// `func_id`'s `INTERP_*` flags in a Python program (see
+    /// `set_python_program`); 0 in any other.
+    #[inline]
+    fn interp_flags(&self, func_id: u32) -> u8 {
+        if !self.python_program {
+            return 0;
+        }
+        self.interp_only.get(func_id as usize).copied().unwrap_or(0)
+    }
+
+    /// Whether a body may compile at all: in a Python program, only one the
+    /// Python frontend emitted.
+    #[inline]
+    pub(crate) fn body_eligible(&self, code: &[Instr]) -> bool {
+        !self.python_only || has_py_ops(code)
+    }
+
+    /// Whether a whole function may compile: as [`Jit::body_eligible`], and a
+    /// Python-emitted function only under `ZIPP_PY_TIERC=1`. Its loops still
+    /// compile as regions. Measured on the Python suite, whole Python
+    /// functions ran slower compiled than interpreted: every call enters the
+    /// native body through the full frame-backed entry (the traceback handler
+    /// every Python function pushes rules out the frame-free lanes), which
+    /// costs more than the straight-line code it saves.
+    pub(crate) fn fn_body_eligible(&self, code: &[Instr]) -> bool {
+        !self.python_program || (self.body_eligible(code) && (!has_py_ops(code) || py_tierc_enabled()))
+    }
+
+    /// A Python program (see `set_python_program`).
+    #[inline]
+    pub(crate) fn python_program(&self) -> bool {
+        self.python_program
+    }
+
+    /// A Python program whose JavaScript runtime stays interpreted (the
+    /// default; see `set_python_program`): no native plan reads the
+    /// interpreter's inline-cache training, and no runtime callback compiles.
+    #[inline]
+    pub fn runtime_interpreted(&self) -> bool {
+        self.python_only
+    }
+
+    /// Interpreter entries before a function is offered to the JIT.
+    #[inline]
+    fn fn_threshold(&self) -> u32 {
+        if self.threshold_override != 0 {
+            self.threshold_override
+        } else {
+            JIT_THRESHOLD
+        }
+    }
+
+    /// Back-edges before a loop region is offered to the OSR compiler.
+    #[inline]
+    fn loop_threshold(&self) -> u32 {
+        if self.threshold_override != 0 {
+            self.threshold_override
+        } else if self.python_program {
+            PY_OSR_THRESHOLD
+        } else {
+            OSR_THRESHOLD
+        }
+    }
+
+    /// Point compiled code at a step counter, and throw away everything already
+    /// compiled without it.
+    ///
+    /// The discard is the whole point: code emitted before the VM was metered
+    /// contains no charge, so leaving it installed would leave a permanently
+    /// unmetered native path — the exact hole this machinery exists to close.
+    /// Buffers are PARKED rather than dropped, because a native frame may be
+    /// live on the stack (see `retired`).
+    #[cfg(feature = "instrument")]
+    pub fn set_meter(&mut self, m: meter::Meter) {
+        self.meter = Some(m);
+        self.retired.extend(self.regions.drain().map(|(_, r)| r));
+        // No regions remain live, so the W9 per-func region census resets too
+        // — a stale count would suppress Tier C for a metered VM forever.
+        self.fn_reg_region.clear();
+        self.compiled.clear();
+        self.counts.clear();
+        self.region_counts.clear();
+        // `region_dead` is deliberately KEPT: it mirrors `region_blacklist`
+        // membership only (never compiled-ness), and the blacklist survives
+        // this reset too. `fn_state` below cannot stay for the same reason in
+        // reverse — it also encodes FN_COMPILED, which `compiled.clear()`
+        // just invalidated.
+        self.fn_state.clear();
+        self.self_cache = None;
+        self.cross_entries.clear();
+        // B207 (review): the live table must disarm with the entries — a
+        // surviving non-null entry with an unchanged mask_gen would let a
+        // parked lane call into a dropped buffer (set_meter drops Tier-C
+        // bodies; pre-B199 the global-epoch guard covered this resume).
+        for r in self.cross_table.iter_mut() {
+            r.entry = 0;
+        }
+        self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
+        self.cross_wide_uninit.clear();
+        self.cross_needs_frame.clear();
+        self.map_kernels.clear();
+        self.reduce_kernels.clear();
+        self.filter_kernels.clear();
+    }
+
+    /// Whether this VM meters native code. The fused array kernels and the
+    /// off-frame method inliner run user work with no VM pointer and no
+    /// interpreter loop, so a metered VM declines them rather than leaving an
+    /// uncharged native path open.
+    #[cfg(feature = "instrument")]
+    pub fn metered(&self) -> bool {
+        self.meter.is_some()
+    }
+
+    /// Look up compiled native code for `func_id`, if any.
+    pub fn get(&self, func_id: u32) -> Option<&JitFn> {
+        self.compiled.get(&func_id)
+    }
+
+    /// Native entry pointer for a SELF-CALL target, via a one-entry cache that
+    /// the hot recursive path hits every time (skipping the `compiled` HashMap
+    /// lookup). See `self_cache`. Returns `None` if `func_id` isn't compiled.
+    #[inline]
+    pub fn self_call_entry(&mut self, func_id: u32) -> Option<*const u8> {
+        if let Some((id, entry)) = self.self_cache {
+            if id == func_id {
+                return Some(entry);
+            }
+        }
+        let entry = self.compiled.get(&func_id)?.entry();
+        self.self_cache = Some((func_id, entry));
+        Some(entry)
+    }
+
+    /// Record an interpreter entry into `func_id`. Returns `true` once it
+    /// crosses the threshold and is neither compiled nor blacklisted — the
+    /// caller should then attempt `compile`.
+    pub fn record_and_should_compile(&mut self, func_id: u32) -> bool {
+        if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
+            return false;
+        }
+        let c = self.counts.entry(func_id).or_insert(0);
+        *c += 1;
+        *c == self.fn_threshold()
+    }
+
+    /// Native entry + W7 window-fill mask for the cross-call fast path, or
+    /// `None` if `func_id` is not currently Tier-C compiled (see
+    /// `cross_entries`).
+    #[inline]
+    pub fn cross_entry(
+        &self,
+        func_id: u32,
+    ) -> Option<(
+        *const u8,
+        u64,
+        Option<JsonWalkPlan>,
+        Option<MarkdownInlinePlan>,
+    )> {
+        match self.cross_entries.get(func_id as usize) {
+            Some(&(p, mask, json, markdown))
+                if !p.is_null() && !self.cross_needs_frame(func_id) =>
+            {
+                Some((p, mask, json, markdown))
+            }
+            _ => None,
+        }
+    }
+
+    /// B272: whether `func_id`'s entry may only be entered frame-backed.
+    #[inline]
+    pub fn cross_needs_frame(&self, func_id: u32) -> bool {
+        self.cross_needs_frame
+            .get(func_id as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// B272: [`Jit::cross_entry`] including the frame-backed entries, with the
+    /// flag as the last element. Only the generic cross-call helper, which can
+    /// push a `Frame` before entering, may consume a flagged entry.
+    #[inline]
+    pub fn cross_entry_framed(
+        &self,
+        func_id: u32,
+    ) -> Option<(
+        *const u8,
+        u64,
+        Option<JsonWalkPlan>,
+        Option<MarkdownInlinePlan>,
+        bool,
+    )> {
+        match self.cross_entries.get(func_id as usize) {
+            Some(&(p, mask, json, markdown)) if !p.is_null() => {
+                Some((p, mask, json, markdown, self.cross_needs_frame(func_id)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Owned wide-register selective-fill words for a live cross entry. The
+    /// caller borrows these only after its GC safe point and consumes them
+    /// before entering native/user code, so reentrant compilation or eviction
+    /// cannot invalidate a live borrow.
+    #[inline]
+    pub fn cross_wide_uninit_mask(&self, func_id: u32) -> Option<&[u64]> {
+        self.cross_wide_uninit
+            .get(func_id as usize)
+            .and_then(Option::as_deref)
+    }
+
+    fn set_cross_entry(
+        &mut self,
+        func_id: u32,
+        entry: *const u8,
+        uninit_mask: u64,
+        wide_uninit_mask: Option<Box<[u64]>>,
+        json_walk: Option<JsonWalkPlan>,
+        markdown_inline: Option<MarkdownInlinePlan>,
+        needs_frame: bool,
+    ) {
+        let i = func_id as usize;
+        if self.cross_entries.len() <= i {
+            self.cross_entries
+                .resize(i + 1, (std::ptr::null(), u64::MAX, None, None));
+        }
+        if self.cross_wide_uninit.len() <= i {
+            self.cross_wide_uninit.resize(i + 1, None);
+        }
+        if self.cross_needs_frame.len() <= i {
+            self.cross_needs_frame.resize(i + 1, false);
+        }
+        self.cross_needs_frame[i] = needs_frame;
+        // B199: the mask generation bumps only when the mask CHANGES — a
+        // same-shape recompile keeps every dependent lane's baked mask
+        // valid, which is what lets a re-set entry resume those lanes
+        // instead of stranding them.
+        let prev_mask = self.cross_entries[i].1;
+        // B228: the WIDE mask has to participate in that comparison. A wide
+        // callee's INLINE mask is permanently `u64::MAX`, so `prev_mask !=
+        // uninit_mask` can never fire for it — a recompile that changed which
+        // wide registers may be read-before-written would leave `mask_gen`
+        // untouched and every dependent lane's baked fill silently stale.
+        // Harmless while no lane could bake a wide mask; a prerequisite the
+        // moment one can (see the cross3 wide-empty admission).
+        // Only a change AWAY FROM A LIVE ENTRY can strand a baked lane: with
+        // no previous entry (null pointer) nothing could have baked anything,
+        // so a first `None -> Some` set is not a change and must not bump.
+        let wide_changed = !self.cross_entries[i].0.is_null()
+            && self.cross_wide_uninit[i].as_deref() != wide_uninit_mask.as_deref();
+        self.cross_entries[i] = (entry, uninit_mask, json_walk, markdown_inline);
+        self.cross_wide_uninit[i] = wide_uninit_mask;
+        if self.cross_table.len() <= i {
+            self.cross_table.resize(i + 1, CrossEntryRec::default());
+            self.cross_table_raw = self.cross_table.as_ptr() as u64;
+        }
+        if prev_mask != uninit_mask || wide_changed {
+            self.cross_table[i].mask_gen = self.cross_table[i].mask_gen.wrapping_add(1);
+            // B229: every lane baked against the OLD generation now guards
+            // false forever. Re-plan those callers — the B199 discipline:
+            // park the artifacts and let hotness re-trigger, no blacklists.
+            if let Some(callers) = self.cross_baked.remove(&func_id) {
+                for caller in callers {
+                    if caller != func_id {
+                        self.evict_for_cross_retry(caller);
+                    }
+                }
+            }
+        }
+        // B272: a frame-backed entry is never visible to emitted lanes — they
+        // read this slot natively and cannot push a frame — so it stays null
+        // and every lane baked against the fid keeps routing to the helper.
+        self.cross_table[i].entry = if needs_frame { 0 } else { entry as u64 };
+        self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
+        if let Some(callers) = self.cross_pending.remove(&func_id) {
+            for caller in callers {
+                self.evict_for_cross_retry(caller);
+            }
+        }
+    }
+
+    /// B199: whether the region at (`func_id`, `entry_ip`) may defer its
+    /// compile one more back-edge while a callee entry is missing.
+    pub fn cross_defer_allowed(&mut self, func_id: u32, entry_ip: u32) -> bool {
+        if !cross_retry_enabled() {
+            return false;
+        }
+        // One extra threshold-window: both compile thresholds are 8, so a
+        // callee heated by this very loop lands its entry within a couple
+        // of back-edges; a callee that never compiles costs the region at
+        // most 8 deferred iterations before it compiles helper-side.
+        let c = self
+            .cross_defer_spent
+            .entry((func_id, entry_ip))
+            .or_insert(0);
+        if *c >= 8 {
+            return false;
+        }
+        *c += 1;
+        true
+    }
+
+    /// B199 retry: record that `caller`'s plan declined sites because these
+    /// `callees` had no cross entry yet. Bounded and deduplicated.
+    /// B229: record that `caller` baked a lane against each of `callees`.
+    pub fn note_cross_baked(&mut self, caller: u32, callees: &[u32]) {
+        if !cross_retry_enabled() || !cross_rebake_enabled() {
+            return;
+        }
+        for &callee in callees {
+            if callee == caller {
+                continue;
+            }
+            let v = self.cross_baked.entry(callee).or_default();
+            if v.len() < 16 && !v.contains(&caller) {
+                v.push(caller);
+            }
+        }
+    }
+
+    pub fn note_cross_pending(&mut self, caller: u32, callees: &[u32]) {
+        if !cross_retry_enabled() {
+            return;
+        }
+        for &callee in callees {
+            // A SELF-recursive site always sees its own entry missing (the
+            // plan builds before set_cross_entry) — recording it would evict
+            // the fn at its own install, forever. Self-calls have their own
+            // lane (jit_self_call_at); skip them here.
+            if callee == caller {
+                continue;
+            }
+            let v = self.cross_pending.entry(callee).or_default();
+            if v.len() < 16 && !v.contains(&caller) {
+                v.push(caller);
+            }
+        }
+    }
+
+    /// B199 retry: park every compiled artifact of `fid` (regions + whole
+    /// fn) and reset its counters so hotness re-triggers — the yield/deopt
+    /// retire discipline, NO blacklists.
+    fn evict_for_cross_retry(&mut self, fid: u32) {
+        let keys: Vec<(u32, u32)> = self
+            .regions
+            .keys()
+            .filter(|k| k.0 == fid)
+            .copied()
+            .collect();
+        for key in keys {
+            if crate::jitlog_enabled() {
+                eprintln!(
+                    "[cross] region fn{} [{}] evicted for cross-entry retry",
+                    key.0, key.1
+                );
+            }
+            if let Some(r) = self.regions.remove(&key) {
+                self.note_reg_region_removed(key.0, &r);
+                self.retired.push(r);
+            }
+            self.region_counts.remove(&key);
+        }
+        if let Some(f) = self.compiled.remove(&fid) {
+            if crate::jitlog_enabled() {
+                eprintln!("[cross] Tier C fn{fid} evicted for cross-entry retry");
+            }
+            self.retired_fns.push(f);
+            self.counts.remove(&fid);
+            self.set_fn_state(fid, FN_COLD);
+            self.clear_cross_entry(fid);
+            if self.self_cache.is_some_and(|(id, _)| id == fid) {
+                self.self_cache = None;
+            }
+        }
+    }
+
+    /// B199: the live mask generation for `fid` (0 for a fid the table has
+    /// never seen — consistent with what the first `set_cross_entry` keeps
+    /// when the mask does not change).
+    pub fn cross_mask_gen(&self, fid: u32) -> u32 {
+        self.cross_table.get(fid as usize).map_or(0, |r| r.mask_gen)
+    }
+
+    /// B270: the generation `fid` carries once `set_cross_entry` installs an
+    /// entry with inline mask `mask` — what a lane baked BEFORE that install
+    /// (a body's CROSS3 arm against itself) must guard. Mirrors the bump rule
+    /// in `set_cross_entry` for the inline-mask form; self arms admit only
+    /// bodies of at most 64 registers, whose wide mask is `None` on both
+    /// sides, so the wide comparison cannot bump.
+    pub fn cross_mask_gen_after_set(&self, fid: u32, mask: u64) -> u32 {
+        let prev_mask = self
+            .cross_entries
+            .get(fid as usize)
+            .map_or(u64::MAX, |entry| entry.1);
+        let gen = self.cross_mask_gen(fid);
+        if prev_mask != mask {
+            gen.wrapping_add(1)
+        } else {
+            gen
+        }
+    }
+
+    fn clear_cross_entry(&mut self, func_id: u32) {
+        if let Some(r) = self.cross_table.get_mut(func_id as usize) {
+            // Null entry: dependent lanes route to the helper (graceful)
+            // and RESUME when a same-mask recompile re-sets it.
+            r.entry = 0;
+        }
+        if let Some(p) = self.cross_entries.get_mut(func_id as usize) {
+            // B207 (review): PRESERVE the recorded mask across the clear.
+            // Resetting it to the MAX sentinel meant every evict+recompile
+            // bumped mask_gen even for an identical mask (the same-mask
+            // resume could never fire), and the one real mask change the
+            // gen guard must observe — a recompile whose analysis declines
+            // to u64::MAX — compared equal to the sentinel and did NOT bump.
+            *p = (std::ptr::null(), p.1, None, None);
+        }
+        if let Some(flag) = self.cross_needs_frame.get_mut(func_id as usize) {
+            *flag = false;
+        }
+        if let Some(mask) = self.cross_wide_uninit.get_mut(func_id as usize) {
+            *mask = None;
+        }
+        self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
+    }
+
+    /// Dense tier state of `func_id` — the frame-entry fast path.
+    #[inline]
+    pub fn fn_state(&self, func_id: u32) -> u8 {
+        if self.interp_flags(func_id) & INTERP_NO_FN != 0 {
+            return FN_DEAD;
+        }
+        self.fn_state
+            .get(func_id as usize)
+            .copied()
+            .unwrap_or(FN_COLD)
+    }
+
+    fn set_fn_state(&mut self, func_id: u32, s: u8) {
+        let i = func_id as usize;
+        if self.fn_state.len() <= i {
+            self.fn_state.resize(i + 1, FN_COLD);
+        }
+        self.fn_state[i] = s;
+    }
+
+    /// Attempt to compile `proto` (id `func_id`). On success it becomes
+    /// available via `get`; on failure the id is blacklisted and never retried.
+    /// `self_call_helper` is the address of the depth-guarded Rust trampoline
+    /// the native code invokes for a self-recursive call (see vm.rs).
+    pub fn compile(
+        &mut self,
+        func_id: u32,
+        proto: &FuncProto,
+        self_call_helper: usize,
+        self_val_bits: u64,
+        globals_base_helper: usize,
+        heap_helpers: HeapHelperAddrs,
+        const_strs: &FxHashMap<u32, u64>,
+        // Tier-C leaf-inline plan for this whole function (built by the caller from
+        // the live ICs; empty = no inlining, e.g. when ZIPP_NO_TIERC_LEAF is set).
+        leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+        // Tier-C transactional own-method/global plans. Empty keeps the
+        // existing live method-cross-call path byte-for-byte.
+        method_plan: &FxHashMap<usize, MethodInlinePlan>,
+        // Tier-C cross-call plan (B83): the `Call` ips whose live interpreter IC
+        // names a plain user-function callee — those sites get the native
+        // cross-call attempt with the unchanged `call_ic` helper as fallback.
+        // Empty = no cross-call emission (e.g. ZIPP_NO_CROSSCALL).
+        cross_plan: &CrossCallPlan,
+        // B206: loop-head ips owned by live reg-homed regions — the emitted
+        // body bails unconditionally at each so the regions keep the loops.
+        yield_heads: &[u32],
+        // B205: fused random-scale windows, keyed by the window's first ip.
+        random_fuse: &FxHashMap<usize, RandomScaleFusePlan>,
+        // B257: `MakeFunc` ips licensed for the plain lane (ip -> child id).
+        plain_makefunc: &FxHashMap<usize, u32>,
+    ) {
+        if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
+            return;
+        }
+        if !self.fn_body_eligible(&proto.code) {
+            self.blacklist.insert(func_id);
+            self.set_fn_state(func_id, FN_DEAD);
+            return;
+        }
+        let meter = self.meter;
+        match compile_proto(proto, func_id, self_call_helper, self_val_bits, meter) {
+            Some(f) => {
+                // Tier A was the ONLY compiled tier with no JITLOG line of its
+                // own, so its reach could be assumed but never measured — and a
+                // generator aimed at it (`jit_tier_fuzz.rs`'s `Stmt::Rec`) had
+                // no way to tell "reached and correct" from "never reached".
+                // Said here rather than inside `compile_proto` so it sits beside
+                // the Tier C line below and reports the same fact: this func_id
+                // now has a compiled whole-function body, on this tier.
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] Tier A fn{func_id} compiled (self-recursive int path, {} ops, self_call={})",
+                        proto.code.len(),
+                        f.self_binding().is_some()
+                    );
+                }
+                {
+                    let (a, n) = f.code_span();
+                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
+                }
+                self.compiled.insert(func_id, f);
+                self.set_fn_state(func_id, FN_COMPILED);
+                return;
+            }
+            None => {}
+        }
+        // ── Tier C (whole-function memory path) ── Tier A declined (not a
+        // fib-shaped int self-recursion). Try the call-heavy / recursive-descent
+        // path before blacklisting. Gated behind ZIPP_FNJIT_MEM (default-ON;
+        // opt out with ZIPP_NO_FNJIT_MEM).
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if crate::jitlog_enabled() && !mem_can_compile(proto, const_strs) {
+            eprintln!(
+                "[jit] fn{func_id} mem_can_compile=false ({} ops)",
+                proto.code.len()
+            );
+        }
+        // B207 (review): the B206 contract "metered bodies never carry
+        // yield heads" is enforced HERE, not trusted to callers — a
+        // charge-then-bail at a head would double-charge every call.
+        let yield_heads: &[u32] = if self.meter.is_some() {
+            &[]
+        } else {
+            yield_heads
+        };
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if fnjit_mem_enabled() && mem_can_compile(proto, const_strs) {
+            // One inline-cache site per GetProp/SetProp in the whole function
+            // (0 for the call/arith-only functions of v1). reserve_ic_sites never
+            // grows the table after, so the pinned r14 stays valid for a run.
+            let n_sites = proto
+                .code
+                .iter()
+                .filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
+                .count();
+            let ic_base_idx = self.reserve_ic_sites(n_sites);
+            let acc_emit = self.register_ic_sites(ic_base_idx, func_id, u32::MAX, &proto.code, 0);
+            let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
+            if let Some(f) = compile_proto_mem(
+                proto,
+                func_id,
+                globals_base_helper,
+                helpers,
+                const_strs,
+                leaf_plan,
+                method_plan,
+                cross_plan,
+                &acc_emit,
+                meter,
+                yield_heads,
+                random_fuse,
+                plain_makefunc,
+            ) {
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] Tier C fn{func_id} compiled (whole-function mem path, leaf_inlines={}, acc_arms={}/{}, direct_miss={})",
+                        leaf_plan.len(),
+                        acc_emit.iter().filter(|s| s.acc).count(),
+                        acc_emit.len(),
+                        acc_emit.iter().filter(|s| s.direct_miss).count()
+                    );
+                }
+                // Cross-call entry (B83): a Tier C body never bakes a
+                // self-binding assumption and Tier C rejects generators/async/
+                // rest/`arguments`, so its entry is safe to dispatch to from
+                // another compiled function's Call site.
+                debug_assert!(f.self_binding().is_none());
+                let entry = f.entry();
+                // W7 window-fill mask: which registers a cross call must zero
+                // when reusing an already-initialized window. Computed ONCE per
+                // compile; >64-register callees store owned words separately.
+                // `ZIPP_NO_CROSSCALL2` disables both forms, while
+                // `ZIPP_NO_CROSSCALL_WIDE_MASK` disables only the wide form.
+                let (uninit_mask, wide_uninit_mask) = if crosscall2_enabled() {
+                    let small = cross_uninit_mask(proto);
+                    let wide = if small == u64::MAX && crosscall_wide_mask_enabled() {
+                        cross_uninit_wide_mask(proto)
+                    } else {
+                        None
+                    };
+                    (small, wide)
+                } else {
+                    (u64::MAX, None)
+                };
+                if let Some(mask) = &wide_uninit_mask {
+                    if crate::jitlog_enabled() {
+                        let marked: u32 = mask.iter().map(|word| word.count_ones()).sum();
+                        eprintln!(
+                            "[jit] fn{func_id} wide cross-uninit mask regs={} words={} marked={marked}",
+                            proto.reg_count,
+                            mask.len()
+                        );
+                    }
+                }
+                {
+                    let (a, n) = f.code_span();
+                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
+                }
+                self.compiled.insert(func_id, f);
+                self.set_fn_state(func_id, FN_COMPILED);
+                let json_walk = meter
+                    .is_none()
+                    .then(|| json_walk_plan(proto, const_strs))
+                    .flatten();
+                let markdown_inline = meter
+                    .is_none()
+                    .then(|| markdown_inline_plan(proto))
+                    .flatten();
+                // A body containing handler ops mutates the ACTIVE FRAME's
+                // handler stack; a frame-free cross-call has no frame to hold
+                // them, so such functions never receive a cross entry and every
+                // invocation goes through the ordinary framed call path.
+                // B272: such a body still receives an entry, flagged so only
+                // the generic helper (which pushes the frame first) enters it.
+                // A Python body (see `codegen::py`) is always entered
+                // frame-backed. Every Python function already carries the
+                // traceback handler's `PushHandler`; the second test states
+                // the requirement rather than relying on that emitter habit.
+                let needs_frame = proto_has_handler_ops(proto) || has_py_ops(&proto.code);
+                if needs_frame && !cross_framed_entry_enabled() {
+                    self.clear_cross_entry(func_id);
+                    return;
+                }
+                // A handler-op body always takes the FULL zero-fill: the
+                // may-read-before-write pass follows jumps only, and a throw
+                // inside a bracket reaches the handler with the bracket's
+                // defs possibly unexecuted (a hoisted `var` assigned in the
+                // `try` and read in the `catch` is the concrete shape), so a
+                // masked fill could expose a stale slot there. The
+                // interpreter zero-fills the whole window; so does this.
+                let (uninit_mask, wide_uninit_mask) = if needs_frame {
+                    (u64::MAX, None)
+                } else {
+                    (uninit_mask, wide_uninit_mask)
+                };
+                self.set_cross_entry(
+                    func_id,
+                    entry,
+                    uninit_mask,
+                    wide_uninit_mask,
+                    json_walk,
+                    markdown_inline,
+                    needs_frame,
+                );
+                return;
+            }
+        }
+        if crate::jitlog_enabled() {
+            eprintln!("[jit] fn{func_id} BLACKLISTED (neither Tier A nor Tier C compiled)");
+        }
+        self.blacklist.insert(func_id);
+        self.set_fn_state(func_id, FN_DEAD);
+    }
+
+    /// Native entry for the fused `map` kernel of callback `func_id`, compiling
+    /// (and caching) it on first request. Returns `None` if the callback isn't
+    /// kernel-eligible. The entry pointer is into the kernel's mmap'd buffer
+    /// (stable; the cache `Option` owns the buffer for the VM's lifetime).
+    pub fn map_kernel(&mut self, func_id: u32, proto: &FuncProto) -> Option<*const u8> {
+        if let Some(slot) = self.map_kernels.get(&func_id) {
+            return slot.as_ref().map(|f| f.entry());
+        }
+        let compiled = compile_map_kernel(proto);
+        let entry = compiled.as_ref().map(|f| f.entry());
+        if let Some(f) = compiled.as_ref() {
+            // B237: array-map kernels are emitted bodies too; without this
+            // their samples land in the profiler's unattributed bucket.
+            let (a, n) = f.code_span();
+            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} map-kernel"));
+        }
+        self.map_kernels.insert(func_id, compiled);
+        entry
+    }
+
+    /// Native entry for the fused `reduce` kernel of callback `func_id`,
+    /// compiling and caching on first request. `None` if ineligible.
+    pub fn reduce_kernel(&mut self, func_id: u32, proto: &FuncProto) -> Option<*const u8> {
+        if let Some(slot) = self.reduce_kernels.get(&func_id) {
+            return slot.as_ref().map(|f| f.entry());
+        }
+        let compiled = compile_reduce_kernel(proto);
+        let entry = compiled.as_ref().map(|f| f.entry());
+        if let Some(f) = compiled.as_ref() {
+            // B237: array-reduce kernels are emitted bodies too; without this
+            // their samples land in the profiler's unattributed bucket.
+            let (a, n) = f.code_span();
+            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} reduce-kernel"));
+        }
+        self.reduce_kernels.insert(func_id, compiled);
+        entry
+    }
+
+    /// Native entry for the fused `filter` kernel of predicate `func_id`,
+    /// compiling and caching on first request. `None` if ineligible.
+    pub fn filter_kernel(&mut self, func_id: u32, proto: &FuncProto) -> Option<*const u8> {
+        if let Some(slot) = self.filter_kernels.get(&func_id) {
+            return slot.as_ref().map(|f| f.entry());
+        }
+        let compiled = compile_filter_kernel(proto);
+        let entry = compiled.as_ref().map(|f| f.entry());
+        if let Some(f) = compiled.as_ref() {
+            // B237: array-filter kernels are emitted bodies too; without this
+            // their samples land in the profiler's unattributed bucket.
+            let (a, n) = f.code_span();
+            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} filter-kernel"));
+        }
+        self.filter_kernels.insert(func_id, compiled);
+        entry
+    }
+
+    // ── OSR loop regions ──
+
+    /// Native code for the loop region of `func_id` whose header is `entry_ip`.
+    pub fn get_region(&self, func_id: u32, entry_ip: u32) -> Option<&Region> {
+        self.regions.get(&(func_id, entry_ip))
+    }
+
+    /// Dense region-state check — the back-edge fast path. `true` iff the loop
+    /// headed at `entry_ip` is permanently blacklisted, so the caller can skip
+    /// `try_run_osr` + `record_region` entirely: `get_region` cannot hit (a
+    /// blacklisted key is never compiled) and `record_region` is a no-op
+    /// `false` for it. The loop-region sibling of the [`FN_DEAD`] check at
+    /// frame entry.
+    #[inline]
+    pub fn region_dead(&self, func_id: u32, entry_ip: u32) -> bool {
+        self.interp_flags(func_id) & INTERP_NO_REGIONS != 0
+            || (self.dense_backedge
+                && self
+                    .region_dead
+                    .get(func_id as usize)
+                    .is_some_and(|v| v.get(entry_ip as usize).copied().unwrap_or(0) != 0))
+    }
+
+    /// Mirror a `region_blacklist` insert into the dense side table. Called at
+    /// every site that inserts the key, and ONLY those: [`Jit::blacklist_region`],
+    /// the decline arm of [`Jit::compile_region`], and the no-retry evict arm of
+    /// [`Jit::note_region_resume`]. The retry-evict and `region_defer` paths
+    /// leave the byte 0, so a loop that can still compile keeps counting.
+    fn set_region_dead(&mut self, func_id: u32, entry_ip: u32) {
+        let f = func_id as usize;
+        if self.region_dead.len() <= f {
+            self.region_dead.resize_with(f + 1, Vec::new);
+        }
+        let v = &mut self.region_dead[f];
+        let i = entry_ip as usize;
+        if v.len() <= i {
+            v.resize(i + 1, 0);
+        }
+        v[i] = 1;
+    }
+
+    /// W9: `true` iff `func_id` owns at least one LIVE register-homed region.
+    /// One dense array read — safe on the per-call decline path.
+    #[inline]
+    pub fn has_reg_region(&self, func_id: u32) -> bool {
+        self.fn_reg_region
+            .get(func_id as usize)
+            .copied()
+            .unwrap_or(0)
+            != 0
+    }
+
+    /// W9: should the whole-function offer for `func_id` be declined because a
+    /// live register-homed region already serves its hot loop? Called on every
+    /// threshold trip of a shadowed function (the trip recurs via
+    /// [`Jit::compile_defer`]), so it is one memoized-switch read plus one
+    /// dense array read. The caller must `compile_defer` on `true` — declining
+    /// without re-arming permanently disarms the offer (B65).
+    #[inline]
+    /// B206: the entry ips of `func_id`'s live REG-homed regions — the
+    /// loop heads a yield-with-entry Tier-C body bails at.
+    pub fn reg_region_heads(&self, func_id: u32) -> Vec<u32> {
+        self.regions
+            .iter()
+            .filter(|(&(f, _), r)| f == func_id && !r.is_mem)
+            .map(|(&(_, ip), _)| ip)
+            .collect()
+    }
+
+    pub fn should_yield_to_region(&mut self, func_id: u32) -> bool {
+        let y = tierc_yield_enabled() && self.has_reg_region(func_id);
+        if y && crate::jitlog_enabled() && self.yield_logged.insert(func_id) {
+            eprintln!("[jit] Tier C fn{func_id} DECLINED (yield: live reg-homed region)");
+        }
+        y
+    }
+
+    /// W9 accounting: a region was just installed for `func_id`.
+    fn note_reg_region_installed(&mut self, func_id: u32, is_mem: bool) {
+        if is_mem {
+            return;
+        }
+        let i = func_id as usize;
+        if self.fn_reg_region.len() <= i {
+            self.fn_reg_region.resize(i + 1, 0);
+        }
+        self.fn_reg_region[i] += 1;
+        debug_assert_eq!(
+            self.fn_reg_region[i] as usize,
+            self.regions
+                .iter()
+                .filter(|(&(f, _), r)| f == func_id && !r.is_mem)
+                .count()
+        );
+    }
+
+    /// W9 accounting: `r` was just removed from `regions` for `func_id`.
+    fn note_reg_region_removed(&mut self, func_id: u32, r: &Region) {
+        if r.is_mem {
+            return;
+        }
+        if let Some(c) = self.fn_reg_region.get_mut(func_id as usize) {
+            debug_assert!(*c > 0);
+            *c = c.saturating_sub(1);
+        }
+        debug_assert_eq!(
+            self.fn_reg_region
+                .get(func_id as usize)
+                .copied()
+                .unwrap_or(0) as usize,
+            self.regions
+                .iter()
+                .filter(|(&(f, _), rr)| f == func_id && !rr.is_mem)
+                .count()
+        );
+    }
+
+    /// W9: a register-homed region just landed for `func_id` — if a Tier C
+    /// body is installed, evict it (park + reset to cold, the `acc_way_gate`
+    /// recipe) so the interpreter's back-edge can enter the region on
+    /// subsequent calls. Tier A bodies (a baked `self_binding`) keep their
+    /// code: their shape is recursion, not the shadowed loop. No deopt
+    /// sentinel is needed: this runs from an interpreted activation (the
+    /// region compile is only reachable from the interpreter's back-edge), so
+    /// at worst a stale outer native activation finishes on parked code once.
+    fn yield_tier_c_to_region(&mut self, func_id: u32) {
+        if !tierc_yield_enabled() {
+            return;
+        }
+        let is_tier_c = self
+            .compiled
+            .get(&func_id)
+            .is_some_and(|f| f.self_binding().is_none());
+        if !is_tier_c {
+            return;
+        }
+        if let Some(f) = self.compiled.remove(&func_id) {
+            if crate::jitlog_enabled() {
+                eprintln!("[jit] Tier C fn{func_id} EVICTED (yield: reg-homed region landed)");
+            }
+            self.retired_fns.push(f);
+            self.counts.remove(&func_id);
+            self.set_fn_state(func_id, FN_COLD);
+            self.clear_cross_entry(func_id);
+            if self.self_cache.is_some_and(|(id, _)| id == func_id) {
+                self.self_cache = None;
+            }
+        }
+    }
+
+    /// Count a back-edge to the loop headed at `entry_ip`. Returns `true` exactly
+    /// once, when the count crosses `OSR_THRESHOLD` and the region is neither
+    /// compiled nor blacklisted — the caller should then attempt `compile_region`.
+    pub fn record_region(&mut self, func_id: u32, entry_ip: u32) -> bool {
+        let key = (func_id, entry_ip);
+        // Called only after a `get_region` miss on the same back-edge, so
+        // `regions` cannot contain the key — only the blacklist gates. This
+        // keeps the per-back-edge cost of a permanently-rejected loop to one
+        // hash probe (plus the counter bump until it is blacklisted).
+        if self.region_blacklist.contains(&key) {
+            return false;
+        }
+        let c = self.region_counts.entry(key).or_insert(0);
+        *c += 1;
+        *c == self.loop_threshold()
+    }
+
+    /// Permanently blacklist the region headed at `entry_ip` (the dispatch-side
+    /// call-mix gate found it would lose to the interpreter — e.g. dominated by
+    /// always-fallback native-callee sites).
+    pub fn blacklist_region(&mut self, func_id: u32, entry_ip: u32) {
+        if crate::jitlog_enabled() {
+            eprintln!("[jit] region fn{func_id} [{entry_ip}] DECLINED (call-mix gate)");
+        }
+        self.region_blacklist.insert((func_id, entry_ip));
+        self.set_region_dead(func_id, entry_ip);
+    }
+
+    /// Undo the threshold trip reported by [`Jit::record_and_should_compile`]:
+    /// the caller found the function not YET safe to compile (a global op whose
+    /// slot is still uninitialized, so the binding may be an own property of the
+    /// global object rather than a slot). Re-arm so a later call re-checks.
+    ///
+    /// The sibling of [`Jit::region_defer`], and it was missing — see B65.
+    pub fn compile_defer(&mut self, func_id: u32) {
+        if let Some(c) = self.counts.get_mut(&func_id) {
+            *c -= 1;
+        }
+    }
+
+    /// Undo the threshold trip reported by [`Jit::record_region`]: the caller
+    /// found the region not YET safe to compile (an uninitialized global in
+    /// the body) but expects it to become safe — re-arm so a later back-edge
+    /// re-trips the threshold and re-checks.
+    pub fn region_defer(&mut self, func_id: u32, entry_ip: u32) {
+        if let Some(c) = self.region_counts.get_mut(&(func_id, entry_ip)) {
+            *c -= 1;
+        }
+    }
+
+    /// Attempt to compile the loop region `[start, end]` of `func_id` (entered at
+    /// `start`). `globals_base_helper` is the address of the win64 helper that
+    /// returns `vm.globals.as_mut_ptr()` (the region pins it for direct global
+    /// access). On failure the region is blacklisted and never retried.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_region(
+        &mut self,
+        func_id: u32,
+        proto: &FuncProto,
+        start: u32,
+        end: u32,
+        globals: &[Value],
+        heap: &crate::heap::Heap,
+        globals_base_helper: usize,
+        heap_helpers: HeapHelperAddrs,
+        field_pool_base: u32,
+        field_pool_size: u32,
+        const_strs: &FxHashMap<u32, u64>,
+        ta_plan: &TaPinPlan,
+        leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+        computed_leaf_plan: &FxHashMap<usize, DenseComputedLeafPlan>,
+        method_plan: &FxHashMap<usize, MethodInlinePlan>,
+        cross_plan: &CrossCallPlan,
+    ) {
+        let key = (func_id, start);
+        if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
+            return;
+        }
+        let meter = self.meter;
+        if !self.body_eligible(&proto.code[start as usize..=end as usize]) {
+            self.region_blacklist.insert(key);
+            self.set_region_dead(key.0, key.1);
+            return;
+        }
+        // A Python loop (see `codegen::py`) takes the memory path alone: the
+        // register tiers and scalar replacement reason about control flow
+        // without its fused instructions' `slow` edges, and its element
+        // accesses are the runtime's, not typed-array pins.
+        let py = has_py_ops(&proto.code[start as usize..=end as usize]);
+        let empty_ta_plan = TaPinPlan::default();
+        let ta_plan = if py { &empty_ta_plan } else { ta_plan };
+        if py {
+            self.region_int_blacklist.insert(key);
+            self.compile_py_region(
+                func_id,
+                proto,
+                start,
+                end,
+                globals_base_helper,
+                heap_helpers,
+                const_strs,
+                leaf_plan,
+                method_plan,
+                cross_plan,
+            );
+            return;
+        }
+
+        // Fresh LOCAL aggregate scalar replacement. Unlike the older global-
+        // object field promotion below, scalar homes are otherwise-unused
+        // registers in this activation: nested execution gets a distinct frame
+        // window, and GC already scans every register. The planner is deliberately
+        // fail-closed (straight-line, no escape/accessor/dynamic-key surface).
+        // Metered execution retains real allocation for heap limits; GC stress
+        // retains it so collector torture keeps exercising the literal path.
+        if !self.region_int_blacklist.contains(&key)
+            && local_sroa_enabled()
+            && meter.is_none()
+            && std::env::var_os("ZIPP_GC_STRESS").is_none()
+        {
+            if let Some(mut local) = plan_local_sroa(proto, start, end) {
+                if local_concat_len_enabled() {
+                    plan_local_concat_len(proto, start, end, &mut local);
+                }
+                let rewritten = &local.proto;
+                let n_sites = rewritten.code[start as usize..=end as usize]
+                    .iter()
+                    .filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
+                    .count();
+                let ic_base_idx = self.reserve_ic_sites(n_sites);
+                let acc_emit = self.register_ic_sites(
+                    ic_base_idx,
+                    func_id,
+                    start,
+                    &rewritten.code[start as usize..=end as usize],
+                    start,
+                );
+                let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
+                let empty_ta = TaPinPlan::default();
+                let empty_leaf = FxHashMap::default();
+                let empty_method = FxHashMap::default();
+                let empty_cross = CrossCallPlan::default();
+                if let Some((code, is_mem, is_boxref)) = compile_region(
+                    rewritten,
+                    start,
+                    end,
+                    globals_base_helper,
+                    helpers,
+                    const_strs,
+                    &empty_ta,
+                    &empty_leaf,
+                    &empty_method,
+                    &empty_cross,
+                    &acc_emit,
+                    false,
+                    meter,
+                ) {
+                    if crate::jitlog_enabled() {
+                        eprintln!(
+                            "[jit] LOCAL-SROA region fn{func_id} [{start},{end}] objects={} arrays={} finalized={} concat_lens={} tier={}",
+                            local.runtime.objects.len(),
+                            local.runtime.arrays.len(),
+                            local.runtime.finalized.len(),
+                            local.runtime.concat_lens.len(),
+                            if is_mem { "MEM" } else { "DOUBLE" }
+                        );
+                    }
+                    {
+                        // B237: the PC profiler maps a sampled RIP onto the body
+                        // that contains it; this is where a region body's range
+                        // becomes known.
+                        let (a, n) = code.code_span();
+                        crate::vm::prof::pc::register(a, n, || {
+                            format!("fn{func_id} region [{start},{end}]")
+                        });
+                    }
+                    self.regions.insert(
+                        key,
+                        Region {
+                            code,
+                            start,
+                            end,
+                            deopts: 0,
+                            ok_runs: 0,
+                            is_int: false,
+                            is_mem,
+                            field_plan: None,
+                            local_sroa: Some(local.runtime),
+                            is_boxref,
+                        },
+                    );
+                    self.note_reg_region_installed(func_id, is_mem);
+                    if !is_mem {
+                        self.yield_tier_c_to_region(func_id);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // ── object scalar-replacement (SROA) ── if the region's heap ops all
+        // target one non-escaping global object, rewrite them to scratch
+        // field-globals and compile the (now purely numeric) region — the loop
+        // becomes register-only, like V8. Tried FIRST (beats the IC mem path).
+        if !self.region_int_blacklist.contains(&key) {
+            if let Some(fp) = plan_field_promotion(proto, start, end, globals, heap) {
+                if (fp.fields.len() as u32) <= field_pool_size {
+                    let sync_fields: Vec<(u32, u32)> = fp
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &name)| (name, field_pool_base + i as u32))
+                        .collect();
+                    let rewritten =
+                        rewrite_for_field_promotion(proto, start, end, &fp, field_pool_base);
+                    let compiled = compile_region_numeric(
+                        &rewritten,
+                        start,
+                        end,
+                        globals_base_helper,
+                        fp.obj_global,
+                        meter,
+                    );
+                    if crate::jitlog_enabled() {
+                        eprintln!(
+                            "[jit] SROA region fn{func_id} [{start},{end}] fields={} -> {}",
+                            fp.fields.len(),
+                            if compiled.is_some() {
+                                "compiled"
+                            } else {
+                                "DECLINED (numeric path)"
+                            }
+                        );
+                    }
+                    if let Some((code, is_int)) = compiled {
+                        let plan = FieldSyncPlan {
+                            obj_global: fp.obj_global,
+                            fields: sync_fields,
+                            func_id,
+                            obj_idx: fp.obj_idx,
+                            obj_version: fp.obj_version,
+                        };
+                        {
+                            // B237: the PC profiler maps a sampled RIP onto the body
+                            // that contains it; this is where a region body's range
+                            // becomes known.
+                            let (a, n) = code.code_span();
+                            crate::vm::prof::pc::register(a, n, || {
+                                format!("fn{func_id} region [{start},{end}]")
+                            });
+                        }
+                        self.regions.insert(
+                            key,
+                            Region {
+                                code,
+                                start,
+                                end,
+                                deopts: 0,
+                                ok_runs: 0,
+                                is_int,
+                                is_mem: false,
+                                field_plan: Some(plan),
+                                local_sroa: None,
+                                is_boxref: false,
+                            },
+                        );
+                        self.note_reg_region_installed(func_id, false);
+                        self.yield_tier_c_to_region(func_id);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Prefer the integer path (i64/paddq — beats the double path on integer
+        // loops) unless it already deoptimised for this loop. Fall back to the
+        // double/memory path.
+        if !self.region_int_blacklist.contains(&key) {
+            // Splice-aware admission: a `Call` the leaf planner already proved
+            // inlinable is flattened into a virtual body BEFORE admission runs,
+            // so the callee's arithmetic joins the region's i64 homes instead of
+            // disqualifying it. `None` (no calls, or any decline) leaves the
+            // arguments below exactly as they were.
+            let splice = plan_int_splice(
+                proto,
+                start,
+                end,
+                ta_plan,
+                leaf_plan,
+                computed_leaf_plan,
+                heap_helpers.regs_fits,
+                meter.is_some(),
+            );
+            let (iproto, istart, iend, ita) = match &splice {
+                Some(sp) => (&sp.proto, sp.start, sp.end, &sp.ta_plan),
+                None => (proto, start, end, ta_plan),
+            };
+            let entry = splice.as_ref().map(|sp| sp.entry()).unwrap_or_default();
+            if let Some(code) = compile_region_int(
+                iproto,
+                istart,
+                iend,
+                globals_base_helper,
+                ita,
+                heap_helpers.ta_snapshot,
+                heap_helpers.math_imul_guard,
+                &entry,
+                None,
+                meter,
+            ) {
+                if crate::jitlog_enabled() {
+                    eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
+                }
+                {
+                    // B237: the PC profiler maps a sampled RIP onto the body
+                    // that contains it; this is where a region body's range
+                    // becomes known.
+                    let (a, n) = code.code_span();
+                    crate::vm::prof::pc::register(a, n, || {
+                        format!("fn{func_id} region [{start},{end}]")
+                    });
+                }
+                self.regions.insert(
+                    key,
+                    Region {
+                        code,
+                        start,
+                        end,
+                        deopts: 0,
+                        ok_runs: 0,
+                        is_int: true,
+                        is_mem: false,
+                        field_plan: None,
+                        local_sroa: None,
+                        is_boxref: false,
+                    },
+                );
+                self.note_reg_region_installed(func_id, false);
+                self.yield_tier_c_to_region(func_id);
+                return;
+            }
+        }
+        // Reserve one inline-cache slot per GetProp/SetProp in the region (only
+        // heap regions take the mem path that uses them; numeric regions have 0).
+        let n_sites = proto.code[start as usize..=end as usize]
+            .iter()
+            .filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
+            .count();
+        let ic_base_idx = self.reserve_ic_sites(n_sites);
+        let acc_emit = self.register_ic_sites(
+            ic_base_idx,
+            func_id,
+            start,
+            &proto.code[start as usize..=end as usize],
+            start,
+        );
+        let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
+        // W20: a region whose BOXREF compile already evicted is re-offered WITHOUT
+        // the boxed arms, so it lands on the memory tier instead of oscillating.
+        let boxref_ok = !self.region_boxref_blacklist.contains(&key);
+        match compile_region(
+            proto,
+            start,
+            end,
+            globals_base_helper,
+            helpers,
+            const_strs,
+            ta_plan,
+            leaf_plan,
+            method_plan,
+            cross_plan,
+            &acc_emit,
+            boxref_ok,
+            meter,
+        ) {
+            Some((code, is_mem, is_boxref)) => {
+                if crate::jitlog_enabled() {
+                    let tier = if is_mem { "MEM" } else { "DOUBLE" };
+                    eprintln!(
+                        "[jit] {tier} region fn{func_id} [{start},{end}] compiled (acc_arms={}/{}, direct_miss={})",
+                        acc_emit.iter().filter(|s| s.acc).count(),
+                        acc_emit.len(),
+                        acc_emit.iter().filter(|s| s.direct_miss).count()
+                    );
+                }
+                {
+                    // B237: the PC profiler maps a sampled RIP onto the body
+                    // that contains it; this is where a region body's range
+                    // becomes known.
+                    let (a, n) = code.code_span();
+                    crate::vm::prof::pc::register(a, n, || {
+                        format!("fn{func_id} region [{start},{end}]")
+                    });
+                }
+                self.regions.insert(
+                    key,
+                    Region {
+                        code,
+                        start,
+                        end,
+                        deopts: 0,
+                        ok_runs: 0,
+                        is_int: false,
+                        is_mem,
+                        field_plan: None,
+                        local_sroa: None,
+                        is_boxref,
+                    },
+                );
+                self.note_reg_region_installed(func_id, is_mem);
+                if !is_mem {
+                    self.yield_tier_c_to_region(func_id);
+                }
+            }
+            None => {
+                if crate::jitlog_enabled() {
+                    eprintln!("[jit] region fn{func_id} [{start},{end}] DECLINED (blacklisted)");
+                }
+                self.region_blacklist.insert(key);
+                self.set_region_dead(key.0, key.1);
+            }
+        }
+    }
+
+    /// Record that a region run resumed at `resume_ip`. If that ip is inside the
+    /// region (a deopt/bail) and the region has now deopted past the limit, evict
+    /// and blacklist it (so the interpreter stops re-entering a guard that keeps
+    /// failing). Returns whether the region remains installed.
+    pub fn note_region_resume(&mut self, func_id: u32, entry_ip: u32, resume_ip: u32) {
+        let key = (func_id, entry_ip);
+        let mut boxref_evicted = false;
+        let (evict, retry) = if let Some(r) = self.regions.get_mut(&key) {
+            if resume_ip >= r.start && resume_ip <= r.end {
+                r.deopts += 1;
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] region fn{} [{}] deopt at ip {}",
+                        key.0, key.1, resume_ip
+                    );
+                }
+                // Retry on a SIMPLER path if this was an int region (value grew
+                // past 2^53 → double handles it) or a SROA region (a field turned
+                // non-numeric → the inline-cache mem path handles any type).
+                (
+                    r.deopts >= OSR_DEOPT_LIMIT,
+                    r.is_int || r.field_plan.is_some() || r.local_sroa.is_some() || r.is_boxref,
+                )
+            } else {
+                // A clean exit: the region reached its loop exit instead of
+                // bailing. DECAY the deopt budget.
+                //
+                // `deopts` used to be a lifetime total, so four rare guard
+                // misses spread over an entire program permanently blacklisted
+                // a loop — measured as a 4.5x cliff (4.00 ns/op -> 18.00 ns/op)
+                // triggered by a 0.00003% event rate, and three of the ten
+                // benches were hitting it. Decaying on success turns it into
+                // "four bails without DEOPT_DECAY_RUNS clean exits between
+                // them", so a region that genuinely misbehaves is still evicted
+                // just as fast (it never earns a decay), while a hot loop with
+                // an occasional cold guard keeps its native code.
+                r.ok_runs += 1;
+                if r.ok_runs >= DEOPT_DECAY_RUNS {
+                    r.ok_runs = 0;
+                    r.deopts = r.deopts.saturating_sub(1);
+                }
+                (false, false)
+            }
+        } else {
+            (false, false)
+        };
+        if evict {
+            if crate::jitlog_enabled() {
+                eprintln!(
+                    "[jit] region fn{} [{}] EVICTED (retry={retry})",
+                    key.0, key.1
+                );
+            }
+            // Park, don't drop: an outer activation of this region may still be
+            // running (a call helper re-entered the interpreter, which looped
+            // back into the region and deopted it) — see `retired`.
+            if let Some(r) = self.regions.remove(&key) {
+                boxref_evicted = r.is_boxref;
+                self.note_reg_region_removed(key.0, &r);
+                self.retired.push(r);
+            }
+            if retry {
+                // Don't blacklist the loop — let it recompile on a more general
+                // path (region_int_blacklist also gates the SROA + int attempts).
+                // Reset the back-edge counter so iterations re-trigger compile.
+                self.region_int_blacklist.insert(key);
+                // W20: and if the evicted code was a BOXREF region, take the
+                // boxed arms away too, so the recompile reaches the memory tier
+                // rather than rebuilding the same guard that just failed.
+                if boxref_evicted {
+                    self.region_boxref_blacklist.insert(key);
+                }
+                self.region_counts.remove(&key);
+            } else {
+                self.region_blacklist.insert(key);
+                self.set_region_dead(key.0, key.1);
+            }
+        }
+    }
+
+    /// Reserve `n` fresh inline-cache sites (one per heap-op site in a region;
+    /// `JIT_IC_WAYS` ways each), returning the base global site id. The ways
+    /// start zeroed; registration marks identity ways with
+    /// `JIT_IC_EMPTY_BITS`, while direct shape-pair sites retain zeroes.
+    pub fn reserve_ic_sites(&mut self, n: usize) -> u32 {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JitCompile);
+        let base = (self.ic_table.len() / JIT_IC_WAYS) as u32;
+        self.ic_table
+            .resize(self.ic_table.len() + n * JIT_IC_WAYS, IcEntry::default());
+        self.ic_table_raw = self.ic_table.as_ptr() as u64;
+        self.ic_rot.resize(self.ic_rot.len() + n, 0);
+        self.ic_site_meta
+            .resize(self.ic_site_meta.len() + n, IcSiteMeta::default());
+        base
+    }
+
+    /// Bind the sites just reserved at `base` to their owning ops, and decide
+    /// PER SITE whether its probe gets the accessor arms: only ops that have
+    /// already filled an accessor way (`acc_sites`) pay them, unless
+    /// `ZIPP_ACC_ALWAYS_EMIT=1` restores wave-2's unconditional emission.
+    /// `code` is the exact instruction range the emitter will walk (a region's
+    /// `[start, end]` slice, or the whole body for Tier C) and `code_off` its
+    /// first ip — the k-th `GetProp`/`SetProp` in it uses site `base + k`,
+    /// mirroring the emitters' `ic_site` cursor (proto_mem debug-asserts the
+    /// same count). Returns the per-site emit choices for the emitter.
+    fn register_ic_sites(
+        &mut self,
+        base: u32,
+        func_id: u32,
+        region_entry: u32,
+        code: &[Instr],
+        code_off: u32,
+    ) -> Vec<IcSiteEmit> {
+        let on = accessor_way_enabled();
+        let always = acc_always_emit();
+        let direct_on = direct_ic_miss_enabled();
+        let force_direct = direct_on && force_direct_ic_miss();
+        let mut flags = Vec::new();
+        for (i, instr) in code.iter().enumerate() {
+            if matches!(instr, Instr::GetProp { .. } | Instr::SetProp { .. }) {
+                let op_ip = code_off + i as u32;
+                let direct_miss = direct_on
+                    && (force_direct || self.direct_miss_sites.contains(&(func_id, op_ip)));
+                // A direct site has no identity ways to carry an accessor tag.
+                // Accessors remain exact via the existing slow helper.
+                let acc =
+                    !direct_miss && on && (always || self.acc_sites.contains(&(func_id, op_ip)));
+                if let Some(m) = self.ic_site_meta.get_mut(base as usize + flags.len()) {
+                    *m = IcSiteMeta {
+                        func_id,
+                        op_ip,
+                        region_entry,
+                        acc_emitted: acc,
+                        direct_miss_emitted: direct_miss,
+                    };
+                }
+                if !direct_miss {
+                    let way_base = (base as usize + flags.len()) * JIT_IC_WAYS;
+                    let ways = self
+                        .ic_table
+                        .get_mut(way_base..way_base + JIT_IC_WAYS)
+                        .expect("fresh identity IC site");
+                    for way in ways {
+                        debug_assert_eq!(way.obj_bits, 0, "identity IC site was not fresh");
+                        way.obj_bits = JIT_IC_EMPTY_BITS;
+                    }
+                }
+                flags.push(IcSiteEmit { acc, direct_miss });
+            }
+        }
+        flags
+    }
+
+    /// May the miss helper fill an ACCESSOR way at `site`? [`AccWayGate::Fill`]
+    /// iff the compiled probe there carries the accessor arms (so a tagged way
+    /// will be dispatched, not mis-walked). Otherwise this is the site-gate
+    /// FLIP ([`AccWayGate::Recompile`]): record the op in `acc_sites`, EVICT
+    /// the owning compile — parked, not blacklisted — and tell the caller to
+    /// DEOPT (`SELF_CALL_DEOPT`, not `PROP_VIA_IC`): the evicted code is the
+    /// frame we are being called FROM, and a top-level loop's single OSR
+    /// activation would otherwise ride the parked arm-less code to the loop
+    /// exit and never recompile. Bailing hands the loop back to the
+    /// interpreter, whose back-edge count (reset here) re-trips the compile —
+    /// now WITH the arms, since the op is marked.
+    ///
+    /// TERMINATES: `acc_sites` only grows, and `register_ic_sites` emits the
+    /// arms for every op in it — so after one recompile the op's new site has
+    /// `acc_emitted == true` and the flip can never fire for it again. At most
+    /// one accessor eviction per compiled artifact per marked op, deopts only
+    /// from already-parked (unreachable-from-dispatch) activations — no
+    /// oscillation (arms are never removed while the way is enabled).
+    pub fn acc_way_gate(&mut self, site: u32) -> AccWayGate {
+        if !accessor_way_enabled() {
+            return AccWayGate::Slow;
+        }
+        let Some(&m) = self.ic_site_meta.get(site as usize) else {
+            return AccWayGate::Slow;
+        };
+        // A direct-miss compile has no identity probe and therefore nowhere an
+        // accessor-tagged way could be consumed. Keep routing through the
+        // existing live slow helper; never evict direct form merely to add dead
+        // accessor metadata.
+        if m.direct_miss_emitted {
+            return AccWayGate::Slow;
+        }
+        if m.acc_emitted {
+            return AccWayGate::Fill;
+        }
+        self.acc_sites.insert((m.func_id, m.op_ip));
+        if m.region_entry == u32::MAX {
+            // Tier C whole-function body: park + reset to cold so the call
+            // counter re-offers it (the blacklist is untouched).
+            if let Some(f) = self.compiled.remove(&m.func_id) {
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] Tier C fn{} EVICTED (accessor site gate, ip {})",
+                        m.func_id, m.op_ip
+                    );
+                }
+                self.retired_fns.push(f);
+                self.counts.remove(&m.func_id);
+                self.set_fn_state(m.func_id, FN_COLD);
+                self.clear_cross_entry(m.func_id);
+                if self.self_cache.is_some_and(|(id, _)| id == m.func_id) {
+                    self.self_cache = None;
+                }
+            }
+        } else {
+            // OSR loop region: park + reset the back-edge counter (the
+            // int-retry eviction's exact recipe, minus the int blacklist).
+            let key = (m.func_id, m.region_entry);
+            if let Some(r) = self.regions.remove(&key) {
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] region fn{} [{}] EVICTED (accessor site gate, ip {})",
+                        key.0, key.1, m.op_ip
+                    );
+                }
+                self.note_reg_region_removed(key.0, &r);
+                self.retired.push(r);
+                self.region_counts.remove(&key);
+            }
+        }
+        AccWayGate::Recompile
+    }
+
+    /// Flip a proven identity-thrashing, shape-memo-hitting property op to the
+    /// compile-time direct-miss form. Callers ask only BEFORE an observable
+    /// data read/write is committed; `Recompile` therefore permits exact
+    /// interpreter replay. The emitted form calls the same helper, so all live
+    /// object-kind, shape, descriptor, prototype and exotic checks remain in
+    /// one Rust implementation.
+    pub fn direct_miss_gate(&mut self, site: u32, memo_sites: &FxHashSet<u32>) -> DirectMissGate {
+        if !direct_ic_miss_enabled() {
+            return DirectMissGate::Probe;
+        }
+        let Some(&m) = self.ic_site_meta.get(site as usize) else {
+            return DirectMissGate::Probe;
+        };
+        if m.direct_miss_emitted {
+            return DirectMissGate::Direct;
+        }
+        // A gate flip deopts and replays this bytecode once. Unmetered code can
+        // do that because the proven own-data access has no observable effect;
+        // a metered native block, however, may already have charged the op.
+        // Never introduce a second charge in a sandboxed activation. Sites
+        // marked before instrumentation may still EMIT direct form safely —
+        // that form executes once and uses the ordinary charged helper path.
+        if self.meter.is_some() {
+            return DirectMissGate::Probe;
+        }
+        if !self.ic_direct_candidate(site) || !memo_sites.contains(&site) {
+            return DirectMissGate::Probe;
+        }
+
+        let owner = (m.func_id, m.region_entry);
+        // A hostile function with N named-property ops must not manufacture N
+        // recompiles that each reserve N fresh IC sites. Four parks keeps total
+        // table growth linear; sites not selected by then retain the safe probe.
+        if self
+            .direct_miss_recompiles
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+            >= DIRECT_MISS_RECOMPILE_CAP
+        {
+            return DirectMissGate::Probe;
+        }
+
+        // Batch siblings in this same native artifact only when EACH has both
+        // parts of the proof: a full round of identity-way eviction and at
+        // least one guardable shape-slot memo. Old site ids from an earlier
+        // compile are useful durable evidence too; their metadata carries the
+        // same stable `(func_id, op_ip)` key.
+        let mut stable = Vec::new();
+        for (id, sm) in self.ic_site_meta.iter().copied().enumerate() {
+            let sid = id as u32;
+            if sm.func_id == m.func_id
+                && sm.region_entry == m.region_entry
+                && memo_sites.contains(&sid)
+                && self.ic_thrashing(sid)
+            {
+                stable.push((sm.func_id, sm.op_ip));
+            }
+        }
+        // The triggering site crossed the stronger 32-eviction threshold, so
+        // it is present even if a defensive caller supplied an incomplete
+        // sibling set (the explicit membership check above still proves memo).
+        stable.push((m.func_id, m.op_ip));
+        stable.sort_unstable();
+        stable.dedup();
+        let mut marked = 0usize;
+        for key in stable {
+            marked += self.direct_miss_sites.insert(key) as usize;
+        }
+        if marked == 0 {
+            return DirectMissGate::Probe;
+        }
+        *self.direct_miss_recompiles.entry(owner).or_insert(0) += 1;
+
+        if m.region_entry == u32::MAX {
+            if let Some(f) = self.compiled.remove(&m.func_id) {
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] Tier C fn{} EVICTED (direct-miss site gate, ip {}, batched {})",
+                        m.func_id, m.op_ip, marked
+                    );
+                }
+                self.retired_fns.push(f);
+                self.counts.remove(&m.func_id);
+                self.set_fn_state(m.func_id, FN_COLD);
+                self.clear_cross_entry(m.func_id);
+                if self.self_cache.is_some_and(|(id, _)| id == m.func_id) {
+                    self.self_cache = None;
+                }
+            }
+        } else {
+            let key = (m.func_id, m.region_entry);
+            if let Some(r) = self.regions.remove(&key) {
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] region fn{} [{}] EVICTED (direct-miss site gate, ip {}, batched {})",
+                        key.0, key.1, m.op_ip, marked
+                    );
+                }
+                self.note_reg_region_removed(key.0, &r);
+                self.retired.push(r);
+                self.region_counts.remove(&key);
+            }
+        }
+        DirectMissGate::Recompile
+    }
+
+    /// Whether this compile omitted the identity probes at `site`. Miss helpers
+    /// use this only to avoid refilling dead ways after a first-seen shape had
+    /// to take the full safe lookup path.
+    #[inline]
+    pub fn direct_miss_active(&self, site: u32) -> bool {
+        self.ic_site_meta
+            .get(site as usize)
+            .is_some_and(|m| m.direct_miss_emitted)
+    }
+
+    /// Cheap preflight before a helper builds the one-shot set of sibling
+    /// sites with shape memos. False means the gate cannot park this artifact,
+    /// so a capped or metered site pays no allocation/hash work per access.
+    #[inline]
+    pub fn direct_miss_gate_ready(&self, site: u32) -> bool {
+        if !direct_ic_miss_enabled() || self.meter.is_some() || !self.ic_direct_candidate(site) {
+            return false;
+        }
+        self.ic_site_meta.get(site as usize).is_some_and(|m| {
+            !m.direct_miss_emitted
+                && self
+                    .direct_miss_recompiles
+                    .get(&(m.func_id, m.region_entry))
+                    .copied()
+                    .unwrap_or(0)
+                    < DIRECT_MISS_RECOMPILE_CAP
+        })
+    }
+
+    /// Base pointer of the inline-cache table (for a region prologue to pin).
+    pub fn ic_base_ptr(&self) -> *const IcEntry {
+        self.ic_table.as_ptr()
+    }
+
+    /// Fill one way of inline-cache site `site` after a miss (called by the
+    /// `*_miss` helpers): an existing way for the same receiver identity is
+    /// updated in place, else the next empty way, else round-robin eviction.
+    /// Never grows the table (the site was reserved at compile time), so a
+    /// pinned base pointer in a running region stays valid. `site == u32::MAX`
+    /// (the hoisted-`.length` pseudo-site) is ignored.
+    /// Has this site evicted a full round of ways?
+    ///
+    /// `ic_rot` only advances when every way is occupied and one has to be
+    /// thrown out, so a non-trivial count means the site has seen more distinct
+    /// RECEIVERS than it has ways — the megamorphic-by-identity case. Callers
+    /// use it to stop refilling ways that will be evicted before they are hit.
+    #[inline]
+    pub fn ic_thrashing(&self, site: u32) -> bool {
+        self.ic_rot
+            .get(site as usize)
+            .is_some_and(|&r| r >= JIT_IC_WAYS as IcRotCursor)
+    }
+
+    /// Stronger than the refill-suppression threshold: wait for 32 actual way
+    /// evictions (40 distinct identity misses after the initial fills) before
+    /// making the permanent compile-site decision. A brief ninth receiver or
+    /// a one-off allocation burst therefore cannot poison a later monomorphic
+    /// phase, while sustained many-identity sites converge almost immediately.
+    #[inline]
+    pub fn ic_direct_candidate(&self, site: u32) -> bool {
+        self.ic_rot
+            .get(site as usize)
+            .is_some_and(|&r| r >= DIRECT_MISS_EVICTION_THRESHOLD)
+    }
+
+    /// Advance the fill cursor for a miss the gate SUPPRESSED — the rotation
+    /// escape. [`Jit::set_ic`] bumps it on every eviction it performs, so a
+    /// gated site that stopped calling `set_ic` would otherwise leave the
+    /// cursor pinned above `JIT_IC_WAYS` and never fill again. Bumping here
+    /// instead makes [`Jit::ic_thrashing`] periodic with period
+    /// [`IC_ROT_PERIOD`]: the site reopens for `JIT_IC_WAYS` fills, captures
+    /// the receivers that are live now, and closes again.
+    #[inline]
+    pub fn ic_rot_bump(&mut self, site: u32) {
+        if let Some(r) = self.ic_rot.get_mut(site as usize) {
+            *r = r.wrapping_add(1);
+        }
+    }
+
+    /// B188: pack a SHAPE PAIR into a direct-form site's ways — four
+    /// `(pattern, slot)` pairs per 64-byte way at the fixed offsets the
+    /// emitted 4-pair probe reads: (pat@0, slot@20), (pat@8, slot@16),
+    /// (pat@24, slot@32), (pat@40, slot@48) — i.e. `obj_bits/slot_nhops`,
+    /// `vals_ptr/version`, `hops[0..2)/hops[1].0`, `hops[2..4)/hops[3].0`.
+    /// Every pattern carries bit 32 (the B178 marker convention), so a zero
+    /// word is FREE and real receiver bits can never collide. Update an
+    /// existing pair for the shape, else claim the first free pair, else
+    /// overwrite round-robin. Direct sites hold ONLY shape pairs, so the
+    /// packing never coexists with identity fields.
+    pub fn fill_shape_pair(&mut self, site: u32, shape: u32, slot: u32) {
+        const PAIR_OFFS: [(usize, usize); 4] = [(0, 20), (8, 16), (24, 32), (40, 48)];
+        if slot > 0x00FF_FFFF || shape == crate::shape::DICT {
+            return;
+        }
+        let pat = (1u64 << 32) | shape as u64;
+        let base = (site as usize).wrapping_mul(JIT_IC_WAYS);
+        let Some(ways) = self.ic_table.get_mut(base..base + JIT_IC_WAYS) else {
+            return;
+        };
+        // The ways as raw bytes: the pair layout is byte-offset addressed on
+        // purpose (the emitted probe reads the same offsets), and `IcEntry`
+        // is `repr(C)` with a compile-checked 64-byte stride.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                ways.as_mut_ptr() as *mut u8,
+                JIT_IC_WAYS * JIT_IC_STRIDE,
+            )
+        };
+        let read_pat = |bytes: &[u8], w: usize, k: usize| {
+            let off = w * JIT_IC_STRIDE + PAIR_OFFS[k].0;
+            u64::from_le_bytes(bytes[off..off + 8].try_into().expect("8 bytes"))
+        };
+        let write_pair = |bytes: &mut [u8], w: usize, k: usize, pat: u64, slot: u32| {
+            let (po, so) = PAIR_OFFS[k];
+            let off = w * JIT_IC_STRIDE;
+            bytes[off + po..off + po + 8].copy_from_slice(&pat.to_le_bytes());
+            bytes[off + so..off + so + 4].copy_from_slice(&slot.to_le_bytes());
+        };
+        let mut free: Option<(usize, usize)> = None;
+        for w in 0..JIT_IC_WAYS {
+            for k in 0..4 {
+                let cur = read_pat(bytes, w, k);
+                if cur == pat {
+                    write_pair(bytes, w, k, pat, slot);
+                    return;
+                }
+                if cur == 0 && free.is_none() {
+                    free = Some((w, k));
+                }
+            }
+        }
+        if let Some((w, k)) = free {
+            write_pair(bytes, w, k, pat, slot);
+            return;
+        }
+        let r = &mut self.ic_rot[site as usize];
+        let n = *r as usize % (JIT_IC_WAYS * 4);
+        write_pair(bytes, n / 4, n % 4, pat, slot);
+        *r = r.wrapping_add(1);
+    }
+
+    pub fn set_ic(&mut self, site: u32, e: IcEntry) {
+        let base = (site as usize).wrapping_mul(JIT_IC_WAYS);
+        let Some(ways) = self.ic_table.get_mut(base..base + JIT_IC_WAYS) else {
+            return;
+        };
+        if let Some(w) = ways.iter_mut().find(|w| w.obj_bits == e.obj_bits) {
+            *w = e;
+            return;
+        }
+        if let Some(w) = ways
+            .iter_mut()
+            .find(|w| matches!(w.obj_bits, JIT_IC_EMPTY_BITS | 0))
+        {
+            *w = e;
+            return;
+        }
+        let r = &mut self.ic_rot[site as usize];
+        ways[*r as usize % JIT_IC_WAYS] = e;
+        *r = r.wrapping_add(1);
+    }
+}
+
+impl Region {
+    /// Raw native entry pointer (into the region's mmap'd `ExecutableBuffer`,
+    /// which never moves — stable across `regions`-map rehashes and, via
+    /// `Jit::retired`, even across an eviction of a still-running region).
+    /// The caller invokes it with the `JitFn::run` ABI; the returned bail slot
+    /// is the ip to resume interpreting at.
+    pub fn entry(&self) -> *const u8 {
+        self.code.entry()
+    }
+
+    /// The object scalar-replacement sync plan, if this region was field-promoted.
+    /// The interpreter syncs the object's fields ↔ the pool globals around `run`.
+    pub fn field_plan(&self) -> Option<&FieldSyncPlan> {
+        self.field_plan.as_ref()
+    }
+
+    /// The local aggregate materialization plan, if this region elides fresh
+    /// object/array literals.
+    pub fn local_sroa_plan(&self) -> Option<&LocalSroaPlan> {
+        self.local_sroa.as_ref()
+    }
+
+    /// Inclusive bytecode bounds of this OSR region.
+    pub fn bounds(&self) -> (u32, u32) {
+        (self.start, self.end)
+    }
+
+    /// True if this region runs on the memory-backed path. Diagnostic only.
+    pub fn is_mem(&self) -> bool {
+        self.is_mem
+    }
+}
+
+// submodules (split out of the former monolithic codegen.rs)
+mod absint;
+mod emit;
+mod emit_misc;
+mod fn_int;
+mod inline;
+mod int_splice;
+mod kernels;
+pub(crate) mod meter;
+mod plan;
+mod plan_region;
+mod proto_mem;
+#[cfg(feature = "python")]
+mod py;
+// No Python program in this build: the tier's questions answer "none".
+#[cfg(not(feature = "python"))]
+#[path = "py_off.rs"]
+mod py;
+mod regalloc;
+mod region_admit;
+mod region_int;
+mod region_int_gpr;
+mod region_mem;
+mod self_call;
+
+pub(crate) use absint::*;
+pub(crate) use emit::*;
+pub(crate) use emit_misc::*;
+pub(crate) use fn_int::*;
+pub(crate) use inline::*;
+pub(crate) use int_splice::*;
+pub(crate) use kernels::*;
+pub(crate) use plan::*;
+pub(crate) use plan_region::*;
+pub(crate) use proto_mem::*;
+pub(crate) use py::*;
+pub(crate) use proto_mem::{splice_body_defs, splice_uninit_mask};
+pub(crate) use regalloc::*;
+pub(crate) use region_admit::*;
+pub(crate) use region_int::*;
+pub(crate) use region_int_gpr::*;
+pub(crate) use region_mem::*;
+pub(crate) use self_call::*;

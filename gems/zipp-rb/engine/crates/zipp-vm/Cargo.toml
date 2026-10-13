@@ -1,0 +1,101 @@
+[package]
+name = "zipp-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIPP dynamic JavaScript engine v2 — explicit-frame register VM with a NaN-boxed value model, designed from the ground up so a JIT can keep unboxed values in registers across call boundaries (the property V8 wins on)."
+
+[dependencies]
+# ZIPP's own Python front end (lexer, parser, and the tree the emitter walks).
+# Optional and off by default: it backs the `frontend::python` compiler.
+zipp-pyparse = { path = "../zipp-pyparse", optional = true }
+# Decimal text to f64 without core's 10 KB power-of-five table (`num_parse`).
+# A crate of its own because zipp-pyparse uses it too.
+zipp-numparse = { path = "../zipp-numparse" }
+rustc-hash = { workspace = true }
+# The regex engine. A DIRECT path dependency on our fork rather than a
+# crates.io version rewritten by `[patch.crates-io]`: zipp-vm calls
+# `Regex::from_unicode_byteopt`, which exists only in the fork, so the upstream
+# crate does not even compile against this code. See crates/regress-fork/FORK.md.
+# `utf16`: find_from_utf16/find_from_ucs2 — regex execution directly over
+# UTF-16 code units (ES semantics; ranges/positions are unit indices).
+regress = { package = "zipp-regress", path = "../regress-fork", features = ["utf16"] }
+# Arbitrary-precision BigInt (pure Rust). The common path stays `i128`
+# (`HeapObj::BigInt`); `num-bigint` only backs values outside i128 range
+# (`HeapObj::BigIntBig`) — see vm/bigint.rs for the canonical-form invariant.
+num-bigint = "0.5"
+num-traits = "0.2"
+dynasm = { workspace = true, optional = true }
+dynasmrt = { workspace = true, optional = true }
+self_cell = "1.3.0"
+
+[dev-dependencies]
+# The reference `src/unorm.rs` is generated from and checked against, code
+# point by code point. Not linked into the engine.
+unicode-normalization = "0.1"
+
+[features]
+# Artifact-internal, subtractive profile for the standalone ZIPP Lite WASM.
+# Retains ECMAScript core; omits ECMA-402 and Temporal. Do not feature-unify
+# with full embedders. Python and JIT are deliberately incompatible.
+wasm-lite = ["safe-sandbox", "wasm-no-fs-loader", "wasm-single-agent", "regress/compact-utf16"]
+# The full WebAssembly artifacts share the UTF-16 and UCS-2 matcher bodies
+# too. The ASCII matcher, which serves every ASCII subject, stays its own.
+wasm-compact-regex = ["regress/compact-utf16"]
+# Experimental Python-subset frontend (see docs/PYTHON_FRONTEND_EXPERIMENT.md).
+# Pulls in the Python parser and `instrument` (a Python state starts with the
+# VM JIT off; a host without an instruction budget, such as the CLI's
+# `zipp py`/`zipp run`, turns on its Python loop tier with
+# `ScriptState::enable_vm_jit`). Off by default so the JavaScript engine is
+# unchanged.
+python = ["dep:zipp-pyparse", "instrument"]
+# Trusted mixed-language programs sharing one VM scope; deliberately opt-in.
+python-js-interop = ["python"]
+# Artifact-internal (the zipp-wasm `python` variant): the Python frontend
+# without the bundled torch package: no `lib/torch*.py`, no `tensor.js`, no
+# native tensor kernels. A host adds torch at run time as a package
+# (`python_packages`, zipp_torch.wasm), whose kernels the engine reaches
+# through one host call. Subtractive, like `wasm-no-fs-loader`: keep it out
+# of feature-unified general zipp-vm graphs.
+python-no-torch = ["python"]
+# `_zipp_gpu.native`: zipp_gpu graphs answered synchronously by an embedder
+# that serves `zipp.gpu.*` host calls (the native CLI's GPU). Inert without
+# such a host; enabled only by zipp-cli's `gpu` feature.
+python-native-gpu = ["python"]
+# Native x86-64 and ARM64 JIT tiers (dynasm). On by default on supported targets; the
+# `codegen` module is `#[cfg(feature = "jit")]` so a `--no-default-features`
+# build is a pure interpreter with no unsafe codegen.
+default = ["jit"]
+jit = ["dep:dynasm", "dep:dynasmrt", "regress/rx-jit"]
+regex-linear = ["regress/linear-ascii"]
+# Step budget, cooperative abort, and per-instruction execution tracing for
+# embedders running untrusted code (see vm/instrument.rs). Off by default: it
+# adds a branch to the inner dispatch loop, and enabling it on a VM turns the
+# JIT off for that VM (native code does not iterate the loop the hook lives in).
+instrument = []
+# Artifact-internal profile for the browser resource meter without algebraic
+# execution traces. Cooperative abort polling is intentionally omitted: the
+# zipp-wasm host enforces its wall-clock deadline by terminating the Worker.
+# Cargo features are additive, so do not unify this into a graph whose other
+# consumers call the trace API; the standalone zipp-wasm workspace is its
+# intended feature-resolution domain.
+meter-only = ["instrument"]
+# Artifact-internal specialization for the standalone zipp-wasm build. Its
+# ScriptState has no filesystem-module-loader host surface, so retaining that
+# unreachable loader only enlarges the artifact and its interpreter dispatch.
+# Like `meter-only`, keep this out of feature-unified general zipp-vm graphs.
+wasm-no-fs-loader = ["meter-only"]
+# Artifact-internal specialization for the standalone zipp-wasm build. Browser
+# Workers provide the process/isolation boundary, so the embedded VM never
+# creates test262 `$262.agent.start` threads. The Atomics waiter machinery is
+# deliberately retained: this feature removes only the worker harness.
+wasm-single-agent = ["meter-only"]
+# Memory-safe interpreter profile for the dedicated untrusted-code runner.
+# This deliberately conflicts with `jit`: native code generation and every
+# performance-only unchecked path are excluded, while the regex engine selects
+# its index-based/safe implementations.
+safe-sandbox = [
+    "instrument",
+    "regress/prohibit-unsafe",
+    "regress/bounded-backtracking",
+]
