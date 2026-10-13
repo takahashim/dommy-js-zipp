@@ -15,13 +15,16 @@ Rake::TestTask.new(:test) do |t|
   t.test_files = FileList["test/**/*_test.rb"]
 end
 
-# The engine's own Rust unit tests, with the feature set the extension builds.
-# `no_core_float_parse_in_engine_sources` reads crates/zipp-wasm, which is not
-# vendored (see engine/UPSTREAM), so it is skipped rather than patched.
+# The engine's own Rust unit tests: with the feature set the extension builds
+# (no JIT), then with upstream's default (JIT), which the local changes must
+# keep compiling and passing. `no_core_float_parse_in_engine_sources` reads
+# crates/zipp-wasm, which is not vendored (see engine/UPSTREAM), so it is
+# skipped rather than patched.
 desc "Run the Zipp engine's Rust unit tests"
 task "engine:test" do
-  sh "cargo test --manifest-path engine/Cargo.toml -p zipp-vm --lib --features instrument " \
-     "-- --skip num_parse::tests::no_core_float_parse_in_engine_sources"
+  skip = "-- --skip num_parse::tests::no_core_float_parse_in_engine_sources"
+  sh "cargo test --manifest-path engine/Cargo.toml -p zipp-vm --lib --no-default-features --features instrument #{skip}"
+  sh "cargo test --manifest-path engine/Cargo.toml -p zipp-vm --lib --features instrument #{skip}"
 end
 
 task default: %i[compile test]

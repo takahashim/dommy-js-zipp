@@ -99,6 +99,16 @@ candidate to propose upstream.
   deadline); the interpreter fast path defers to the slow path when a deadline
   is set. zipp-rb's `timeout_msec` uses this instead of a timer thread.
 
+## Memory (crates/zipp-vm/src/heap.rs)
+
+- **JIT mirrors only for the x86-64 JIT** — the per-slot `hot_mirror`,
+  `this_mirror` and `upvals_mirror` (32 bytes on every slot) were kept
+  unless `meter-only`; only the x86-64 JIT (`codegen/`) reads them. They are
+  now `cfg(all(feature = "jit", target_arch = "x86_64"))`, with the
+  mirrorless fallbacks (the `meter-only` ones) for every other build. zipp-rb
+  builds without `jit` (ext/zipp_rb/Cargo.toml), so a slot is 101 bytes, not
+  133. `rake engine:test` runs both feature sets.
+
 ## Performance (crates/zipp-vm/src/parse/parser.rs, src/compile/*)
 
 - **Scope lookups indexed** — parser `Scope` gains `lex_all` / `lex_nonfn` /
