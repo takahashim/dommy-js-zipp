@@ -18,3 +18,7 @@ notes/
 
 # Capybara compliance suite output
 save_path_tmp/
+
+# Resolved per environment: the Gemfile takes dommy from a sibling checkout
+# when there is one, else from GitHub.
+/Gemfile.lock
