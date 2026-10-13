@@ -33,6 +33,63 @@ class LimitsTest < Minitest::Test
     vm.dispose
   end
 
+  # A bounded VM is interruptible from Ruby while it runs without the GVL:
+  # Ruby's unblocking function raises the engine's abort flag, and the
+  # interrupt itself (not an InterruptedError) reaches the caller.
+  def test_thread_raise_interrupts_a_bounded_eval
+    vm = ZippRb::VM.new(timeout_msec: 60_000)
+    main = Thread.current
+    raiser = Thread.new do
+      sleep 0.1
+      main.raise(ArgumentError, "stop")
+    end
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    err = assert_raises(ArgumentError) { vm.eval("while (true) {}") }
+    assert_equal "stop", err.message
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5.0
+    raiser.join
+    assert_equal 2, vm.eval("1 + 1"), "the VM stays usable after the interrupt"
+  ensure
+    vm.dispose
+  end
+
+  def test_timeout_block_interrupts_a_bounded_eval
+    require "timeout"
+    vm = ZippRb::VM.new(timeout_msec: 60_000)
+    assert_raises(Timeout::Error) { Timeout.timeout(0.1) { vm.eval("while (true) {}") } }
+    assert_equal 2, vm.eval("1 + 1")
+  ensure
+    vm.dispose
+  end
+
+  def test_thread_kill_stops_a_bounded_eval
+    ran_ensure = false
+    thread = Thread.new do
+      vm = ZippRb::VM.new(timeout_msec: 60_000)
+      begin
+        vm.eval("while (true) {}")
+      ensure
+        ran_ensure = true
+      end
+    end
+    sleep 0.1
+    thread.kill
+    assert thread.join(5), "the killed thread must finish"
+    assert ran_ensure
+  end
+
+  # The timeout is an engine deadline, not a timer thread per VM.
+  def test_timeouts_start_no_threads
+    skip "needs ps -M" unless RUBY_PLATFORM.include?("darwin")
+    count = -> { `ps -M #{Process.pid}`.lines.size }
+    before = count.call
+    vms = Array.new(20) { ZippRb::VM.new(timeout_msec: 1000) }
+    vms.each { |vm| vm.eval("1") }
+    assert_equal before, count.call
+  ensure
+    vms&.each(&:dispose)
+  end
+
   def test_no_limits_runs_normally
     vm = ZippRb::VM.new
     assert_equal 42, vm.eval("40 + 2")

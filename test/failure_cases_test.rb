@@ -9,8 +9,8 @@ class FailureCasesTest < Minitest::Test
   def test_js_exception_in_callback_surfaces_and_vm_survives
     vm = ZippRb::VM.new
     vm.define_function("boom") { raise "kaboom" }
-    err = assert_raises(ZippRb::Error) { vm.eval("boom()") }
-    assert_match(/kaboom/, err.message)
+    err = assert_raises(RuntimeError) { vm.eval("boom()") }
+    assert_equal "kaboom", err.message
     assert_equal 1, vm.eval("1"), "the VM is usable after a callback error"
   ensure
     vm.dispose

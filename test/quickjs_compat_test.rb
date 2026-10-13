@@ -161,7 +161,9 @@ class QuickjsCompatTest < Minitest::Test
   def test_ruby_exception_is_visible_to_js
     v = vm
     v.define_function("boom") { raise "kaboom" }
-    err = assert_raises(ZippRb::Error) { v.eval("boom()") }
-    assert_match(/kaboom/, err.message)
+    # An uncaught callback exception reaches Ruby as itself (quickjs.rb does
+    # the same), not as a ZippRb::Error.
+    err = assert_raises(RuntimeError) { v.eval("boom()") }
+    assert_equal "kaboom", err.message
   end
 end

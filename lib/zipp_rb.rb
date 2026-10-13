@@ -17,6 +17,11 @@ module ZippRb
   # A constant so the GC roots the procs.
   LISTENERS = {}
 
+  # Ruby exceptions raised by callbacks during the current entry into a VM,
+  # kept (and GC-rooted) until the entry returns so an uncaught one can be
+  # re-raised as itself. Internal.
+  PENDING = {}
+
   # Reopen the native base error to expose the JS error name (quickjs.rb's
   # `#js_name`).
   class Error
@@ -48,12 +53,21 @@ module ZippRb
   # A durable handle to a JS value (usually a function) the VM keeps alive, so
   # Ruby can hold it and call it later (e.g. an event listener). Returned by
   # VM#handle.
+  #
+  # A handle that is garbage-collected without #release has its engine root
+  # released on the owning thread's next use of the VM.
   class Handle
     attr_reader :id
+
+    # Finalizer body; captures only ids, never the handle.
+    def self.finalizer(vm_id, id)
+      proc { ZippRb._queue_release(vm_id, id) }
+    end
 
     def initialize(vm_id, id)
       @vm_id = vm_id
       @id = id
+      ObjectSpace.define_finalizer(self, self.class.finalizer(vm_id, id))
     end
 
     # Call the JS function this handle roots.
@@ -68,7 +82,9 @@ module ZippRb
 
     # Release the handle (drops its root). Returns whether it was live.
     def release
-      ZippRb._release_handle(@vm_id, @id)
+      released = ZippRb._release_handle(@vm_id, @id)
+      ObjectSpace.undefine_finalizer(self)
+      released
     end
   end
 
@@ -170,10 +186,11 @@ module ZippRb
       nil
     end
 
-    # Zipp does not poison a VM on out-of-memory: a bounded VM raises a
-    # catchable error and stays usable. Present for quickjs.rb API parity.
+    # Whether the VM was discarded after an internal engine panic; every later
+    # use raises. (Zipp does not poison a VM on out-of-memory: a bounded VM
+    # raises a catchable error and stays usable.)
     def poisoned?
-      false
+      ZippRb._poisoned?(@id)
     end
 
     # See #poisoned? — Zipp has no separate memory-poison latch.
