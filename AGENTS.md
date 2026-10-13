@@ -34,7 +34,6 @@ gems/zipp-rb/
   lib/zipp_rb.rb          # ZippRb module, errors, constants
   lib/zipp_rb/{vm,handle}.rb  # ZippRb::VM, ZippRb::Handle
   test/                   # minitest
-  benchmarks/             # Ruby benchmarks + compile_bench (Rust)
 notes/                    # local design notes; git-ignored, not shipped
 ```
 
