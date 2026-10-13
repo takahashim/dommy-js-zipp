@@ -28,6 +28,10 @@ vm.dispose
   (`ZippRb::InterruptedError` / `ZippRb::RangeError`). A bounded VM can also
   be interrupted from Ruby (`Thread#raise`, `Timeout`, signals); an unbounded
   one cannot, so give untrusted or long-running code a `timeout_msec`.
+- `time_zone:` (or `VM#time_zone=`) names the IANA zone `Date` works in;
+  UTC when omitted.
+- A Ruby string that is not valid UTF-8 crosses with each invalid sequence
+  replaced by U+FFFD.
 - A VM belongs to the thread that created it. A VM without Ruby callbacks
   releases the GVL while it runs.
 

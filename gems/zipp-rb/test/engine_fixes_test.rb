@@ -134,4 +134,32 @@ class EngineFixesTest < Minitest::Test
     JS
     assert_equal [[1], "static", 2], @vm.eval("[f.data, f.s(), h.own]")
   end
+
+  # A script's top-level `const` destructuring initializes its globals (the
+  # pre-initialization a `let` needs made the const's write the second one).
+  def test_top_level_const_destructuring
+    @vm.load('const {a, b = a + 1, c: {d}} = {a: 1, c: {d: 4}}; const [x, y] = [5, 6];')
+    assert_equal [1, 2, 4, 5, 6], @vm.eval("[a, b, d, x, y]")
+    @vm.load('"use strict"; const {s} = {s: 7};')
+    assert_equal 7, @vm.eval("s")
+    # An eval's own lexicals are locals: its destructuring initializes them.
+    assert_equal [3, 4], @vm.eval("(function () { eval('const {p, q} = {p: 3, q: 4}; globalThis.pq = [p, q];'); return pq; })()")
+    assert_equal 9, @vm.eval("(0, eval)('const {r} = {r: 9}; r')")
+    error = assert_raises(ZippRb::TypeError) { @vm.eval("a = 2") }
+    assert_equal "Assignment to constant variable.", error.message
+  end
+
+  # A typed array's elements are own properties to hasOwnProperty too.
+  def test_typed_array_indices_are_own_properties
+    @vm.load("var u = new Uint8Array([7, 8]); u.named = 1;")
+    assert_equal [true, true, false, false, true, true],
+      @vm.eval("[u.hasOwnProperty(0), Object.prototype.hasOwnProperty.call(u, 1), u.hasOwnProperty(2), u.hasOwnProperty('-0'), Object.hasOwn(u, 0), u.hasOwnProperty('named')]")
+  end
+
+  # A Proxy can be constructed only when its target can.
+  def test_new_on_a_proxy_of_a_non_constructor_throws
+    @vm.load("var arrow = new Proxy(() => 1, { construct() { return {}; } }); var fn = new Proxy(function () {}, {});")
+    assert_equal "TypeError", @vm.eval("try { new arrow(); 'constructed' } catch (e) { e.name }")
+    assert_equal "object", @vm.eval("typeof new fn()")
+  end
 end

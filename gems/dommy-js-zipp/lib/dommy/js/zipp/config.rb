@@ -23,6 +23,34 @@ module Dommy
           env.positive? ? env : DEFAULT_TIMEOUT_MSEC
         end
 
+        # The IANA time zone `Date` works in: DOMMY_JS_TIME_ZONE when set (`UTC`
+        # makes a page's dates independent of the host), else the host's own,
+        # as a browser's is. nil (UTC) when the host's cannot be named.
+        def time_zone
+          env = ENV["DOMMY_JS_TIME_ZONE"].to_s
+          env.empty? ? host_time_zone : env
+        end
+
+        # The host's zone: TZ when it names one (`Asia/Tokyo`, `:Asia/Tokyo`),
+        # else what /etc/localtime links to, else a whole-hour fixed offset
+        # (`Etc/GMT-9` for +09:00; the Etc sign is inverted).
+        def host_time_zone
+          tz = ENV["TZ"].to_s.delete_prefix(":")
+          return tz if tz.include?("/") || tz == "UTC"
+
+          link = ::File.readlink("/etc/localtime") if ::File.symlink?("/etc/localtime")
+          zone = link&.split("zoneinfo/")&.last
+          return zone if zone && !zone.empty? && zone != link
+
+          offset = Time.now.utc_offset
+          return nil if offset.zero? || offset % 3600 != 0
+
+          hours = offset / 3600
+          "Etc/GMT#{hours.positive? ? "-" : "+"}#{hours.abs}"
+        rescue SystemCallError
+          nil
+        end
+
         # The VM's heap ceiling, in bytes (set in MB). Zipp raises a catchable
         # RangeError at the ceiling and the VM stays usable.
         def memory_limit

@@ -8276,7 +8276,8 @@ impl<'p> Vm<'p> {
                     Instr::DateParse { dst, src } => {
                         let s = self.get(base, src);
                         let str = self.to_js_string(s)?;
-                        self.set(base, dst, Value::num(parse_date(&str)));
+                        let t = parse_date(&str, &|t| self.local_to_utc_ms(t));
+                        self.set(base, dst, Value::num(t));
                         ip += 1;
                     }
                     Instr::Return { src } => {

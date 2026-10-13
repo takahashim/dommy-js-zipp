@@ -740,6 +740,11 @@ impl<'p> Vm<'p> {
                     "TypeError: Cannot perform 'construct' on a revoked proxy",
                 ));
             }
+            // A Proxy has [[Construct]] only when its target does (ProxyCreate
+            // step 7): `new` on one around an arrow throws before any trap.
+            if !self.is_constructor(target) {
+                return Err(Thrown::from_static("TypeError: proxy is not a constructor"));
+            }
             return match self.proxy_trap(handler, "construct")? {
                 Some(trap) => {
                     let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));

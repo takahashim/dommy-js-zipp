@@ -57,7 +57,9 @@ scripts, import maps and dynamic `import()`.
   `ZippRb::InterruptedError` at the deadline).
 
 `DOMMY_JS_TIMEOUT_MSEC` and `DOMMY_JS_MEMORY_LIMIT_MB` work as in
-dommy-js-quickjs.
+dommy-js-quickjs. A page's `Date` works in the host's time zone, as a
+browser's does; `DOMMY_JS_TIME_ZONE` names another (`UTC` keeps results
+independent of the host).
 
 ## Tests
 

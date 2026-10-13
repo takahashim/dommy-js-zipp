@@ -45,8 +45,16 @@ module Dommy
         JS
         private_constant :BOOT_JS
 
-        def initialize(timeout_msec: Config.timeout_msec, memory_limit: Config.memory_limit, **vm_opts)
+        def initialize(timeout_msec: Config.timeout_msec, memory_limit: Config.memory_limit,
+                       time_zone: Config.time_zone, **vm_opts)
           @vm = ::ZippRb::VM.new(timeout_msec: timeout_msec, memory_limit: memory_limit, **vm_opts)
+          # An unnameable host zone leaves the VM in UTC rather than failing to
+          # build a page.
+          begin
+            @vm.time_zone = time_zone
+          rescue ArgumentError
+            nil
+          end
           @vm.load(BOOT_JS)
         end
 

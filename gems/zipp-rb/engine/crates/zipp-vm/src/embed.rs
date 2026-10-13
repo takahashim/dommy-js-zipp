@@ -439,6 +439,13 @@ impl ScriptState {
         .unwrap_or_else(torn_down)
     }
 
+    /// Set the local time zone `Date` works in to the IANA zone `id` (and
+    /// Intl's default time zone with it); `None` is UTC, the default. An
+    /// unknown identifier is an error.
+    pub fn set_time_zone(&mut self, id: Option<&str>) -> Result<(), String> {
+        self.with_vm(|vm| vm.set_local_time_zone(id)).unwrap_or_else(torn_down)
+    }
+
     /// Name the code evaluated from now on (a script's URL or file name): the
     /// functions it defines report it in their Errors' `stack` frames. `None`
     /// goes back to unnamed (`<anonymous>`). A module is named by its path, or
