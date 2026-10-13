@@ -2566,3 +2566,53 @@ fn major_refill_enabled() -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod value_capture_tests {
+    use crate::heap::HeapObj;
+    use crate::vm::Vm;
+
+    /// Run `source`, which throws if it computes a wrong answer.
+    fn run(source: &str) -> Vm<'static> {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let program = Box::leak(Box::new(
+            crate::compile::compile_program(&ast, source).expect("source compiles"),
+        ));
+        let mut vm = Vm::new(program);
+        vm.run().expect("program runs");
+        vm.force_gc();
+        vm
+    }
+
+    fn cells(vm: &Vm<'_>) -> usize {
+        (0..vm.heap.len() as u32)
+            .filter(|&i| matches!(vm.heap.get(i), HeapObj::Cell))
+            .count()
+    }
+
+    /// Bindings nobody writes are captured by value: an object, a string and
+    /// a boolean cost no cell, and a number one cell per distinct value
+    /// however many closures capture it.
+    #[test]
+    fn unwritten_captured_bindings_take_no_cells() {
+        let vm = run(
+            "function mk(h) { const a = {n: h}, s = 's' + h, t = true; \
+             return [() => a.n, () => s, () => t, () => h, () => h + 1]; } \
+             var keep = []; for (let i = 0; i < 100; i++) keep.push(mk(i)); \
+             var got = keep[42].map(f => f()).join(); \
+             if (got !== '42,s42,true,42,43') throw new Error(got);",
+        );
+        assert!(cells(&vm) < 110, "{} cells for 100 activations", cells(&vm));
+    }
+
+    /// A binding written after a closure captures it keeps its cell.
+    #[test]
+    fn a_written_binding_keeps_its_cell() {
+        let vm = run(
+            "function mk() { let v = 1; const g = () => v; v = 2; return g; } \
+             var keep = []; for (let i = 0; i < 100; i++) keep.push(mk()); \
+             if (keep[0]() !== 2) throw new Error('stale');",
+        );
+        assert!(cells(&vm) >= 100, "{} cells for 100 activations", cells(&vm));
+    }
+}

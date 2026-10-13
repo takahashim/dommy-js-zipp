@@ -5157,18 +5157,9 @@ impl<'p> Vm<'p> {
                         // (defining) frame: a ParentLocal source reads the cell
                         // index from a local register (the local was boxed via
                         // MakeCell); a ParentUpval source forwards one of this
-                        // frame's own captured cells.
-                        let sources = &self.func(func_id as usize).upvalues;
-                        let mut cells = Vec::with_capacity(sources.len());
-                        for src in sources {
-                            let cell = match *src {
-                                UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
-                                UpvalSource::ParentUpval(idx) => {
-                                    self.closure_upvalue(cur_closure, idx)
-                                }
-                            };
-                            cells.push(cell);
-                        }
+                        // frame's own captured cells; a ParentValue source
+                        // captures a plain local's value (`Heap::capture_value`).
+                        let cells = self.capture_upvalues(func_id, base, cur_closure);
                         let v = Value::heap(self.heap.alloc(HeapObj::Closure {
                             func: func_id,
                             upvalues: cells,
@@ -5195,17 +5186,7 @@ impl<'p> Vm<'p> {
                         // `this_override.unwrap_or(0)` at the definition site â€” usually
                         // reg 0, but the class value inside a static field initializer)
                         // so a later call binds it lexically (FuncProto::lexical_this).
-                        let sources = &self.func(func_id as usize).upvalues;
-                        let mut cells = Vec::with_capacity(sources.len());
-                        for src in sources {
-                            let cell = match *src {
-                                UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
-                                UpvalSource::ParentUpval(idx) => {
-                                    self.closure_upvalue(cur_closure, idx)
-                                }
-                            };
-                            cells.push(cell);
-                        }
+                        let cells = self.capture_upvalues(func_id, base, cur_closure);
                         let this_val = self.get(base, this_reg);
                         let v = Value::heap(self.heap.alloc(HeapObj::Closure {
                             func: func_id,
@@ -10149,7 +10130,7 @@ impl<'p> Vm<'p> {
     /// boxed cell from a local register; a ParentUpval forwards one of the current
     /// closure's own cells. Mirrors the `MakeClosure` op.
     pub(crate) fn capture_upvalue_cells(
-        &self,
+        &mut self,
         sources: &[UpvalSource],
         base: usize,
         cur_closure: u32,
@@ -10159,8 +10140,19 @@ impl<'p> Vm<'p> {
             .map(|src| match *src {
                 UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
                 UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                // A by-value capture: the register holds the binding's value.
+                UpvalSource::ParentValue(reg) => {
+                    let v = self.get(base, reg);
+                    self.heap.capture_value(v)
+                }
             })
             .collect()
+    }
+
+    /// `capture_upvalue_cells` for `functions[func_id]`'s own sources.
+    pub(crate) fn capture_upvalues(&mut self, func_id: u32, base: usize, cur_closure: u32) -> Vec<u32> {
+        let sources = &self.func(func_id as usize).upvalues;
+        self.capture_upvalue_cells(sources, base, cur_closure)
     }
 
     /// Materialize a class member function as a callable value: a plain `Func`

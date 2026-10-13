@@ -130,6 +130,9 @@ fn resolve_upvalues(
                 }
                 v.heap_index()
             }
+            // A by-value capture may allocate a shared cell; the interpreter
+            // makes those closures (their functions are not JIT-eligible).
+            UpvalSource::ParentValue(_) => return None,
             UpvalSource::ParentUpval(idx) => {
                 if site.closure == NO_CLOSURE {
                     return None;
@@ -444,9 +447,11 @@ mod tests {
 
     /// Malformed direct calls decline before any observable effect: a bad
     /// window, a bad ip, a mismatched activation, or a non-cell register.
+    /// (The `c += 0` in these programs keeps `c` a cell: a binding nobody
+    /// writes is captured by value, through the interpreter.)
     #[test]
     fn malformed_helper_inputs_decline_without_effects() {
-        let mut vm = vm("function outer(v) { let c = v; return function inner() { return c; }; } var keep = outer(7);");
+        let mut vm = vm("function outer(v) { let c = v; c += 0; return function inner() { return c; }; } var keep = outer(7);");
         let (fid, ip) = find_site(&vm, |i| matches!(i, Instr::MakeClosure { .. }));
         let packed = ((fid as u64) << 32) | ip as u64;
         let heap_before = vm.heap.len();
@@ -479,7 +484,7 @@ mod tests {
     #[test]
     fn helper_closure_matches_interpreter_capture_semantics() {
         let mut vm = vm(
-            "function outer(v) { let c = v; return function inner() { return c; }; } var keep = outer(7);",
+            "function outer(v) { let c = v; c += 0; return function inner() { return c; }; } var keep = outer(7);",
         );
         let (fid, ip) = find_site(&vm, |i| matches!(i, Instr::MakeClosure { .. }));
         let Instr::MakeClosure { func_id: child, .. } = vm.func(fid as usize).code[ip] else {

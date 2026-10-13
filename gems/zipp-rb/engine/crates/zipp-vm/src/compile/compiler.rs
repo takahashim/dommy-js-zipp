@@ -467,7 +467,16 @@ impl Compiler {
             }
             captured.extend(all);
         }
+        // Captured bindings nobody writes are captured by value, without a
+        // cell (`capture::value_captures`).
+        let value_captured = if is_script || body_refs_eval {
+            HashSet::new()
+        } else {
+            capture::value_captures(params, params_ast, body, false, &captured)
+        };
+        captured.retain(|n| !value_captured.contains(n));
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.value_captured = value_captured;
         if body_refs_eval {
             fc.box_all_locals = true;
         }
@@ -1163,6 +1172,7 @@ impl Compiler {
             wtf8_consts: fc.wtf8_consts,
             name_global: None, // set by the caller for top-level declarations
             upvalues,
+            makes_value_captures: fc.makes_value_captures.get(),
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by the caller from the function node's span
             positions: std::mem::take(&mut fc.positions),
@@ -1514,6 +1524,7 @@ impl Compiler {
             wtf8_consts: fc.wtf8_consts,
             name_global: None,
             upvalues,
+            makes_value_captures: fc.makes_value_captures.get(),
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // class methods: caller may override from span
             positions: std::mem::take(&mut fc.positions),
@@ -1555,11 +1566,18 @@ impl Compiler {
             }
             captured.extend(all);
         }
+        let value_captured = if arrow_refs_eval {
+            HashSet::new()
+        } else {
+            capture::value_captures_arrow(params, a, &captured)
+        };
+        captured.retain(|n| !value_captured.contains(n));
         let saved_dyn_zone_arrow = self.dyn_global_zone;
         if arrow_refs_eval {
             self.dyn_global_zone = true;
         }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.value_captured = value_captured;
         if arrow_refs_eval {
             fc.box_all_locals = true;
         }
@@ -1803,6 +1821,7 @@ impl Compiler {
             wtf8_consts: fc.wtf8_consts,
             name_global: None,
             upvalues,
+            makes_value_captures: fc.makes_value_captures.get(),
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by compile_arrow from the arrow's span
             positions: std::mem::take(&mut fc.positions),

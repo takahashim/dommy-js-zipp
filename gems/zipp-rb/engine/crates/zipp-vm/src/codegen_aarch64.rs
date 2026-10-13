@@ -726,6 +726,7 @@ mod tests {
             wtf8_consts: Vec::new(),
             name_global: None,
             upvalues: Vec::new(),
+            makes_value_captures: false,
             eval_sites: Vec::new(),
             source: String::new(),
             positions: Vec::new(),

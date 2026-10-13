@@ -124,6 +124,13 @@ struct EnclosingFn {
     /// name → register holding that binding's CELL in the parent frame. Only
     /// captured bindings appear here (non-captured locals can't be upvalues).
     cell_locals: Vec<(String, Reg)>,
+    /// name → register holding a binding the parent captures BY VALUE
+    /// (`FnCompiler::value_captured`), for the ones in scope. Each is the only
+    /// binding of its name in the parent, so it shadows any cell local.
+    value_locals: Vec<(String, Reg)>,
+    /// Set when a nested function captures one of `value_locals`
+    /// (`FuncProto::makes_value_captures`); shared with the parent.
+    makes_value_captures: Rc<std::cell::Cell<bool>>,
     /// The ancestor's own upvalue list (shared handle).
     upvalues: UpvalList,
 }
@@ -343,6 +350,10 @@ struct Compiler {
 /// every intermediate level. `None` if no enclosing function binds `name`.
 fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
     let (parent, outer) = chain.split_last()?;
+    if let Some((_, reg)) = parent.value_locals.iter().find(|(n, _)| n == name) {
+        parent.makes_value_captures.set(true);
+        return Some(UpvalSource::ParentValue(*reg));
+    }
     // Direct parent holds the cell as a local. Scanned BACKWARDS: `cell_locals`
     // is weakest-binding-first, so the last match is the innermost one in scope
     // at the child's creation point — the binding `resolve` would pick in the
@@ -425,6 +436,7 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         wtf8_consts: Vec::new(),
         name_global: None,
         upvalues: Vec::new(),
+        makes_value_captures: false,
         eval_sites: Vec::new(),
         source: String::new(),
         positions: Vec::new(),
@@ -609,6 +621,13 @@ struct FnCompiler<'a> {
     /// This function's own bindings that some nested function captures; these
     /// are boxed into heap cells at declaration so the closure shares the slot.
     captured: HashSet<String>,
+    /// The captured bindings nested functions capture BY VALUE instead
+    /// (`capture::value_captures`). They are not in `captured`: here they are
+    /// plain registers, never boxed.
+    value_captured: HashSet<String>,
+    /// Whether a nested function captured one of them (shared with the
+    /// snapshots handed to nested functions).
+    makes_value_captures: Rc<std::cell::Cell<bool>>,
     /// Registers currently holding a CELL (a boxed captured binding), so reads/
     /// writes of them go through CellGet/CellSet.
     cell_regs: HashSet<Reg>,

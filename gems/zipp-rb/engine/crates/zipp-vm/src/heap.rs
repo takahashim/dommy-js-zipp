@@ -5698,7 +5698,9 @@ pub struct Heap {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     upvals_mirror: Vec<u64>,
     /// CELL-VALUE MIRROR (B189), parallel to `objs`: a live copy of
-    /// `HeapObj::Cell` payloads (UNDEFINED bits everywhere else), so the
+    /// `HeapObj::Cell` payloads (UNDEFINED bits everywhere else, except a
+    /// by-value capture's own slot, which holds itself — see
+    /// [`Heap::capture_value`]), so the
     /// emitted Tier-C `UpvalGet` reads a captured variable in three loads
     /// instead of a helper round-trip. Soundness rests on every Cell-payload
     /// write flowing through this file's TWO write-through chokepoints
@@ -5707,6 +5709,10 @@ pub struct Heap {
     /// `refresh_mirror`) and `free_slot` covering occupancy changes. The mirror carries the
     /// UNINITIALIZED sentinel verbatim — the emitted TDZ check depends on it.
     cell_vals_mirror: Vec<u64>,
+    /// The immutable cells [`Heap::capture_value`] shares between by-value
+    /// captures of one primitive, by its bits. An entry goes when its cell
+    /// is freed (`forget_shared_cell`), so it never names another occupant.
+    shared_cells: rustc_hash::FxHashMap<u64, u32>,
     /// Raw bases of the mirrors and version table, re-cached whenever the
     /// vectors grow. Shape/cell/closure probes load their bases THROUGH the VM
     /// (`[rdi + offset]`) on every access. Tier-C loads `versions_raw` only on
@@ -6476,6 +6482,7 @@ impl Heap {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             hot_mirror: vec![HotMirror::CLEAR; versions.len()],
             cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
+            shared_cells: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -6597,6 +6604,10 @@ impl Heap {
     /// must never hold a guardable shape. The exclusion becomes an invariant
     /// here instead of an accident of shape non-collision (B178 review).
     #[inline]
+    #[cfg_attr(
+        not(all(feature = "jit", target_arch = "x86_64")),
+        allow(unused_variables)
+    )]
     pub fn pin_mirror_dict(&mut self, idx: u32) {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
@@ -6604,7 +6615,9 @@ impl Heap {
             self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
             self.upvals_mirror[idx as usize] = 0;
         }
-        self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
+        // The cell-value mirror is left alone: a pinned object is never a
+        // Cell, and its entry may be the self-reference a by-value capture
+        // reads (`capture_value`).
     }
 
     /// B201: allocate a captured-variable cell holding `initial` — the only
@@ -6614,6 +6627,44 @@ impl Heap {
         let idx = self.alloc(HeapObj::Cell);
         self.cell_vals_mirror[idx as usize] = initial.bits();
         idx
+    }
+
+    /// The upvalue a closure holds for a binding captured BY VALUE
+    /// (`UpvalSource::ParentValue`), which the compiler proved is never
+    /// written. A heap value is its own slot: its cell-value mirror entry is
+    /// set to the value, so every cell read (`cell_get`, the JIT's inline
+    /// mirror load) yields it, and `cell_set` (which writes Cells only) can
+    /// never disturb it. A primitive gets an immutable cell, shared by every
+    /// capture of the same bits. Either way the binding costs no slot of its
+    /// own, where boxing it took one cell per binding.
+    pub fn capture_value(&mut self, v: Value) -> u32 {
+        if v.is_heap() {
+            let idx = v.heap_index();
+            debug_assert!(!matches!(self.get(idx), HeapObj::Cell));
+            self.cell_vals_mirror[idx as usize] = v.bits();
+            return idx;
+        }
+        if let Some(&idx) = self.shared_cells.get(&v.bits()) {
+            return idx;
+        }
+        let idx = self.alloc_cell(v);
+        // Unbounded, like the cells it names: a capture of a number that
+        // missed the table would cost a cell per closure, where the boxed
+        // binding cost one.
+        self.shared_cells.insert(v.bits(), idx);
+        idx
+    }
+
+    /// Drop the dying Cell `idx` from the shared-cell table if it is the one
+    /// the table names for its bits (called before its mirror is cleared).
+    #[inline]
+    fn forget_shared_cell(&mut self, idx: u32) {
+        if !self.shared_cells.is_empty() {
+            let bits = self.cell_vals_mirror[idx as usize];
+            if self.shared_cells.get(&bits) == Some(&idx) {
+                self.shared_cells.remove(&bits);
+            }
+        }
     }
 
     /// B220: hand a freed key buffer back to the pool. DELETES are the pool's
@@ -8184,6 +8235,7 @@ impl Heap {
             })
             .saturating_add(vec_capacity_bytes(&self.versions))
             .saturating_add(vec_capacity_bytes(&self.cell_vals_mirror))
+            .saturating_add(self.shared_cells.capacity() * (size_of::<(u64, u32)>() + 1))
             .saturating_add({
                 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
                 {
@@ -8344,6 +8396,7 @@ impl Heap {
         // plain-object sweep mass stops touching those three lines.
         match &dead {
             HeapObj::Cell => {
+                self.forget_shared_cell(idx);
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -8822,6 +8875,7 @@ impl Heap {
         // maintains (refresh below writes the new occupant's own fields).
         match &old {
             HeapObj::Cell => {
+                self.forget_shared_cell(idx);
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -9399,7 +9453,8 @@ impl Heap {
     pub fn cell_get(&self, idx: u32) -> Value {
         // B201: a BLIND mirror read — the B198 kind-conditional invariant
         // guarantees a non-Cell occupant leaves this field at UNDEFINED
-        // bits, so the old kind-match here was a redundant second cache
+        // bits (or, for a by-value capture, its own value: `capture_value`),
+        // so the old kind-match here was a redundant second cache
         // line (it re-read the objs slot). One load, exact semantics.
         Value::from_bits(self.cell_vals_mirror[idx as usize])
     }
@@ -11155,6 +11210,35 @@ mod tests {
 
         h.audit_resident_bytes();
         assert_eq!(h.resident_payload_current.get(), baseline + charge);
+    }
+
+    #[test]
+    fn a_by_value_capture_reads_through_the_cell_mirror() {
+        let mut h = Heap::new();
+        // A heap value is its own upvalue, read back as itself.
+        let obj = h.alloc(HeapObj::Func(0));
+        assert_eq!(h.capture_value(Value::heap(obj)), obj);
+        assert_eq!(h.cell_get(obj), Value::heap(obj));
+        // A cell write never lands on it.
+        h.cell_set(obj, Value::int(1));
+        assert_eq!(h.cell_get(obj), Value::heap(obj));
+
+        // A primitive gets one cell per distinct value, shared.
+        let seven = h.capture_value(Value::int(7));
+        assert!(matches!(h.get(seven), HeapObj::Cell));
+        assert_eq!(h.cell_get(seven), Value::int(7));
+        assert_eq!(h.capture_value(Value::int(7)), seven);
+        assert_ne!(h.capture_value(Value::int(8)), seven);
+
+        // Once the shared cell dies, its slot is never handed out for the
+        // value again, even if another cell takes the slot.
+        h.free_slot(seven);
+        let other = h.alloc_cell(Value::int(9));
+        assert_eq!(other, seven, "the free-list slot should be reused");
+        let seven_again = h.capture_value(Value::int(7));
+        assert_ne!(seven_again, other);
+        assert_eq!(h.cell_get(seven_again), Value::int(7));
+        assert_eq!(h.cell_get(other), Value::int(9));
     }
 
     #[test]

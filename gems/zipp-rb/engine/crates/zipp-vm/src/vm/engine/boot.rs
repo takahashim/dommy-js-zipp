@@ -94,6 +94,11 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub(crate) fn jit_func_eligible(&self, func_id: u32) -> bool {
+        // A by-value capture source is a register read no native tier's
+        // liveness sees (`FuncProto::makes_value_captures`).
+        if self.func(func_id as usize).makes_value_captures {
+            return false;
+        }
         if (func_id as usize) < self.main_func_count {
             return true;
         }

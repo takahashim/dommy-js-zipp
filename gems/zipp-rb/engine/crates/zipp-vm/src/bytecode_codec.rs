@@ -347,6 +347,7 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         wtf8_consts,
         name_global,
         upvalues,
+        makes_value_captures,
         eval_sites,
         source,
         positions,
@@ -370,6 +371,7 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         *super_static,
         *is_strict,
         *simple_params,
+        *makes_value_captures,
     ] {
         w.bool(b);
     }
@@ -400,6 +402,10 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
             UpvalSource::ParentUpval(i) => {
                 w.u8(1);
                 w.u16(*i);
+            }
+            UpvalSource::ParentValue(r) => {
+                w.u8(2);
+                w.u16(*r);
             }
         }
     }
@@ -455,6 +461,7 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
     let super_static = r.bool()?;
     let is_strict = r.bool()?;
     let simple_params = r.bool()?;
+    let makes_value_captures = r.bool()?;
     let n = r.len()?;
     let mut constants = Vec::with_capacity(n);
     for _ in 0..n {
@@ -482,6 +489,7 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         upvalues.push(match r.u8()? {
             0 => UpvalSource::ParentLocal(r.u16()?),
             1 => UpvalSource::ParentUpval(r.u16()?),
+            2 => UpvalSource::ParentValue(r.u16()?),
             b => return Err(format!("bad upvalue kind {b}")),
         });
     }
@@ -532,6 +540,7 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         wtf8_consts,
         name_global,
         upvalues,
+        makes_value_captures,
         eval_sites,
         source,
         positions,
