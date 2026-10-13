@@ -1361,50 +1361,12 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // console.log(...) → Print opcode.
-        if let Expr::Member(m) = &c.callee {
-            if let MemberProp::Ident(prop) = &m.prop {
-                if let Expr::Ident(obj) = &m.object {
-                    if &**obj == "console"
-                        && matches!(&**prop, "log" | "info" | "warn" | "error" | "debug")
-                        && self.builtin_unshadowed("console")
-                    {
-                        // node routes console.error / console.warn to stderr.
-                        let to_stderr = matches!(&**prop, "error" | "warn");
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::Print {
-                            arg_base,
-                            argc,
-                            to_stderr,
-                        });
-                        self.emit(Instr::LoadUndefined { dst });
-                        return Ok(dst);
-                    }
-                }
-            }
-        }
+        // `console.log(...)` and friends are ordinary calls: a page (or a test
+        // framework) may replace `console.log`, and a Print lowering decided
+        // at compile time would bypass the replacement.
 
-        // The host-only `performance.now()` pseudo-namespace has no live object
-        // to capture. Date is a real namespace and therefore deliberately falls
-        // through to the captured ordinary-call path below, so replacements,
-        // accessors and a rebound global remain observable.
-        if let Expr::Member(m) = &c.callee {
-            if let MemberProp::Ident(prop) = &m.prop {
-                if let Expr::Ident(obj) = &m.object {
-                    let epoch = match (&**obj, &**prop) {
-                        ("performance", "now") => Some(false),
-                        _ => None,
-                    };
-                    if let Some(epoch) = epoch.filter(|_| self.builtin_unshadowed("performance")) {
-                        // Although the host pseudo ignores its arguments, call
-                        // argument expressions are still evaluated in order.
-                        let _ = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::Now { dst, epoch });
-                        return Ok(dst);
-                    }
-                }
-            }
-        }
+        // `performance.now()` is an ordinary call: `performance` is a real
+        // global object (a host such as a browser shim may replace it).
 
         // `JSON.parse(text)` / `JSON.stringify(value)` → fast ops. The forms with
         // a reviver / replacer (2+ args) fall through to the generic call so the

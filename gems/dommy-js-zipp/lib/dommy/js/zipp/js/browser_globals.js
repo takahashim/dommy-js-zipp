@@ -1,0 +1,145 @@
+// The bare browser globals frameworks reach for, aliased onto the installed
+// window. This is what lets real frontend bundles (Turbo, …) run unmodified.
+//
+// The window's names for itself are the window proxy, as everywhere else a
+// window is handed out (`window.self`, `document.defaultView`, a frame's
+// `parent`): globalThis is the one object that is not, since QuickJS makes the
+// global. For the top-level window, parent and top are the window itself
+// (spec), so frame-walking loops terminate. `frames` is indexable by
+// child-frame number (`frames[0]` === the first <iframe>'s contentWindow).
+// They read the live `window`, which a host can rebind. self, parent and
+// frames are [Replaceable]: an assignment replaces the accessor with the
+// value. top is [LegacyUnforgeable]: an assignment does nothing.
+//
+// Every bare global here that stands for a window member reaches the
+// window's own implementation (dommy's `__rbWindowMember`), not whatever the
+// window answers for the name: the window answers with the bare global
+// itself, and a page that saved the bare `fetch` before wrapping
+// `window.fetch` must get the original back, as from a browser's native
+// function. Each is declared so to dommy (`__rbWindowForward`). Against a
+// dommy without them, they read the window as before.
+const __rbForward = globalThis.__rbWindowForward || ((fn) => fn);
+const __rbMember = globalThis.__rbWindowMember || ((name) => window[name]);
+for (const __n of ["self", "parent", "frames"]) {
+  Object.defineProperty(globalThis, __n, {
+    get: __rbForward(function () { return window; }),
+    set(value) {
+      Object.defineProperty(globalThis, __n, { value, writable: true, enumerable: true, configurable: true });
+    },
+    enumerable: true,
+    configurable: true,
+  });
+}
+Object.defineProperty(globalThis, "top", {
+  get: __rbForward(function () { return window; }),
+  set(_value) {},
+  enumerable: true,
+  configurable: true,
+});
+// `location` is the window's own [LegacyUnforgeable] attribute with
+// [PutForwards=href]: an assignment navigates, as `window.location = url`
+// does. A window has one Location for its life (a cross-document navigation
+// makes a new realm), so it is read again only when a host rebinds `window`.
+let __rbLocationWindow = null;
+let __rbLocation = null;
+Object.defineProperty(globalThis, "location", {
+  get: __rbForward(function () {
+    if (__rbLocationWindow !== window) {
+      __rbLocationWindow = window;
+      __rbLocation = __rbMember("location");
+    }
+    return __rbLocation;
+  }),
+  set(value) { window.location = value; },
+  enumerable: true,
+  configurable: true,
+});
+// The objects a window keeps for its life, aliased by reference. history,
+// navigator, crypto, indexedDB and caches are plain readonly attributes, so
+// assigning the bare name leaves them (a strict-mode assignment throws);
+// performance, screen and visualViewport are [Replaceable], so an assignment
+// replaces them.
+for (const __n of ["history", "navigator", "crypto", "indexedDB", "caches"]) {
+  try {
+    Object.defineProperty(globalThis, __n, { value: window[__n], writable: false, enumerable: true, configurable: true });
+  } catch (__e) {}
+}
+// Web Storage is read from the window on each access, not copied at boot: the
+// sessionStorage / localStorage getters throw a SecurityError when "obtain a
+// session/local storage bottle map" fails (HTML, Web storage), which it does
+// for an opaque origin (Storage Standard, "obtain a storage key": an opaque
+// origin is failure). A page on about:blank, data: or a sandboxed frame must
+// see that when it reads `localStorage`, and it must not abort installing the
+// rest of the globals. Not enumerable: on a real window they are accessors of
+// Window.prototype, not own keys of the global — and an enumerable throwing
+// getter would break whatever walks the global's own properties (handing
+// `globalThis` to the host, as window_builtins.js does, reads each of them).
+for (const __n of ["sessionStorage", "localStorage"]) {
+  Object.defineProperty(globalThis, __n, {
+    get: __rbForward(function () { return __rbMember(__n); }),
+    enumerable: false,
+    configurable: true,
+  });
+}
+globalThis.CSS = window.CSS;
+// A bare window method forwards to the window, named and sized as the IDL
+// declares it (`structuredClone.length` is 1, not a rest wrapper's 0): the
+// generated signatures dommy loads give each operation's required-argument
+// count, looked up along the interface's inheritance (EventTarget's
+// addEventListener).
+const __rbWindowOperation = (name) => {
+  const signatures = globalThis.__rbIdlSignatures || {};
+  for (let iface = "Window"; iface && signatures[iface]; iface = signatures[iface].inherits) {
+    const operation = (signatures[iface].operations || {})[name];
+    if (operation) return operation;
+  }
+  return null;
+};
+const __rbForwardWindowMethod = (name) => {
+  const forward = __rbForward(function (...args) { return __rbMember(name).apply(window, args); });
+  const operation = __rbWindowOperation(name);
+  Object.defineProperty(forward, "name", { value: name });
+  Object.defineProperty(forward, "length", { value: operation ? operation.required : 0 });
+  globalThis[name] = forward;
+};
+for (const __m of ["getComputedStyle", "matchMedia", "fetch",
+                   "addEventListener", "removeEventListener", "dispatchEvent"]) {
+  __rbForwardWindowMethod(__m);
+}
+
+// The [Replaceable] objects frameworks read directly (performance.now(),
+// screen), aliased by reference as plain data properties, which an assignment
+// replaces; methods forward (above) so `this` binds to the window.
+for (const __n of ["performance", "screen", "visualViewport"]) {
+  try { globalThis[__n] = window[__n]; } catch (__e) {}
+}
+// Values that change (a resize, a scroll) are read from the window each time
+// rather than copied once at boot. They are [Replaceable]: an assignment
+// replaces the accessor with the assigned value, as on a real window.
+for (const __n of ["devicePixelRatio", "innerWidth", "innerHeight",
+                   "scrollX", "scrollY", "pageXOffset", "pageYOffset"]) {
+  try {
+    Object.defineProperty(globalThis, __n, {
+      get: __rbForward(function () { return __rbMember(__n); }),
+      set(value) {
+        Object.defineProperty(globalThis, __n, { value, writable: true, enumerable: true, configurable: true });
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  } catch (__e) {}
+}
+// `frameElement` is a plain readonly attribute: read from the window each
+// time (a frame's container can change), never replaced by an assignment.
+try {
+  Object.defineProperty(globalThis, "frameElement", {
+    get: __rbForward(function () { return __rbMember("frameElement"); }),
+    enumerable: false,
+    configurable: true,
+  });
+} catch (__e) {}
+for (const __m of ["scrollTo", "scrollBy", "requestIdleCallback", "cancelIdleCallback",
+                   "getSelection", "structuredClone", "reportError", "btoa", "atob",
+                   "alert", "confirm", "prompt", "open", "postMessage"]) {
+  try { __rbForwardWindowMethod(__m); } catch (__e) {}
+}

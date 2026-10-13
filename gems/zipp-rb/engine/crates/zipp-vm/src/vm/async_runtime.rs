@@ -982,7 +982,7 @@ impl<'p> Vm<'p> {
         // collected (the browser `unhandledrejection` contract); otherwise the
         // historical Test262 narrowing applies (only a thrown job's rejection,
         // only when the report switch is on).
-        let track = if self.unhandled_rejection_sink.is_some() {
+        let track = if self.unhandled_rejection_sink.is_some() || self.promise_rejection_hook.is_heap() {
             unhandled
         } else {
             unhandled && self.report_unhandled && self.rejecting_thrown_job
@@ -1626,6 +1626,7 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p) {
                     *handled = true;
                 }
+                self.note_rejection_handled(p);
                 self.microtasks.push_back(Microtask::Reaction {
                     callback: on_r,
                     arg: result,
@@ -2556,6 +2557,7 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p) {
                     *handled = true;
                 }
+                self.note_rejection_handled(p);
                 self.microtasks.push_back(Microtask::AsyncResume {
                     activation,
                     input: Resume::Throw(result),
@@ -2635,6 +2637,7 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p) {
                     *handled = true;
                 }
+                self.note_rejection_handled(p);
                 self.microtasks.push_back(Microtask::Reaction {
                     callback: cap_reject,
                     arg: value,
@@ -3562,6 +3565,7 @@ impl<'p> Vm<'p> {
                     {
                         *handled = true;
                     }
+                    self.note_rejection_handled(awaited.heap_index());
                 }
                 inline_budget -= 1;
                 asyncstats::inline_await();
@@ -3878,8 +3882,37 @@ impl<'p> Vm<'p> {
     /// up anywhere else — the process still exits 0 — so without these lines a
     /// positive test whose assertion fails inside a promise job or a timer
     /// scores PASS. A no-op when reporting is off.
+    /// A rejected promise `p` just gained a handler: if the host's hook was
+    /// told it went unhandled, queue its "rejectionhandled" notification.
+    pub(crate) fn note_rejection_handled(&mut self, p: u32) {
+        if let Some(i) = self.reported_rejections.iter().position(|&r| r == p) {
+            self.reported_rejections.swap_remove(i);
+            self.rejections_handled_late.push(p);
+        }
+    }
+
+    /// Call the host's rejection hook as `hook(type, promise, reason)`. What it
+    /// throws is dropped: the rest of the batch still goes out.
+    fn call_promise_rejection_hook(&mut self, kind: &str, p: u32, reason: Value) {
+        let hook = self.promise_rejection_hook;
+        let kind = self.alloc_str(kind.to_string());
+        if let Err(t) = self.call_value(hook, Value::UNDEFINED, &[kind, Value::heap(p), reason]) {
+            self.take_host_throw(t);
+        }
+    }
+
     pub(crate) fn report_unhandled_errors(&mut self) {
-        if !self.report_unhandled && self.unhandled_rejection_sink.is_none() {
+        let hooked = self.promise_rejection_hook.is_heap();
+        if hooked {
+            for p in std::mem::take(&mut self.rejections_handled_late) {
+                let reason = match self.heap.get(p) {
+                    HeapObj::Promise { result, .. } => *result,
+                    _ => continue,
+                };
+                self.call_promise_rejection_hook("rejectionhandled", p, reason);
+            }
+        }
+        if !self.report_unhandled && self.unhandled_rejection_sink.is_none() && !hooked {
             return;
         }
         for p in std::mem::take(&mut self.unhandled_rejections) {
@@ -3892,6 +3925,10 @@ impl<'p> Vm<'p> {
                 } => *result,
                 _ => continue,
             };
+            if hooked {
+                self.reported_rejections.push(p);
+                self.call_promise_rejection_hook("unhandledrejection", p, reason);
+            }
             let msg = if reason.is_heap()
                 && matches!(self.heap.get(reason.heap_index()), HeapObj::Object(_))
             {

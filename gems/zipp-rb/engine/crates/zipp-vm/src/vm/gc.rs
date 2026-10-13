@@ -671,6 +671,10 @@ impl Vm<'_> {
         for &promise in &self.unhandled_rejections {
             root_idx!(promise);
         }
+        root_val!(self.promise_rejection_hook);
+        for &promise in self.reported_rejections.iter().chain(&self.rejections_handled_late) {
+            root_idx!(promise);
+        }
         for f in &self.frames {
             root_idx!(f.closure);
             root_val!(f.new_target);

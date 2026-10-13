@@ -2,7 +2,7 @@
 
 # Aggregate tasks for the monorepo. Each gem keeps its own Rakefile (and
 # default task); these fan out to them.
-GEMS = %w[zipp-rb].freeze
+GEMS = %w[zipp-rb dommy-js-zipp].freeze
 
 GEMS.each do |name|
   desc "Compile and test #{name}"

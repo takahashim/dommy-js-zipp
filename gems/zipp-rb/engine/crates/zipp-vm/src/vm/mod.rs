@@ -1439,6 +1439,47 @@ pub enum ConsoleStream {
     Stderr,
 }
 
+/// A host module resolver: `(referrer directory, specifier) -> module path`
+/// (see `Vm::module_resolver`). `None` falls back to the lexical join.
+pub type ModuleResolver =
+    std::rc::Rc<dyn Fn(Option<&std::path::Path>, &str) -> Option<std::path::PathBuf>>;
+
+/// `spec` resolved against the referrer directory `dir`: the host resolver's
+/// answer when one is installed and answers, else the lexical join.
+pub(crate) fn join_module_specifier(
+    resolver: Option<&ModuleResolver>,
+    dir: Option<&std::path::Path>,
+    spec: &str,
+) -> std::path::PathBuf {
+    if let Some(path) = resolver.and_then(|r| r(dir, spec)) {
+        return path;
+    }
+    match dir {
+        Some(d) => d.join(spec),
+        None => std::path::PathBuf::from(spec),
+    }
+}
+
+/// The `console` method a line came from (`print` reports `Log`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleLevel {
+    Log,
+    Info,
+    Debug,
+    Warn,
+    Error,
+}
+
+impl ConsoleLevel {
+    /// The stream node routes the level to.
+    pub fn stream(self) -> ConsoleStream {
+        match self {
+            ConsoleLevel::Warn | ConsoleLevel::Error => ConsoleStream::Stderr,
+            _ => ConsoleStream::Stdout,
+        }
+    }
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
@@ -1647,6 +1688,9 @@ pub struct Vm<'p> {
     /// of into the buffers above (a CLI that prints progress while a long
     /// program runs). `None` everywhere else.
     pub(crate) console_sink: Option<Box<dyn FnMut(ConsoleStream, &str)>>,
+    /// Like `console_sink`, but told the console method's level; takes
+    /// precedence over it.
+    pub(crate) console_level_sink: Option<Box<dyn FnMut(ConsoleLevel, &str)>>,
     /// Embedder host hook, backing the `HOST_CALL` native. `None` in every
     /// engine-internal path (`run`, `run_module_file`, the CLI, test262), so a
     /// stock build has no host surface at all; only `crate::embed` installs one.
@@ -1788,6 +1832,16 @@ pub struct Vm<'p> {
     /// the rejection being reported. `report_unhandled_errors` names the ones
     /// still unhandled at exit. Never pushed when reporting is off.
     unhandled_rejections: Vec<u32>,
+    /// The host's JS rejection hook (HTML HostPromiseRejectionTracker): called
+    /// as `hook(type, promise, reason)` with "unhandledrejection" for a
+    /// rejection still unhandled at a report point, and "rejectionhandled"
+    /// when one so reported gains a handler. UNDEFINED when not installed.
+    /// GC ROOT, as are the two lists below.
+    pub(crate) promise_rejection_hook: Value,
+    /// Rejections reported to the hook and not yet handled.
+    pub(crate) reported_rejections: Vec<u32>,
+    /// Reported rejections that gained a handler since the last report point.
+    pub(crate) rejections_handled_late: Vec<u32>,
     /// Set only while `reject_thrown_job` is settling a promise, so `settle`
     /// can tell an exception that escaped a job from an ordinary
     /// `reject(value)`. Test262 scores the first as a lost failure and the
@@ -2488,6 +2542,13 @@ pub struct Vm<'p> {
     /// register module sources in memory and import them with no files on disk.
     pub(crate) module_provider:
         Option<std::rc::Rc<dyn Fn(&std::path::Path) -> Option<Vec<u8>>>>,
+    /// Host specifier resolution: given the referrer's directory (None for
+    /// the entry) and a specifier, the module path to load. Replaces the
+    /// lexical `dir.join(spec)` wherever a specifier is resolved, so a host
+    /// whose module names are not paths (URLs, bare names) can map them.
+    pub(crate) module_resolver: Option<crate::vm::ModuleResolver>,
+    /// Host `import.meta.url`: given a loaded module's path, its URL.
+    pub(crate) module_meta_url: Option<std::rc::Rc<dyn Fn(&std::path::Path) -> Option<String>>>,
     /// Canonical confined module paths and the largest byte length successfully
     /// observed for each. All loader variants share this ledger, so rereading a
     /// file (including as a typed/deferred/source-phase module) does not charge
@@ -3325,6 +3386,22 @@ impl<'p> Vm<'p> {
     /// Every console emission goes through here.
     #[inline]
     pub(crate) fn push_console_line(&mut self, line: String, to_stderr: bool) {
+        let level = if to_stderr {
+            ConsoleLevel::Error
+        } else {
+            ConsoleLevel::Log
+        };
+        self.push_console_line_at(line, level);
+    }
+
+    /// [`Self::push_console_line`] for a line whose console method is known.
+    #[inline]
+    pub(crate) fn push_console_line_at(&mut self, line: String, level: ConsoleLevel) {
+        let to_stderr = level.stream() == ConsoleStream::Stderr;
+        if let Some(sink) = self.console_level_sink.as_mut() {
+            sink(level, &line);
+            return;
+        }
         if let Some(sink) = self.console_sink.as_mut() {
             let stream = if to_stderr {
                 ConsoleStream::Stderr

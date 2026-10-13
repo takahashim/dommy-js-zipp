@@ -320,7 +320,7 @@ impl<'p> Vm<'p> {
                 let settle: Result<Value, Value> = match self
                     .module_base_dir
                     .as_ref()
-                    .map(|d| d.join(&spec))
+                    .map(|d| join_module_specifier(self.module_resolver.as_ref(), Some(d), &spec))
                 {
                     None => {
                         let e = self.alloc_error_from_message(

@@ -60,6 +60,16 @@ class LifecycleTest < Minitest::Test
     vm.dispose
   end
 
+  # While a callback runs, the VM is out of the registry (its entry holds it),
+  # but it is alive: a host that checks `disposed?` before re-entering must
+  # not be told otherwise.
+  def test_an_executing_vm_is_not_disposed
+    vm = ZippRb::VM.new
+    vm.define_function("probe") { vm.disposed? }
+    assert_equal false, vm.eval("probe()")
+    vm.dispose
+  end
+
   def test_dispose_releases_registered_callbacks
     before = ZippRb::CALLBACKS.size
     3.times do |i|

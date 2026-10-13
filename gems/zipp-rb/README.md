@@ -32,6 +32,9 @@ vm.dispose
   releases the GVL while it runs.
 
 Other API: `VM#load` (run for side effects), `#eval_async` (top-level
-`await`; with `features: [ZippRb::FEATURE_TIMEOUT]` for timers), `#handle`,
-`#set_module_provider` / `#import`, `#on_log`, `#on_unhandled_rejection`,
-`#drain_jobs!`, `#gc!`, `#memory_usage`.
+`await`; with `features: [ZippRb::FEATURE_TIMEOUT]` for timers), `#invoke`
+(`#call` that leaves microtasks for `#drain_jobs!`), `#handle`,
+`#module_loader=` (quickjs.rb's `(specifier, importer)` loader; modules may be
+named by URL) or `#set_module_provider`, and `#import`, `#on_log`
+(quickjs.rb's severities), `#on_unhandled_rejection`,
+`#promise_rejection_hook=`, `#drain_jobs!`, `#gc!`, `#memory_usage`.

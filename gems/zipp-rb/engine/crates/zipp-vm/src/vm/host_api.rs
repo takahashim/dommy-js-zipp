@@ -1579,6 +1579,17 @@ impl<'p> Vm<'p> {
         name: &str,
         args: &[HostValue],
     ) -> Result<HostValue, JsError> {
+        self.host_call_global_structured_opts(name, args, true)
+    }
+
+    /// [`Self::host_call_global_structured`], draining microtasks afterwards
+    /// only when `drain_microtasks` is set.
+    pub(crate) fn host_call_global_structured_opts(
+        &mut self,
+        name: &str,
+        args: &[HostValue],
+        drain_microtasks: bool,
+    ) -> Result<HostValue, JsError> {
         let callee = match self.host_resolve_global_by_name(name) {
             Ok(v) => v,
             Err(msg) => return Err(JsError::from_message(&msg)),
@@ -1596,7 +1607,7 @@ impl<'p> Vm<'p> {
         };
         let res = self.host_invoke(callee, &argv);
         let mut budget = HostValueBudget::default();
-        self.marshal_after_drain_structured(res, &mut budget, true)
+        self.marshal_after_drain_structured(res, &mut budget, drain_microtasks)
     }
 
     /// Evaluate `src` as indirect eval and return its completion value as a
@@ -1706,6 +1717,17 @@ impl<'p> Vm<'p> {
         src: &str,
         budget: &mut HostValueBudget,
     ) -> Result<HostValue, HostCallError> {
+        self.host_eval_rich_opts(src, budget, true)
+    }
+
+    /// [`Self::host_eval_rich`], draining microtasks afterwards only when
+    /// `drain_microtasks` is set (a re-entrant eval leaves them queued).
+    pub(crate) fn host_eval_rich_opts(
+        &mut self,
+        src: &str,
+        budget: &mut HostValueBudget,
+        drain_microtasks: bool,
+    ) -> Result<HostValue, HostCallError> {
         let res = self.do_eval(
             src,
             false,            // force_strict: inherit the source's own directive
@@ -1724,7 +1746,7 @@ impl<'p> Vm<'p> {
             None,             // exact_src
         );
         // Rooted across the drain, as a slot call's result is (ZA-05).
-        self.marshal_after_drain(res, budget, true)
+        self.marshal_after_drain(res, budget, drain_microtasks)
     }
 
     /// A snapshot of what this VM currently retains and has spent — see
@@ -2249,8 +2271,10 @@ pub trait HostCtx {
     fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, String>;
     /// Evaluate `src` as indirect eval in the running global context, from
     /// inside the host call, and return the completion value as a structured
-    /// [`HostValue`]. Top-level `var`/`function` declarations persist, and
-    /// microtasks are drained afterwards. This is the general re-entry a host
+    /// [`HostValue`]. Top-level `var`/`function` declarations persist.
+    /// Microtasks are NOT drained: the host call is still on the guest's
+    /// stack, and the queue runs at the outermost entry's checkpoint, as a
+    /// browser runs it only when the stack empties. This is the general re-entry a host
     /// needs to run guest JS while serving a `__zippHostCall` (a Ruby callback
     /// dispatching a DOM event can evaluate the handler it just found).
     ///
@@ -2487,17 +2511,18 @@ impl<'p> HostCtx for Vm<'p> {
 
     /// General re-entry: indirect eval in the running global context, with the
     /// completion value marshalled as a structured [`HostValue`]. Microtasks
-    /// are drained (see [`Vm::host_eval_rich`]).
+    /// stay queued for the outermost entry (see [`HostCtx::eval_script`]).
     fn eval_script(&mut self, src: &str) -> Result<HostValue, String> {
         let mut budget = HostValueBudget::default();
-        self.host_eval_rich(src, &mut budget)
+        self.host_eval_rich_opts(src, &mut budget, false)
             .map_err(HostCallError::into_message)
     }
 
     /// Rich by-name call: resolve `name` the way a bare identifier read is,
     /// marshal the arguments in, invoke re-entrantly, and marshal the result
     /// back. Mirrors [`Vm::host_call_slot_bounded_opts`] for a name rather
-    /// than a slot, and drains microtasks after the call as that entry does.
+    /// than a slot. Microtasks stay queued for the outermost entry: the host
+    /// call is still on the guest's stack.
     fn call_global_value(&mut self, name: &str, args: &[HostValue]) -> Result<HostValue, String> {
         // Resolve the way a bare identifier read is — program/eval bindings,
         // then the global object and its prototype chain, then the builtins —
@@ -2513,7 +2538,7 @@ impl<'p> HostCtx for Vm<'p> {
             args.iter().map(|a| self.host_in(a, 0)).collect()
         };
         let res = self.host_invoke(callee, &argv);
-        self.marshal_after_drain(res, &mut budget, true)
+        self.marshal_after_drain(res, &mut budget, false)
             .map_err(HostCallError::into_message)
     }
 
@@ -2526,7 +2551,8 @@ impl<'p> HostCtx for Vm<'p> {
             return Err("zipp: handle belongs to another VM".into());
         }
         let mut budget = HostValueBudget::default();
-        self.host_handle_call(handle.index(), args, &mut budget, true)
+        // Re-entrant: microtasks stay queued for the outermost entry.
+        self.host_handle_call(handle.index(), args, &mut budget, false)
             .map_err(HostCallError::into_message)
     }
 

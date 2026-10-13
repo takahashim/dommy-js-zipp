@@ -10,8 +10,9 @@ Keep this list current when you change the engine: it is what a merge of a new
 upstream import is resolved against (`bin/engine-import`). Each entry says what
 the change is for, so a conflict can be settled by keeping the behaviour, not
 the exact lines — upstream may have grown its own equivalent, in which case
-prefer upstream's and adapt `ext/zipp_rb`. Everything here except the compiler
-fix is additive embed API, and all of it is a candidate to propose upstream.
+prefer upstream's and adapt `ext/zipp_rb`. Everything here except the
+performance and correctness fixes is additive embed API, and all of it is a
+candidate to propose upstream.
 
 ## Embed API (crates/zipp-vm/src/embed.rs, vm/host_api.rs, vm/natives.rs, vm/mod.rs, vm/engine/boot.rs)
 
@@ -36,6 +37,21 @@ fix is additive embed API, and all of it is a candidate to propose upstream.
   reported, not only Test262's narrow case).
 - **Lifecycle** — `ScriptState::dispose` / `disposed` (idempotent teardown),
   `gc_now` (`Vm::force_gc`, a no-op while a host conversion holds the GC lock).
+- **Module resolver and `import.meta.url`** — `ModuleResolver`,
+  `join_module_specifier` (vm/mod.rs), `ScriptState::set_module_resolver` /
+  `set_module_meta_url`; every `dir.join(spec)` in vm/engine/modules.rs,
+  vm/dispatch.rs (dynamic import) and vm/construct/modules_dispose.rs goes
+  through `join_module_specifier`, and `Vm::fill_module_meta_url` gives a
+  module's `import.meta` a `url` (it had none). Lets zipp-rb's
+  `VM#module_loader=` load modules named by URL or bare name.
+- **Non-draining call** — `ScriptState::call_global_structured_opts`
+  (`host_call_global_structured_opts`): a call that leaves the microtasks it
+  queued for the host's next `run_microtasks`, for a host with its own
+  checkpoints. zipp-rb's `VM#invoke`.
+- **Console levels** — `ConsoleLevel`, `ScriptState::set_console_level_sink`
+  (vm/mod.rs `push_console_line_at`, vm/natives.rs `CONSOLE_*`, vm/engine/boot.rs):
+  a sink told which `console` method produced a line, since `warn` and
+  `error` share a stream. zipp-rb's `on_log` severities come from it.
 - **In-memory modules** — `HostModuleProvider`,
   `ScriptState::set_module_provider` (vm/engine/modules.rs): modules under a
   virtual root served from host memory, sharing the confined loader's budgets.
@@ -55,6 +71,51 @@ fix is additive embed API, and all of it is a candidate to propose upstream.
   `with_obj_regs` and `bound_anywhere`. Fixes O(n²) compile time in the number
   of locals of one function (6400 `var`s: 173 ms → 13 ms). Behaviour-neutral;
   if upstream rewrites scope handling, re-measure before re-porting.
+
+## Correctness (crates/zipp-vm/src)
+
+- **A builtin replaced on the global object is the binding later scripts
+  see** — `eval_global_slot` seeded a later script's fresh slot for a builtin
+  name (`setTimeout`, `Map`, …) from the boot intrinsic, ignoring an own data
+  property an earlier script had set (`globalThis.setTimeout = f` before any
+  code named it bare). It now seeds from that property. dommy installs its
+  timer globals this way. Test: `test/engine_fixes_test.rb`.
+- **`typeof` of a global agrees with a read** — `LoadGlobalOrUndefined` /
+  `LoadGlobalOrUndefinedDyn` (vm/dispatch.rs) returned a live slot even when
+  the global object shadowed it with a real own property, which `LoadGlobal`
+  reads instead; and `eval_global_slot` (vm/engine/run.rs) re-seeded a builtin
+  deleted from the global object before any code named it. Test:
+  `test/engine_fixes_test.rb`.
+- **Re-entry does not drain microtasks** — `HostCtx::eval_script`,
+  `call_global_value` and `call_handle_value` drained the job queue on return,
+  running promise jobs while the guest's stack (the host call) was still
+  live; dommy's custom-element reactions then ran before the element's
+  upgrade. They now leave the queue to the outermost entry
+  (`host_eval_rich_opts`). Test: `test/zipp_rb_test.rb`
+  `test_reentry_does_not_run_microtasks_early`.
+
+- **`typeof name` inside `with`** — `typeof_operand` (src/compile/exprs.rs)
+  loaded a global-resolving name straight from the global, skipping active
+  `with` objects, so `with (o) typeof o.member` read "undefined". It now
+  probes them first (`emit_with_get_chain`). Test: `test/engine_fixes_test.rb`.
+- **`performance` is a real global** — `performance.now()` was a compile-time
+  lowering to `Instr::Now` with no `performance` object behind it, so a host's
+  replacement (dommy's virtual-time `performance`) was never called. Now
+  `performance` is a builtin object (vm/setup.rs) whose `now` is the
+  `PERFORMANCE_NOW` native (vm/native.rs, vm/natives.rs), and the lowering is
+  gone (src/compile/calls.rs). Test: `test/engine_fixes_test.rb`.
+- **A replaced `console` method is called** — the compiler lowered
+  `console.log/info/warn/error/debug(…)` to the `Print` instruction whenever
+  `console` was not shadowed, so `console.warn = wrapper` was never called
+  (test frameworks and pages wrap console methods). The lowering is removed;
+  the calls go through the `CONSOLE_*` natives. Test:
+  `test/zipp_rb_test.rb` `test_a_replaced_console_method_is_called`.
+- **Promise resolving functions inherit `Function.prototype`** — the
+  `BoundResolver` / `CombinatorResolver` heap kinds (a `new Promise`
+  executor's resolve/reject, `Promise.all`'s element functions) were missing
+  from `get_member_slow`'s callable arm, so `resolve.apply` / `.call` /
+  `.bind` read `undefined`. dommy's bridge settles host promises with
+  `resolve.apply(…)`. Test: `test/engine_fixes_test.rb`.
 
 ## Tests
 

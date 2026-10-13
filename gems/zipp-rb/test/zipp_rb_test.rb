@@ -115,6 +115,39 @@ class ZippRbTest < Minitest::Test
     assert_equal 42, vm.eval("nested()")
   end
 
+  # A re-entrant call leaves queued microtasks alone: they run once the
+  # outermost entry's stack is empty, as in a browser.
+  def test_reentry_does_not_run_microtasks_early
+    vm = ZippRb::VM.new
+    vm.load(<<~JS)
+      globalThis.order = [];
+      globalThis.queue = () => { Promise.resolve().then(() => order.push("microtask")); };
+      globalThis.noop = () => {};
+    JS
+    handle = vm.handle("noop")
+    vm.define_function("reenter") do
+      vm.call("queue")
+      vm.call("noop")
+      vm.eval("order.push('eval')")
+      handle.call
+      nil
+    end
+    vm.eval("reenter(); order.push('after host call');")
+    assert_equal ["eval", "after host call", "microtask"], vm.eval("order")
+  end
+
+  def test_invoke_leaves_microtasks_for_the_host
+    vm = ZippRb::VM.new
+    vm.load("globalThis.order = []; globalThis.step = (n) => { order.push(n); Promise.resolve().then(() => order.push('micro' + n)); };")
+    vm.invoke("step", 1)
+    vm.invoke("step", 2)
+    assert_equal [1, 2], vm.eval("order.slice()")
+    vm.drain_jobs!
+    assert_equal [1, 2, "micro1", "micro2"], vm.eval("order")
+    vm.call("step", 3)
+    assert_equal [1, 2, "micro1", "micro2", 3, "micro3"], vm.eval("order")
+  end
+
   def test_call_global_from_ruby
     vm = ZippRb::VM.new
     vm.eval("function add(a, b) { return a + b }")
@@ -143,9 +176,17 @@ class ZippRbTest < Minitest::Test
     vm = ZippRb::VM.new
     lines = []
     vm.on_log { |severity, message| lines << [severity, message] }
-    vm.eval("console.log('hi'); console.error('bad');")
-    assert_includes lines, [:log, "hi"]
-    assert_includes lines, [:error, "bad"]
+    vm.eval("console.log('hi'); console.info('i'); console.debug('d'); console.warn('w'); console.error('bad');")
+    assert_equal [[:info, "hi"], [:info, "i"], [:verbose, "d"], [:warning, "w"], [:error, "bad"]], lines
+  end
+
+  # A page may replace a console method; the replacement is what runs.
+  def test_a_replaced_console_method_is_called
+    vm = ZippRb::VM.new
+    lines = []
+    vm.on_log { |severity, message| lines << [severity, message] }
+    vm.eval("const warn = console.warn; console.warn = (m) => warn('wrapped ' + m); console.warn('x');")
+    assert_equal [[:warning, "wrapped x"]], lines
   end
 
   def test_on_unhandled_rejection
@@ -155,6 +196,31 @@ class ZippRbTest < Minitest::Test
     vm.eval("Promise.reject(new Error('boom'));")
     vm.drain_jobs!
     assert(seen.any? { |m| m.include?("boom") }, "seen #{seen.inspect}")
+  end
+
+  # The listener runs once the VM is free again, so it may drive the VM.
+  def test_an_unhandled_rejection_listener_may_reenter_the_vm
+    vm = ZippRb::VM.new
+    vm.load("globalThis.reported = [];")
+    vm.on_unhandled_rejection { |message| vm.eval("reported.push(#{message.dump})") }
+    vm.eval("Promise.reject(new Error('boom'));")
+    vm.drain_jobs!
+    assert_equal ["Error: boom"], vm.eval("reported")
+  end
+
+  def test_promise_rejection_hook_sees_the_promise_and_the_reason
+    vm = ZippRb::VM.new
+    vm.load(<<~JS)
+      globalThis.events = [];
+      globalThis.hook = (type, promise, reason) => events.push([type, promise === globalThis.p, reason === globalThis.reason]);
+    JS
+    vm.promise_rejection_hook = "hook"
+    vm.eval("globalThis.reason = { why: 1 }; globalThis.p = Promise.reject(reason);")
+    vm.drain_jobs!
+    assert_equal [["unhandledrejection", true, true]], vm.eval("events")
+    vm.eval("p.catch(() => {});")
+    vm.drain_jobs!
+    assert_equal [["unhandledrejection", true, true], ["rejectionhandled", true, true]], vm.eval("events")
   end
 
   def test_drain_jobs_runs_promise_callbacks

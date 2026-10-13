@@ -34,7 +34,7 @@ use magnus::{
 };
 
 use zipp_vm::embed::{
-    compile_script, ConsoleStream, HostCallValues, HostCtx, HostHandle, HostValue, JsError,
+    compile_script, ConsoleLevel, HostCallValues, HostCtx, HostHandle, HostValue, JsError,
     ScriptState,
 };
 
@@ -93,7 +93,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_configure_limits", function!(configure_limits, 4))?;
     module.define_singleton_method("_eval", function!(eval, 2))?;
     module.define_singleton_method("_load", function!(load, 2))?;
-    module.define_singleton_method("_call", function!(call, 3))?;
+    module.define_singleton_method("_call", function!(call, 4))?;
     module.define_singleton_method("_handle", function!(handle, 2))?;
     module.define_singleton_method("_call_handle", function!(call_handle, 3))?;
     module.define_singleton_method("_get_handle", function!(get_handle, 2))?;
@@ -101,10 +101,13 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_queue_release", function!(queue_release, 2))?;
     module.define_singleton_method("_define_function", function!(define_function, 4))?;
     module.define_singleton_method("_set_module_provider", function!(set_module_provider, 4))?;
+    module.define_singleton_method("_set_module_resolver", function!(set_module_resolver, 2))?;
+    module.define_singleton_method("_set_module_meta_url", function!(set_module_meta_url, 2))?;
     module.define_singleton_method("_import", function!(import_module, 2))?;
     module.define_singleton_method("_enable_timers", function!(enable_timers, 1))?;
     module.define_singleton_method("_eval_async", function!(eval_async, 3))?;
     module.define_singleton_method("_on_log", function!(on_log, 2))?;
+    module.define_singleton_method("_set_promise_rejection_hook", function!(set_promise_rejection_hook, 2))?;
     module.define_singleton_method("_on_unhandled_rejection", function!(on_unhandled_rejection, 2))?;
     module.define_singleton_method("_drain_jobs", function!(drain_jobs, 1))?;
     module.define_singleton_method("_dispose", function!(dispose, 1))?;
