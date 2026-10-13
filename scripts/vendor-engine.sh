@@ -20,7 +20,12 @@ if [ ! -d "$src/crates/zipp-vm" ]; then
     exit 1
 fi
 
+# The fork is the pinned upstream commit PLUS the uncommitted patch series
+# (scripts/apply-patches.sh), so the stamp covers both: HEAD alone would call
+# a copy up to date after a patch changed.
 head="$(git -C "$src" rev-parse HEAD 2>/dev/null || echo unknown)"
+diff_sum="$(git -C "$src" diff HEAD 2>/dev/null | shasum | cut -d' ' -f1)"
+head="$head+$diff_sum"
 stamp="$dst/.engine-rev"
 
 if [ -d "$dst/crates/zipp-vm" ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$head" ]; then

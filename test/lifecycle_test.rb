@@ -54,7 +54,7 @@ class LifecycleTest < Minitest::Test
   def test_dispose_during_a_callback_is_refused
     vm = ZippRb::VM.new
     vm.define_function("stop") { vm.dispose }
-    assert_raises(ZippRb::Error) { vm.eval("stop()") }
+    assert_raises(ThreadError) { vm.eval("stop()") }
     refute vm.disposed?, "the VM must survive a refused dispose"
     assert_equal 42, vm.eval("40 + 2"), "the VM stays usable afterwards"
     vm.dispose
