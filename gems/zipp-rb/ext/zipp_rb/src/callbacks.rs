@@ -93,17 +93,21 @@ pub(crate) fn define_function(
 }
 
 /// Register a Ruby block as the console listener for VM `id`; it is called
-/// with `(severity_symbol, line)` for every `console.*` line.
+/// with `(severity_symbol, line)` for every `console.*` line. The severities
+/// are quickjs.rb's: `log`/`info` → `:info`, `debug` → `:verbose`, `warn` →
+/// `:warning`, `error` → `:error`.
 pub(crate) fn on_log(ruby: &Ruby, id: u64, block: Value) -> Result<(), Error> {
     mark_bridged(id);
     let key = format!("log:{id}");
     store_listener(ruby, &key, block)?;
     with_entry(ruby, id, |entry| {
         entry.run(ruby, |s| {
-            s.set_console_sink(Box::new(move |stream, line| {
-                let severity = match stream {
-                    ConsoleStream::Stdout => "log",
-                    ConsoleStream::Stderr => "error",
+            s.set_console_level_sink(Box::new(move |level, line| {
+                let severity = match level {
+                    ConsoleLevel::Log | ConsoleLevel::Info => "info",
+                    ConsoleLevel::Debug => "verbose",
+                    ConsoleLevel::Warn => "warning",
+                    ConsoleLevel::Error => "error",
                 };
                 let Ok(ruby) = Ruby::get() else { return };
                 let args = [
@@ -118,6 +122,11 @@ pub(crate) fn on_log(ruby: &Ruby, id: u64, block: Value) -> Result<(), Error> {
 
 /// Register a Ruby block as the unhandled-rejection listener for VM `id`; it
 /// is called with the rejection's message.
+///
+/// The engine reports a rejection while the VM is still out of the registry,
+/// where the listener could not use it; reports are queued and delivered once
+/// the entry has put the VM back (see `with_entry`), so a listener may drive
+/// the VM (dispatch an `unhandledrejection` event to the page, say).
 pub(crate) fn on_unhandled_rejection(ruby: &Ruby, id: u64, block: Value) -> Result<(), Error> {
     mark_bridged(id);
     let key = format!("rejection:{id}");
@@ -125,12 +134,42 @@ pub(crate) fn on_unhandled_rejection(ruby: &Ruby, id: u64, block: Value) -> Resu
     with_entry(ruby, id, |entry| {
         entry.run(ruby, |s| {
             s.set_unhandled_rejection_sink(Box::new(move |message| {
-                let Ok(ruby) = Ruby::get() else { return };
-                let args = [ruby.str_new(message).as_value()];
-                call_listener(&ruby, id, &key, &args);
+                PENDING_REJECTIONS.with(|q| q.borrow_mut().entry(id).or_default().push(message.to_string()));
             }))
         })
     })
+}
+
+thread_local! {
+    /// Rejection reports awaiting delivery, per VM.
+    static PENDING_REJECTIONS: RefCell<HashMap<u64, Vec<String>>> = RefCell::new(HashMap::new());
+}
+
+/// Drop VM `id`'s undelivered rejection reports (it is being torn down).
+pub(crate) fn forget_rejections(id: u64) {
+    PENDING_REJECTIONS.with(|q| {
+        q.borrow_mut().remove(&id);
+    });
+}
+
+/// Deliver VM `id`'s queued rejection reports to its listener, oldest first.
+/// The VM is back in the registry, so the listener may re-enter it.
+pub(crate) fn deliver_rejections(ruby: &Ruby, id: u64) {
+    let key = format!("rejection:{id}");
+    loop {
+        let next = PENDING_REJECTIONS.with(|q| {
+            let mut q = q.borrow_mut();
+            let list = q.get_mut(&id)?;
+            let message = (!list.is_empty()).then(|| list.remove(0));
+            if list.is_empty() {
+                q.remove(&id);
+            }
+            message
+        });
+        let Some(message) = next else { break };
+        let args = [ruby.str_new(&message).as_value()];
+        call_listener(ruby, id, &key, &args);
+    }
 }
 
 /// Store a Ruby block in the `ZippRb::LISTENERS` constant so the GC roots it.
@@ -221,4 +260,15 @@ pub(crate) fn active_ctx(vm_id: u64) -> Option<*mut (dyn HostCtx + 'static)> {
     ACTIVE_CTX
         .with(|c| c.get())
         .and_then(|(id, ptr)| (id == vm_id).then_some(ptr))
+}
+
+/// Install the JS function `expression` evaluates to (once, in global scope)
+/// as VM `id`'s promise rejection hook: called with `(type, promise, reason)`,
+/// `type` being "unhandledrejection" or "rejectionhandled".
+pub(crate) fn set_promise_rejection_hook(ruby: &Ruby, id: u64, expression: String) -> Result<(), Error> {
+    with_entry(ruby, id, |entry| {
+        entry
+            .run(ruby, |s| s.set_promise_rejection_hook(&expression))?
+            .map_err(|msg| js_error_from_message(ruby, id, &msg))
+    })
 }

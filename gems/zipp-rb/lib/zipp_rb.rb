@@ -52,4 +52,5 @@ module ZippRb
 end
 
 require_relative "zipp_rb/handle"
+require_relative "zipp_rb/module_paths"
 require_relative "zipp_rb/vm"

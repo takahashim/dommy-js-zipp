@@ -1479,9 +1479,29 @@ impl<'p> Vm<'p> {
         // code (`eval("new RangeError()")`, `eval("Object.keys(x)")`): seed the
         // fresh slot with the builtin value rather than the never-declared
         // sentinel. A genuinely-undeclared name stays UNINITIALIZED → ReferenceError.
-        let seed = match self.builtin_globals.get(name) {
-            Some(&v) => Value::heap(v),
-            None => Value::UNINITIALIZED,
+        //
+        // An earlier script may already have replaced the builtin through the
+        // global object (`globalThis.setTimeout = f`, before any code named it
+        // bare): that own data property IS the binding's value, so the slot
+        // starts from it rather than from the boot intrinsic.
+        let replaced = if self.builtin_globals.contains_key(name) && self.global_this != 0 {
+            match self.heap.get(self.global_this) {
+                HeapObj::Object(m) => m
+                    .pos(name)
+                    .filter(|&i| !m.attr_at(i).accessor)
+                    .map(|i| m.val_at(i)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // A builtin deleted from the global object before any code named it
+        // stays deleted.
+        let deleted = self.deleted_globals.contains(name);
+        let seed = match (replaced, self.builtin_globals.get(name)) {
+            (Some(v), _) => v,
+            (None, Some(&v)) if !deleted => Value::heap(v),
+            _ => Value::UNINITIALIZED,
         };
         let s = self.alloc_global_pool_slot(seed, "global names introduced by eval")?;
         self.eval_global_map.insert(name.to_string(), s);

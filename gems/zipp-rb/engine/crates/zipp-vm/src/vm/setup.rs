@@ -2663,9 +2663,8 @@ impl<'p> Vm<'p> {
         // Host `print` as a first-class value (shells + the test262 harness
         // expect a global; the bare call form compiles to the Print instr).
         let print_fn = self.heap.alloc(HeapObj::Native(native::GLOBAL_PRINT));
-        // `console` is usually compiled straight to `Print`, but it still has
-        // to exist as a real namespace whenever lexical/with resolution or a
-        // first-class method reference makes that shortcut inapplicable.
+        // `console` and `performance` are real namespaces, called like any
+        // object's methods, so a host or page can replace them or their methods.
         let console_obj = build(
             self,
             &[
@@ -2677,6 +2676,7 @@ impl<'p> Vm<'p> {
             ],
             None,
         );
+        let performance_obj = build(self, &[("now", PERFORMANCE_NOW)], None);
         // The Annex-B call-assignment-target ReferenceError thrower (lib.rs
         // parse-retry rewrite). Resolvable as a global under its reserved name
         // only; hidden from globalThis own-keys reflection (props.rs).
@@ -2816,6 +2816,7 @@ impl<'p> Vm<'p> {
             ("unescape", unescape_fn),
             ("print", print_fn),
             ("console", console_obj),
+            ("performance", performance_obj),
             ("eval", eval_fn),
             ("globalThis", global_this),
             (native::ANNEXB_REF_ERROR_NAME, annexb_ref_error_fn),

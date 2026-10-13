@@ -75,7 +75,9 @@ pub(crate) fn load(ruby: &Ruby, id: u64, src: String) -> Result<(), Error> {
 }
 
 /// Call the global function `name` with Ruby `args`, converting both ways.
-pub(crate) fn call(ruby: &Ruby, id: u64, name: String, args: RArray) -> Result<Value, Error> {
+/// `drain` runs the microtasks the call queued before returning (a nested
+/// call never drains: the outer entry's stack is still live).
+pub(crate) fn call(ruby: &Ruby, id: u64, name: String, args: RArray, drain: bool) -> Result<Value, Error> {
     let host_args: Vec<HostValue> = args.into_iter().map(|a| ruby_to_host(ruby, a)).collect();
     if let Some(ptr) = active_ctx(id) {
         let ctx: &mut dyn HostCtx = unsafe { &mut *ptr };
@@ -83,7 +85,7 @@ pub(crate) fn call(ruby: &Ruby, id: u64, name: String, args: RArray) -> Result<V
         return nested_result(ruby, id, result);
     }
     with_entry(ruby, id, |entry| {
-        match entry.run_nogvl(ruby, |s| s.call_global_structured(&name, &host_args))? {
+        match entry.run_nogvl(ruby, |s| s.call_global_structured_opts(&name, &host_args, drain))? {
             Ok(hv) => Ok(host_to_ruby(ruby, &hv)),
             Err(e) => Err(js_error(ruby, id, &e)),
         }

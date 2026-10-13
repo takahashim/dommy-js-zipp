@@ -59,7 +59,15 @@ module ZippRb
     # Call the JS global function +name+ with +args+, converting both ways.
     def call(name, *args)
       check_usable!
-      ZippRb._call(@id, name.to_s, args)
+      ZippRb._call(@id, name.to_s, args, true)
+    end
+
+    # Like #call, but leaves the microtasks the call queued for the next
+    # #drain_jobs! — for a host that runs its own microtask checkpoints (as
+    # quickjs.rb's `call` does). Inside a callback #call behaves this way too.
+    def invoke(name, *args)
+      check_usable!
+      ZippRb._call(@id, name.to_s, args, false)
     end
 
     # Take a durable handle to the global +name+ (a function or any value), so
@@ -124,16 +132,44 @@ module ZippRb
       nil
     end
 
+    # Resolve and load ES modules by name (quickjs.rb's module loader). The
+    # +loader+ is called as `loader.call(specifier, importer)` for every
+    # static and dynamic import — +importer+ is the importing module's name,
+    # nil for code outside a module — and answers one of:
+    #
+    #   "source"                 the module named +specifier+
+    #   { code: "…", as: name }  the module, under the canonical name +name+
+    #   { as: name }             a module already loaded under +name+
+    #   nil                      not found
+    #
+    # A module is loaded once per canonical name, and its relative imports and
+    # `import.meta.url` are its name. Names need not be paths (URLs and bare
+    # names work). Replaces #set_module_provider.
+    #
+    #   vm.module_loader = ->(spec, importer) {
+    #     { code: SOURCES.fetch(spec), as: spec } if SOURCES.key?(spec)
+    #   }
+    #   vm.import("https://example.test/app.js")
+    def module_loader=(loader)
+      check_usable!
+      paths = ModulePaths.new
+      set_module_provider(ModulePaths::ROOT, paths.sources)
+      ZippRb._set_module_resolver(@id, ->(dir, specifier) { paths.resolve(loader, dir, specifier) })
+      ZippRb._set_module_meta_url(@id, ->(path) { paths.name_of(path) })
+    end
+
     # Evaluate the ES module +specifier+ (via dynamic import) and return its
-    # namespace exports as a Hash. Requires a module loader, usually
-    # #set_module_provider.
+    # namespace exports as a Hash. Requires a module loader (#module_loader=
+    # or #set_module_provider).
     def import(specifier)
       check_usable!
       ZippRb._import(@id, specifier.to_s)
     end
 
-    # Register +block+ to receive every console line as `(severity, message)`,
-    # where severity is :log or :error. Replaces any previous listener.
+    # Register +block+ to receive every console line as `(severity, message)`.
+    # Severities follow quickjs.rb: :info (console.log / info), :verbose
+    # (debug), :warning (warn) and :error (error). Replaces any previous
+    # listener.
     def on_log(&block)
       check_usable!
       ZippRb._on_log(@id, block)
@@ -146,6 +182,17 @@ module ZippRb
       check_usable!
       ZippRb._on_unhandled_rejection(@id, block)
       nil
+    end
+
+    # Point the promise rejection hook at the JS function +expression+
+    # evaluates to (once, in global scope; quickjs.rb's shape). At each
+    # microtask checkpoint it is called as `hook("unhandledrejection", promise,
+    # reason)` for a rejection no handler caught, and later as
+    # `hook("rejectionhandled", promise, reason)` if one is attached — the
+    # promise and the reason themselves, unlike #on_unhandled_rejection.
+    def promise_rejection_hook=(expression)
+      check_usable!
+      ZippRb._set_promise_rejection_hook(@id, expression.to_s)
     end
 
     # Run queued microtasks (promise reactions, queueMicrotask). Returns nil.

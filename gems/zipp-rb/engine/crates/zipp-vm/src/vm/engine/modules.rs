@@ -122,6 +122,40 @@ impl<'p> Vm<'p> {
         canonical_module_path(self.module_root.as_deref(), raw_path)
     }
 
+    /// Give the fresh `import.meta` object `meta` of the module whose namespace
+    /// is heap index `ns` a `url`, when the host answers one for its path.
+    pub(crate) fn fill_module_meta_url(&mut self, meta: u32, ns: u32) {
+        let Some(url_of) = self.module_meta_url.clone() else {
+            return;
+        };
+        let ns = Value::heap(ns);
+        let Some(path) = self
+            .module_cache
+            .iter()
+            .find(|(_, v)| **v == ns)
+            .map(|(p, _)| p.clone())
+        else {
+            return;
+        };
+        let Some(url) = url_of(&path) else {
+            return;
+        };
+        let url = self.alloc_str(url);
+        if let HeapObj::Object(map) = self.heap.get_mut(meta) {
+            map.define(
+                "url",
+                url,
+                crate::heap::PropAttr {
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                },
+            );
+        }
+    }
+
     /// Install a host module provider over a virtual `root`: specifiers under
     /// `root` resolve lexically and each module's bytes come from `provider`
     /// (never from the filesystem). `root` must be absolute; it need not exist.
@@ -215,7 +249,18 @@ impl<'p> Vm<'p> {
         // declines is "module not found"; the filesystem is never consulted, so
         // nothing can leak through it.
         if let Some(provider) = self.module_provider.clone() {
-            let bytes = provider(path).ok_or_else(|| Thrown(MODULE_NOT_FOUND.into()))?;
+            let bytes = match provider(path) {
+                Some(bytes) => bytes,
+                // Name the module when the host can (its `import.meta.url`
+                // hook maps a provider path back to the module's name).
+                None => {
+                    let name = self.module_meta_url.as_ref().and_then(|url_of| url_of(path));
+                    return Err(Thrown(match name {
+                        Some(name) => format!("{MODULE_NOT_FOUND}: {name}"),
+                        None => MODULE_NOT_FOUND.into(),
+                    }));
+                }
+            };
             if let Some(limit) = self.module_max_bytes {
                 self.account_confined_module(path, bytes.len() as u64, limit)?;
             }
@@ -576,11 +621,9 @@ impl<'p> Vm<'p> {
         // dependency loop: `module_loading` holds exactly the in-flight
         // ancestors throughout it.
         let module_root = self.module_root.clone();
+        let resolver = self.module_resolver.clone();
         let canon_of = |dir: Option<&std::path::Path>, spec: &str| -> std::path::PathBuf {
-            let raw = match dir {
-                Some(d) => d.join(spec),
-                None => std::path::PathBuf::from(spec),
-            };
+            let raw = join_module_specifier(resolver.as_ref(), dir, spec);
             canonical_module_path(module_root.as_deref(), &raw).unwrap_or(raw)
         };
         use crate::bytecode::ImportName as IN;
@@ -753,10 +796,8 @@ impl<'p> Vm<'p> {
                 if matches!(e.import, IN::Source) && e.specifier == "<module source>" {
                     continue;
                 }
-                let dep_raw = match dir.as_deref() {
-                    Some(d) => d.join(&e.specifier),
-                    None => std::path::PathBuf::from(&e.specifier),
-                };
+                let dep_raw =
+                    join_module_specifier(self.module_resolver.as_ref(), dir.as_deref(), &e.specifier);
                 let confined = self.module_root.is_some();
                 let dep_canon = self.resolve_module_path(&dep_raw).map_err(|err| {
                     if confined {
@@ -783,10 +824,8 @@ impl<'p> Vm<'p> {
                 if matches!(e.import, IN::Source) && e.specifier == "<module source>" {
                     continue;
                 }
-                let dep_raw = match dir.as_deref() {
-                    Some(d) => d.join(&e.specifier),
-                    None => std::path::PathBuf::from(&e.specifier),
-                };
+                let dep_raw =
+                    join_module_specifier(self.module_resolver.as_ref(), dir.as_deref(), &e.specifier);
                 let dep_canon = self.resolve_module_path(&dep_raw)?;
                 // A TYPED import (json/text) is a DISTINCT module record even
                 // for the importing file itself — never self/in-flight.
@@ -1221,10 +1260,7 @@ impl<'p> Vm<'p> {
         // matches the spec's (module, ~namespace~) ResolvedBinding. Cycles
         // resolve through the loader's pre-registered cache entry.
         for (exported, spec) in ns_reexports {
-            let dep = match dir {
-                Some(d) => d.join(spec),
-                None => std::path::PathBuf::from(spec),
-            };
+            let dep = join_module_specifier(self.module_resolver.as_ref(), dir, spec);
             let canon = self.resolve_module_path(&dep)?;
             let slot = self.module_ns_slot(&canon)?;
             let ns = self.import_module_sync(&dep, None)?;
@@ -1234,10 +1270,7 @@ impl<'p> Vm<'p> {
             full.push((exported.clone(), slot));
         }
         for (exported, imported, spec) in reexports {
-            let dep = match dir {
-                Some(d) => d.join(spec),
-                None => std::path::PathBuf::from(spec),
-            };
+            let dep = join_module_specifier(self.module_resolver.as_ref(), dir, spec);
             if let Some(slot) = self.resolve_export(&dep, imported, None)? {
                 full.push((exported.clone(), slot));
             } else {
@@ -1255,10 +1288,7 @@ impl<'p> Vm<'p> {
             std::collections::HashMap::new();
         let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
         for spec in star_reexports {
-            let dep = match dir {
-                Some(d) => d.join(spec),
-                None => std::path::PathBuf::from(spec),
-            };
+            let dep = join_module_specifier(self.module_resolver.as_ref(), dir, spec);
             for (name, slot) in self.all_exports(&dep)? {
                 if own.contains(&name) {
                     continue; // a local/indirect export shadows star names
@@ -1716,10 +1746,7 @@ impl<'p> Vm<'p> {
                 if spec == "<module source>" {
                     continue;
                 }
-                let raw = match dir.as_deref() {
-                    Some(d) => d.join(&spec),
-                    None => std::path::PathBuf::from(&spec),
-                };
+                let raw = join_module_specifier(self.module_resolver.as_ref(), dir.as_deref(), &spec);
                 let canon = self.resolve_module_path(&raw).map_err(|err| {
                     if confined {
                         err
@@ -2077,12 +2104,10 @@ impl<'p> Vm<'p> {
             return self.resolve_export(dep, name, None);
         };
         let module_root = self.module_root.clone();
+        let resolver = self.module_resolver.clone();
         let join =
             |pdir: Option<&std::path::Path>, spec: &str| -> Result<std::path::PathBuf, Thrown> {
-                let raw = match pdir {
-                    Some(d) => d.join(spec),
-                    None => std::path::PathBuf::from(spec),
-                };
+                let raw = join_module_specifier(resolver.as_ref(), pdir, spec);
                 canonical_module_path(module_root.as_deref(), &raw)
             };
         for (exported, imported, spec) in &reex {

@@ -2248,6 +2248,8 @@ impl<'p> Vm<'p> {
             }
             // Functions / natives / bound functions: own props set on them
             // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
+            // The promise resolving functions are functions too: without them
+            // here, `resolve.apply(…)` read `apply` as undefined.
             _ if matches!(
                 self.heap.get(obj.heap_index()),
                 HeapObj::Func(_)
@@ -2256,6 +2258,8 @@ impl<'p> Vm<'p> {
                     | HeapObj::Wrapped { .. }
                     | HeapObj::Native(_)
                     | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. }
             ) =>
             {
                 // An own property in the fn_props bag (incl. an explicitly defined

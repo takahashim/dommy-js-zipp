@@ -173,6 +173,7 @@ pub(crate) fn with_entry<T>(
     let mut entry = Entry::take(ruby, id)?;
     let result = f(&mut entry);
     drop(entry);
+    deliver_rejections(ruby, id);
     finish(ruby, id, result)
 }
 
@@ -206,8 +207,12 @@ pub(crate) fn dispose(ruby: &Ruby, id: u64) -> Result<(), Error> {
     Ok(())
 }
 
-/// Whether the VM `id` has been disposed (unknown ids report `true`).
+/// Whether the VM `id` has been disposed (unknown ids report `true`). A VM
+/// that is executing is out of the registry (its `Entry` holds it) but alive.
 pub(crate) fn disposed(id: u64) -> bool {
+    if IN_FLIGHT.with(|s| s.borrow().contains(&id)) {
+        return false;
+    }
     VMS.with(|vms| {
         vms.borrow()
             .get(&id)
@@ -244,8 +249,14 @@ pub(crate) fn put_vm(id: u64, state: ScriptState) {
 /// procs (and whatever application objects they close over) would live for the
 /// process lifetime even after the VM is disposed or GC'd.
 pub(crate) fn forget_vm(ruby: &Ruby, id: u64) {
+    forget_rejections(id);
     if let Some(listeners) = hash_const(ruby, "LISTENERS") {
-        for key in [format!("log:{id}"), format!("rejection:{id}")] {
+        for key in [
+            format!("log:{id}"),
+            format!("rejection:{id}"),
+            format!("module_resolver:{id}"),
+            format!("module_meta_url:{id}"),
+        ] {
             let _ = listeners.delete::<_, Value>(key);
         }
     }

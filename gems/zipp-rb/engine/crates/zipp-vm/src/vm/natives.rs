@@ -3554,20 +3554,20 @@ impl<'p> Vm<'p> {
                 self.push_console_line(line, false);
                 Value::UNDEFINED
             }
-            CONSOLE_LOG | CONSOLE_INFO | CONSOLE_DEBUG => {
+            PERFORMANCE_NOW => Value::num(crate::vm::clock::now_mono_ms() - self.start_mono_ms),
+            CONSOLE_LOG | CONSOLE_INFO | CONSOLE_DEBUG | CONSOLE_WARN | CONSOLE_ERROR => {
+                let level = match id {
+                    CONSOLE_INFO => ConsoleLevel::Info,
+                    CONSOLE_DEBUG => ConsoleLevel::Debug,
+                    CONSOLE_WARN => ConsoleLevel::Warn,
+                    CONSOLE_ERROR => ConsoleLevel::Error,
+                    _ => ConsoleLevel::Log,
+                };
                 let line = self.inspect_line(args.len(), |i| args[i]);
                 #[cfg(feature = "instrument")]
                 self.instrument_output_line(&line)
                     .map_err(|msg| Thrown(msg.into()))?;
-                self.push_console_line(line, false);
-                Value::UNDEFINED
-            }
-            CONSOLE_WARN | CONSOLE_ERROR => {
-                let line = self.inspect_line(args.len(), |i| args[i]);
-                #[cfg(feature = "instrument")]
-                self.instrument_output_line(&line)
-                    .map_err(|msg| Thrown(msg.into()))?;
-                self.push_console_line(line, true);
+                self.push_console_line_at(line, level);
                 Value::UNDEFINED
             }
             AGENT_SLEEP => {

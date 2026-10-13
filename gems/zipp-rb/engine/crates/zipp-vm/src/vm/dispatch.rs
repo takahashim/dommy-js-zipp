@@ -759,6 +759,11 @@ impl<'p> Vm<'p> {
                                 }
                                 _ => Value::UNDEFINED,
                             }
+                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
+                            // A live slot the global object shadows with a real
+                            // own property: the property is the binding, as
+                            // for `LoadGlobal` (`typeof x` agrees with `x`).
+                            self.load_global_slow(idx, func_id)?
                         } else {
                             v
                         };
@@ -846,6 +851,11 @@ impl<'p> Vm<'p> {
                                 }
                                 _ => Value::UNDEFINED,
                             }
+                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
+                            // A live slot the global object shadows with a real
+                            // own property: the property is the binding, as
+                            // for `LoadGlobal` (`typeof x` agrees with `x`).
+                            self.load_global_slow(idx, func_id)?
                         } else {
                             v
                         };
@@ -5893,7 +5903,7 @@ impl<'p> Vm<'p> {
                                     // promise waiting on them.
                                     match self
                                         .dynamic_import_base_dir(func_id)
-                                        .map(|d| d.join(&spec_str))
+                                        .map(|d| join_module_specifier(self.module_resolver.as_ref(), Some(&d), &spec_str))
                                     {
                                         None => Err(self.make_error(1, None)),
                                         // A fresh Evaluate() for the eager
@@ -5955,7 +5965,7 @@ impl<'p> Vm<'p> {
                                     // the joined path.
                                     match self
                                         .dynamic_import_base_dir(func_id)
-                                        .map(|d| d.join(&spec_str))
+                                        .map(|d| join_module_specifier(self.module_resolver.as_ref(), Some(&d), &spec_str))
                                     {
                                         None => Err(self.make_error(1, None)),
                                         Some(path) => {
@@ -6752,6 +6762,7 @@ impl<'p> Vm<'p> {
                                             .alloc(HeapObj::Object(Box::new(ObjMap::new())));
                                         self.proto_of.insert(m, Value::NULL);
                                         self.module_metas.insert(k, m);
+                                        self.fill_module_meta_url(m, k);
                                         m
                                     }
                                 },

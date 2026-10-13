@@ -43,7 +43,7 @@ pub use crate::vm::host_api::{HostCallCtx, HostCtx};
 /// `meter-only` profile deliberately does not.
 #[cfg(feature = "instrument")]
 pub use crate::vm::instrument::{op, TraceStep};
-pub use crate::vm::ConsoleStream;
+pub use crate::vm::{ConsoleLevel, ConsoleStream};
 
 /// Decimal text to `f64`, exactly as `text.parse::<f64>().ok()` reads it (the
 /// same grammar, the same correctly rounded value), by the engine's own
@@ -439,6 +439,43 @@ impl ScriptState {
         .unwrap_or_else(torn_down)
     }
 
+    /// Install the JS function that `expression` (evaluated once, in global
+    /// scope) yields as the promise rejection hook, HTML's
+    /// HostPromiseRejectionTracker: at each report point it is called as
+    /// `hook("unhandledrejection", promise, reason)` for a rejection still
+    /// unhandled, and `hook("rejectionhandled", promise, reason)` once such a
+    /// rejection gains a handler. Unlike [`Self::set_unhandled_rejection_sink`]
+    /// it receives the promise and the reason themselves.
+    pub fn set_promise_rejection_hook(&mut self, expression: &str) -> Result<(), String> {
+        self.with_vm(|vm| {
+            let hook = eval_indirect(vm, expression).map_err(|t| vm.take_host_throw(t))?;
+            if !vm.is_callable(hook) {
+                return Err(format!("TypeError: {expression} is not a function"));
+            }
+            vm.promise_rejection_hook = hook;
+            Ok(())
+        })
+        .unwrap_or_else(torn_down)
+    }
+
+    /// Resolve module specifiers through `resolver` instead of joining them
+    /// lexically onto the referrer's directory: it receives that directory
+    /// (`None` for the entry) and the specifier, and answers the module path
+    /// to load, or `None` for the lexical join. With a module provider, this
+    /// lets module names that are not paths (URLs, bare names) be mapped to
+    /// provider paths.
+    pub fn set_module_resolver(&mut self, resolver: crate::vm::ModuleResolver) {
+        self.with_vm(|vm| vm.module_resolver = Some(resolver));
+    }
+
+    /// Answer `import.meta.url` for each loaded module from its path.
+    pub fn set_module_meta_url(
+        &mut self,
+        url_of: std::rc::Rc<dyn Fn(&std::path::Path) -> Option<String>>,
+    ) {
+        self.with_vm(|vm| vm.module_meta_url = Some(url_of));
+    }
+
     /// Disable the VM's native code generators for this script state.
     ///
     /// Sandboxed callers should also disable regress' process-global regex JIT
@@ -613,6 +650,13 @@ impl ScriptState {
     /// is charged exactly as before.
     pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &str)>) {
         self.with_vm(|vm| vm.console_sink = Some(sink));
+    }
+
+    /// Like [`Self::set_console_sink`], but each line is tagged with the
+    /// `console` method that produced it (`warn` and `error` share a stream).
+    /// Takes precedence over a stream sink.
+    pub fn set_console_level_sink(&mut self, sink: Box<dyn FnMut(ConsoleLevel, &str)>) {
+        self.with_vm(|vm| vm.console_level_sink = Some(sink));
     }
 
     /// Deliver every still-unhandled Promise rejection to `sink`, with the
@@ -944,8 +988,21 @@ impl ScriptState {
         name: &str,
         args: &[HostValue],
     ) -> Result<HostValue, JsError> {
+        self.call_global_structured_opts(name, args, true)
+    }
+
+    /// [`Self::call_global_structured`], leaving the microtasks the call
+    /// queued for the host's next [`Self::run_microtasks`] unless
+    /// `drain_microtasks` is set — for a host that runs its own microtask
+    /// checkpoints (a browser event loop).
+    pub fn call_global_structured_opts(
+        &mut self,
+        name: &str,
+        args: &[HostValue],
+        drain_microtasks: bool,
+    ) -> Result<HostValue, JsError> {
         let result = self
-            .with_vm(|vm| vm.host_call_global_structured(name, args))
+            .with_vm(|vm| vm.host_call_global_structured_opts(name, args, drain_microtasks))
             .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)));
         self.report_rejections();
         result
