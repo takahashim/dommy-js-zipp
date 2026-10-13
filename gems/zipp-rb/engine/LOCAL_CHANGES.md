@@ -132,6 +132,23 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   binding `global_slot_binding_descriptor` reports as the own data property
   it is. dommy-js-zipp's unified window keeps the window proxy on the
   global's chain. Test: `test/engine_fixes_test.rb`.
+- **A builtin read finds the global's own property first** — a global slot
+  an eval-installed program reads (vm/dispatch.rs: `LoadGlobalOrUndefined`,
+  `LoadGlobalOrUndefinedDyn`, `LoadGlobalDyn`, `load_global_slow`) consulted
+  the global's prototype chain before `global_by_name`, so every read of
+  `Array` or `Object` in dommy's `host_runtime.js` asked the window proxy's
+  `has` trap once the window sat on that chain (and walked
+  `Object.prototype` before). The builtin is an own property of the global
+  object, so it now answers first. Test: `test/engine_fixes_test.rb`.
+
+## Performance: naming a global slot (crates/zipp-vm/src/vm/engine/run.rs, vm/mod.rs, vm/engine/boot.rs)
+
+- `global_slot_name` found an eval-introduced slot's name by scanning all of
+  `eval_global_map`, on every slow global read (a global that is an own
+  property of the global object, not a slot), so the read was linear in the
+  realm's globals. `Vm::eval_global_names` keeps the reverse map, filled where
+  `eval_global_slot` fills the forward one. An element property read through
+  dommy's bridge went from 2.6µs to 2.0µs.
 
 ## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, compile/*, vm/dispatch.rs)
 

@@ -1516,6 +1516,10 @@ pub struct Vm<'p> {
     /// compile-time `program.global_names`) to the EVAL_POOL slot it was assigned.
     /// Persists across `eval` calls so repeated evals see each other's globals.
     eval_global_map: std::collections::HashMap<String, u32>,
+    /// `eval_global_map` the other way round (slot -> name), for
+    /// `global_slot_name`: a slow global read names its slot on every call,
+    /// and scanning the forward map made that linear in the realm's globals.
+    eval_global_names: std::collections::HashMap<u32, String>,
     /// Pool slots that deliberately have NO `eval_global_map` entry, by what
     /// they bind: a loaded module's own declarations (per-module, so two
     /// modules' same-named bindings never collide) and ShadowRealm names.

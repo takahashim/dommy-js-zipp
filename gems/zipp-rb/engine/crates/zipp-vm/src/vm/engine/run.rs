@@ -1505,6 +1505,7 @@ impl<'p> Vm<'p> {
         };
         let s = self.alloc_global_pool_slot(seed, "global names introduced by eval")?;
         self.eval_global_map.insert(name.to_string(), s);
+        self.eval_global_names.insert(s, name.to_string());
         Ok(s)
     }
 
@@ -1520,12 +1521,7 @@ impl<'p> Vm<'p> {
             .global_names
             .get(idx as usize)
             .cloned()
-            .or_else(|| {
-                self.eval_global_map
-                    .iter()
-                    .find(|(_, &v)| v == idx)
-                    .map(|(k, _)| k.clone())
-            })
+            .or_else(|| self.eval_global_names.get(&idx).cloned())
     }
 
     /// The global SLOT behind a name — the inverse of `global_slot_name`. Main-program
@@ -1620,12 +1616,11 @@ impl<'p> Vm<'p> {
         if m.keys.is_empty() {
             return false;
         }
-        let name = self.program.global_names.get(idx as usize).or_else(|| {
-            self.eval_global_map
-                .iter()
-                .find(|(_, &v)| v == idx)
-                .map(|(k, _)| k)
-        });
+        let name = self
+            .program
+            .global_names
+            .get(idx as usize)
+            .or_else(|| self.eval_global_names.get(&idx));
         match name {
             Some(n) => m.pos(n).is_some(),
             None => false,

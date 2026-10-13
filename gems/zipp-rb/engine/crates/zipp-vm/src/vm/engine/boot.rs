@@ -177,6 +177,7 @@ impl<'p> Vm<'p> {
             eval_classes: Vec::new(),
             main_class_count: program.classes.len(),
             eval_global_map: std::collections::HashMap::new(),
+            eval_global_names: std::collections::HashMap::new(),
             pool_slot_names: rustc_hash::FxHashMap::default(),
             eval_global_next: program.global_count + FIELD_POOL as u32,
             builtin_globals: std::collections::HashMap::new(),
@@ -874,6 +875,10 @@ impl<'p> Vm<'p> {
         n = self.eval_global_map.keys().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.eval_global_map)),
             |n, key| n.saturating_add(key.capacity()),
+        );
+        n = self.eval_global_names.values().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.eval_global_names)),
+            |n, name| n.saturating_add(name.capacity()),
         );
         n = self.pool_slot_names.values().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.pool_slot_names)),

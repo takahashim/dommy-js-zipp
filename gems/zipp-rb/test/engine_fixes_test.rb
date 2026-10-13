@@ -35,6 +35,21 @@ class EngineFixesTest < Minitest::Test
     assert_equal ["brandNew", 2, "ReferenceError"], result
   end
 
+  # Reading a builtin finds it as the global object's own property, before a
+  # Proxy on the global's chain is asked `has` — in ordinary code and in a
+  # function that names `eval` (whose globals resolve dynamically).
+  def test_a_builtin_read_does_not_ask_a_proxy_on_the_global_chain
+    result = @vm.eval(<<~JS)
+      var asked = [];
+      Object.setPrototypeOf(globalThis, new Proxy({}, { has(t, k) { asked.push(String(k)); return false; } }));
+      (0, eval)("(function () { return [Array.isArray([]), typeof Math, JSON.stringify(1)]; })()");
+      (0, eval)("(function () { const e = eval; return [Array.isArray([]), typeof Math, JSON.stringify(1)]; })()");
+      try { notDeclaredAnywhere; } catch (e) {}
+      asked.join(",");
+    JS
+    assert_equal "notDeclaredAnywhere", result
+  end
+
   # The extension builds the engine's safe profile (no `unsafe`), where a
   # SharedArrayBuffer keeps agent-local bytes; with one agent per VM it still
   # behaves as one: brand, growth, Atomics, and a waiter notified in-agent.
