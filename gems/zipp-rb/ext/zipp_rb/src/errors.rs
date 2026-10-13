@@ -12,15 +12,17 @@ pub(crate) const INTERRUPT_PENDING_MSG: &str = "Error: a Ruby interrupt is pendi
 
 /// A non-local exit a callback raised that JS must not be able to swallow:
 /// a non-`StandardError` exception (`Interrupt`, `SystemExit`, the exception
-/// `Timeout` and `Thread#raise` deliver …), `Thread#kill`, or `throw`/`break`.
-/// It is re-delivered when the VM returns to Ruby. An exception is kept in
-/// `ZippRb::PENDING` (so the GC roots it), not here.
+/// `Timeout` and `Thread#raise` deliver …), `Thread#kill`, `throw`, or
+/// `break`. It is re-delivered when the VM returns to Ruby. An exception is
+/// kept in `ZippRb::PENDING` (so the GC roots it), not here.
 pub(crate) enum Fatal {
     Exception,
-    /// `Thread#kill`: the captured `Jump(Fatal)` itself. Re-issuing the kill
-    /// would be a no-op (the thread is already marked to-be-killed), so the
-    /// original jump is resumed instead; it carries no Ruby object.
-    Kill(Error),
+    /// `Thread#kill` or `throw`: the captured jump itself, resumed when the VM
+    /// returns to Ruby. Re-issuing a kill would be a no-op (the thread is
+    /// already marked to-be-killed), and a throw's tag and value live in the
+    /// thread's errinfo, which the resumed jump picks up. (Ruby 3.2's
+    /// `Timeout` delivers its timeout as a throw.)
+    Resume(Error),
     Jump(String),
 }
 
@@ -61,9 +63,9 @@ pub(crate) fn fatal_to_error(ruby: &Ruby, id: u64, fatal: Fatal) -> Error {
             .and_then(Exception::from_value)
             .map(Error::from)
             .unwrap_or_else(|| base_error(ruby, "a Ruby exception raised in a callback was lost")),
-        // Resume the kill. (On the main thread Thread#kill is an exit, which
-        // arrives as a SystemExit exception, not here.)
-        Fatal::Kill(jump) => jump,
+        // Resume the kill or throw. (On the main thread Thread#kill is an
+        // exit, which arrives as a SystemExit exception, not here.)
+        Fatal::Resume(jump) => jump,
         Fatal::Jump(what) => base_error(
             ruby,
             &format!("a non-local exit ({what}) out of a JS callback is not supported"),
@@ -98,7 +100,7 @@ pub(crate) fn capture_ruby_error(ruby: &Ruby, vm_id: u64, e: Error) -> String {
         }
         ErrorType::Jump(tag) => {
             let fatal = match tag {
-                magnus::error::Tag::Fatal => Fatal::Kill(e.clone()),
+                magnus::error::Tag::Fatal | magnus::error::Tag::Throw => Fatal::Resume(e.clone()),
                 other => Fatal::Jump(other.to_string().to_lowercase()),
             };
             record_fatal(vm_id, fatal);

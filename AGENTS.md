@@ -62,7 +62,11 @@ bundle exec ruby -Ilib -Itest test/dommy/js/test_turbo_integration.rb
 ```
 
 dommy-js-zipp resolves `dommy` from a sibling checkout of the dommy monorepo
-(`../dommy/gems`) when there is one, else from dommy's main on GitHub.
+(`../dommy/gems`) when there is one, else from dommy's main on GitHub — which
+is why `Gemfile.lock` is not tracked. CI (`.github/workflows/test.yml`) runs
+`bundle exec rake` on Ruby 3.2–4.0 and `rake engine:test`, on x86_64 Linux;
+note the engine's x86_64 JIT is code a local Apple Silicon build never
+compiles.
 
 The first compile builds the engine in release mode (about a minute); later
 ones are incremental. `rake test` does not rebuild: run `rake compile` after a

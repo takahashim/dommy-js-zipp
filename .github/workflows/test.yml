@@ -1,0 +1,85 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Every gem: build the extension (and the engine with it, in release mode)
+  # and run zipp-rb's and dommy-js-zipp's suites — what `bundle exec rake`
+  # does locally. dommy resolves from its main branch on GitHub (see the
+  # Gemfile).
+  test:
+    name: Ruby ${{ matrix.ruby }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.2", "3.3", "3.4", "4.0"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Ruby ${{ matrix.ruby }}
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+
+      # The extension's build tree (cargo's target dir lives under it) and
+      # cargo's downloads. Keyed by commit, restored from the latest one, so a
+      # build is incremental rather than a full release build of the engine.
+      - name: Cache the Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            gems/zipp-rb/tmp
+          key: ext-${{ runner.os }}-ruby${{ matrix.ruby }}-${{ hashFiles('gems/zipp-rb/ext/zipp_rb/Cargo.lock', 'gems/zipp-rb/engine/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ext-${{ runner.os }}-ruby${{ matrix.ruby }}-${{ hashFiles('gems/zipp-rb/ext/zipp_rb/Cargo.lock', 'gems/zipp-rb/engine/Cargo.lock') }}-
+            ext-${{ runner.os }}-ruby${{ matrix.ruby }}-
+
+      - name: Compile and test every gem
+        run: bundle exec rake
+
+  # The Zipp engine's own Rust unit tests, with the feature set the extension
+  # builds (gems/zipp-rb/Rakefile's engine:test).
+  engine:
+    name: Engine unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: Cache the Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            gems/zipp-rb/engine/target
+          key: engine-${{ runner.os }}-${{ hashFiles('gems/zipp-rb/engine/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            engine-${{ runner.os }}-${{ hashFiles('gems/zipp-rb/engine/Cargo.lock') }}-
+            engine-${{ runner.os }}-
+
+      - name: Run the engine's unit tests
+        run: bundle exec rake engine:test
