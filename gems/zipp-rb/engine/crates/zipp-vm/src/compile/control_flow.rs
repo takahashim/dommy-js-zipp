@@ -503,10 +503,10 @@ impl<'a> FnCompiler<'a> {
                 if (fc.captured.contains(name)
                     || early.contains(name)
                     || matches!(name, "undefined" | "NaN" | "Infinity"))
-                    && !fc.scopes.last().unwrap().iter().any(|(n, _)| n == name)
+                    && fc.lookup_in_scope(fc.scopes.len() - 1, name).is_none()
                 {
                     let r = fc.alloc_reg();
-                    fc.scopes.last_mut().unwrap().push((name.to_string(), r));
+                    fc.bind_last(name, r);
                     fc.emit(Instr::MakeCellTdz { reg: r });
                     fc.cell_regs.insert(r);
                     fc.block_tdz_cells.insert(r);
@@ -1124,7 +1124,7 @@ impl<'a> FnCompiler<'a> {
             self.push_scope();
             for n in &tdz_added {
                 let r = self.alloc_reg();
-                self.scopes.last_mut().unwrap().push((n.clone(), r));
+                self.bind_last(n, r);
                 self.emit(Instr::MakeCellTdz { reg: r });
                 self.cell_regs.insert(r);
             }
@@ -1620,7 +1620,7 @@ impl<'a> FnCompiler<'a> {
             self.push_scope();
             for n in &tdz_added {
                 let r = self.alloc_reg();
-                self.scopes.last_mut().unwrap().push((n.clone(), r));
+                self.bind_last(n, r);
                 self.emit(Instr::MakeCellTdz { reg: r });
                 self.cell_regs.insert(r);
             }

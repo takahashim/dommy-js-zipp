@@ -30,6 +30,7 @@ impl<'a> FnCompiler<'a> {
             bigint_consts: Vec::new(),
             wtf8_consts: Vec::new(),
             scopes: vec![Vec::new()],
+            scope_index: vec![HashMap::new()],
             scope_lex_names: vec![HashSet::new()],
             next_reg: 0,
             max_reg: 0,
@@ -96,7 +97,7 @@ impl<'a> FnCompiler<'a> {
         let _this_reg = fc.alloc_reg(); // reg 0 = this
         for p in params {
             let r = fc.alloc_reg();
-            fc.scopes[0].push((p.clone(), r));
+            fc.bind_in_scope(0, p, r);
             // A captured parameter is boxed into a cell immediately so a nested
             // closure shares the live slot (mutations visible both ways).
             if fc.captured.contains(p) {
@@ -110,7 +111,7 @@ impl<'a> FnCompiler<'a> {
         if let Some(name) = rest {
             let r = fc.alloc_reg();
             fc.rest_reg = Some(r);
-            fc.scopes[0].push((name.to_string(), r));
+            fc.bind_in_scope(0, name, r);
             if fc.captured.contains(name) {
                 fc.emit(Instr::MakeCell { reg: r });
                 fc.cell_regs.insert(r);
@@ -131,7 +132,7 @@ impl<'a> FnCompiler<'a> {
             return;
         }
         let r = self.alloc_reg();
-        self.scopes[0].push(("arguments".to_string(), r));
+        self.bind_in_scope(0, "arguments", r);
         self.arguments_reg = Some(r);
     }
 
@@ -454,7 +455,34 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn push_scope(&mut self) {
         self.scopes.push(Vec::new());
+        self.scope_index.push(HashMap::new());
         self.scope_lex_names.push(HashSet::new());
+    }
+
+    /// Push a binding `(name, reg)` onto scope `scope`, keeping `scope_index`
+    /// in sync. THE way to add a scope entry (a raw `scopes[..].push` would
+    /// leave the index stale).
+    pub(crate) fn bind_in_scope(&mut self, scope: usize, name: &str, reg: Reg) {
+        self.scopes[scope].push((name.to_string(), reg));
+        self.scope_index[scope].insert(name.to_string(), reg);
+    }
+
+    /// [`Self::bind_in_scope`] for the innermost (current) scope.
+    pub(crate) fn bind_last(&mut self, name: &str, reg: Reg) {
+        let last = self.scopes.len() - 1;
+        self.bind_in_scope(last, name, reg);
+    }
+
+    /// The register bound to `name` in scope `scope`, if any (last binding wins,
+    /// matching the previous reverse scan).
+    pub(crate) fn lookup_in_scope(&self, scope: usize, name: &str) -> Option<Reg> {
+        self.scope_index[scope].get(name).copied()
+    }
+
+    /// Whether `name` is bound in ANY scope of this function (the O(1) form of
+    /// the previous `self.scopes.iter().flatten().any(|(n,_)| n == name)`).
+    pub(crate) fn bound_anywhere(&self, name: &str) -> bool {
+        self.scope_index.iter().any(|m| m.contains_key(name))
     }
 
     /// Record the lexically-declared names of the block scope just opened, for
@@ -472,6 +500,7 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn pop_scope(&mut self) {
         self.scope_lex_names.pop();
+        self.scope_index.pop();
         let scope = self.scopes.pop().unwrap();
         // Free the registers the scope's locals used (block-local reuse) —
         // and drop their per-register markings, or a later local reallocated
@@ -513,7 +542,7 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn declare_local(&mut self, name: &str) -> Reg {
         let r = self.alloc_reg();
-        self.scopes.last_mut().unwrap().push((name.to_string(), r));
+        self.bind_last(name, r);
         // Box the local into a cell if a nested function captures it, so the
         // closure and this scope share one mutable slot — or unconditionally in
         // a function whose body may direct-eval (the eval closes over cells).
@@ -537,7 +566,7 @@ impl<'a> FnCompiler<'a> {
     /// where boxing must happen AFTER the value is present.
     pub(crate) fn declare_local_no_box(&mut self, name: &str) -> Reg {
         let r = self.alloc_reg();
-        self.scopes.last_mut().unwrap().push((name.to_string(), r));
+        self.bind_last(name, r);
         r
     }
 
@@ -554,15 +583,13 @@ impl<'a> FnCompiler<'a> {
         if name == "arguments" {
             self.uses_arguments = true; // request the call-time `arguments` array
         }
-        for scope in self.scopes.iter().rev() {
-            for (n, r) in scope.iter().rev() {
-                if n == name {
-                    return if self.cell_regs.contains(r) {
-                        Binding::LocalCell(*r)
-                    } else {
-                        Binding::Local(*r)
-                    };
-                }
+        for scope in (0..self.scopes.len()).rev() {
+            if let Some(r) = self.lookup_in_scope(scope, name) {
+                return if self.cell_regs.contains(&r) {
+                    Binding::LocalCell(r)
+                } else {
+                    Binding::Local(r)
+                };
             }
         }
         // A named function expression's own name: outside the param/var scope, so
@@ -674,7 +701,7 @@ impl<'a> FnCompiler<'a> {
         if self.heritage_class.as_ref().is_some_and(|(n, _)| n == name) {
             return true;
         }
-        !self.scopes.iter().any(|s| s.iter().any(|(n, _)| n == name))
+        !self.bound_anywhere(name)
             && !self.self_name.as_ref().is_some_and(|(n, _)| n == name)
     }
 
@@ -697,15 +724,13 @@ impl<'a> FnCompiler<'a> {
     /// Does not thread upvalues (no side effects); an enclosing-function local is
     /// reported as unresolved, which only affects the rare `delete <outer local>`.
     pub(crate) fn resolve_existing(&self, name: &str) -> Option<Binding> {
-        for scope in self.scopes.iter().rev() {
-            for (n, r) in scope.iter().rev() {
-                if n == name {
-                    return Some(if self.cell_regs.contains(r) {
-                        Binding::LocalCell(*r)
-                    } else {
-                        Binding::Local(*r)
-                    });
-                }
+        for scope in (0..self.scopes.len()).rev() {
+            if let Some(r) = self.lookup_in_scope(scope, name) {
+                return Some(if self.cell_regs.contains(&r) {
+                    Binding::LocalCell(r)
+                } else {
+                    Binding::Local(r)
+                });
             }
         }
         if let Some((n, r)) = &self.self_name {

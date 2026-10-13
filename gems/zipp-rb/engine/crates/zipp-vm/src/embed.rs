@@ -33,7 +33,7 @@ use crate::value::Value;
 use crate::vm::Vm;
 
 pub use crate::vm::host_api::{
-    FingerprintBudget, HostCallError, HostValue, HostValueBudget, ResourceUsage, Symbol,
+    FingerprintBudget, HostCallError, HostValue, HostValueBudget, JsError, ResourceUsage, Symbol,
     SymbolScope, DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
     DEFAULT_HOST_VALUE_WORK_PER_NODE,
 };
@@ -61,6 +61,36 @@ pub fn parse_f64(text: &str) -> Option<f64> {
 /// can `try`/`catch`; include the `TypeError: ` / `Error: ` prefix you want the
 /// script to see.
 pub type HostCall = Box<dyn FnMut(&str, &[String]) -> Result<String, String>>;
+
+/// The re-entrant host channel, installed with
+/// [`ScriptState::set_host_call_reentrant`]. Like [`HostCallCtx`], it receives
+/// the VM as [`HostCtx`] (so it may resolve typed arrays, evaluate JS and call
+/// globals), but it is shared behind an `Rc` and invoked through a cloned
+/// handle, so a guest that calls `__zippHostCall` again while a call is being
+/// served re-enters the same closure instead of failing with "no host
+/// installed". The closure is `Fn`: mutable host state lives behind the host's
+/// own interior mutability (which also makes re-entry the host's decision to
+/// allow or refuse). This is the channel a Ruby binding needs for the common
+/// JS→Ruby→JS round trip.
+pub type HostCallReentrant =
+    std::rc::Rc<dyn Fn(&mut dyn HostCtx, &str, &[String]) -> Result<String, String>>;
+
+/// The structured host channel, installed with
+/// [`ScriptState::set_host_call_values`]. Backs the `__zippHostCallValue` native:
+/// like [`HostCallReentrant`] it is shared behind an `Rc` and re-entrant, but
+/// every argument and the reply cross as an owned [`HostValue`] tree rather
+/// than a ToString'd string, so numbers, arrays, plain objects, `Float32Array`s
+/// and lone-surrogate strings round-trip exactly — no JSON in the path. This is
+/// the channel a Ruby binding uses for anything that is not a bare string.
+pub type HostCallValues = std::rc::Rc<
+    dyn Fn(&mut dyn HostCtx, &str, &[HostValue]) -> Result<HostValue, String>,
+>;
+
+/// An in-memory module source provider, installed with
+/// [`ScriptState::set_module_provider`]. It receives the resolved module path
+/// (as a string) and returns the module's source bytes, or `None` when it does
+/// not know that module. No file is ever read for such a module.
+pub type HostModuleProvider = std::rc::Rc<dyn Fn(&str) -> Option<Vec<u8>>>;
 
 /// A JS value marshalled out of the VM. Deliberately shallow: the engine's
 /// `Value` is a NaN-boxed heap index whose meaning depends on the live VM, so
@@ -104,6 +134,34 @@ impl JsValue {
     }
 }
 
+/// A durable, VM-scoped handle to a JS value the host keeps across re-entries
+/// (see [`ScriptState::handle_of_slot`]). Opaque on purpose: the value it roots
+/// lives in the VM's heap and is only meaningful to that VM. Using it on
+/// another VM, or after the VM is dropped, is refused rather than reinterpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HostHandle {
+    /// High 32 bits: a per-VM id. Low 32 bits: the registry index.
+    raw: u64,
+}
+
+impl HostHandle {
+    fn new(vm_id: u64, index: u32) -> Self {
+        HostHandle {
+            raw: (vm_id << 32) | index as u64,
+        }
+    }
+    pub(crate) fn vm_id(self) -> u64 {
+        self.raw >> 32
+    }
+    pub(crate) fn index(self) -> u32 {
+        self.raw as u32
+    }
+}
+
+/// Handed out in `ScriptState::from_program`; starts above zero so a default
+/// `HostHandle` cannot alias a live VM.
+static NEXT_VM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// A compiled program plus the live VM executing it.
 ///
 /// `Vm<'p>` borrows its `Program`, which makes the pair self-referential. It
@@ -124,6 +182,9 @@ pub struct ScriptState {
     vm: Option<OwnedVm>,
     /// Key for [`Self::fingerprint_slot`]. See [`Self::set_fingerprint_seed`].
     fp_seed: u64,
+    /// Identity stamped into every [`HostHandle`] this state hands out, so a
+    /// handle from one VM cannot be used on another.
+    vm_id: u64,
 }
 
 self_cell::self_cell!(
@@ -256,12 +317,16 @@ impl ScriptState {
             vm.host_262 = false;
             vm
         });
-        ScriptState {
+        let mut state = ScriptState {
             vm: Some(cell),
             // Unkeyed until a host supplies randomness. Documented on
             // set_fingerprint_seed: a fixed start is solvable.
             fp_seed: 0,
-        }
+            vm_id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        let vm_id = state.vm_id;
+        state.with_vm(|vm| vm.host_owner_id = vm_id);
+        state
     }
 
     /// The VM, shared. `None` once torn down.
@@ -300,6 +365,25 @@ impl ScriptState {
     /// regions and call guest functions with numbers while it runs.
     pub fn set_host_call_ctx(&mut self, host: HostCallCtx) {
         self.with_vm(|vm| vm.host_ctx = Some(host));
+    }
+
+    /// Install the re-entrant host channel (see [`HostCallReentrant`]). Served
+    /// in preference to both [`Self::set_host_call_ctx`] and
+    /// [`Self::set_host_call`]. Unlike them it is not taken out of the VM for
+    /// the duration of a call, so the guest may call `__zippHostCall` again
+    /// while a call is being served, and the host may evaluate JS or call
+    /// globals through the [`HostCtx`] it receives.
+    pub fn set_host_call_reentrant(&mut self, host: HostCallReentrant) {
+        self.with_vm(|vm| vm.host_reentrant = Some(host));
+    }
+
+    /// Install the structured host channel backing `__zippHostCallValue` (see
+    /// [`HostCallValues`]). Leaves the string channels
+    /// ([`Self::set_host_call`], [`Self::set_host_call_ctx`],
+    /// [`Self::set_host_call_reentrant`]) in place for `__zippHostCall`; the two
+    /// natives are independent, so a host may serve either or both.
+    pub fn set_host_call_values(&mut self, host: HostCallValues) {
+        self.with_vm(|vm| vm.host_values = Some(host));
     }
 
     /// Enable filesystem module loading, confined to one canonical directory.
@@ -346,6 +430,34 @@ impl ScriptState {
         Err("filesystem module loader is disabled in this build".into())
     }
 
+    /// Install an in-memory module loader over a VIRTUAL root: `import` of a
+    /// specifier under `root` resolves lexically and each module's bytes come
+    /// from `provider` — the filesystem is never consulted, so sources can be
+    /// registered from Ruby with no files on disk. `root` must be absolute and
+    /// need not exist. The count/size/aggregate budgets of the confined loader
+    /// apply, so `max_module_bytes` must be in `1..u64::MAX`.
+    ///
+    /// `provider` receives the resolved module path as a string (for example
+    /// `/app/mod.mjs`) and returns its source bytes, or `None` for a module it
+    /// does not know (reported to the guest as "module not found"). Because the
+    /// loader resolves relative specifiers against the importing module's
+    /// directory, a provider that keys its sources by path gets correct
+    /// relative imports for free.
+    pub fn set_module_provider(
+        &mut self,
+        root: &std::path::Path,
+        max_module_bytes: u64,
+        provider: HostModuleProvider,
+    ) -> Result<(), String> {
+        let root = root.to_path_buf();
+        self.with_vm(|vm| {
+            let p: std::rc::Rc<dyn Fn(&std::path::Path) -> Option<Vec<u8>>> =
+                std::rc::Rc::new(move |path: &std::path::Path| provider(&path.to_string_lossy()));
+            vm.set_module_provider(root, max_module_bytes, p)
+        })
+        .unwrap_or_else(torn_down)
+    }
+
     /// Disable the VM's native code generators for this script state.
     ///
     /// Sandboxed callers should also disable regress' process-global regex JIT
@@ -381,11 +493,14 @@ impl ScriptState {
     /// throw is preserved and still readable via [`Self::take_output`] — the
     /// engine flushes what it managed to print, like a real one.
     pub fn run_init(&mut self) -> Result<JsValue, String> {
-        self.with_vm(|vm| match vm.run() {
-            Ok(v) => Ok(marshal(vm, v)),
-            Err(thrown) => Err(vm.take_host_throw(thrown)),
-        })
-        .unwrap_or_else(torn_down)
+        let result = self
+            .with_vm(|vm| match vm.run() {
+                Ok(v) => Ok(marshal(vm, v)),
+                Err(thrown) => Err(vm.take_host_throw(thrown)),
+            })
+            .unwrap_or_else(torn_down);
+        self.report_rejections();
+        result
     }
 
     /// Evaluate `src` in the running script's global context and return its
@@ -486,6 +601,12 @@ impl ScriptState {
         .unwrap_or(false)
     }
 
+    /// Collect garbage now. A no-op while the engine is in a state that
+    /// forbids collection (a host conversion in flight).
+    pub fn gc_now(&mut self) {
+        self.with_vm(|vm| vm.force_gc());
+    }
+
     /// Run queued microtasks (promise reactions, `queueMicrotask`) to
     /// completion.
     ///
@@ -500,6 +621,7 @@ impl ScriptState {
     /// does nothing.
     pub fn run_microtasks(&mut self) {
         self.with_vm(|vm| vm.drain_microtasks());
+        self.report_rejections();
     }
 
     /// Deliver console lines to `sink` as they are produced, each tagged with
@@ -510,6 +632,26 @@ impl ScriptState {
     /// is charged exactly as before.
     pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &str)>) {
         self.with_vm(|vm| vm.console_sink = Some(sink));
+    }
+
+    /// Deliver every still-unhandled Promise rejection to `sink`, with the
+    /// rejection's rendered message, as it reaches a microtask checkpoint.
+    ///
+    /// The host counterpart of the browser's `unhandledrejection` event: a
+    /// framework that swallows the promises it rejects otherwise leaves the
+    /// host no way to observe it. Once installed, EVERY unhandled rejection is
+    /// collected (not only the Test262 narrowing of `report_unhandled_errors`),
+    /// and the reports are delivered at the host entry points that drain
+    /// microtasks — [`Self::run_microtasks`], [`Self::pump`], [`Self::call_slot`],
+    /// [`Self::eval_in_context_rich`] and [`Self::run_init`].
+    pub fn set_unhandled_rejection_sink(&mut self, sink: Box<dyn FnMut(&str)>) {
+        self.with_vm(|vm| vm.unhandled_rejection_sink = Some(sink));
+    }
+
+    /// Flush any pending unhandled-rejection reports to the installed sink
+    /// (no-op without one). Called after every host entry that drains jobs.
+    fn report_rejections(&mut self) {
+        self.with_vm(|vm| vm.report_unhandled_errors());
     }
 
     /// Take the `console.log`/`info`/`debug` lines produced so far, clearing the
@@ -725,14 +867,153 @@ impl ScriptState {
             .unwrap_or(false)
     }
 
+    // ---- Durable host handles -------------------------------------------
+    //
+    // A handle roots a JS value (function, object, …) in this VM's heap for as
+    // long as the host holds it, so the host can call it later without
+    // re-resolving a name or re-importing it. This is what lets a Ruby binding
+    // keep a JS callback and invoke it on a later event. Handles are scoped to
+    // one VM: using one on another is refused.
+
+    /// Take a durable handle to the value in global slot `index`. `None` when
+    /// the slot has no such value (out of range).
+    pub fn handle_of_slot(&mut self, index: u32) -> Option<HostHandle> {
+        let vm_id = self.vm_id;
+        self.with_vm(|vm| vm.host_handle_of_slot(index))
+            .flatten()
+            .map(|idx| HostHandle::new(vm_id, idx))
+    }
+
+    /// Take a durable handle to the global binding `name` resolves to. `None`
+    /// when the name does not resolve.
+    pub fn handle_of_global(&mut self, name: &str) -> Option<HostHandle> {
+        let vm_id = self.vm_id;
+        self.with_vm(|vm| vm.host_handle_of_global(name))
+            .flatten()
+            .map(|idx| HostHandle::new(vm_id, idx))
+    }
+
+    /// Call the function a handle roots, with arguments and result crossing as
+    /// structured [`HostValue`]s. Drains microtasks, as [`Self::call_slot`]
+    /// does. A handle from another VM, or one already released, is refused.
+    pub fn call_handle(
+        &mut self,
+        handle: HostHandle,
+        args: &[HostValue],
+    ) -> Result<HostValue, String> {
+        if handle.vm_id() != self.vm_id {
+            return Err("zipp: handle belongs to another VM".into());
+        }
+        let index = handle.index();
+        let mut budget = HostValueBudget::default();
+        let result = self
+            .with_vm(|vm| vm.host_handle_call(index, args, &mut budget, true))
+            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
+            .map_err(HostCallError::into_message);
+        self.report_rejections();
+        result
+    }
+
+    /// Read the value a handle roots, as a structured [`HostValue`].
+    pub fn get_handle(&mut self, handle: HostHandle) -> Result<HostValue, String> {
+        if handle.vm_id() != self.vm_id {
+            return Err("zipp: handle belongs to another VM".into());
+        }
+        let index = handle.index();
+        let mut budget = HostValueBudget::default();
+        self.with_vm(|vm| vm.host_handle_read(index, &mut budget))
+            .unwrap_or_else(|| Err(TORN_DOWN.into()))
+    }
+
+    /// Release a handle, dropping its root. `false` for a handle from another
+    /// VM or one already released.
+    pub fn release_handle(&mut self, handle: HostHandle) -> bool {
+        if handle.vm_id() != self.vm_id {
+            return false;
+        }
+        let index = handle.index();
+        self.with_vm(|vm| vm.host_handle_release(index))
+            .unwrap_or(false)
+    }
+
+    /// Tear the VM down now, releasing its heap and compiled program. After
+    /// this every entry point reports the "VM has been torn down" error and
+    /// [`Self::disposed`] is `true`. Idempotent: a second call is a no-op.
+    ///
+    /// Reclamation is bounded by the engine's own retention rules: a
+    /// `ScriptState`'s heap and program are freed here, but dynamically defined
+    /// functions and classes are not broadly reclaimed, so a process that
+    /// cycles many states still grows until it is recycled (see
+    /// [`Self::resource_usage`]). A multi-tenant host should recycle the
+    /// process, not just dispose states.
+    pub fn dispose(&mut self) {
+        self.vm = None;
+    }
+
+    /// Whether [`Self::dispose`] ran (every entry point is inert afterwards).
+    pub fn disposed(&self) -> bool {
+        self.vm.is_none()
+    }
+
+    // ---- Structured errors ----------------------------------------------
+    //
+    // The string entry points above report an uncaught throw as its rendered
+    // message. These report a [`JsError`] with the thrown Error's `name`,
+    // `message` and `stack`, so a binding can map JS error classes and attach
+    // a backtrace. Same rooting, drain and value-marshalling rules otherwise.
+
+    /// [`Self::call_slot`] returning a structured [`JsError`] on a throw.
+    pub fn call_slot_structured(
+        &mut self,
+        index: u32,
+        args: &[HostValue],
+    ) -> Result<HostValue, JsError> {
+        let result = self
+            .with_vm(|vm| vm.host_call_slot_structured(index, args))
+            .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)));
+        self.report_rejections();
+        result
+    }
+
+    /// Call the global function `name` with structured arguments, returning a
+    /// structured [`HostValue`] and a throw as a structured [`JsError`]. The
+    /// by-name counterpart of [`Self::call_slot_structured`]: it resolves the
+    /// name a bare identifier read would (program and eval-created bindings,
+    /// the global object and its chain, then the builtins), so an
+    /// eval-declared function or a `globalThis` property is found.
+    pub fn call_global_structured(
+        &mut self,
+        name: &str,
+        args: &[HostValue],
+    ) -> Result<HostValue, JsError> {
+        let result = self
+            .with_vm(|vm| vm.host_call_global_structured(name, args))
+            .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)));
+        self.report_rejections();
+        result
+    }
+
+    /// [`Self::eval_in_context_rich`]-style evaluation returning the result as
+    /// a structured [`HostValue`] and a throw as a structured [`JsError`].
+    pub fn eval_in_context_structured(&mut self, src: &str) -> Result<HostValue, JsError> {
+        let result = self
+            .with_vm(|vm| vm.host_eval_structured(src))
+            .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)));
+        self.report_rejections();
+        result
+    }
+
     /// Call the function in global slot `index` and drain the microtask queue.
     ///
     /// Prefer this to [`Self::call_global`] on a hot path: a slot is a direct
     /// index, while a name is looked up through the global environment on
     /// every call (no compilation either way).
     pub fn call_slot(&mut self, index: u32, args: &[HostValue]) -> Result<HostValue, String> {
-        self.with_vm(|vm| vm.host_call_slot(index, args))
-            .unwrap_or_else(torn_down)
+        let result = self
+            .with_vm(|vm| vm.host_call_slot(index, args))
+            .unwrap_or_else(torn_down);
+        self.report_rejections();
+        result
     }
 
     /// [`Self::call_slot`] with the caller's own conversion budget for the
@@ -817,6 +1098,7 @@ impl ScriptState {
     /// Run pending microtasks without calling anything.
     pub fn pump(&mut self) {
         self.with_vm(|vm| vm.host_pump());
+        self.report_rejections();
     }
 
     /// Evaluate `src` in the script's global context and marshal its
@@ -832,8 +1114,11 @@ impl ScriptState {
         src: &str,
         budget: &mut HostValueBudget,
     ) -> Result<HostValue, HostCallError> {
-        self.with_vm(|vm| vm.host_eval_rich(src, budget))
-            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
+        let result = self
+            .with_vm(|vm| vm.host_eval_rich(src, budget))
+            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())));
+        self.report_rejections();
+        result
     }
 
     /// What this VM currently retains and has spent — see [`ResourceUsage`].
@@ -895,6 +1180,21 @@ impl ScriptState {
             rec.set_step_limit(max_steps);
             rec.abort = abort;
             vm.set_instrumentation(rec);
+        });
+    }
+
+    /// Stop the script once `deadline` passes, as if the abort flag passed to
+    /// [`Self::set_limits`] had been set (the same "aborted by the host"
+    /// error), checked at the same poll points. `None` clears it. Requires
+    /// [`Self::set_limits`] first, which resets it; without a recorder this is
+    /// a no-op. A host that only needs a time bound can use this instead of a
+    /// timer thread driving the abort flag.
+    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+    pub fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.with_vm(|vm| {
+            if let Some(rec) = vm.instr_rec.as_mut() {
+                rec.deadline = deadline;
+            }
         });
     }
 
@@ -2095,5 +2395,259 @@ mod tests {
             .resource_limit_error()
             .expect("recorder status survives promise rejection");
         assert!(error.contains("instruction budget"), "{error}");
+    }
+
+    #[test]
+    fn reentrant_host_channel_serves_nested_calls() {
+        let mut st = compile_script("").expect("compiles");
+        st.run_init().expect("runs");
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let seen = calls.clone();
+        st.set_host_call_reentrant(std::rc::Rc::new(
+            move |ctx: &mut dyn HostCtx, kind: &str, _args: &[String]| -> Result<String, String> {
+                seen.borrow_mut().push(kind.to_string());
+                if kind == "outer" {
+                    // The guest calls the host again from inside the host call;
+                    // the reentrant channel must serve it instead of throwing.
+                    let v = ctx.eval_script("__zippHostCall('inner')")?;
+                    Ok(format!("{v:?}"))
+                } else {
+                    Ok("inner".into())
+                }
+            },
+        ));
+        assert_eq!(
+            st.eval_in_context("__zippHostCall('outer')"),
+            Ok(JsValue::String("String(\"inner\")".into()))
+        );
+        assert_eq!(*calls.borrow(), vec!["outer".to_string(), "inner".to_string()]);
+    }
+
+    #[test]
+    fn host_ctx_can_eval_and_call_globals() {
+        let mut st = compile_script("function greet(n){ return 'hi ' + n; }").expect("compiles");
+        st.run_init().expect("runs");
+        st.set_host_call_ctx(Box::new(|ctx, kind, args| match kind {
+            "eval" => Ok(format!("{:?}", ctx.eval_script("21 * 2")?)),
+            "call" => Ok(format!(
+                "{:?}",
+                ctx.call_global_value("greet", &[HostValue::String(args[0].clone())])?
+            )),
+            other => Err(format!("Error: unknown {other}")),
+        }));
+        assert_eq!(
+            st.eval_in_context("__zippHostCall('eval')"),
+            Ok(JsValue::String("Number(42.0)".into()))
+        );
+        assert_eq!(
+            st.eval_in_context("__zippHostCall('call','bob')"),
+            Ok(JsValue::String("String(\"hi bob\")".into()))
+        );
+    }
+
+    #[test]
+    fn handles_root_values_across_calls_and_reject_cross_vm() {
+        let mut st =
+            compile_script("function adder(a,b){ return a+b; } var obj = { v: 7 };").expect("compiles");
+        st.run_init().expect("runs");
+        let adder = st.handle_of_global("adder").expect("adder handle");
+        // A handle roots its value: allocate heavily between taking and using it.
+        for _ in 0..200 {
+            let _ = st.eval_in_context("[1,2,3,4,5,6,7,8].map(x => ({ x }))");
+        }
+        assert_eq!(
+            st.call_handle(adder, &[HostValue::Number(2.0), HostValue::Number(3.0)]),
+            Ok(HostValue::Number(5.0))
+        );
+        let obj = st.handle_of_global("obj").expect("obj handle");
+        assert!(matches!(st.get_handle(obj), Ok(HostValue::Object(_))));
+        assert!(st.release_handle(adder), "first release drops the root");
+        assert!(!st.release_handle(adder), "second release is a no-op");
+
+        let mut other = compile_script("function f(){}").expect("compiles");
+        other.run_init().expect("runs");
+        let h = other.handle_of_global("f").expect("handle");
+        assert!(st.call_handle(h, &[]).is_err(), "cross-VM call refused");
+        assert!(st.get_handle(h).is_err(), "cross-VM read refused");
+        assert!(!st.release_handle(h), "cross-VM release refused");
+    }
+
+    #[test]
+    fn unhandled_rejection_sink_observes_a_rejected_promise() {
+        let mut st = compile_script("").expect("compiles");
+        st.run_init().expect("runs");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        st.set_unhandled_rejection_sink(Box::new(move |msg| sink.borrow_mut().push(msg.to_string())));
+        let _ = st.eval_in_context("Promise.reject(new Error('boom'));");
+        st.run_microtasks();
+        assert!(
+            seen.borrow().iter().any(|m| m.contains("boom")),
+            "sink saw {:?}",
+            seen.borrow()
+        );
+    }
+
+    #[test]
+    fn host_ctx_reaches_handles_of_its_own_vm_only() {
+        let mut other = compile_script("function other() { return 1 }").expect("compiles");
+        other.run_init().expect("runs");
+        let foreign = other.handle_of_global("other").expect("handle");
+
+        let mut st = compile_script("function dbl(x) { return x * 2 }").expect("compiles");
+        st.run_init().expect("runs");
+        let own = st.handle_of_global("dbl").expect("handle");
+        st.set_host_call_values(std::rc::Rc::new(
+            move |ctx: &mut dyn HostCtx, kind: &str, args: &[HostValue]| match kind {
+                "call" => ctx.call_handle_value(own, args),
+                "read" => ctx.read_handle_value(own).map(|v| HostValue::Bool(v == HostValue::Opaque)),
+                "foreign" => ctx.call_handle_value(foreign, args),
+                "release" => Ok(HostValue::Bool(ctx.release_handle_value(own))),
+                other => Err(format!("Error: unknown {other}")),
+            },
+        ));
+        let mut budget = HostValueBudget::default();
+        assert_eq!(
+            st.eval_in_context_rich("__zippHostCallValue('call', 21)", &mut budget),
+            Ok(HostValue::Number(42.0))
+        );
+        assert_eq!(
+            st.eval_in_context_rich("__zippHostCallValue('read')", &mut budget),
+            Ok(HostValue::Bool(true)),
+            "a function reads as Opaque"
+        );
+        let refused = st.eval_in_context_rich(
+            "try { __zippHostCallValue('foreign'); 'no' } catch (e) { String(e.message) }",
+            &mut budget,
+        );
+        assert!(
+            matches!(&refused, Ok(HostValue::String(m)) if m.contains("another VM")),
+            "a foreign handle is refused: {refused:?}"
+        );
+        assert_eq!(
+            st.eval_in_context_rich("__zippHostCallValue('release')", &mut budget),
+            Ok(HostValue::Bool(true))
+        );
+        assert_eq!(
+            st.eval_in_context_rich("__zippHostCallValue('release')", &mut budget),
+            Ok(HostValue::Bool(false)),
+            "a released handle is not live"
+        );
+    }
+
+    #[test]
+    fn structured_host_channel_round_trips_without_json() {
+        let mut st = compile_script("").expect("compiles");
+        st.run_init().expect("runs");
+        st.set_host_call_values(std::rc::Rc::new(
+            |_ctx: &mut dyn HostCtx, kind: &str, args: &[HostValue]| match kind {
+                "sum" => {
+                    let total: f64 = match &args[0] {
+                        HostValue::Array(items) => items
+                            .iter()
+                            .map(|v| if let HostValue::Number(n) = v { *n } else { 0.0 })
+                            .sum(),
+                        _ => 0.0,
+                    };
+                    Ok(HostValue::Object(vec![(
+                        "total".into(),
+                        HostValue::Number(total),
+                    )]))
+                }
+                "echo" => Ok(args[0].clone()),
+                other => Err(format!("Error: unknown {other}")),
+            },
+        ));
+        let mut budget = HostValueBudget::default();
+        assert_eq!(
+            st.eval_in_context_rich("__zippHostCallValue('sum', [1,2,3,4])", &mut budget),
+            Ok(HostValue::Object(vec![(
+                "total".into(),
+                HostValue::Number(10.0)
+            )]))
+        );
+        // A typed array crosses both ways without a JSON projection.
+        let mut budget = HostValueBudget::default();
+        assert_eq!(
+            st.eval_in_context_rich(
+                "(()=>{ const a = __zippHostCallValue('echo', new Float32Array([1.5,2.5])); \
+                 return [a instanceof Float32Array, a[1]] })()",
+                &mut budget,
+            ),
+            Ok(HostValue::Array(vec![
+                HostValue::Bool(true),
+                HostValue::Number(2.5)
+            ]))
+        );
+    }
+
+    #[test]
+    fn dispose_tears_down_and_is_idempotent() {
+        let mut st = compile_script("1 + 1").expect("compiles");
+        st.run_init().expect("runs");
+        assert!(!st.disposed());
+        st.dispose();
+        st.dispose();
+        assert!(st.disposed());
+        assert!(st.eval_in_context("1").is_err(), "entry is inert after dispose");
+    }
+
+    #[test]
+    fn structured_errors_preserve_name_message_and_stack() {
+        let mut st = compile_script("").expect("compiles");
+        st.run_init().expect("runs");
+        let err = st
+            .eval_in_context_structured("throw new TypeError('bad')")
+            .expect_err("throws");
+        assert_eq!(err.name, "TypeError");
+        assert_eq!(err.message, "bad");
+        assert!(err.stack.is_some(), "an Error carries a stack");
+
+        let mut st = compile_script("function boom(){ throw new RangeError('rng'); }").expect("compiles");
+        st.run_init().expect("runs");
+        let slot = slot_of(&st, "boom");
+        let err = st.call_slot_structured(slot, &[]).expect_err("throws");
+        assert_eq!(err.name, "RangeError");
+        assert_eq!(err.message, "rng");
+
+        // A non-object throw has no Error structure: the value's text is the
+        // message and the name falls back to "Error".
+        let err = st.eval_in_context_structured("throw 'plain'").expect_err("throws");
+        assert_eq!(err.name, "Error");
+        assert!(err.message.contains("plain"), "{:?}", err.message);
+    }
+
+    #[test]
+    fn in_memory_module_provider_loads_without_files() {
+        let mut st = compile_script("").expect("compiles");
+        st.run_init().expect("runs");
+        let mut map: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        map.insert("/zippvfs/dep.mjs".to_string(), b"export const two = 2;".to_vec());
+        map.insert(
+            "/zippvfs/mod.mjs".to_string(),
+            b"import { two } from './dep.mjs'; export const value = two * 21;".to_vec(),
+        );
+        let map = std::rc::Rc::new(map);
+        let lookup = map.clone();
+        // The root does not exist on disk; the provider serves every module.
+        st.set_module_provider(
+            std::path::Path::new("/zippvfs"),
+            1 << 20,
+            std::rc::Rc::new(move |p: &str| lookup.get(p).cloned()),
+        )
+        .expect("installs the provider");
+        let _ = st.eval_in_context(
+            "globalThis.__v = null; import('./mod.mjs').then(ns => { globalThis.__v = ns.value; });",
+        );
+        st.run_microtasks();
+        assert_eq!(st.eval_in_context("globalThis.__v"), Ok(JsValue::Number(42.0)));
+
+        // A path the provider declines is "module not found", never a disk read.
+        let _ = st.eval_in_context(
+            "globalThis.__m = null; import('./nope.mjs').then(() => {}, e => { globalThis.__m = e.name; });",
+        );
+        st.run_microtasks();
+        assert_eq!(st.eval_in_context("globalThis.__m"), Ok(JsValue::String("TypeError".into())));
     }
 }

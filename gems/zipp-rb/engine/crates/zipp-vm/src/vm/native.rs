@@ -308,6 +308,15 @@ pub const ANNEXB_REF_ERROR_NAME: &str = "__zipp_annexb_ref_error__";
 /// natives added by ongoing engine work.
 pub const HOST_CALL: u16 = 950;
 pub const HOST_CALL_NAME: &str = "__zippHostCall";
+/// The structured twin of [`HOST_CALL`]: `__zippHostCallValue(kind, ...values)`
+/// hands the host the same `kind` but marshals every argument, and the reply,
+/// as an owned `HostValue` tree instead of ToString'd strings, so numbers,
+/// arrays, plain objects, `Float32Array`s and lone-surrogate strings cross
+/// exactly (no JSON round-trip). Installed by
+/// [`crate::embed::ScriptState::set_host_call_values`]; absent and inert in a
+/// stock run, like `HOST_CALL`.
+pub const HOST_CALL_VALUE: u16 = 952;
+pub const HOST_CALL_VALUE_NAME: &str = "__zippHostCallValue";
 /// The Python runtime's native tensor loops (`vm::py_tensor`), bound to the
 /// reserved global below only in a program the Python frontend built
 /// (`Program::python_natives`): an ordinary JavaScript program never sees it.
@@ -1737,6 +1746,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_ESCAPE => ("escape", 1),
         GLOBAL_UNESCAPE => ("unescape", 1),
         HOST_CALL => (HOST_CALL_NAME, 1),
+        HOST_CALL_VALUE => (HOST_CALL_VALUE_NAME, 1),
         #[cfg(feature = "python")]
         PY_TENSOR => ("", 0),
         #[cfg(feature = "python")]

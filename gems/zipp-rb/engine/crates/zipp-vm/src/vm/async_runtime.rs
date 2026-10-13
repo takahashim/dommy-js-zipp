@@ -978,7 +978,16 @@ impl<'p> Vm<'p> {
         // HostPromiseRejectionTracker(promise, "reject"), narrowed to the
         // rejections a running job THREW and kept only for the Test262 host
         // report (see `reject_thrown_job` and `report_unhandled_errors`).
-        if unhandled && self.report_unhandled && self.rejecting_thrown_job {
+        // When a host sink is installed, every still-unhandled rejection is
+        // collected (the browser `unhandledrejection` contract); otherwise the
+        // historical Test262 narrowing applies (only a thrown job's rejection,
+        // only when the report switch is on).
+        let track = if self.unhandled_rejection_sink.is_some() {
+            unhandled
+        } else {
+            unhandled && self.report_unhandled && self.rejecting_thrown_job
+        };
+        if track {
             self.unhandled_rejections.push(p);
         }
         let kind = if state == PromiseState::Fulfilled {
@@ -3870,7 +3879,7 @@ impl<'p> Vm<'p> {
     /// positive test whose assertion fails inside a promise job or a timer
     /// scores PASS. A no-op when reporting is off.
     pub(crate) fn report_unhandled_errors(&mut self) {
-        if !self.report_unhandled {
+        if !self.report_unhandled && self.unhandled_rejection_sink.is_none() {
             return;
         }
         for p in std::mem::take(&mut self.unhandled_rejections) {
@@ -3890,11 +3899,18 @@ impl<'p> Vm<'p> {
             } else {
                 self.display(reason)
             };
-            self.errput
-                .push(format!("zipp: unhandled exception in promise job: {msg}"));
+            if let Some(sink) = self.unhandled_rejection_sink.as_mut() {
+                sink(&msg);
+            }
+            if self.report_unhandled {
+                self.errput
+                    .push(format!("zipp: unhandled exception in promise job: {msg}"));
+            }
         }
-        let timers = std::mem::take(&mut self.uncaught_timer_errors);
-        self.errput.extend(timers);
+        if self.report_unhandled {
+            let timers = std::mem::take(&mut self.uncaught_timer_errors);
+            self.errput.extend(timers);
+        }
     }
 
     /// The full event loop: deliver cross-thread waitAsync wakes, drain

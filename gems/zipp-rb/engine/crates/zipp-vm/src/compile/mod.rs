@@ -17,7 +17,7 @@
 //! time, the same way the old engine did.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 // The AST, under both spellings: `ast::Expr` for code that wants the prefix and
@@ -456,6 +456,14 @@ struct FnCompiler<'a> {
     wtf8_consts: Vec<u32>,
     /// Lexical scope chain: each entry is (name, register).
     scopes: Vec<Vec<(String, Reg)>>,
+    /// Parallel to `scopes` (same length, same indices): a name→register index
+    /// for each scope, kept in sync with `scopes`. Binding a local pushes the
+    /// entry onto `scopes` and inserts here; resolving a name looks up the
+    /// innermost scope that has it in O(1). Without it, `resolve`/
+    /// `resolve_existing` and the declaration paths scanned the scope `Vec`s,
+    /// which is quadratic in the number of locals in one function body (a
+    /// bundle's single huge IIFE).
+    scope_index: Vec<HashMap<String, Reg>>,
     /// Parallel to `scopes` (same length, same indices): the lexically-declared
     /// names of each BLOCK-like scope, recorded at block ENTRY.
     ///

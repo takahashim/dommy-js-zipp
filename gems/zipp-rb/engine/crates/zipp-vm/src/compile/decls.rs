@@ -986,16 +986,12 @@ impl<'a> FnCompiler<'a> {
             // rather than duplicating. A nested closure over it boxes the slot (the
             // var name is in the capture set). A bare `var x;` never resets `x`.
             if !d.kind.is_lexical() {
-                let existing = self.scopes[0]
-                    .iter()
-                    .rev()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, r)| *r);
+                let existing = self.lookup_in_scope(0, name);
                 let reg = match existing {
                     Some(r) => r,
                     None => {
                         let r = self.alloc_reg();
-                        self.scopes[0].push((name.to_string(), r));
+                        self.bind_in_scope(0, name, r);
                         if self.captured.contains(name) {
                             self.emit(Instr::MakeCell { reg: r });
                             self.cell_regs.insert(r);
@@ -1058,20 +1054,13 @@ impl<'a> FnCompiler<'a> {
             // rather than shadowed, so the closure and this declaration share one
             // cell; otherwise a fresh binding is allocated.
             let reg = if self.scopes.len() == 1 && self.entry_lexicals.contains(name) {
-                let r = self.scopes[0]
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, r)| *r)
+                let r = self
+                    .lookup_in_scope(0, name)
                     .unwrap_or_else(|| self.declare_local(name));
                 self.entry_tdz_cells.remove(&r); // TDZ ends here
                 r
             } else if let Some(r) = self
-                .scopes
-                .last()
-                .unwrap()
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, r)| *r)
+                .lookup_in_scope(self.scopes.len() - 1, name)
                 .filter(|r| self.block_tdz_cells.contains(r))
             {
                 // A block-entry pre-created TDZ cell (captured forward-referenced
@@ -1204,7 +1193,7 @@ impl<'a> FnCompiler<'a> {
         }
         // First mention: create the function-scoped var binding (scopes[0]).
         let r = self.alloc_reg();
-        self.scopes[0].push((name.to_string(), r));
+        self.bind_in_scope(0, name, r);
         if self.box_all_locals || self.captured.contains(name) {
             self.emit(Instr::MakeCell { reg: r });
             self.cell_regs.insert(r);
@@ -1246,20 +1235,12 @@ impl<'a> FnCompiler<'a> {
                     // Its TDZ ends here: the extraction that follows writes
                     // through `store_binding`, and a checked store would throw on
                     // the very cell it is initializing (`const {z} = {z:9}`).
-                    if let Some(r) = self.scopes[0]
-                        .iter()
-                        .find(|(n, _)| n == &**id)
-                        .map(|(_, r)| *r)
+                    if let Some(r) = self.lookup_in_scope(0, &**id)
                     {
                         self.entry_tdz_cells.remove(&r);
                     }
                 } else if let Some(r) = self
-                    .scopes
-                    .last()
-                    .unwrap()
-                    .iter()
-                    .find(|(n, _)| n == &**id)
-                    .map(|(_, r)| *r)
+                    .lookup_in_scope(self.scopes.len() - 1, &**id)
                     .filter(|r| self.block_tdz_cells.contains(r))
                 {
                     // The block-entry TDZ cell of this leaf (captured, or

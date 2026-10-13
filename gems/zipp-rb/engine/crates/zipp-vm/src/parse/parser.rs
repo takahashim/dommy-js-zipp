@@ -351,6 +351,14 @@ pub(crate) struct Scope {
     pub kind: ScopeKind,
     pub lex: Vec<(Box<str>, BindKind, u32)>,
     pub var: Vec<(Box<str>, u32)>,
+    /// Membership indexes over `lex`/`var`. The declaration early-error checks
+    /// used to scan these `Vec`s, which is quadratic in the number of bindings
+    /// in one function body (a bundle's single huge IIFE). `lex_all` is every
+    /// lexical name; `lex_nonfn` those with a non-`Function` kind (the Annex B
+    /// function-duplicate carve-out); `var_all` every var/param name.
+    pub lex_all: rustc_hash::FxHashSet<Box<str>>,
+    pub lex_nonfn: rustc_hash::FxHashSet<Box<str>>,
+    pub var_all: rustc_hash::FxHashSet<Box<str>>,
     /// `var` stops here: Script, Module, Function, ClassStaticBlock.
     pub var_boundary: bool,
     /// Annex B B.3.5: `catch (e) { var e; }` is legal for a SIMPLE catch
@@ -381,6 +389,9 @@ impl ScopeStack {
             kind,
             lex: Vec::new(),
             var: Vec::new(),
+            lex_all: rustc_hash::FxHashSet::default(),
+            lex_nonfn: rustc_hash::FxHashSet::default(),
+            var_all: rustc_hash::FxHashSet::default(),
             var_boundary,
             simple_catch_param: None,
         });
@@ -423,17 +434,22 @@ impl ScopeStack {
         let Some(scope) = self.scopes.last_mut() else {
             return Ok(());
         };
-        let dup_lex = scope
-            .lex
-            .iter()
-            .any(|(n, k, _)| &**n == name && !(annexb_dup_ok && *k == BindKind::Function));
-        if dup_lex || scope.var.iter().any(|(n, _)| &**n == name) {
+        let dup_lex = if annexb_dup_ok {
+            scope.lex_nonfn.contains(name)
+        } else {
+            scope.lex_all.contains(name)
+        };
+        if dup_lex || scope.var_all.contains(name) {
             return Err(SyntaxError::new(
                 format!("SyntaxError: Identifier '{name}' has already been declared"),
                 pos,
             ));
         }
         scope.lex.push((name.into(), kind, pos));
+        scope.lex_all.insert(name.into());
+        if kind != BindKind::Function {
+            scope.lex_nonfn.insert(name.into());
+        }
         Ok(())
     }
 
@@ -454,9 +470,9 @@ impl ScopeStack {
     /// Is `name` bound anywhere at the module's top level (lexically or by a
     /// `var`)? An `export { x }` must resolve to such a binding.
     pub(crate) fn module_binds(&self, name: &str) -> bool {
-        self.scopes.iter().any(|s| {
-            s.lex.iter().any(|(n, _, _)| &**n == name) || s.var.iter().any(|(n, _)| &**n == name)
-        })
+        self.scopes
+            .iter()
+            .any(|s| s.lex_all.contains(name) || s.var_all.contains(name))
     }
 
     /// May a `using` / `await using` declaration appear in the current scope?
@@ -486,8 +502,9 @@ impl ScopeStack {
     /// binding that does not exist yet.
     pub(crate) fn declare_param(&mut self, name: &str) {
         if let Some(scope) = self.scopes.last_mut() {
-            if !scope.var.iter().any(|(n, _)| &**n == name) {
+            if !scope.var_all.contains(name) {
                 scope.var.push((name.into(), 0));
+                scope.var_all.insert(name.into());
             }
         }
     }
@@ -502,7 +519,7 @@ impl ScopeStack {
                     break;
                 }
             }
-            if scope.lex.iter().any(|(n, _, _)| &**n == name) {
+            if scope.lex_all.contains(name) {
                 return Err(SyntaxError::new(
                     format!("SyntaxError: Identifier '{name}' has already been declared"),
                     pos,
@@ -521,8 +538,9 @@ impl ScopeStack {
         // boundary erased exactly that association. `var f; { let f }` stays
         // legal because there the `var` is recorded in the outer scope.
         if let Some(scope) = self.scopes.last_mut() {
-            if !scope.var.iter().any(|(n, _)| &**n == name) {
+            if !scope.var_all.contains(name) {
                 scope.var.push((name.into(), pos));
+                scope.var_all.insert(name.into());
             }
         }
         Ok(())

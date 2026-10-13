@@ -432,6 +432,10 @@ pub(crate) struct Recorder {
     steps_base: u64,
     /// Set by another thread to stop a running script.
     pub(crate) abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// A wall-clock deadline, checked wherever `abort` is polled: passing it
+    /// stops the script exactly as the flag would. Lets a host bound run time
+    /// without a timer thread that only flips `abort`.
+    pub(crate) deadline: Option<std::time::Instant>,
     /// Approximate heap ceiling in bytes; `usize::MAX` means unlimited.
     ///
     /// Checked on the same schedule as the abort flag, for the same reason:
@@ -530,6 +534,7 @@ impl Recorder {
             #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
             steps_base: 0,
             abort: None,
+            deadline: None,
             heap_limit: usize::MAX,
             output_limit: usize::MAX,
             output_used: 0,
@@ -643,6 +648,19 @@ impl Recorder {
             return None;
         }
         Some(self.remaining.max(0) as u64)
+    }
+
+    /// Whether the host asked this run to stop: the abort flag is set, or the
+    /// deadline has passed. Read at the abort-poll points only (every
+    /// `ABORT_CHECK_MASK + 1` instructions, and once per native entry), so the
+    /// clock read is amortised the same way the flag read is.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline]
+    pub(crate) fn abort_requested(&self) -> bool {
+        self.abort
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            || self.deadline.is_some_and(|d| std::time::Instant::now() >= d)
     }
 
     #[inline]
@@ -1388,12 +1406,10 @@ impl super::Vm<'_> {
         // a hot loop is running natively.
         #[cfg(not(feature = "meter-only"))]
         {
-            if let Some(flag) = rec.abort.as_ref() {
-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    rec.exhaust(ResourceExhaustion::Abort);
-                    self.jit_steps = 0;
-                    return 0;
-                }
+            if rec.abort_requested() {
+                rec.exhaust(ResourceExhaustion::Abort);
+                self.jit_steps = 0;
+                return 0;
             }
         }
         // The heap ceiling needs checking here for the same reason: compiled
@@ -1586,11 +1602,7 @@ impl super::Vm<'_> {
             if rec.tracing {
                 return false;
             }
-            if rec
-                .abort
-                .as_ref()
-                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-            {
+            if rec.abort_requested() {
                 return false;
             }
         }
@@ -1618,12 +1630,7 @@ impl super::Vm<'_> {
         let mut open = rec.terminal_message().is_none();
         #[cfg(not(feature = "meter-only"))]
         {
-            open = open
-                && !rec.tracing
-                && !rec
-                    .abort
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+            open = open && !rec.tracing && !rec.abort_requested();
         }
         let room = if rec.heap_limit == usize::MAX {
             usize::MAX
@@ -1642,10 +1649,7 @@ impl super::Vm<'_> {
     pub(crate) fn native_kernel_interrupted(&self) -> bool {
         #[cfg(not(feature = "meter-only"))]
         if let Some(rec) = self.instr_rec.as_ref() {
-            return rec
-                .abort
-                .as_ref()
-                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+            return rec.abort_requested();
         }
         false
     }
@@ -1834,7 +1838,7 @@ impl super::Vm<'_> {
         // opcode dispatch; trace completion, atomics, and row construction stay
         // in the out-of-line path below. `pending` is checked independently so
         // ending a trace can never strand its final row.
-        if rec.tracing || rec.pending.is_some() || rec.abort.is_some() {
+        if rec.tracing || rec.pending.is_some() || rec.abort.is_some() || rec.deadline.is_some() {
             return self.instrument_step_slow(base, ip, instr);
         }
         if let Some(message) = rec.terminal_message() {
@@ -1919,12 +1923,8 @@ impl super::Vm<'_> {
         // Advance it only after the budget check: an instruction rejected at
         // zero remaining steps did not execute and must not be billed.
         rec.ticks = rec.ticks.wrapping_add(1);
-        if rec.ticks & ABORT_CHECK_MASK == 0 {
-            if let Some(flag) = rec.abort.as_ref() {
-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err(rec.exhaust(ResourceExhaustion::Abort));
-                }
-            }
+        if rec.ticks & ABORT_CHECK_MASK == 0 && rec.abort_requested() {
+            return Err(rec.exhaust(ResourceExhaustion::Abort));
         }
         let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
         let tracing = rec.tracing;
@@ -3075,6 +3075,27 @@ mod tests {
         assert_eq!(abort_rec.remaining, ABORT_BUDGET - used as i64);
         assert_eq!(used + abort_rec.remaining as u64, ABORT_BUDGET as u64);
         assert_eq!(aborted.instrument_resource_limit_error(), Some(ABORT_MSG));
+    }
+
+    #[cfg(not(feature = "meter-only"))]
+    #[test]
+    fn deadline_stops_execution_like_abort() {
+        let mut late = crate::vm::Vm::new(program("while (true) {}"));
+        let mut rec = Recorder::new();
+        rec.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(20));
+        late.set_instrumentation(rec);
+        let started = std::time::Instant::now();
+        late.run().expect_err("a passed deadline stops execution");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(late.instr_rec.as_ref().unwrap().exhaustion, Some(ResourceExhaustion::Abort));
+        assert_eq!(late.instrument_resource_limit_error(), Some(ABORT_MSG));
+
+        // A deadline still ahead does not disturb a run that finishes first.
+        let mut early = crate::vm::Vm::new(program("var n = 0; for (let i = 0; i < 1000; i++) n += i;"));
+        let mut rec = Recorder::new();
+        rec.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        early.set_instrumentation(rec);
+        early.run().expect("a run that ends before its deadline completes");
     }
 
     #[test]

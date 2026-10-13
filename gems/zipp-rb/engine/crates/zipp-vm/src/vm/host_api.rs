@@ -692,6 +692,50 @@ impl HostCallError {
     }
 }
 
+/// A JS exception at the host boundary with its structure preserved: the
+/// `name` and `message` properties (so a Ruby binding maps `TypeError` to a
+/// Ruby class rather than parsing a string) and the `stack` when the thrown
+/// value was an Error. Produced by the structured entry points
+/// (`ScriptState::call_slot_structured` / `eval_in_context_structured`); the
+/// string entry points continue to report a rendered message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsError {
+    pub name: String,
+    pub message: String,
+    pub stack: Option<String>,
+}
+
+impl JsError {
+    /// Best-effort structure from a rendered `"Name: message"` string, for a
+    /// throw whose value was not an object (a thrown string/number) or a
+    /// resource-limit error raised inside the engine.
+    pub fn from_message(msg: &str) -> JsError {
+        if let Some((name, rest)) = msg.split_once(": ") {
+            if is_error_name(name) {
+                return JsError {
+                    name: name.to_string(),
+                    message: rest.to_string(),
+                    stack: None,
+                };
+            }
+        }
+        JsError {
+            name: "Error".to_string(),
+            message: msg.to_string(),
+            stack: None,
+        }
+    }
+}
+
+/// A plausible JS error `name`: identifier characters ending in `Error`
+/// (`TypeError`, `Test262Error`, a user `CustomError`). Guards the message
+/// split so `"zipp: …"`/`"RangeError: …"` are told apart correctly.
+fn is_error_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.ends_with("Error")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 #[derive(Debug, Clone)]
 pub struct HostValueBudget {
     max_nodes: usize,
@@ -1222,6 +1266,113 @@ impl<'p> Vm<'p> {
         true
     }
 
+    /// Allocate a durable handle rooting `v` for as long as the host holds it
+    /// (see `crate::embed::HostHandle`). Reuses a released index when one is
+    /// free, so a host that releases its handles does not grow the table
+    /// without bound.
+    pub(crate) fn host_handle_new(&mut self, v: Value) -> u32 {
+        if let Some(idx) = self.host_handle_free.pop() {
+            self.host_handles[idx as usize] = Some(v);
+            idx
+        } else {
+            let idx = self.host_handles.len() as u32;
+            self.host_handles.push(Some(v));
+            idx
+        }
+    }
+
+    /// A durable handle for the value currently in global slot `index`.
+    pub(crate) fn host_handle_of_slot(&mut self, index: u32) -> Option<u32> {
+        let v = *self.globals.get(index as usize)?;
+        Some(self.host_handle_new(v))
+    }
+
+    /// A durable handle for the global binding `name` resolves to, by the same
+    /// lookup a bare identifier read uses (program/eval bindings, the global
+    /// object and its chain, then the builtins).
+    pub(crate) fn host_handle_of_global(&mut self, name: &str) -> Option<u32> {
+        let v = self.host_resolve_global_by_name(name).ok()?;
+        Some(self.host_handle_new(v))
+    }
+
+    /// Read the value a handle roots, as a structured [`HostValue`].
+    pub(crate) fn host_handle_read(
+        &mut self,
+        idx: u32,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, String> {
+        let v = match self.host_handles.get(idx as usize).and_then(|h| *h) {
+            Some(v) => v,
+            None => return Err(format!("zipp: no value in handle {idx}")),
+        };
+        let mut seen = Vec::new();
+        self.host_out(v, 0, &mut seen, budget)
+    }
+
+    /// Call the function a handle roots, marshalling arguments in and the
+    /// result out. The handle is a durable root, so the callee survives any
+    /// collection the call triggers; microtasks are drained after the call as
+    /// [`Self::host_call_slot_bounded_opts`] drains them.
+    pub(crate) fn host_handle_call(
+        &mut self,
+        idx: u32,
+        args: &[HostValue],
+        budget: &mut HostValueBudget,
+        drain_microtasks: bool,
+    ) -> Result<HostValue, HostCallError> {
+        let callee = match self.host_handles.get(idx as usize).and_then(|h| *h) {
+            Some(v) => v,
+            None => {
+                return Err(HostCallError::Thrown(format!(
+                    "zipp: no function in handle {idx}"
+                )))
+            }
+        };
+        if !self.is_callable(callee) {
+            return Err(HostCallError::Thrown(format!(
+                "TypeError: handle {idx} is not a function"
+            )));
+        }
+        let argv: Vec<Value> = {
+            let _g = self.gc_lock_guard();
+            args.iter().map(|a| self.host_in(a, 0)).collect()
+        };
+        let res = self.host_invoke(callee, &argv);
+        self.marshal_after_drain(res, budget, drain_microtasks)
+    }
+
+    /// Release a handle, dropping its root. Returns `false` for an index that
+    /// is not currently live (already released, or never allocated).
+    pub(crate) fn host_handle_release(&mut self, idx: u32) -> bool {
+        match self.host_handles.get_mut(idx as usize) {
+            Some(slot @ Some(_)) => {
+                *slot = None;
+                self.host_handle_free.push(idx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Marshal one guest `Value` to an owned [`HostValue`] under `budget` — the
+    /// entry the structured host channel (`HOST_CALL_VALUE`) uses for each
+    /// argument. Same cycle/depth/opaque rules as a slot read.
+    pub(crate) fn host_marshal_out(
+        &mut self,
+        v: Value,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, String> {
+        let mut seen = Vec::new();
+        self.host_out(v, 0, &mut seen, budget)
+    }
+
+    /// Marshal an owned [`HostValue`] back into a guest `Value`, under the GC
+    /// lock so a collection cannot run between the allocations that build it.
+    pub(crate) fn host_marshal_in(&mut self, hv: &HostValue) -> Value {
+        let _g = self.gc_lock_guard();
+        self.host_in(hv, 0)
+    }
+
     /// Call the function in global slot `index`, then drain the microtask queue
     /// so promise callbacks the call scheduled have run before the host looks
     /// at the resulting state.
@@ -1386,6 +1537,132 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// [`Self::marshal_after_drain`] returning a structured [`JsError`]
+    /// instead of a message string. Same rooting, drain and ordering rules.
+    fn marshal_after_drain_structured(
+        &mut self,
+        res: Result<Value, crate::vm::Thrown>,
+        budget: &mut HostValueBudget,
+        drain_microtasks: bool,
+    ) -> Result<HostValue, JsError> {
+        let res = match res {
+            Ok(v) => {
+                if v.is_heap() {
+                    self.host_result_roots.push(v);
+                }
+                Ok(v)
+            }
+            Err(t) => Err(self.take_host_throw_structured(t)),
+        };
+        if drain_microtasks {
+            self.drain_microtasks();
+        } else {
+            self.finish_weak_job();
+        }
+        match res {
+            Ok(v) => {
+                let out = {
+                    let _g = self.gc_lock_guard();
+                    let mut seen: Vec<u32> = Vec::new();
+                    self.host_out(v, 0, &mut seen, budget)
+                        .map_err(|m| JsError::from_message(&m))
+                };
+                if v.is_heap() {
+                    self.host_result_roots.pop();
+                }
+                out
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Call the function in global slot `index` and return its result as a
+    /// structured [`HostValue`], with a throw reported as a structured
+    /// [`JsError`] (name/message/stack). Drains microtasks like
+    /// [`Self::host_call_slot`].
+    pub(crate) fn host_call_slot_structured(
+        &mut self,
+        index: u32,
+        args: &[HostValue],
+    ) -> Result<HostValue, JsError> {
+        let callee = match self.globals.get(index as usize) {
+            Some(v) => *v,
+            None => {
+                return Err(JsError::from_message(&format!(
+                    "zipp: no global in slot {index}"
+                )))
+            }
+        };
+        if !self.is_callable(callee) {
+            return Err(JsError {
+                name: "TypeError".to_string(),
+                message: format!("global slot {index} is not a function"),
+                stack: None,
+            });
+        }
+        let argv: Vec<Value> = {
+            let _g = self.gc_lock_guard();
+            args.iter().map(|a| self.host_in(a, 0)).collect()
+        };
+        let res = self.host_invoke(callee, &argv);
+        let mut budget = HostValueBudget::default();
+        self.marshal_after_drain_structured(res, &mut budget, true)
+    }
+
+    /// Call the global function `name` with structured arguments and return
+    /// its result as a structured [`HostValue`], reporting a throw as a
+    /// structured [`JsError`]. Resolves `name` the way a bare identifier read
+    /// is (so an eval-declared function or a `globalThis` property is found).
+    pub(crate) fn host_call_global_structured(
+        &mut self,
+        name: &str,
+        args: &[HostValue],
+    ) -> Result<HostValue, JsError> {
+        let callee = match self.host_resolve_global_by_name(name) {
+            Ok(v) => v,
+            Err(msg) => return Err(JsError::from_message(&msg)),
+        };
+        if !self.is_callable(callee) {
+            return Err(JsError {
+                name: "TypeError".to_string(),
+                message: format!("{name} is not a function"),
+                stack: None,
+            });
+        }
+        let argv: Vec<Value> = {
+            let _g = self.gc_lock_guard();
+            args.iter().map(|a| self.host_in(a, 0)).collect()
+        };
+        let res = self.host_invoke(callee, &argv);
+        let mut budget = HostValueBudget::default();
+        self.marshal_after_drain_structured(res, &mut budget, true)
+    }
+
+    /// Evaluate `src` as indirect eval and return its completion value as a
+    /// structured [`HostValue`], with a throw reported as a structured
+    /// [`JsError`]. Mirrors [`Self::host_eval_rich`] otherwise.
+    pub(crate) fn host_eval_structured(&mut self, src: &str) -> Result<HostValue, JsError> {
+        let res = self.do_eval(
+            src,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Value::UNDEFINED,
+            None,
+            true,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let mut budget = HostValueBudget::default();
+        self.marshal_after_drain_structured(res, &mut budget, true)
+    }
+
     /// A throw that has propagated to the host boundary, as its message.
     ///
     /// `run_loop` leaves `pending_throw` set when a throw escapes it, so an
@@ -1400,6 +1677,47 @@ impl<'p> Vm<'p> {
     pub(crate) fn take_host_throw(&mut self, t: crate::vm::Thrown) -> String {
         self.pending_throw = None;
         t.0
+    }
+
+    /// The structured twin of [`Self::take_host_throw`]: read the thrown
+    /// value's `name`/`message`/`stack` before clearing it, falling back to
+    /// the rendered message when the value was not an Error object (a thrown
+    /// string/number) or the throw carried no value (an engine resource-limit
+    /// error).
+    pub(crate) fn take_host_throw_structured(&mut self, t: crate::vm::Thrown) -> JsError {
+        let thrown = self.pending_throw.take();
+        if let Some(v) = thrown {
+            if v.is_heap() {
+                if matches!(self.heap.get(v.heap_index()), crate::heap::HeapObj::Object(_)) {
+                    let idx = v.heap_index();
+                    let name = self.read_data_prop(idx, "name").map(|n| self.display(n));
+                    let message = self.read_data_prop(idx, "message").map(|m| self.display(m));
+                    // The engine does not populate Error.stack in embedded
+                    // states; an empty/absent stack is reported as `None` so a
+                    // host leaves Ruby's own backtrace in place.
+                    let stack = self
+                        .read_data_prop(idx, "stack")
+                        .map(|s| self.display(s))
+                        .filter(|s| !s.is_empty());
+                    if name.is_some() || message.is_some() || stack.is_some() {
+                        return JsError {
+                            name: name.unwrap_or_else(|| "Error".to_string()),
+                            message: message.unwrap_or_default(),
+                            stack,
+                        };
+                    }
+                }
+            } else {
+                // A primitive throw (string/number/undefined): the value's text
+                // is the message.
+                return JsError {
+                    name: "Error".to_string(),
+                    message: self.display(v),
+                    stack: None,
+                };
+            }
+        }
+        JsError::from_message(&t.0)
     }
 
     /// How many host completion values are currently rooted — zero between
@@ -1968,6 +2286,51 @@ pub trait HostCtx {
     /// Runs the guest re-entrantly inside the host call; the guest cannot make
     /// a nested host call while it does.
     fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, String>;
+    /// Evaluate `src` as indirect eval in the running global context, from
+    /// inside the host call, and return the completion value as a structured
+    /// [`HostValue`]. Top-level `var`/`function` declarations persist, and
+    /// microtasks are drained afterwards. This is the general re-entry a host
+    /// needs to run guest JS while serving a `__zippHostCall` (a Ruby callback
+    /// dispatching a DOM event can evaluate the handler it just found).
+    ///
+    /// Requires no nested host call to run unaided; a guest that calls
+    /// `__zippHostCall` again during it fails honestly unless the re-entrant
+    /// host channel is also installed. The default implementation refuses,
+    /// for a context that cannot reach the evaluator.
+    fn eval_script(&mut self, _src: &str) -> Result<HostValue, String> {
+        Err("TypeError: this host context cannot evaluate scripts".into())
+    }
+    /// Call the guest function a global names, with structured arguments, and
+    /// return its result as a structured [`HostValue`]. The rich counterpart
+    /// of [`Self::call_global_numbers`]: any JSON-shaped argument and result
+    /// crosses without a string round-trip. The default implementation
+    /// refuses.
+    fn call_global_value(&mut self, _name: &str, _args: &[HostValue]) -> Result<HostValue, String> {
+        Err("TypeError: this host context cannot call globals".into())
+    }
+    /// Call the function a durable handle roots, from inside the host call —
+    /// [`crate::embed::ScriptState::call_handle`] for a host that is already
+    /// serving a call into the same VM (a Ruby event listener invoking the
+    /// JS handler it holds). A handle from another VM is refused. The
+    /// default implementation refuses.
+    fn call_handle_value(
+        &mut self,
+        _handle: crate::embed::HostHandle,
+        _args: &[HostValue],
+    ) -> Result<HostValue, String> {
+        Err("TypeError: this host context cannot call handles".into())
+    }
+    /// Read the value a durable handle roots, from inside the host call. The
+    /// default implementation refuses.
+    fn read_handle_value(&mut self, _handle: crate::embed::HostHandle) -> Result<HostValue, String> {
+        Err("TypeError: this host context cannot read handles".into())
+    }
+    /// Release a durable handle from inside the host call; `false` for one
+    /// that is not live in this VM. The default implementation releases
+    /// nothing.
+    fn release_handle_value(&mut self, _handle: crate::embed::HostHandle) -> bool {
+        false
+    }
 }
 
 /// The context-taking twin of [`crate::embed::HostCall`]: the same string
@@ -2159,5 +2522,62 @@ impl<'p> HostCtx for Vm<'p> {
             .map_err(|t| self.take_host_throw(t))?;
         self.to_number_strict(v)
             .map_err(|t| self.take_host_throw(t))
+    }
+
+    /// General re-entry: indirect eval in the running global context, with the
+    /// completion value marshalled as a structured [`HostValue`]. Microtasks
+    /// are drained (see [`Vm::host_eval_rich`]).
+    fn eval_script(&mut self, src: &str) -> Result<HostValue, String> {
+        let mut budget = HostValueBudget::default();
+        self.host_eval_rich(src, &mut budget)
+            .map_err(HostCallError::into_message)
+    }
+
+    /// Rich by-name call: resolve `name` the way a bare identifier read is,
+    /// marshal the arguments in, invoke re-entrantly, and marshal the result
+    /// back. Mirrors [`Vm::host_call_slot_bounded_opts`] for a name rather
+    /// than a slot, and drains microtasks after the call as that entry does.
+    fn call_global_value(&mut self, name: &str, args: &[HostValue]) -> Result<HostValue, String> {
+        // Resolve the way a bare identifier read is — program/eval bindings,
+        // then the global object and its prototype chain, then the builtins —
+        // so a function installed as `globalThis[name]` is found, matching
+        // `ScriptState::call_global`.
+        let callee = self.host_resolve_global_by_name(name)?;
+        if !self.is_callable(callee) {
+            return Err(format!("TypeError: {name} is not a function"));
+        }
+        let mut budget = HostValueBudget::default();
+        let argv: Vec<Value> = {
+            let _g = self.gc_lock_guard();
+            args.iter().map(|a| self.host_in(a, 0)).collect()
+        };
+        let res = self.host_invoke(callee, &argv);
+        self.marshal_after_drain(res, &mut budget, true)
+            .map_err(HostCallError::into_message)
+    }
+
+    fn call_handle_value(
+        &mut self,
+        handle: crate::embed::HostHandle,
+        args: &[HostValue],
+    ) -> Result<HostValue, String> {
+        if handle.vm_id() != self.host_owner_id {
+            return Err("zipp: handle belongs to another VM".into());
+        }
+        let mut budget = HostValueBudget::default();
+        self.host_handle_call(handle.index(), args, &mut budget, true)
+            .map_err(HostCallError::into_message)
+    }
+
+    fn read_handle_value(&mut self, handle: crate::embed::HostHandle) -> Result<HostValue, String> {
+        if handle.vm_id() != self.host_owner_id {
+            return Err("zipp: handle belongs to another VM".into());
+        }
+        let mut budget = HostValueBudget::default();
+        self.host_handle_read(handle.index(), &mut budget)
+    }
+
+    fn release_handle_value(&mut self, handle: crate::embed::HostHandle) -> bool {
+        handle.vm_id() == self.host_owner_id && self.host_handle_release(handle.index())
     }
 }

@@ -2688,6 +2688,7 @@ impl<'p> Vm<'p> {
         // installed the native itself throws, so a stock `zipp js` run cannot
         // reach anything through it.
         let host_call_fn = self.heap.alloc(HeapObj::Native(native::HOST_CALL));
+        let host_call_value_fn = self.heap.alloc(HeapObj::Native(native::HOST_CALL_VALUE));
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.setup_object(ObjMap::new());
@@ -2819,6 +2820,7 @@ impl<'p> Vm<'p> {
             ("globalThis", global_this),
             (native::ANNEXB_REF_ERROR_NAME, annexb_ref_error_fn),
             (native::HOST_CALL_NAME, host_call_fn),
+            (native::HOST_CALL_VALUE_NAME, host_call_value_fn),
         ];
         #[cfg(feature = "safe-sandbox")]
         all.retain(|(name, _)| !matches!(*name, "SharedArrayBuffer" | "Atomics"));

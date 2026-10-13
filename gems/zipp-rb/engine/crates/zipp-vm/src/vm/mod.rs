@@ -1659,6 +1659,51 @@ pub struct Vm<'p> {
     /// call runs. Preferred over `host` when both are installed; taken out
     /// of the `Vm` for the duration of the call like `host`.
     pub(crate) host_ctx: Option<crate::vm::host_api::HostCallCtx>,
+    /// Embedder hook for unhandled Promise rejections. When installed, every
+    /// rejection that reaches the microtask checkpoint with no handler is
+    /// reported here with its rendered message, in addition to (never
+    /// instead of) the Test262 `errput` line `report_unhandled_errors`
+    /// already produces. The host counterpart of the browser's
+    /// `unhandledrejection` event.
+    pub(crate) unhandled_rejection_sink: Option<Box<dyn FnMut(&str)>>,
+    /// Re-entrant host channel: like `host_ctx`, but stored behind an `Rc`
+    /// and called through a cloned handle rather than taken out of the `Vm`,
+    /// so a guest that calls `__zippHostCall` again while a call is being
+    /// served re-enters the SAME closure instead of throwing "no host
+    /// installed". The closure is `Fn` (not `FnMut`); host-side mutable state
+    /// belongs behind the host's own interior mutability. Preferred over
+    /// `host_ctx` and `host` when installed. A Ruby binding needs this: a
+    /// host call that dispatches a DOM event can run a handler that calls
+    /// back into the host.
+    pub(crate) host_reentrant:
+        Option<std::rc::Rc<dyn Fn(&mut dyn crate::vm::host_api::HostCtx, &str, &[String]) -> Result<String, String>>>,
+    /// Structured host channel backing the `HOST_CALL_VALUE` native. Like
+    /// `host_reentrant`, it is shared behind an `Rc` and called through a
+    /// cloned handle (so it is re-entrant), but arguments and the reply cross
+    /// as owned `HostValue` trees rather than strings. The channel a Ruby
+    /// binding uses for everything that is not a bare string.
+    pub(crate) host_values: Option<
+        std::rc::Rc<
+            dyn Fn(
+                &mut dyn crate::vm::host_api::HostCtx,
+                &str,
+                &[crate::vm::host_api::HostValue],
+            ) -> Result<crate::vm::host_api::HostValue, String>,
+        >,
+    >,
+    /// The owning `ScriptState`'s id, so a [`crate::embed::HostHandle`] used
+    /// through [`crate::vm::host_api::HostCtx`] can be checked against this
+    /// VM as `ScriptState`'s own handle methods check it. 0 outside a
+    /// `ScriptState`.
+    pub(crate) host_owner_id: u64,
+    /// Durable roots a host holds across re-entries via
+    /// [`crate::embed::HostHandle`]. A `Some` entry is a live JS value the
+    /// collector must trace (see `mark_roots`); a `None` entry is a released
+    /// or never-used handle. `host_handle_free` lists the `None` indices, so a
+    /// release is reused rather than growing the table. Empty in every
+    /// engine-internal path.
+    pub(crate) host_handles: Vec<Option<Value>>,
+    pub(crate) host_handle_free: Vec<u32>,
     /// Monotonic-clock reading at VM start — the zero point for
     /// `performance.now()` (which reports fractional milliseconds elapsed
     /// since the program began). A host-installed clock's reading when one
@@ -2445,6 +2490,14 @@ pub struct Vm<'p> {
     /// Maximum bytes read from any one module while `module_root` is active.
     /// `None` preserves the unrestricted compatibility loader.
     module_max_bytes: Option<u64>,
+    /// Host-provided module sources for a VIRTUAL module root, keyed by the
+    /// module's path under `module_root`. When installed, the loader resolves
+    /// specifiers lexically (never touching the filesystem) and asks this
+    /// closure for each module's bytes; a path it does not know is
+    /// "module not found". This is what lets an embedder (a Ruby binding)
+    /// register module sources in memory and import them with no files on disk.
+    pub(crate) module_provider:
+        Option<std::rc::Rc<dyn Fn(&std::path::Path) -> Option<Vec<u8>>>>,
     /// Canonical confined module paths and the largest byte length successfully
     /// observed for each. All loader variants share this ledger, so rereading a
     /// file (including as a typed/deferred/source-phase module) does not charge

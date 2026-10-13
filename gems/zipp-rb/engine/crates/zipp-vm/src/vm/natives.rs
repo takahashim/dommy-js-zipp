@@ -5330,10 +5330,13 @@ impl<'p> Vm<'p> {
                     self.preflight_guest_string_size(aggregate)?;
                     rest.push(value);
                 }
-                // The context-taking hook first: it receives the VM, so the
-                // host may resolve typed arrays and call guest functions while
-                // it runs (`crate::vm::host_api::HostCtx`).
-                let reply = if let Some(mut host) = self.host_ctx.take() {
+                // The re-entrant hook first: a cloned `Rc` is called while the
+                // `Vm` is passed as `HostCtx`, so the host may resolve typed
+                // arrays, evaluate JS, and be re-entered by the guest without
+                // the "no host installed" failure the taken-out hooks produce.
+                let reply = if let Some(host) = self.host_reentrant.clone() {
+                    host(self, &kind, &rest)
+                } else if let Some(mut host) = self.host_ctx.take() {
                     let reply = host(self, &kind, &rest);
                     self.host_ctx = Some(host);
                     reply
@@ -5357,6 +5360,33 @@ impl<'p> Vm<'p> {
                         self.preflight_guest_string_size(e.len())?;
                         return Err(Thrown(e));
                     }
+                }
+            }
+            HOST_CALL_VALUE => {
+                // The structured twin of HOST_CALL: each argument crosses as an
+                // owned HostValue (no ToString), and the reply is marshalled
+                // back. The host closure is re-entrant (cloned Rc, not taken).
+                let kind = self.to_js_string(a0)?;
+                let mut budget = crate::vm::host_api::HostValueBudget::default();
+                let rest_len = args.len().saturating_sub(1);
+                let mut rest: Vec<crate::vm::host_api::HostValue> = Vec::new();
+                rest.try_reserve_exact(rest_len)
+                    .map_err(|_| Thrown::from_static("RangeError: host argument allocation failed"))?;
+                for &a in args.iter().skip(1) {
+                    let hv = self.host_marshal_out(a, &mut budget).map_err(Thrown)?;
+                    rest.push(hv);
+                }
+                let reply = match self.host_values.clone() {
+                    Some(host) => host(self, &kind, &rest),
+                    None => {
+                        return Err(Thrown(format!(
+                            "TypeError: {HOST_CALL_VALUE_NAME}(\"{kind}\") with no value host installed"
+                        )))
+                    }
+                };
+                match reply {
+                    Ok(hv) => self.host_marshal_in(&hv),
+                    Err(e) => return Err(Thrown(e)),
                 }
             }
             // Global functions as values.

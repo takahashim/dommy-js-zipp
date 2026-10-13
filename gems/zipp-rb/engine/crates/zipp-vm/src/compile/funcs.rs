@@ -1958,7 +1958,7 @@ impl<'a> FnCompiler<'a> {
         let mut map = std::collections::HashMap::new();
         for name in free_names {
             let mut chain = self.with_names_for(&name);
-            if !self.scopes.iter().flatten().any(|(n, _)| *n == name)
+            if !self.bound_anywhere(&name)
                 && self.self_name.as_ref().map_or(true, |(n, _)| *n != name)
             {
                 if let Some(inh) = self.inherited_with_shadows.get(&name) {

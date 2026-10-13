@@ -947,9 +947,9 @@ impl Compiler {
             }
             // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
             for name in &crate::compile::helpers::sorted_name_vec(&lex) {
-                if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                if fc.lookup_in_scope(0, name).is_none() {
                     let r = fc.alloc_reg();
-                    fc.scopes[0].push((name.clone(), r));
+                    fc.bind_in_scope(0, name, r);
                     fc.emit(Instr::MakeCellTdz { reg: r });
                     fc.cell_regs.insert(r);
                     fc.entry_lexicals.insert(name.clone());
@@ -978,7 +978,7 @@ impl Compiler {
             // textually after the `with` (unscopables-with); (3) `for (var k
             // in …)` heads resolve the hoisted binding instead of minting one.
             for name in &sorted_name_vec(&hv) {
-                if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                if fc.lookup_in_scope(0, name).is_none() {
                     fc.declare_local(name); // boxes a cell if captured (undefined)
                 }
             }
@@ -1396,7 +1396,7 @@ impl Compiler {
         // Hoisted declarations must capture the method/constructor's own
         // bindings even when their textual declarations appear later.
         for local in hoisted_var_names(body) {
-            if !fc.scopes[0].iter().any(|(n, _)| n == &local) {
+            if fc.lookup_in_scope(0, &local).is_none() {
                 fc.declare_local(&local);
             }
         }
@@ -1618,7 +1618,7 @@ impl Compiler {
                         collect_hoisted_vars(s, &mut hv);
                     }
                     for name in &sorted_name_vec(&hv) {
-                        if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                        if fc.lookup_in_scope(0, name).is_none() {
                             fc.declare_local(name);
                         }
                     }
@@ -1684,9 +1684,9 @@ impl Compiler {
                             || fc.captured.contains(name)
                             || fc.box_all_locals
                             || early_cell.contains(name);
-                        if needs_cell && !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                        if needs_cell && fc.lookup_in_scope(0, name).is_none() {
                             let r = fc.alloc_reg();
-                            fc.scopes[0].push((name.clone(), r));
+                            fc.bind_in_scope(0, name, r);
                             fc.emit(Instr::MakeCellTdz { reg: r });
                             fc.cell_regs.insert(r);
                             fc.entry_lexicals.insert(name.clone());
@@ -1900,11 +1900,7 @@ impl<'a> FnCompiler<'a> {
             if name == "arguments" || !seen.contains(name) {
                 continue;
             }
-            let Some(preg) = self.scopes[0]
-                .iter()
-                .rev()
-                .find(|(n, _)| n == name)
-                .map(|(_, r)| *r)
+            let Some(preg) = self.lookup_in_scope(0, name)
             else {
                 continue;
             };
@@ -1980,13 +1976,13 @@ impl<'a> FnCompiler<'a> {
                 || self.box_all_locals
                 || forward.contains(name)
                 || matches!(name.as_str(), "undefined" | "NaN" | "Infinity"))
-                && !self.scopes[0].iter().any(|(n, _)| n == name)
+                && self.lookup_in_scope(0, name).is_none()
             {
                 // Box a TDZ cell: a read before the textual declaration runs
                 // (e.g. via a forward-materialised function) throws a
                 // ReferenceError rather than reading undefined.
                 let r = self.alloc_reg();
-                self.scopes[0].push((name.clone(), r));
+                self.bind_in_scope(0, name, r);
                 self.emit(Instr::MakeCellTdz { reg: r });
                 self.cell_regs.insert(r);
                 self.entry_lexicals.insert(name.clone());

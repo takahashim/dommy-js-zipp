@@ -108,7 +108,85 @@ impl<'p> Vm<'p> {
         &self,
         raw_path: &std::path::Path,
     ) -> Result<std::path::PathBuf, Thrown> {
+        // With a host module provider the root is VIRTUAL: resolve lexically
+        // (never touching the filesystem, which would reject a path that has
+        // no file), confining to the root by the same lexical rule.
+        if self.module_provider.is_some() {
+            if let Some(root) = self.module_root.as_deref() {
+                if !lexically_confined(root, raw_path) {
+                    return Err(Thrown(MODULE_NOT_FOUND.into()));
+                }
+            }
+            return lexical_module_path(raw_path).ok_or_else(|| Thrown(MODULE_NOT_FOUND.into()));
+        }
         canonical_module_path(self.module_root.as_deref(), raw_path)
+    }
+
+    /// Install a host module provider over a virtual `root`: specifiers under
+    /// `root` resolve lexically and each module's bytes come from `provider`
+    /// (never from the filesystem). `root` must be absolute; it need not exist.
+    /// The aggregate/count/size budgets of the confined loader apply.
+    pub(crate) fn set_module_provider(
+        &mut self,
+        root: std::path::PathBuf,
+        max_bytes: u64,
+        provider: std::rc::Rc<dyn Fn(&std::path::Path) -> Option<Vec<u8>>>,
+    ) -> Result<(), String> {
+        if max_bytes == 0 || max_bytes == u64::MAX {
+            return Err("module size limit must be in 1..u64::MAX".into());
+        }
+        if !root.is_absolute() {
+            return Err(format!(
+                "module provider root '{}' must be an absolute path",
+                root.display()
+            ));
+        }
+        self.module_root = Some(root.clone());
+        self.module_max_bytes = Some(max_bytes);
+        self.module_base_dir = Some(root);
+        self.module_provider = Some(provider);
+        self.module_read_bytes.clear();
+        self.module_total_bytes = 0;
+        self.module_load_depth = 0;
+        Ok(())
+    }
+
+    /// Apply the confined loader's count/size/aggregate budgets to one read of
+    /// `bytes.len()` bytes at `path`.
+    fn account_confined_module(
+        &mut self,
+        path: &std::path::Path,
+        observed: u64,
+        limit: u64,
+    ) -> Result<(), Thrown> {
+        let already_seen = self.module_read_bytes.contains_key(path);
+        if !already_seen && self.module_read_bytes.len() >= CONFINED_MODULE_COUNT_LIMIT {
+            return Err(Thrown(format!(
+                "RangeError: sandbox module count limit of {CONFINED_MODULE_COUNT_LIMIT} exceeded"
+            )));
+        }
+        if observed > limit {
+            return Err(Thrown(format!(
+                "RangeError: module exceeds the sandbox size limit of {limit} bytes"
+            )));
+        }
+        let previous = self.module_read_bytes.get(path).copied().unwrap_or(0);
+        let growth = observed.saturating_sub(previous);
+        let new_total = self
+            .module_total_bytes
+            .checked_add(growth)
+            .filter(|&n| n <= CONFINED_MODULE_TOTAL_BYTES_LIMIT)
+            .ok_or_else(|| {
+                Thrown(format!(
+                    "RangeError: sandbox aggregate module size limit of {CONFINED_MODULE_TOTAL_BYTES_LIMIT} bytes exceeded"
+                ))
+            })?;
+        if !already_seen || observed > previous {
+            self.module_read_bytes
+                .insert(path.to_path_buf(), observed.max(previous));
+            self.module_total_bytes = new_total;
+        }
+        Ok(())
     }
 
     /// Run one recursive loader operation under the confined graph-depth cap.
@@ -133,6 +211,16 @@ impl<'p> Vm<'p> {
     }
 
     fn read_module_bytes(&mut self, path: &std::path::Path) -> Result<Vec<u8>, Thrown> {
+        // A host module provider serves VIRTUAL modules from memory. A path it
+        // declines is "module not found"; the filesystem is never consulted, so
+        // nothing can leak through it.
+        if let Some(provider) = self.module_provider.clone() {
+            let bytes = provider(path).ok_or_else(|| Thrown(MODULE_NOT_FOUND.into()))?;
+            if let Some(limit) = self.module_max_bytes {
+                self.account_confined_module(path, bytes.len() as u64, limit)?;
+            }
+            return Ok(bytes);
+        }
         let Some(limit) = self.module_max_bytes else {
             return std::fs::read(path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()));
         };
@@ -162,23 +250,7 @@ impl<'p> Vm<'p> {
         // Charge a canonical path once at its observed high-water mark. This
         // closes both the many-small-files attack and a mutate-between-reads
         // variant without double-charging ordinary repeated/typed reads.
-        let observed = bytes.len() as u64;
-        let previous = self.module_read_bytes.get(path).copied().unwrap_or(0);
-        let growth = observed.saturating_sub(previous);
-        let new_total = self
-            .module_total_bytes
-            .checked_add(growth)
-            .filter(|&n| n <= CONFINED_MODULE_TOTAL_BYTES_LIMIT)
-            .ok_or_else(|| {
-                Thrown(format!(
-                    "RangeError: sandbox aggregate module size limit of {CONFINED_MODULE_TOTAL_BYTES_LIMIT} bytes exceeded"
-                ))
-            })?;
-        if !already_seen || observed > previous {
-            self.module_read_bytes
-                .insert(path.to_path_buf(), observed.max(previous));
-            self.module_total_bytes = new_total;
-        }
+        self.account_confined_module(path, bytes.len() as u64, limit)?;
         Ok(bytes)
     }
 

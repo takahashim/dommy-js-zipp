@@ -391,6 +391,23 @@ impl Vm<'_> {
         self.closure_new_target.insert(closure, new_target);
     }
 
+    /// Collect now, on the host's request (e.g. a `gc!` binding API). A no-op
+    /// while a host conversion holds the GC lock, since the collector must not
+    /// run while the host is walking values.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn force_gc(&mut self) {
+        if self.gc_lock == 0 {
+            self.gc();
+        }
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn force_gc(&mut self) {
+        if self.gc_lock.get() == 0 {
+            self.gc();
+        }
+    }
+
     fn gc(&mut self) {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Gc);
         let n = self.heap.len();
@@ -483,6 +500,13 @@ impl Vm<'_> {
         // values across result rendering or the microtask drain (ZA-05).
         for &v in &self.host_result_roots {
             root_val!(v);
+        }
+        // Durable host handles: values a host holds across re-entries, so the
+        // collector never reclaims a function/object the embedder still owns.
+        for slot in &self.host_handles {
+            if let Some(v) = *slot {
+                root_val!(v);
+            }
         }
         // Short interpreter string constants memoized by immutable
         // (function, constant-slot). The cache is bounded and its Values are
