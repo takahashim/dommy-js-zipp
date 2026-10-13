@@ -153,6 +153,22 @@ impl HostHandle {
 /// `HostHandle` cannot alias a live VM.
 static NEXT_VM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// A classic script parsed and compiled once, for
+/// [`ScriptState::load_compiled`] in any number of VMs, on any thread. A
+/// compiled program holds no VM state (string constants are resolved per VM,
+/// global slots and function ids are remapped at install), so each load
+/// installs its own copy and the shared one never changes.
+#[derive(Clone)]
+pub struct CompiledScript(std::sync::Arc<Program>);
+
+impl CompiledScript {
+    /// Compile `src` as [`ScriptState::load_in_context`] would. A syntax error
+    /// is its message; load the source itself for the structured error.
+    pub fn compile(src: &str) -> Result<Self, String> {
+        crate::vm::compile_host_script(src).map(|p| Self(std::sync::Arc::new(p)))
+    }
+}
+
 /// A compiled program plus the live VM executing it.
 ///
 /// `Vm<'p>` borrows its `Program`, which makes the pair self-referential. It
@@ -577,6 +593,20 @@ impl ScriptState {
     pub fn load_in_context(&mut self, src: &str) -> Result<(), JsError> {
         self.with_vm(|vm| {
             let result = match vm.host_run_script(src) {
+                Ok(_) => Ok(()),
+                Err(thrown) => Err(vm.take_host_throw_structured(thrown)),
+            };
+            vm.finish_weak_job();
+            result
+        })
+        .unwrap_or_else(|| Err(JsError::from_message(TORN_DOWN)))
+    }
+
+    /// [`Self::load_in_context`] for a script compiled ahead of time, once for
+    /// any number of VMs: nothing is parsed or compiled here.
+    pub fn load_compiled(&mut self, script: &CompiledScript) -> Result<(), JsError> {
+        self.with_vm(|vm| {
+            let result = match vm.host_run_compiled(Program::clone(&script.0)) {
                 Ok(_) => Ok(()),
                 Err(thrown) => Err(vm.take_host_throw_structured(thrown)),
             };
@@ -2635,6 +2665,36 @@ mod tests {
         let err = st.eval_in_context_structured("throw 'plain'").expect_err("throws");
         assert_eq!(err.name, "Error");
         assert!(err.message.contains("plain"), "{:?}", err.message);
+    }
+
+    #[test]
+    fn a_compiled_script_loads_into_many_vms_independently() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<CompiledScript>();
+
+        let script = CompiledScript::compile(
+            "var hits = 0; function bump() { return ++hits; }\n\
+             function fail() { throw new TypeError('from bundle'); }",
+        )
+        .expect("compiles");
+        let mut a = compile_script("").expect("compiles");
+        a.run_init().expect("runs");
+        let mut b = compile_script("var before = 1;").expect("compiles");
+        b.run_init().expect("runs");
+        a.load_compiled(&script).expect("loads into a");
+        b.set_script_name(Some("bundle.js"));
+        b.load_compiled(&script).expect("loads into b");
+        // Each VM owns its globals: bumping one leaves the other alone.
+        assert_eq!(a.eval_in_context("bump(); bump()").unwrap(), JsValue::Number(2.0));
+        assert_eq!(b.eval_in_context("bump() + before").unwrap(), JsValue::Number(2.0));
+        // The script name is the loading VM's, stamped at install.
+        let err = b.call_global_structured("fail", &[]).expect_err("throws");
+        assert_eq!(err.name, "TypeError");
+        assert!(err.stack.as_deref().unwrap_or("").contains("bundle.js"), "{:?}", err.stack);
+        let err = a.call_global_structured("fail", &[]).expect_err("throws");
+        assert!(!err.stack.as_deref().unwrap_or("").contains("bundle.js"), "{:?}", err.stack);
+
+        assert!(CompiledScript::compile("let = ;").is_err());
     }
 
     #[test]

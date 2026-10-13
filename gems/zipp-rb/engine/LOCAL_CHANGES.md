@@ -14,7 +14,7 @@ prefer upstream's and adapt `ext/zipp_rb`. Everything here except the
 performance and correctness fixes is additive embed API, and all of it is a
 candidate to propose upstream.
 
-## Embed API (crates/zipp-vm/src/embed.rs, vm/host_api.rs, vm/natives.rs, vm/mod.rs, vm/engine/boot.rs)
+## Embed API (crates/zipp-vm/src/embed.rs, vm/host_api.rs, vm/natives.rs, vm/mod.rs, vm/engine/boot.rs, vm/engine/eval_prog.rs)
 
 - **Structured host channel** — `__zippHostCallValue` (`HOST_CALL_VALUE`,
   vm/native.rs + natives.rs), `HostCallValues`,
@@ -48,6 +48,13 @@ candidate to propose upstream.
   (`host_call_global_structured_opts`): a call that leaves the microtasks it
   queued for the host's next `run_microtasks`, for a host with its own
   checkpoints. zipp-rb's `VM#invoke`.
+- **Compiled scripts** — `CompiledScript::compile` (embed.rs, over
+  vm/engine/eval_prog.rs `compile_host_script`) and
+  `ScriptState::load_compiled` (`Vm::host_run_compiled`, split out of
+  `host_run_script`): a classic script compiled once, needing no VM, and
+  loaded into any number of VMs on any thread. Each load installs its own copy
+  (`prepare_eval_program` remaps slots and ids on it). zipp-rb's compile cache
+  (`VM#load(cache: true)`). Test: `a_compiled_script_loads_into_many_vms_independently`.
 - **Local time zone** — `Vm::local_tz` and vm/local_time.rs
   (`set_local_time_zone`, `local_offset_ms`, `local_to_utc_ms`, over
   temporal/tzdb.rs), `ScriptState::set_time_zone`. `Date`'s local getters,

@@ -46,9 +46,12 @@ scripts, import maps and dynamic `import()`.
   statement each frame was executing (and the start of an expression-bodied
   arrow), not the exact expression; names come from declarations, so an
   arrow assigned to a variable reports as anonymous.
-- **No bytecode cache.** `load_script_cached` and the bridge's runtime bundles
-  are parsed on every Runtime (Zipp parses the bundles in tens of ms); a
-  preloaded module saves the fetch, not the parse.
+- **The compile cache is per process and in memory.** The bridge's runtime
+  bundles and `load_script_cached` scripts are compiled once per process and
+  shared by every Runtime (zipp-rb's `VM#load(cache: true)`); nothing is
+  written to disk. `Dommy::Js::Zipp.prewarm` compiles the bundles up front,
+  before forking workers, say. A preloaded module saves the fetch, not the
+  parse.
 - **Out of memory is not fatal.** Zipp raises a catchable `RangeError` at the
   heap ceiling and the VM stays usable; a VM is only "poisoned" once disposed
   or discarded after an engine panic.

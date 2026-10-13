@@ -39,6 +39,11 @@ module Dommy
         private_constant :TIMER_GLOBALS_JS, :BROWSER_GLOBALS_JS, :WINDOW_BUILTINS_JS,
           :INTL_POLYFILL_JS, :WASM_STUB_JS, :ERROR_REBUILD_JS
 
+        # Every payload's source, for Zipp.prewarm.
+        def self.payloads
+          [TIMER_GLOBALS_JS, BROWSER_GLOBALS_JS, WINDOW_BUILTINS_JS, INTL_POLYFILL_JS, WASM_STUB_JS, ERROR_REBUILD_JS]
+        end
+
         def initialize(backend)
           @backend = backend
         end

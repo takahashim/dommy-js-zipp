@@ -10,9 +10,9 @@ module Dommy
       # / call_js / run_bundle) to a ZippRb::VM, plus what Runtime asks of an
       # engine beyond that.
       #
-      # Zipp has no bytecode cache, so #run_bundle parses its source on every
-      # VM; Zipp's parser is fast enough that the bridge's runtime bundles take
-      # a few tens of milliseconds per VM.
+      # #run_bundle compiles each bundle once per process (zipp-rb's compile
+      # cache) and runs that compilation in every VM: parsing and compiling
+      # the bridge's runtime is most of a VM's start-up.
       class Backend
         # A console line, shaped like quickjs.rb's log object so a host's
         # `on_log` block works with either backend.
@@ -70,12 +70,14 @@ module Dommy
 
         # Run `js` in global scope for its side effects; the completion value is
         # not converted (a UMD bundle's last statement can be a large object).
-        # `filename` names it in its Errors' stack frames.
-        def load(js, filename: nil) = guarded { @vm.load(js, filename: filename) }
+        # `filename` names it in its Errors' stack frames. With `cache`, the
+        # compilation comes from zipp-rb's process-wide compile cache.
+        def load(js, filename: nil, cache: false) = guarded { @vm.load(js, filename: filename, cache: cache) }
 
         # The cache key names the bundle's frames (`host_runtime.js`), which is
-        # how a host tells the bridge's own frames from the page's.
-        def run_bundle(cache_key, source) = load(source, filename: cache_key.to_s)
+        # how a host tells the bridge's own frames from the page's. The compile
+        # cache itself is keyed by the source.
+        def run_bundle(cache_key, source) = load(source, filename: cache_key.to_s, cache: true)
 
         # Run `body` as an async function body, awaiting its result for at most
         # `max_ms`.

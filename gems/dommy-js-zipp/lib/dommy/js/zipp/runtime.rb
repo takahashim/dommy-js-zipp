@@ -107,10 +107,11 @@ module Dommy
           in_page_turn { @backend.load(js) }
         end
 
-        # Zipp has no bytecode cache; an external script is parsed each time.
-        # `cache_key` is its URL, which its Errors' stack frames report.
+        # An external script, compiled once per process for every Runtime that
+        # loads the same source (zipp-rb's compile cache). `cache_key` is its
+        # URL, which its Errors' stack frames report.
         def load_script_cached(js, cache_key: nil)
-          in_page_turn { @backend.load(js, filename: cache_key) }
+          in_page_turn { @backend.load(js, filename: cache_key, cache: true) }
         end
 
         # Install the ESM module resolver: a callable `(specifier, importer) ->

@@ -45,6 +45,13 @@ runs `<script>`: top-level declarations (strict code's included, and
 `filename:`, which an Error's `stack` (and the
 backtrace of a `ZippRb::Error`) reports as the script of its frames.
 
+`VM#load(src, cache: true)` compiles `src` once per process and runs that
+compilation in every VM that loads the same source, on any thread; each VM
+still gets globals of its own. Use it for scripts every VM loads (a bridge
+runtime, a framework bundle). `ZippRb.precompile(src)` fills the cache without
+a VM (before forking workers, so they share it); `ZippRb.compile_cache_stats`
+reports it. The cache is keyed by source and bounded by total source bytes.
+
 Other API: `VM#load` (run for side effects), `#eval_async` (top-level
 `await`; with `features: [ZippRb::FEATURE_TIMEOUT]` for timers), `#invoke`
 (`#call` that leaves microtasks for `#drain_jobs!`), `#handle`,

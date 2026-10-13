@@ -3241,6 +3241,7 @@ mod builtins;
 pub(crate) mod clock;
 mod dispatch;
 mod engine;
+pub(crate) use engine::compile_host_script;
 mod error_stack;
 mod local_time;
 pub(crate) use local_time::gmt_offset;
