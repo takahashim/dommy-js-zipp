@@ -8,11 +8,11 @@ Gem::Specification.new do |spec|
   spec.authors = ["takahashim"]
   spec.email = ["takahashimm@gmail.com"]
 
-  spec.summary = "Ruby binding for the Zipp JavaScript engine (prototype)."
+  spec.summary = "Ruby binding for the Zipp JavaScript engine."
   spec.description = <<~DESC
     zipp-rb embeds the Zipp JavaScript engine (a from-scratch Rust engine) in Ruby
-    via a Magnus/Rust native extension. This is a Phase-0/1 prototype exploring a
-    Rust glue layer as an alternative to the QuickJS-based quickjs.rb.
+    through a Magnus/rb-sys native extension. The engine is built from source with
+    the gem. Its API follows quickjs.rb where the two overlap.
   DESC
   spec.homepage = "https://github.com/takahashim/dommy-js-zipp/tree/main/gems/zipp-rb"
   spec.metadata["source_code_uri"] = spec.homepage
