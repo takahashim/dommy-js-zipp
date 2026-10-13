@@ -20,7 +20,19 @@ gems/zipp-rb/
     LOCAL_CHANGES.md      # what differs from upstream, and why
     Cargo.toml            # workspace root for the vendored crates (ours)
   ext/zipp_rb/            # the Rust extension (path-depends on engine/)
-  lib/                    # Ruby API (ZippRb::VM, ZippRb::Handle)
+    src/lib.rs            # `init`: Ruby classes and the `_xxx` entry points
+    src/registry.rs       # VM registry, `Entry` (every host entry), lifecycle
+    src/nogvl.rs          # GVL release, interrupt delivery
+    src/errors.rs         # JS errors -> Ruby; callback exceptions -> re-raise
+    src/convert.rs        # HostValue <-> Ruby values
+    src/evaluate.rs       # eval / load / call / gc / memory_usage
+    src/callbacks.rs      # define_function, listeners, same-VM re-entry
+    src/event_loop.rs     # timers, eval_async, import, drain_jobs
+    src/handles.rs        # durable JS handles held by Ruby
+    src/limits.rs         # step / heap / deadline limits, interruption
+    src/modules.rs        # in-memory ES module provider
+  lib/zipp_rb.rb          # ZippRb module, errors, constants
+  lib/zipp_rb/{vm,handle}.rb  # ZippRb::VM, ZippRb::Handle
   test/                   # minitest
   benchmarks/             # Ruby benchmarks + compile_bench (Rust)
 notes/                    # local design notes; git-ignored, not shipped
