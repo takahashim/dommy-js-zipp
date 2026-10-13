@@ -2,8 +2,16 @@
 
 source "https://rubygems.org"
 
-gemspec
+# Every gem of this monorepo resolves from its local path, so a change in one
+# is seen by the others without a release.
+gem "zipp-rb", path: "gems/zipp-rb"
 
+# Shared dev tooling.
 gem "minitest"
 gem "rake"
 gem "rake-compiler"
+
+# gems/zipp-rb/benchmarks compare against quickjs.rb.
+group :benchmark, optional: true do
+  gem "quickjs", "~> 0.22.0"
+end
