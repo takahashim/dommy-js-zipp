@@ -26,6 +26,7 @@ gems/zipp-rb/
     src/errors.rs         # JS errors -> Ruby; callback exceptions -> re-raise
     src/convert.rs        # HostValue <-> Ruby values
     src/evaluate.rs       # eval / load / call / gc / memory_usage
+    src/compile_cache.rs  # process-wide compiled-script cache (load cache: true)
     src/callbacks.rs      # define_function, listeners, same-VM re-entry
     src/event_loop.rs     # timers, eval_async, import, drain_jobs
     src/handles.rs        # durable JS handles held by Ruby
@@ -66,7 +67,9 @@ dommy-js-zipp resolves `dommy` from a sibling checkout of the dommy monorepo
 is why `Gemfile.lock` is not tracked. CI (`.github/workflows/test.yml`) runs
 `bundle exec rake` on Ruby 3.2–4.0 and `rake engine:test`, on x86_64 Linux;
 note the engine's x86_64 JIT is code a local Apple Silicon build never
-compiles.
+compiles. The extension builds the engine's `safe-sandbox` profile (no JIT, no
+`unsafe` in the engine); `rake engine:test` runs that feature set and
+upstream's default.
 
 The first compile builds the engine in release mode (about a minute); later
 ones are incremental. `rake test` does not rebuild: run `rake compile` after a

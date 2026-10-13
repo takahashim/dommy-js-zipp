@@ -55,9 +55,14 @@ module ZippRb
     # Evaluate +src+ for its side effects, discarding the completion value.
     # Prefer this to #eval when a script's last expression is a large object
     # (loading a bundle): the completion value is not marshalled into Ruby.
-    def load(src, filename: nil)
+    #
+    # With +cache: true+ the script is compiled once per process and the
+    # compilation reused by every VM that loads the same source (see
+    # ZippRb.precompile): for scripts every VM loads, such as a bridge runtime
+    # or a framework bundle. Each VM still runs it with globals of its own.
+    def load(src, filename: nil, cache: false)
       check_usable!
-      with_script_name(filename) { ZippRb._load(@id, src) }
+      with_script_name(filename) { ZippRb._load(@id, src, cache) }
       nil
     end
 

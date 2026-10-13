@@ -742,9 +742,15 @@ impl<'p> Vm<'p> {
     /// itself). Returns the completion value.
     pub(crate) fn host_run_script(&mut self, code: &str) -> Result<Value, Thrown> {
         self.require_external_code_enabled()?;
-        let ast = crate::front::parse_script(code).map_err(Thrown)?;
-        let prog = crate::compile::compile_script_with_completion(&ast, code)
-            .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
+        let prog = compile_host_script(code).map_err(Thrown)?;
+        self.host_run_compiled(prog)
+    }
+
+    /// Run a classic script [`compile_host_script`] compiled, possibly for
+    /// another VM: the program holds nothing VM-specific until
+    /// `prepare_eval_program` installs it.
+    pub(crate) fn host_run_compiled(&mut self, prog: crate::bytecode::Program) -> Result<Value, Thrown> {
+        self.require_external_code_enabled()?;
         self.eval_script_gdi = true;
         let (completion, _gmap) = self.run_eval_program(
             prog,
@@ -795,6 +801,13 @@ impl<'p> Vm<'p> {
         )?;
         Ok((completion, gmap))
     }
+}
+
+/// Parse and compile `code` as a classic script with its completion value,
+/// the program [`Vm::host_run_compiled`] runs. Needs no VM.
+pub(crate) fn compile_host_script(code: &str) -> Result<crate::bytecode::Program, String> {
+    let ast = crate::front::parse_script(code)?;
+    crate::compile::compile_script_with_completion(&ast, code).map_err(|e| format!("SyntaxError: {e}"))
 }
 
 #[cfg(test)]

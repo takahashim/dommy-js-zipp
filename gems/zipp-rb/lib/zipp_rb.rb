@@ -39,6 +39,15 @@ module ZippRb
   # Feature flag: provide setTimeout/setInterval (mirrors Quickjs::FEATURE_TIMEOUT).
   FEATURE_TIMEOUT = :feature_timeout
 
+  # The process-wide compile cache behind VM#load's +cache: true+ (native):
+  #
+  #   ZippRb.precompile(src)     # compile +src+ into the cache without a VM;
+  #                              # false when it does not compile. Call it
+  #                              # before forking so workers share the result.
+  #   ZippRb.compile_cache_stats # {entries:, bytes:, hits:, misses:}
+  #
+  # Entries are keyed by source and bounded by total source bytes.
+
   # Evaluate +code+ on a fresh VM and return the completion value, disposing the
   # VM afterwards (quickjs.rb's `Quickjs.eval_code`). +opts+ are the VM options.
   def self.eval_code(code, **opts)

@@ -34,12 +34,23 @@ vm.dispose
   replaced by U+FFFD.
 - A VM belongs to the thread that created it. A VM without Ruby callbacks
   releases the GVL while it runs.
+- The engine is built without `unsafe` code (its `safe-sandbox` profile, no
+  JIT): an engine bug is a panic, after which that VM is discarded
+  (`VM#poisoned?`), not memory corruption. A `SharedArrayBuffer` is local to
+  its VM.
 
 `VM#eval` and `#load` run their source as a classic script, as a browser
 runs `<script>`: top-level declarations (strict code's included, and
 `let`/`const`/`class`) are global and visible to later evaluations. They take
 `filename:`, which an Error's `stack` (and the
 backtrace of a `ZippRb::Error`) reports as the script of its frames.
+
+`VM#load(src, cache: true)` compiles `src` once per process and runs that
+compilation in every VM that loads the same source, on any thread; each VM
+still gets globals of its own. Use it for scripts every VM loads (a bridge
+runtime, a framework bundle). `ZippRb.precompile(src)` fills the cache without
+a VM (before forking workers, so they share it); `ZippRb.compile_cache_stats`
+reports it. The cache is keyed by source and bounded by total source bytes.
 
 Other API: `VM#load` (run for side effects), `#eval_async` (top-level
 `await`; with `features: [ZippRb::FEATURE_TIMEOUT]` for timers), `#invoke`

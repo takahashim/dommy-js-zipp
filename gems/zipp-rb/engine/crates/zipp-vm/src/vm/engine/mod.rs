@@ -44,6 +44,7 @@ fn jit_module_functions_enabled() -> bool {
 // submodules (split out of the former monolithic engine.rs)
 mod boot;
 mod eval_prog;
+pub(crate) use eval_prog::compile_host_script;
 mod jit_calls;
 mod jit_frame;
 mod jit_plans;

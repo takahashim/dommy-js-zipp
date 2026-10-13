@@ -632,10 +632,29 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "instrument")]
         self.instrument_preflight_heap_growth(capacity)
             .map_err(|message| Thrown(message.into()))?;
-        let mem = crate::heap::SharedMem::try_new(byte_len, capacity)
-            .map_err(|_| Thrown::from_static("RangeError: SharedArrayBuffer allocation failed"))?;
+        #[cfg(not(feature = "safe-sandbox"))]
+        let data = {
+            let mem = crate::heap::SharedMem::try_new(byte_len, capacity).map_err(|_| {
+                Thrown::from_static("RangeError: SharedArrayBuffer allocation failed")
+            })?;
+            crate::heap::AbData::Shared(std::sync::Arc::new(mem))
+        };
+        // The safe profile has no truly-shared bytes (they need `unsafe`), so
+        // a SharedArrayBuffer keeps agent-local bytes. With one agent — no
+        // `$262.agent` workers — nothing can tell: the brand (`shared_buffers`),
+        // growth (`ab_max`, `grow_bytes`) and Atomics all work on them, and a
+        // waiter can only time out, as no other agent can notify it.
+        #[cfg(feature = "safe-sandbox")]
+        let data = {
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(capacity).map_err(|_| {
+                Thrown::from_static("RangeError: SharedArrayBuffer allocation failed")
+            })?;
+            bytes.resize(byte_len, 0u8);
+            crate::heap::AbData::Local(bytes)
+        };
         let idx = self.heap.alloc(HeapObj::ArrayBuffer {
-            data: crate::heap::AbData::Shared(std::sync::Arc::new(mem)),
+            data,
             detached: false,
         });
         self.shared_buffers.insert(idx);

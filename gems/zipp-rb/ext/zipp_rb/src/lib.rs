@@ -48,6 +48,7 @@ mod handles;
 mod callbacks;
 mod modules;
 mod evaluate;
+mod compile_cache;
 
 use nogvl::*;
 use registry::*;
@@ -59,6 +60,7 @@ use handles::*;
 use callbacks::*;
 use modules::*;
 use evaluate::*;
+use compile_cache::*;
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -92,7 +94,9 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_create", function!(create, 0))?;
     module.define_singleton_method("_configure_limits", function!(configure_limits, 4))?;
     module.define_singleton_method("_eval", function!(eval, 2))?;
-    module.define_singleton_method("_load", function!(load, 2))?;
+    module.define_singleton_method("_load", function!(load, 3))?;
+    module.define_singleton_method("precompile", function!(precompile, 1))?;
+    module.define_singleton_method("compile_cache_stats", function!(compile_cache_stats, 0))?;
     module.define_singleton_method("_call", function!(call, 4))?;
     module.define_singleton_method("_set_script_name", function!(set_script_name, 2))?;
     module.define_singleton_method("_set_time_zone", function!(set_time_zone, 2))?;

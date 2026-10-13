@@ -58,8 +58,9 @@ pub(crate) fn memory_usage(ruby: &Ruby, id: u64) -> Result<RHash, Error> {
 /// Evaluate `src` for its side effects, discarding the completion value. Much
 /// cheaper than `eval` when a script's last expression is a large object (a
 /// UMD factory's return value, say): `eval` marshals that value into Ruby,
-/// whereas this does not convert it at all.
-pub(crate) fn load(ruby: &Ruby, id: u64, src: String) -> Result<(), Error> {
+/// whereas this does not convert it at all. With `cache`, the compiled script
+/// comes from (or goes into) the process-wide compile cache.
+pub(crate) fn load(ruby: &Ruby, id: u64, src: String, cache: bool) -> Result<(), Error> {
     if let Some(ptr) = active_ctx(id) {
         let ctx: &mut dyn HostCtx = unsafe { &mut *ptr };
         let result = ctx.eval_script(&src);
@@ -67,7 +68,10 @@ pub(crate) fn load(ruby: &Ruby, id: u64, src: String) -> Result<(), Error> {
     }
     with_entry(ruby, id, |entry| {
         entry
-            .run_nogvl(ruby, |s| s.load_in_context(&src))?
+            .run_nogvl(ruby, |s| match cache.then(|| compiled(&src)).flatten() {
+                Some(script) => s.load_compiled(&script),
+                None => s.load_in_context(&src),
+            })?
             .map_err(|e| js_error(ruby, id, &e))
     })
 }
