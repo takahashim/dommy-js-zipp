@@ -5740,7 +5740,7 @@ impl<'p> Vm<'p> {
             DATE_NOW => Value::num(crate::vm::clock::now_epoch_ms()),
             DATE_PARSE => {
                 let source = self.to_js_string(a0)?;
-                Value::num(parse_date(&source))
+                Value::num(parse_date(&source, &|t| self.local_to_utc_ms(t)))
             }
             DATE_UTC => Value::num(self.date_utc_ms(args)?),
             STR_RAW => {

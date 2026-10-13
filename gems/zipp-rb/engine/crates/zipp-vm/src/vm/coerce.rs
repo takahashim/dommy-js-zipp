@@ -1286,7 +1286,8 @@ impl<'p> Vm<'p> {
                     match self.heap.as_callable(v.heap_index()) {
                         Some((fid, _)) => {
                             let fp = self.func(fid as usize);
-                            !(fp.is_generator || fp.is_async || fp.non_constructable)
+                            // An arrow (`lexical_this`) has no [[Construct]] either.
+                            !(fp.is_generator || fp.is_async || fp.non_constructable || fp.lexical_this)
                         }
                         None => true,
                     }
@@ -3212,7 +3213,8 @@ impl<'p> Vm<'p> {
                     out.push_str("[object Object]");
                 }
                 HeapObj::Date(ms) => {
-                    out.push_str(&date_to_string(*ms));
+                    let off = self.local_offset_ms(*ms);
+                    out.push_str(&date_to_string(*ms + off, off));
                 }
             };
             let popped = out.active.pop();

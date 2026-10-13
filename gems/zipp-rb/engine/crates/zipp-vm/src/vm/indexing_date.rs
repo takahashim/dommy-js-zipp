@@ -1192,7 +1192,7 @@ impl<'p> Vm<'p> {
                     )
                 {
                     let s = self.heap.str_cow(prim.heap_index()).unwrap().into_owned();
-                    return Ok(parse_date(&s));
+                    return Ok(parse_date(&s, &|t| self.local_to_utc_ms(t)));
                 }
                 Ok(time_clip(self.to_number_strict(prim)?))
             }
@@ -1200,8 +1200,10 @@ impl<'p> Vm<'p> {
                 let comp = self.date_components(args)?;
                 Ok(match comp {
                     Some(mut c) => {
+                        // The components are LOCAL time: UTC(MakeDate(…)).
                         c[0] = legacy_year_f64(c[0]);
-                        time_clip(ms_from_utc_f64(c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
+                        let local = ms_from_utc_f64(c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+                        time_clip(self.local_to_utc_ms(local))
                     }
                     None => f64::NAN,
                 })
@@ -1245,8 +1247,10 @@ impl<'p> Vm<'p> {
         })
     }
 
-    /// Dispatch a method on a `Date` receiver (`idx` is its heap index). All
-    /// getters/setters are UTC. Returns `Ok(None)` if `name` isn't a Date method.
+    /// Dispatch a method on a `Date` receiver (`idx` is its heap index). The
+    /// local getters/setters work in the VM's local time zone (`local_time.rs`;
+    /// UTC unless a host set one). Returns `Ok(None)` if `name` isn't a Date
+    /// method.
     pub(crate) fn date_method(
         &mut self,
         idx: u32,
@@ -1261,6 +1265,10 @@ impl<'p> Vm<'p> {
             _ => return Err(Thrown::from_static("TypeError: this is not a Date object")),
         };
         let p = date_parts(ms); // (year, month0, day, hour, min, sec, ms, weekday)
+        // The same, in local time: LocalTime(t) = t + the offset in force at t.
+        let off = self.local_offset_ms(ms);
+        let local_ms = ms + off;
+        let pl = date_parts(local_ms);
         let field = |v: i64| {
             if ms.is_nan() {
                 Value::num(f64::NAN)
@@ -1279,15 +1287,24 @@ impl<'p> Vm<'p> {
                 }
                 return Ok(Some(self.make_instant((ms as i128) * 1_000_000)?));
             }
-            "getFullYear" | "getUTCFullYear" => field(p.0),
-            "getMonth" | "getUTCMonth" => field(p.1),
-            "getDate" | "getUTCDate" => field(p.2),
-            "getHours" | "getUTCHours" => field(p.3),
-            "getMinutes" | "getUTCMinutes" => field(p.4),
-            "getSeconds" | "getUTCSeconds" => field(p.5),
-            "getMilliseconds" | "getUTCMilliseconds" => field(p.6),
-            "getDay" | "getUTCDay" => field(p.7),
-            "getTimezoneOffset" => Value::num(if ms.is_nan() { f64::NAN } else { 0.0 }),
+            "getFullYear" => field(pl.0),
+            "getMonth" => field(pl.1),
+            "getDate" => field(pl.2),
+            "getHours" => field(pl.3),
+            "getMinutes" => field(pl.4),
+            "getSeconds" => field(pl.5),
+            "getMilliseconds" => field(pl.6),
+            "getDay" => field(pl.7),
+            "getUTCFullYear" => field(p.0),
+            "getUTCMonth" => field(p.1),
+            "getUTCDate" => field(p.2),
+            "getUTCHours" => field(p.3),
+            "getUTCMinutes" => field(p.4),
+            "getUTCSeconds" => field(p.5),
+            "getUTCMilliseconds" => field(p.6),
+            "getUTCDay" => field(p.7),
+            // (UTC - local) in minutes: -540 in Tokyo.
+            "getTimezoneOffset" => Value::num(if ms.is_nan() { f64::NAN } else { -off / 60_000.0 }),
             "toISOString" => {
                 if ms.is_nan() {
                     return Err(Thrown::from_static("RangeError: Invalid time value"));
@@ -1315,9 +1332,9 @@ impl<'p> Vm<'p> {
                     "Invalid Date".to_owned()
                 } else {
                     match name {
-                        "toLocaleDateString" => date_to_date_string(ms),
-                        "toLocaleTimeString" => date_to_time_string(ms),
-                        _ => date_to_string(ms),
+                        "toLocaleDateString" => date_to_date_string(local_ms),
+                        "toLocaleTimeString" => date_to_time_string(local_ms, off),
+                        _ => date_to_string(local_ms, off),
                     }
                 };
                 self.alloc_str(s)
@@ -1345,24 +1362,24 @@ impl<'p> Vm<'p> {
                     self.alloc_str(s)
                 }
             }
-            // The human/RFC date string forms (the engine is UTC-only, so the
-            // local `toString`/`toTimeString` zone is always GMT+0000). toGMTString
+            // The human/RFC date string forms: `toString`/`toDateString`/
+            // `toTimeString` in local time, `toUTCString` in UTC. toGMTString
             // is a legacy (Annex B) alias of toUTCString.
             "toString" | "toUTCString" | "toGMTString" | "toDateString" | "toTimeString" => {
                 if ms.is_nan() {
                     self.alloc_str("Invalid Date".to_string())
                 } else {
                     let s = match name {
-                        "toDateString" => date_to_date_string(ms),
-                        "toTimeString" => date_to_time_string(ms),
+                        "toDateString" => date_to_date_string(local_ms),
+                        "toTimeString" => date_to_time_string(local_ms, off),
                         "toUTCString" | "toGMTString" => date_to_utc_string(ms),
-                        _ => date_to_string(ms),
+                        _ => date_to_string(local_ms, off),
                     };
                     self.alloc_str(s)
                 }
             }
             // Legacy (Annex B): getYear = full year - 1900; setYear maps 0..99 to 19xx.
-            "getYear" => field(p.0 - 1900),
+            "getYear" => field(pl.0 - 1900),
             "setYear" => {
                 let y = match args.first() {
                     Some(&v) => self.to_number_strict(v)?,
@@ -1380,7 +1397,7 @@ impl<'p> Vm<'p> {
                     } else {
                         yi
                     };
-                    self.date_set(idx, &p, &[Value::num(full as f64)], 0)?
+                    self.date_set(idx, &pl, &[Value::num(full as f64)], 0, true)?
                 }
             }
             "setTime" => {
@@ -1393,13 +1410,20 @@ impl<'p> Vm<'p> {
                 }
                 Value::num(n)
             }
-            "setFullYear" | "setUTCFullYear" => self.date_set(idx, &p, args, 0)?,
-            "setMonth" | "setUTCMonth" => self.date_set(idx, &p, args, 1)?,
-            "setDate" | "setUTCDate" => self.date_set(idx, &p, args, 2)?,
-            "setHours" | "setUTCHours" => self.date_set(idx, &p, args, 3)?,
-            "setMinutes" | "setUTCMinutes" => self.date_set(idx, &p, args, 4)?,
-            "setSeconds" | "setUTCSeconds" => self.date_set(idx, &p, args, 5)?,
-            "setMilliseconds" | "setUTCMilliseconds" => self.date_set(idx, &p, args, 6)?,
+            "setFullYear" => self.date_set(idx, &pl, args, 0, true)?,
+            "setMonth" => self.date_set(idx, &pl, args, 1, true)?,
+            "setDate" => self.date_set(idx, &pl, args, 2, true)?,
+            "setHours" => self.date_set(idx, &pl, args, 3, true)?,
+            "setMinutes" => self.date_set(idx, &pl, args, 4, true)?,
+            "setSeconds" => self.date_set(idx, &pl, args, 5, true)?,
+            "setMilliseconds" => self.date_set(idx, &pl, args, 6, true)?,
+            "setUTCFullYear" => self.date_set(idx, &p, args, 0, false)?,
+            "setUTCMonth" => self.date_set(idx, &p, args, 1, false)?,
+            "setUTCDate" => self.date_set(idx, &p, args, 2, false)?,
+            "setUTCHours" => self.date_set(idx, &p, args, 3, false)?,
+            "setUTCMinutes" => self.date_set(idx, &p, args, 4, false)?,
+            "setUTCSeconds" => self.date_set(idx, &p, args, 5, false)?,
+            "setUTCMilliseconds" => self.date_set(idx, &p, args, 6, false)?,
             _ => return Ok(None),
         };
         Ok(Some(r))
@@ -1407,12 +1431,16 @@ impl<'p> Vm<'p> {
 
     /// A Date setter starting at component `start` (0=year … 6=ms): overwrite that
     /// field and the following ones from `args`, recompute, store, return the new ms.
+    /// `p` are the current components in local time when `local` (a `setHours`)
+    /// and in UTC otherwise (a `setUTCHours`); the result is converted back with
+    /// UTC(t) in the first case.
     pub(crate) fn date_set(
         &mut self,
         idx: u32,
         p: &(i64, i64, i64, i64, i64, i64, i64, i64),
         args: &[Value],
         start: usize,
+        local: bool,
     ) -> Result<Value, Thrown> {
         let orig_ms = match self.heap.get(idx) {
             HeapObj::Date(m) => *m,
@@ -1458,14 +1486,15 @@ impl<'p> Vm<'p> {
         if orig_ms.is_nan() && start != 0 {
             return Ok(Value::num(f64::NAN));
         }
-        let ms = match wide {
-            Some(t) => time_clip(t),
+        let t = match wide {
+            Some(t) => t,
             None if any_nan => f64::NAN,
             None => {
                 let [y, mo, d, h, mi, sec, ms] = comp;
-                time_clip(ms_from_utc(y, mo, d, h, mi, sec, ms))
+                ms_from_utc(y, mo, d, h, mi, sec, ms)
             }
         };
+        let ms = time_clip(if local { self.local_to_utc_ms(t) } else { t });
         if let HeapObj::Date(m) = self.heap.get_mut(idx) {
             *m = ms;
         }

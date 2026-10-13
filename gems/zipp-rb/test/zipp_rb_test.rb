@@ -223,6 +223,15 @@ class ZippRbTest < Minitest::Test
     assert_equal [["unhandledrejection", true, true], ["rejectionhandled", true, true]], vm.eval("events")
   end
 
+  # A Ruby string that is not valid UTF-8 crosses with each invalid sequence
+  # as U+FFFD (quickjs.rb's behaviour), not as an empty string.
+  def test_invalid_utf8_becomes_replacement_characters
+    vm = ZippRb::VM.new
+    vm.define_function("binary") { "\xFFa".b }
+    vm.define_function("broken") { "ok\xE3\x81".dup.force_encoding("UTF-8") }
+    assert_equal ["\uFFFDa", 2, "ok\uFFFD"], vm.eval("[binary(), binary().length, broken()]")
+  end
+
   def test_drain_jobs_runs_promise_callbacks
     vm = ZippRb::VM.new
     vm.eval("globalThis.__v = 0; Promise.resolve().then(() => { globalThis.__v = 42; });")

@@ -753,7 +753,19 @@ impl<'a> FnCompiler<'a> {
                 // statement, not at the store. Lexical leaves also register
                 // like their simple-identifier siblings (const immutability,
                 // module per-module slots, script-GDI bookkeeping).
-                if self.is_script && self.cx.script_binds_globals && !block_local {
+                // A global `const`'s leaves are extracted into locals and each
+                // slot written once at the end (see below): a script's const
+                // slot accepts exactly one write, the one that ends its TDZ, so
+                // pre-initializing it to undefined here would make the
+                // extraction's write the second.
+                // (Not in an eval whose lexicals are its own locals: there the
+                // leaves are registers, initialized by the extraction itself.)
+                let global_const = is_const
+                    && self.is_script
+                    && self.cx.script_binds_globals
+                    && !self.cx.eval_locals
+                    && !block_local;
+                if self.is_script && self.cx.script_binds_globals && !block_local && !global_const {
                     let mut leaves = std::collections::HashSet::new();
                     capture::collect_pattern_names(&decl.id, &mut leaves);
                     let undef = self.alloc_reg();
@@ -796,7 +808,37 @@ impl<'a> FnCompiler<'a> {
                 if sv != src {
                     self.emit(Instr::Move { dst: src, src: sv });
                 }
-                self.extract_pattern(&decl.id, src)?;
+                if global_const {
+                    let mut leaves = std::collections::HashSet::new();
+                    capture::collect_pattern_names(&decl.id, &mut leaves);
+                    let leaves = sorted_name_vec(&leaves);
+                    self.push_scope();
+                    let regs: Vec<Reg> = leaves.iter().map(|n| self.declare_local(n)).collect();
+                    let extracted = self.extract_pattern(&decl.id, src);
+                    // Read each leaf out of its (possibly boxed) local before
+                    // the scope goes, then initialize the global slot once.
+                    let values: Vec<Reg> = regs
+                        .iter()
+                        .map(|&r| {
+                            if self.cell_regs.contains(&r) {
+                                let t = self.alloc_reg();
+                                self.emit(Instr::CellGet { dst: t, cell: r });
+                                t
+                            } else {
+                                r
+                            }
+                        })
+                        .collect();
+                    self.pop_scope();
+                    extracted?;
+                    for (n, v) in leaves.iter().zip(values) {
+                        let slot = self.cx.global_slot(n) as u32;
+                        self.cx.lexical_globals.insert(slot);
+                        self.emit(Instr::StoreGlobal { idx: slot, src: v });
+                    }
+                } else {
+                    self.extract_pattern(&decl.id, src)?;
+                }
                 // `const {a} = o` / `const [a] = xs`: the leaves are immutable
                 // too. Recorded only NOW — the extraction above stores through
                 // `store_binding`, which would reject its own initialization —

@@ -143,6 +143,23 @@ impl<'a> FnCompiler<'a> {
         self.store_binding_ex(b, src, true)
     }
 
+    /// Throw a TypeError carrying `message` (V8's wording for the case).
+    fn emit_type_error(&mut self, message: &str) {
+        let m = self.alloc_reg();
+        let idx = self.add_string_const(message);
+        self.emit(Instr::LoadConst { dst: m, idx });
+        let e = self.alloc_reg();
+        self.emit(Instr::NewError {
+            dst: e,
+            kind: 1,
+            arg: Some(m),
+            opts: None,
+            errors: None,
+        });
+        self.emit(Instr::Throw { src: e });
+        self.dec_next_reg(2);
+    }
+
     pub(crate) fn store_binding_ex(&mut self, b: &Binding, src: Reg, read_first: bool) {
         // A named function expression's own name is an immutable binding: assigning
         // to it inside the body throws a TypeError in strict mode and is a silent
@@ -151,16 +168,7 @@ impl<'a> FnCompiler<'a> {
         if let Binding::Local(r) | Binding::LocalCell(r) = b {
             if self.is_self_name_reg(*r) {
                 if self.cx.in_strict {
-                    let e = self.alloc_reg();
-                    self.emit(Instr::NewError {
-                        dst: e,
-                        kind: 1,
-                        arg: None,
-                        opts: None,
-                        errors: None,
-                    });
-                    self.emit(Instr::Throw { src: e });
-                    self.dec_next_reg(1);
+                    self.emit_type_error("Assignment to constant variable.");
                 }
                 return;
             }
@@ -190,16 +198,7 @@ impl<'a> FnCompiler<'a> {
                     self.dec_next_reg(1);
                 }
             }
-            let e = self.alloc_reg();
-            self.emit(Instr::NewError {
-                dst: e,
-                kind: 1,
-                arg: None,
-                opts: None,
-                errors: None,
-            });
-            self.emit(Instr::Throw { src: e });
-            self.dec_next_reg(1);
+            self.emit_type_error("Assignment to constant variable.");
             return;
         }
         match b {

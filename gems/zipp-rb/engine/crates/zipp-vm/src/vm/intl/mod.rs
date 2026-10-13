@@ -300,7 +300,8 @@ impl<'p> Vm<'p> {
                     self.get_prop(options, "timeZone")?
                 };
                 let tz = if tz_v == Value::UNDEFINED {
-                    "UTC".to_string()
+                    // DefaultTimeZone: the VM's local zone (UTC unless set).
+                    self.local_time_zone_id()
                 } else {
                     let s = self.to_js_string(tz_v)?;
                     self.preflight_native_iteration_work(s.len() as u64)?;

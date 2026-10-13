@@ -48,6 +48,14 @@ candidate to propose upstream.
   (`host_call_global_structured_opts`): a call that leaves the microtasks it
   queued for the host's next `run_microtasks`, for a host with its own
   checkpoints. zipp-rb's `VM#invoke`.
+- **Local time zone** — `Vm::local_tz` and vm/local_time.rs
+  (`set_local_time_zone`, `local_offset_ms`, `local_to_utc_ms`, over
+  temporal/tzdb.rs), `ScriptState::set_time_zone`. `Date`'s local getters,
+  setters, `new Date(y, m, …)`, zoneless `Date.parse` forms
+  (vm/helpers_num2.rs `parse_date` takes the conversion) and `toString` forms
+  (vm/indexing_date.rs, coerce.rs) work in it, and Intl's DefaultTimeZone
+  (vm/intl/mod.rs) is it. Unset, local time is UTC, as before. Test:
+  `test/time_zone_test.rb`.
 - **Console levels** — `ConsoleLevel`, `ScriptState::set_console_level_sink`
   (vm/mod.rs `push_console_line_at`, vm/natives.rs `CONSOLE_*`, vm/engine/boot.rs):
   a sink told which `console` method produced a line, since `warn` and
@@ -102,6 +110,30 @@ candidate to propose upstream.
 
 ## Correctness (crates/zipp-vm/src)
 
+- **A top-level `const` destructuring initializes its globals** —
+  `var_decl` (compile/decls.rs) pre-initialized a script's destructured
+  leaves to undefined (strict stores need the TDZ over), which made the
+  extraction a const's second write under script GDI (`const {a} = o` threw
+  "Assignment to constant variable"). A global const's leaves are now
+  extracted into locals and each slot written once. A const reassignment's
+  TypeError also carries V8's message (compile/bindings.rs). Test:
+  `test/engine_fixes_test.rb`.
+- **A derived class leaves `newTarget.prototype` to its base** — class
+  construction (vm/construct/construct.rs) pre-makes the instance and read
+  `newTarget.prototype` for it even for a derived class, whose [[Construct]]
+  creates nothing; with a Proxy base whose construct trap makes the object
+  (dommy's HTMLElement), the read was a second, observable Get. The Get is
+  now deferred (`deferred_instance_protos`, rooted and pruned in vm/gc.rs)
+  to the base that adopts the instance (`apply_deferred_instance_proto`,
+  vm/construct/inherit.rs `run_class_ctor`) and dropped for a Proxy base.
+  Test: `test/engine_fixes_test.rb`.
+- **A typed array's indices are own properties** — `has_own_property`
+  (vm/construct/iterate.rs) had no TypedArray arm, so `u8.hasOwnProperty(0)`
+  was false. Test: `test/engine_fixes_test.rb`.
+- **A Proxy is constructible only when its target is** — the Proxy
+  `[[Construct]]` path (vm/construct/construct.rs) ran the trap for any
+  target, and `is_constructor` (vm/coerce.rs) counted an arrow as one. Test:
+  `test/engine_fixes_test.rb`.
 - **A host runs classic scripts, not evals** — `Vm::host_run_script`
   (vm/engine/eval_prog.rs, with `compile_script_with_completion` /
   `Compiler::script_completion` in compile/) runs a script with script

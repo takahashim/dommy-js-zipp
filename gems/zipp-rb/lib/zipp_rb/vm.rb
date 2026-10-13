@@ -21,7 +21,9 @@ module ZippRb
     #   memory_limit:  heap ceiling in bytes
     #   step_limit:    instruction budget per evaluation
     #   features:      [:feature_timeout] enables setTimeout/setInterval
-    def initialize(timeout_msec: nil, memory_limit: nil, step_limit: nil, features: [])
+    #   time_zone:     the IANA zone `Date` works in ("Asia/Tokyo"; see
+    #                  #time_zone=). UTC when omitted.
+    def initialize(timeout_msec: nil, memory_limit: nil, step_limit: nil, features: [], time_zone: nil)
       @id = ZippRb._create
       @thread = Thread.current
       @disposed = false
@@ -30,6 +32,16 @@ module ZippRb
         ZippRb._configure_limits(@id, step_limit, memory_limit, timeout_msec)
       end
       ZippRb._enable_timers(@id) if features.include?(FEATURE_TIMEOUT)
+      self.time_zone = time_zone if time_zone
+    end
+
+    # Set the local time zone `Date` (and Intl's default time zone) works in to
+    # the IANA zone +zone+ (`"Asia/Tokyo"`), nil for UTC — the default, which
+    # keeps a script's results independent of the host. Daylight saving time
+    # follows the tz database. An unknown zone raises ArgumentError.
+    def time_zone=(zone)
+      check_usable!
+      ZippRb._set_time_zone(@id, zone&.to_s)
     end
 
     # Evaluate +src+ in the VM's global context and return the completion value.

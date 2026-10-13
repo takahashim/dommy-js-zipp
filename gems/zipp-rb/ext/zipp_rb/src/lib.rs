@@ -95,6 +95,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_load", function!(load, 2))?;
     module.define_singleton_method("_call", function!(call, 4))?;
     module.define_singleton_method("_set_script_name", function!(set_script_name, 2))?;
+    module.define_singleton_method("_set_time_zone", function!(set_time_zone, 2))?;
     module.define_singleton_method("_handle", function!(handle, 2))?;
     module.define_singleton_method("_call_handle", function!(call_handle, 3))?;
     module.define_singleton_method("_get_handle", function!(get_handle, 2))?;

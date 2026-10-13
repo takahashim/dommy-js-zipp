@@ -618,6 +618,17 @@ impl<'p> Vm<'p> {
                     // A legacy sloppy function OWNS `caller`/`arguments`.
                     || self.fn_has_legacy_caller_prop(obj.heap_index(), key)
             }
+            // A TypedArray's integer-indexed elements are own properties
+            // ([[GetOwnProperty]] of an integer-indexed exotic object); any other
+            // canonical numeric key is absorbed, never an own property. Named
+            // props live in arr_props, as for the other exotics.
+            HeapObj::TypedArray { .. } => {
+                let idx = obj.heap_index();
+                if self.is_canonical_numeric_index(key) {
+                    return self.ta_valid_index(idx, key).is_some();
+                }
+                self.arr_props.get(&idx).map_or(false, |m| m.pos(key).is_some())
+            }
             // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*, …)
             // keep their named own props in the arr_props side table; a boxed String
             // also owns the wrapped string's chars + `length`.

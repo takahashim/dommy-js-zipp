@@ -1841,6 +1841,12 @@ pub struct Vm<'p> {
     /// `(frame index << 32) | ip` of the instruction the interpreter is
     /// executing, written at each instruction (see `dispatch_body`).
     pub(crate) interp_pc: u64,
+    /// The tz-database zone local time is in (`local_time.rs`); `None` is UTC.
+    pub(crate) local_tz: Option<u16>,
+    /// A derived class's pre-made instance whose `prototype` Get waits for the
+    /// base that adopts it: instance heap index -> (newTarget, class). GC
+    /// roots the newTargets; pruned with the instance.
+    pub(crate) deferred_instance_protos: std::collections::HashMap<u32, (Value, u32)>,
     /// The name the host gave the code it is evaluating (a script URL), stamped
     /// on the functions it installs (`FuncProto::script`).
     pub(crate) script_name: Option<std::sync::Arc<str>>,
@@ -3236,6 +3242,8 @@ pub(crate) mod clock;
 mod dispatch;
 mod engine;
 mod error_stack;
+mod local_time;
+pub(crate) use local_time::gmt_offset;
 pub(crate) mod host_api;
 mod indexing_date;
 /// Step budget, cooperative abort, and the optional execution trace. Off by

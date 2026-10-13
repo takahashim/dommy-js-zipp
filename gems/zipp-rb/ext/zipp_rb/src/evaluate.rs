@@ -100,3 +100,13 @@ pub(crate) fn set_script_name(ruby: &Ruby, id: u64, name: Option<String>) -> Res
     }
     with_entry(ruby, id, |entry| entry.run(ruby, |s| s.set_script_name(name.as_deref())))
 }
+
+/// Set VM `id`'s local time zone to the IANA zone `zone` (nil: UTC). An
+/// unknown zone raises ArgumentError.
+pub(crate) fn set_time_zone(ruby: &Ruby, id: u64, zone: Option<String>) -> Result<(), Error> {
+    with_entry(ruby, id, |entry| {
+        entry
+            .run(ruby, |s| s.set_time_zone(zone.as_deref()))?
+            .map_err(|msg| Error::new(ruby.exception_arg_error(), msg))
+    })
+}

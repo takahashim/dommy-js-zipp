@@ -620,20 +620,22 @@ pub(crate) fn date_to_date_string(ms: f64) -> String {
     )
 }
 
-/// `Date.prototype.toTimeString`: `"00:00:00 GMT+0000"`. The engine is UTC-only, so
-/// the zone is always `GMT+0000` and the optional `(Zone Name)` suffix is omitted.
-pub(crate) fn date_to_time_string(ms: f64) -> String {
+/// `Date.prototype.toTimeString`: `"09:00:00 GMT+0900"` — the fields of the
+/// LOCAL time value `ms` and the `offset_ms` it is at. The optional
+/// `(Zone Name)` suffix is omitted (no localized zone names ship).
+pub(crate) fn date_to_time_string(ms: f64, offset_ms: f64) -> String {
     let (_, _, _, h, mi, s, _, _) = date_parts(ms);
-    format!("{:02}:{:02}:{:02} GMT+0000", h, mi, s)
+    format!("{:02}:{:02}:{:02} {}", h, mi, s, crate::vm::gmt_offset(offset_ms))
 }
 
 /// `Date.prototype.toString`: DateString + " " + TimeString + TimeZone, e.g.
-/// `"Thu Jan 01 1970 00:00:00 GMT+0000"`. `"Invalid Date"` for a NaN time.
-pub(crate) fn date_to_string(ms: f64) -> String {
+/// `"Thu Jan 01 1970 09:00:00 GMT+0900"`, for the LOCAL time value `ms` at
+/// `offset_ms`. `"Invalid Date"` for a NaN time.
+pub(crate) fn date_to_string(ms: f64, offset_ms: f64) -> String {
     if ms.is_nan() {
         return "Invalid Date".to_string();
     }
-    format!("{} {}", date_to_date_string(ms), date_to_time_string(ms))
+    format!("{} {}", date_to_date_string(ms), date_to_time_string(ms, offset_ms))
 }
 
 /// `Date.prototype.toUTCString` (and its legacy `toGMTString` alias):
@@ -667,12 +669,16 @@ pub(crate) fn date_to_utc_string(ms: f64) -> String {
 /// `parse_iso_date_time` is the strict layer; `parse_legacy_date` is the
 /// heuristic one, modelled on V8's `DateParser` (`src/date/dateparser*`) because
 /// that is the behaviour test262's staging tests were written against.
-pub(crate) fn parse_date(s: &str) -> f64 {
+///
+/// A form with no offset that the specification reads as local time — an ISO
+/// date-time, or a legacy string without a zone — goes through `local_to_utc`
+/// (UTC(t)); an ISO date-only form is UTC.
+pub(crate) fn parse_date(s: &str, local_to_utc: &dyn Fn(f64) -> f64) -> f64 {
     let s = s.trim();
-    if let Some(t) = parse_iso_date_time(s) {
+    if let Some(t) = parse_iso_date_time(s, local_to_utc) {
         return time_clip(t);
     }
-    time_clip(parse_legacy_date(s))
+    time_clip(parse_legacy_date(s, local_to_utc))
 }
 
 // ---- strict: the Date Time String Format (21.4.1.20) -----------------------
@@ -699,7 +705,7 @@ fn take_digits(b: &[u8], i: &mut usize, n: usize) -> Option<i64> {
 /// format at all, so the caller can try the legacy parser; a string that IS in
 /// this format but carries an out-of-range field returns `Some(NaN)` — it must
 /// not fall through and be re-read by the looser grammar.
-fn parse_iso_date_time(s: &str) -> Option<f64> {
+fn parse_iso_date_time(s: &str, local_to_utc: &dyn Fn(f64) -> f64) -> Option<f64> {
     let b = s.as_bytes();
     let mut i = 0usize;
     // `YYYY`, or an expanded `±YYYYYY`. A negative zero year is not a year.
@@ -769,8 +775,7 @@ fn parse_iso_date_time(s: &str) -> Option<f64> {
         }
     }
     // `Z`, or `±HH:mm`. Absent: a date-only form is UTC and a date-time is local
-    // time — identical here, since this engine's local time zone IS UTC
-    // (`getTimezoneOffset` is 0 unconditionally).
+    // time.
     let mut offset_min = 0i64;
     let mut has_zone = false;
     if i < b.len() {
@@ -818,7 +823,11 @@ fn parse_iso_date_time(s: &str) -> Option<f64> {
     {
         return Some(f64::NAN);
     }
-    Some(ms_from_utc(year, month - 1, day, h, mi, sec, ms) - offset_min as f64 * 60_000.0)
+    let t = ms_from_utc(year, month - 1, day, h, mi, sec, ms);
+    if has_time && !has_zone {
+        return Some(local_to_utc(t));
+    }
+    Some(t - offset_min as f64 * 60_000.0)
 }
 
 // ---- heuristic: the legacy forms (V8's DateParser) -------------------------
@@ -838,7 +847,7 @@ fn is_day_num(n: i64) -> bool {
 /// be one and the year otherwise; and a year of 0–49 means 20xx, 50–99 means
 /// 19xx. staging/sm/Date/two-digit-years.js asserts exactly that, across
 /// 100 × 12 × 31 dates plus 1000 written-month ones.
-fn parse_legacy_date(s: &str) -> f64 {
+fn parse_legacy_date(s: &str, local_to_utc: &dyn Fn(f64) -> f64) -> f64 {
     let b = s.as_bytes();
     let mut i = 0usize;
     // Up to three bare numbers (a fourth is a parse failure, which is what makes
@@ -1074,7 +1083,12 @@ fn parse_legacy_date(s: &str) -> f64 {
     if h > 24 || mi > 59 || sec > 59 || (h == 24 && (mi != 0 || sec != 0 || ms != 0)) {
         return f64::NAN;
     }
-    ms_from_utc(year, month - 1, day, h, mi, sec, ms) - offset_min.unwrap_or(0) as f64 * 60_000.0
+    let t = ms_from_utc(year, month - 1, day, h, mi, sec, ms);
+    match offset_min {
+        Some(off) => t - off as f64 * 60_000.0,
+        // No zone in the string: local time, as V8 reads it.
+        None => local_to_utc(t),
+    }
 }
 
 /// Read a run of ASCII digits at `i` (at least one), advancing `i`.
