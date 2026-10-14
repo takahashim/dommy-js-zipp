@@ -10,6 +10,20 @@ use super::*;
 /// its heap version + 1, 0 = no proof; `next_slot`/`next_bits` the value
 /// proven) and, when `chain_len > 0`, that no `return` is reachable from it
 /// (`chain` holds the ancestors examined and their heap versions).
+/// The last proof that a generator's `next` is %GeneratorPrototype%'s
+/// intrinsic (`Vm::gen_method_pristine`): its first prototype `first` (heap
+/// version + 1, 0 = no proof), and the object `holder` whose own data slot
+/// `slot` held the native `bits`, at version `holder_ver`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GenNextProof {
+    first: u32,
+    first_ver: u32,
+    holder: u32,
+    holder_ver: u32,
+    slot: u32,
+    bits: u64,
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct IterProtoProof {
     proto: u32,
@@ -24,6 +38,67 @@ impl<'p> Vm<'p> {
     /// `Object.assign(target, ...sources)`: copy each source's own enumerable
     /// keys (object keys, or an array's index strings) onto `target`; returns
     /// `target`. Primitive (incl. null/undefined) sources contribute nothing.
+    /// `{ ...src }` into `target`, the object literal under construction:
+    /// CopyDataProperties — each own enumerable property of `src`, in
+    /// [[OwnPropertyKeys]] order, its value read by [[Get]] (a getter runs, a
+    /// Proxy's traps fire) — with every value CREATED on the target as an own
+    /// data property (CreateDataPropertyOrThrow). It used to go through
+    /// `Object.assign`, whose [[Set]] let an inherited setter or read-only
+    /// property intercept the copy, and an own `"__proto__"` key of the
+    /// source (a `JSON.parse` result) replace the result's prototype.
+    ///
+    /// A plain source whose properties are all default data, onto an empty
+    /// literal, is copied whole (`ObjMap::spread_copy`).
+    pub(crate) fn object_spread(&mut self, target: Value, src: Value) -> Result<(), Thrown> {
+        if src.is_nullish() {
+            return Ok(());
+        }
+        let ti = target.heap_index();
+        if src.is_heap() && src.heap_index() != ti {
+            let copy = match (self.heap.get(src.heap_index()), self.heap.get(ti)) {
+                (HeapObj::Object(sm), HeapObj::Object(tm))
+                    if !sm.is_ctor
+                        && tm.keys.is_empty()
+                        && tm.extensible
+                        && tm.class.is_none()
+                        && !tm.class_proto =>
+                {
+                    sm.spread_copy()
+                }
+                _ => None,
+            };
+            if let Some(copy) = copy {
+                for &v in copy.vals_slice() {
+                    if v.is_heap() {
+                        self.heap.write_barrier_val(ti, v);
+                    }
+                }
+                if let HeapObj::Object(tm) = self.heap.get_mut(ti) {
+                    tm.assign_spread_copy(copy);
+                }
+                self.heap.bump_version(ti);
+                return Ok(());
+            }
+        }
+        // Everything else: the general CopyDataProperties (getters, proxies,
+        // strings, arrays, symbols, index order), then each property defined.
+        let m = self.with_host_roots(&[target], |vm| vm.copy_data_properties_rest(src, &[]))?;
+        let n = m.keys.len();
+        for i in 0..n {
+            let v = m.val_at(i);
+            if v.is_heap() {
+                self.heap.write_barrier_val(ti, v);
+            }
+            if let HeapObj::Object(tm) = self.heap.get_mut(ti) {
+                tm.define(&m.keys[i], v, crate::heap::PropAttr::data());
+            }
+        }
+        if n > 0 {
+            self.heap.bump_version(ti);
+        }
+        Ok(())
+    }
+
     pub(crate) fn object_assign(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // target = ToObject(arg0): a primitive boxes (so `Object.assign("x")`
@@ -77,6 +152,10 @@ impl<'p> Vm<'p> {
                 }
                 continue;
             }
+            if !string_target && self.object_assign_plain(tidx, src.heap_index()) {
+                added_any = true;
+                continue;
+            }
             // CopyDataProperties: ? from.[[OwnPropertyKeys]]() (integer, string,
             // THEN symbol — symbols INCLUDED), and per key ? [[GetOwnProperty]]
             // (skip absent / non-enumerable) then ? [[Get]]. object_own_keys +
@@ -112,6 +191,103 @@ impl<'p> Vm<'p> {
             self.heap.bump_version(tidx);
         }
         Ok(target)
+    }
+
+    /// One source of `Object.assign` that is a plain object holding only
+    /// ordinary data properties (no index key, no symbol key, no accessor),
+    /// into a plain extensible target: its own keys are its insertion order
+    /// and each Get is its slot, so the copy is each key's Set made where it
+    /// is — a store into the target's own writable data property, or the
+    /// append of a key no level of the target's chain intercepts
+    /// (`plain_add_chain_clear`); an empty target takes the source's whole
+    /// store, as an object spread does. `false`, with nothing written, for
+    /// anything else (a Proxy, a getter, a setter or a read-only property in
+    /// the way, a class instance or prototype as the target, the global, a
+    /// namespace, Object.prototype or Array.prototype): the general loop
+    /// then performs it. The general path built every key's string, read a
+    /// descriptor object for it and ran `set_prop`: a microsecond for
+    /// `Object.assign({}, {a, b})`.
+    fn object_assign_plain(&mut self, tidx: u32, sidx: u32) -> bool {
+        if sidx == tidx
+            || !assign_plain_enabled()
+            || (tidx == self.global_this && self.global_this != 0)
+            || self.is_indexed_proto_anchor(tidx)
+            || !self.realm_global_objs.is_empty()
+            || !self.deferred_ns_state.is_empty()
+            || (!self.module_namespaces.is_empty()
+                && (self.module_namespaces.contains_key(&tidx)
+                    || self.module_namespaces.contains_key(&sidx)))
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&tidx))
+        {
+            return false;
+        }
+        let keys: Vec<String> = match self.heap.get(sidx) {
+            HeapObj::Object(sm)
+                if !sm.is_ctor
+                    && !sm.has_element_key()
+                    && sm.attrs_all_data()
+                    && !sm.keys.iter().any(|k| k.starts_with("@@") || k == "__proto__") =>
+            {
+                sm.keys.iter().cloned().collect()
+            }
+            _ => return false,
+        };
+        let target_ok = matches!(
+            self.heap.get(tidx),
+            HeapObj::Object(tm)
+                if tm.extensible && tm.class.is_none() && !tm.class_proto && !tm.is_ctor
+        );
+        if !target_ok || keys.iter().any(|k| !self.plain_add_chain_clear(tidx, k)) {
+            return false;
+        }
+        // Every key's Set is now an own store or an ordinary append.
+        let own_ok = match self.heap.get(tidx) {
+            HeapObj::Object(tm) => keys.iter().all(|k| match tm.pos(k) {
+                Some(i) => {
+                    let a = tm.attr_at(i);
+                    !a.accessor && a.writable && !tm.val_at(i).is_uninitialized()
+                }
+                None => true,
+            }),
+            _ => false,
+        };
+        if !own_ok {
+            return false;
+        }
+        let target_empty = matches!(self.heap.get(tidx), HeapObj::Object(tm) if tm.keys.is_empty());
+        if target_empty {
+            let copy = match self.heap.get(sidx) {
+                HeapObj::Object(sm) => sm.spread_copy(),
+                _ => None,
+            };
+            if let Some(copy) = copy {
+                for &v in copy.vals_slice() {
+                    if v.is_heap() {
+                        self.heap.write_barrier_val(tidx, v);
+                    }
+                }
+                if let HeapObj::Object(tm) = self.heap.get_mut(tidx) {
+                    tm.assign_spread_copy(copy);
+                }
+                return true;
+            }
+        }
+        let vals: Vec<Value> = match self.heap.get(sidx) {
+            HeapObj::Object(sm) => sm.vals_slice().to_vec(),
+            _ => return false,
+        };
+        for (k, v) in keys.into_iter().zip(vals) {
+            if v.is_heap() {
+                self.heap.write_barrier_val(tidx, v);
+            }
+            if let HeapObj::Object(tm) = self.heap.get_mut(tidx) {
+                match tm.pos(&k) {
+                    Some(i) => tm.set_val_at(i, v),
+                    None => tm.push_data(k, v),
+                }
+            }
+        }
+        true
     }
 
     /// Set(to, key, value, true) — STRICT, per CopyDataProperties: a setter is
@@ -618,16 +794,18 @@ impl<'p> Vm<'p> {
                     // A legacy sloppy function OWNS `caller`/`arguments`.
                     || self.fn_has_legacy_caller_prop(obj.heap_index(), key)
             }
-            // A TypedArray's integer-indexed elements are own properties
-            // ([[GetOwnProperty]] of an integer-indexed exotic object); any other
-            // canonical numeric key is absorbed, never an own property. Named
-            // props live in arr_props, as for the other exotics.
+            // An integer-indexed exotic object: a CanonicalNumericIndexString
+            // is an own property exactly when it is a valid integer index (in
+            // range of a live buffer: "-0", "1.5" and an index past the end
+            // or on a detached buffer are not); every other key is an
+            // ordinary named property in the side table.
             HeapObj::TypedArray { .. } => {
-                let idx = obj.heap_index();
                 if self.is_canonical_numeric_index(key) {
-                    return self.ta_valid_index(idx, key).is_some();
+                    return self.ta_valid_index(obj.heap_index(), key).is_some();
                 }
-                self.arr_props.get(&idx).map_or(false, |m| m.pos(key).is_some())
+                self.arr_props
+                    .get(&obj.heap_index())
+                    .map_or(false, |m| m.pos(key).is_some())
             }
             // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*, …)
             // keep their named own props in the arr_props side table; a boxed String
@@ -934,6 +1112,102 @@ impl<'p> Vm<'p> {
         proof.chain = chain;
         proof.chain_len = len as u8;
         true
+    }
+
+    /// Whether `proto`, a built-in iterator's [[Prototype]], is one of the
+    /// four %XIteratorPrototype%s with its intrinsic `next` still in place: a
+    /// `.next()` call on such an iterator is then exactly the `ITER_NEXT`
+    /// native (`it.next()` resolves `next` through the prototype chain alone).
+    pub(crate) fn builtin_iter_next_pristine(&self, proto: u32) -> bool {
+        let slot = if proto == self.array_iter_proto {
+            0
+        } else if proto == self.set_iter_proto {
+            1
+        } else if proto == self.map_iter_proto {
+            2
+        } else if proto == self.string_iter_proto {
+            3
+        } else {
+            return false;
+        };
+        proto != 0 && self.iter_proto_pristine(slot, false)
+    }
+
+    /// Whether `g.<name>()` (`next`, `return` or `throw`) on the generator
+    /// `idx` resolves to %GeneratorPrototype%'s intrinsic: no own property of
+    /// that name, and the first object on its chain that has one — the
+    /// generator function's `prototype` object, then %GeneratorPrototype%
+    /// itself — holds the matching native as a data property. A method call
+    /// or a `for-of` step that runs the generator directly is only right
+    /// then; a replaced `next` is called (Node calls it; this did not).
+    pub(crate) fn gen_method_pristine(&self, idx: u32, name: &str) -> bool {
+        use crate::vm::native::{GEN_NEXT, GEN_RETURN, GEN_THROW};
+        let id = match name {
+            "next" => GEN_NEXT,
+            "return" => GEN_RETURN,
+            "throw" => GEN_THROW,
+            _ => return false,
+        };
+        if !self.arr_props.is_empty()
+            && self.arr_props.get(&idx).is_some_and(|m| m.pos(name).is_some())
+        {
+            return false;
+        }
+        let first = match self.proto_of.get(&idx) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            Some(_) => return false,
+            None => self.gen_proto,
+        };
+        // `next`, the per-step question, from the memo of its last proof:
+        // the first prototype and the holder unchanged (versions) and the
+        // holder's `next` still the same value (an in-place overwrite moves
+        // no version).
+        let memo = self.gen_next_memo.get();
+        if id == GEN_NEXT
+            && memo.first_ver != 0
+            && memo.first == first
+            && self.heap.version_of(first).wrapping_add(1) == memo.first_ver
+            && self.heap.version_of(memo.holder) == memo.holder_ver
+            && matches!(self.heap.get(memo.holder), HeapObj::Object(m)
+                if (memo.slot as usize) < m.vals_len() && m.val_at(memo.slot as usize).bits() == memo.bits)
+        {
+            return true;
+        }
+        let mut cur = first;
+        // The function's `prototype` object, %GeneratorPrototype%, and
+        // %Iterator.prototype% at most; anything deeper is not the default
+        // chain.
+        for depth in 0..3 {
+            let HeapObj::Object(m) = self.heap.get(cur) else {
+                return false;
+            };
+            if m.is_ctor || m.class.is_some() {
+                return false;
+            }
+            if let Some(i) = m.pos(name) {
+                let v = m.val_at(i);
+                let ok = !m.attr_at(i).accessor
+                    && v.is_heap()
+                    && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == id);
+                // A proof made within two levels names everything it read.
+                if ok && id == GEN_NEXT && depth < 2 {
+                    self.gen_next_memo.set(GenNextProof {
+                        first,
+                        first_ver: self.heap.version_of(first).wrapping_add(1),
+                        holder: cur,
+                        holder_ver: self.heap.version_of(cur),
+                        slot: i as u32,
+                        bits: v.bits(),
+                    });
+                }
+                return ok;
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                _ => return false,
+            };
+        }
+        false
     }
 
     /// For-of's [`Vm::builtin_iter_pristine`] proof for an Array receiver
@@ -1362,7 +1636,8 @@ impl<'p> Vm<'p> {
                 iter
             }
         };
-        let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. });
+        let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
+            && self.gen_method_pristine(iter.heap_index(), "next");
         let lim = max as usize;
         let mut out = Vec::new();
         let mut iter_done = false;
@@ -1798,7 +2073,10 @@ impl<'p> Vm<'p> {
     fn iterator_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
         // A generator is drained eagerly via repeated next() (spread / Array.from
         // produce a buffer; an infinite generator hangs here, matching V8).
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. }) {
+        if v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. })
+            && self.gen_method_pristine(v.heap_index(), "next")
+        {
             return self.drain_iterator_rooted(v, None);
         }
         // A user iterator object (one with a `next()` method) or a built-in
@@ -1806,7 +2084,8 @@ impl<'p> Vm<'p> {
         // %SegmentIterator% — the same reason `IterNext` carries it — because
         // without it `[...segmenter.segment(s)]` fell past this drain to the
         // positional plan below and reported the iterator "not iterable", even
-        // though `for-of` over the same object worked.
+        // though `for-of` over the same object worked. A generator whose `next`
+        // was replaced is drained through it here too.
         if v.is_heap()
             && matches!(
                 self.heap.get(v.heap_index()),
@@ -1815,6 +2094,7 @@ impl<'p> Vm<'p> {
                     | HeapObj::Iterator { .. }
                     | HeapObj::IterHelper { .. }
                     | HeapObj::Intl { .. }
+                    | HeapObj::Generator { .. }
             )
         {
             let next = self.get_prop(v, "next")?;
@@ -2321,6 +2601,22 @@ impl<'p> Vm<'p> {
                 }
             }
             k += 1;
+        }
+    }
+}
+
+/// `ZIPP_NO_ASSIGN_PLAIN=1` sends every `Object.assign` source through the
+/// general loop again (`Vm::object_assign_plain`'s same-binary A/B).
+fn assign_plain_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ASSIGN_PLAIN").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
         }
     }
 }

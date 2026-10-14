@@ -25,6 +25,26 @@ fn callvalue_flat_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_JOB_INT_WINDOW=1` makes `call_compiled_windowed` decline whenever
+/// the frame stack is empty, as it did for every body: a promise reaction's
+/// int-tier callback then takes a frame of its own again. The two sides of a
+/// one-binary A/B.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn job_int_window_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_JOB_INT_WINDOW").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 mod tier_a_module_pin_tests {
     use super::*;
@@ -220,6 +240,7 @@ impl<'p> Vm<'p> {
             arg_win: u32::MAX,
             argc: 0,
             is_eval: false,
+            construct_this: false,
             func: 0,
             base,
             ip: 0,
@@ -984,7 +1005,9 @@ impl<'p> Vm<'p> {
             ));
         }
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if let Some(r) = self.call_compiled_windowed(callee, this, args, func_id, closure) {
+        if let Some(r) =
+            self.call_compiled_windowed(callee, this, WinArgs::Slice(args), func_id, closure)
+        {
             return r;
         }
         // Copy the scalar layout fields out so the FuncProto borrow (which now
@@ -1055,6 +1078,7 @@ impl<'p> Vm<'p> {
             arg_win: u32::MAX,
             argc: 0,
             is_eval,
+            construct_this: false,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -1069,6 +1093,31 @@ impl<'p> Vm<'p> {
             return r;
         }
         self.run_loop(stop_depth)
+    }
+
+    /// Whether a constructor function's body can be run frame-free by `new`:
+    /// nothing in it can observe the frame's `new.target` (a `new.target`
+    /// read, an arrow that captures it, a direct `eval`). Scanned once per
+    /// function (`ctor_framefree`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ctor_body_framefree(&mut self, fid: u32) -> bool {
+        let f = fid as usize;
+        if let Some(&s) = self.ctor_framefree.get(f) {
+            if s != 0 {
+                return s == 1;
+            }
+        }
+        let ok = !self.func(f).code.iter().any(|op| {
+            matches!(
+                op,
+                Instr::LoadNewTarget { .. } | Instr::MakeArrow { .. } | Instr::DirectEval { .. }
+            )
+        });
+        if self.ctor_framefree.len() <= f {
+            self.ctor_framefree.resize(f + 1, 0);
+        }
+        self.ctor_framefree[f] = if ok { 1 } else { 2 };
+        ok
     }
 
     /// Call the compiled function `callee` frame-free: its body run over a
@@ -1089,22 +1138,15 @@ impl<'p> Vm<'p> {
     /// frame-backed entry around a body that needs none of it.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
-    fn call_compiled_windowed(
+    pub(crate) fn call_compiled_windowed(
         &mut self,
         callee: Value,
         this: Value,
-        args: &[Value],
+        args: WinArgs<'_>,
         fid: u32,
         closure: u32,
     ) -> Option<Result<Value, Thrown>> {
         if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
-            // A frame-free activation always has a frame under it: the
-            // compiled caller's, or the frame of the code that called the
-            // builtin. The helpers a native body calls rely on that (a frame
-            // call records the caller's resume point in the top frame). A job
-            // or a timer callback the host runs has none, and takes a frame
-            // of its own.
-            || self.frames.is_empty()
             || !self.jit_fused_ok()
             || self.jit_recurse_depth != 0
             || !self.pending_new_target.is_undefined()
@@ -1117,10 +1159,23 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
+        // A frame-free activation always has a frame under it: the compiled
+        // caller's, or the frame of the code that called the builtin. The
+        // helpers a Tier C body calls rely on that (a frame call records the
+        // caller's resume point in the top frame). A job or a timer callback
+        // the host runs has none, and takes a frame of its own. An int-tier
+        // body calls no helper but its own self-call, which pushes the frames
+        // it needs (`jit_self_call_impl`, `jit_self_call_at_impl`), so the
+        // host's jobs run it frame-free too: a promise reaction's callback.
+        let frameless = self.frames.is_empty();
+        if frameless && !job_int_window_enabled() {
+            return None;
+        }
         // A Tier C body's frame-free entry, run under an activation; or an
         // int-tier body, which needs neither a frame nor an activation and
         // only its self-binding rechecked (`try_run_jit`).
         let (entry, activate) = match self.jit.cross_entry(fid) {
+            Some(_) if frameless => return None,
             Some((entry, _, _, _)) => (entry, true),
             None => {
                 let body = self.jit.get(fid).filter(|body| body.int_tier())?;
@@ -1163,9 +1218,19 @@ impl<'p> Vm<'p> {
         self.regs.resize(win + callee_regs, Value::UNDEFINED);
         self.bump_regs_hw(win + callee_regs);
         self.regs[win] = this;
-        let n = args.len().min(params);
-        for (i, &arg) in args[..n].iter().enumerate() {
-            self.regs[win + 1 + i] = arg;
+        match args {
+            WinArgs::Slice(args) => {
+                let n = args.len().min(params);
+                for (i, &arg) in args[..n].iter().enumerate() {
+                    self.regs[win + 1 + i] = arg;
+                }
+            }
+            // The caller's window is below `win`, in the same pinned file.
+            WinArgs::Regs { at, argc } => {
+                for i in 0..(argc as usize).min(params) {
+                    self.regs[win + 1 + i] = self.regs[at + i];
+                }
+            }
         }
         // The loop's safe point at a frame transition. The arguments are in
         // the window and the callee and its closure are the activation's
@@ -1357,6 +1422,7 @@ impl<'p> Vm<'p> {
             arg_win: u32::MAX,
             argc: 0,
             is_eval,
+            construct_this: false,
             func: func_id,
             base,
             ip,
@@ -1683,8 +1749,13 @@ impl<'p> Vm<'p> {
         if self.global_this == 0 || obj_idx != self.global_this {
             return;
         }
-        if self.global_slot_of_name(key).is_some() {
+        if let Some(slot) = self.global_slot_of_name(key) {
             self.note_global_route_change();
+            // The property now IS the binding (a define, a delete, a getter
+            // or setter put on it): a spliced call keyed on the slot's
+            // generation (W12 `slot_guard`) must miss as well, or a hot loop
+            // keeps calling the function the slot held before.
+            self.bump_global_gen(slot);
         }
     }
 

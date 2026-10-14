@@ -66,7 +66,10 @@ candidate to propose upstream.
 - **Console levels** — `ConsoleLevel`, `ScriptState::set_console_level_sink`
   (vm/mod.rs `push_console_line_at`, vm/natives.rs `CONSOLE_*`, vm/engine/boot.rs):
   a sink told which `console` method produced a line, since `warn` and
-  `error` share a stream. zipp-rb's `on_log` severities come from it.
+  `error` share a stream. zipp-rb's `on_log` severities come from it. The
+  `Print` lowering of `console.*(…)` prints at its method's level too
+  (vm/helpers_misc.rs `console_print_level`, in place of upstream's
+  stream-only `console_print_stream`; vm/dispatch.rs `Instr::Print`).
 - **In-memory modules** — `HostModuleProvider`,
   `ScriptState::set_module_provider` (vm/engine/modules.rs): modules under a
   virtual root served from host memory, sharing the confined loader's budgets.
@@ -198,18 +201,6 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   extracted into locals and each slot written once. A const reassignment's
   TypeError also carries V8's message (compile/bindings.rs). Test:
   `test/engine_fixes_test.rb`.
-- **A derived class leaves `newTarget.prototype` to its base** — class
-  construction (vm/construct/construct.rs) pre-makes the instance and read
-  `newTarget.prototype` for it even for a derived class, whose [[Construct]]
-  creates nothing; with a Proxy base whose construct trap makes the object
-  (dommy's HTMLElement), the read was a second, observable Get. The Get is
-  now deferred (`deferred_instance_protos`, rooted and pruned in vm/gc.rs)
-  to the base that adopts the instance (`apply_deferred_instance_proto`,
-  vm/construct/inherit.rs `run_class_ctor`) and dropped for a Proxy base.
-  Test: `test/engine_fixes_test.rb`.
-- **A typed array's indices are own properties** — `has_own_property`
-  (vm/construct/iterate.rs) had no TypedArray arm, so `u8.hasOwnProperty(0)`
-  was false. Test: `test/engine_fixes_test.rb`.
 - **A Proxy is constructible only when its target is** — the Proxy
   `[[Construct]]` path (vm/construct/construct.rs) ran the trap for any
   target, and `is_constructor` (vm/coerce.rs) counted an arrow as one. Test:
@@ -224,19 +215,6 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   evals, a strict script's `var`s and functions stayed inside it, and no
   script's `let`/`const`/`class` reached later ones (WPT's `common.js`
   files are strict). Test: `test/engine_fixes_test.rb`.
-- **`obj.hasOwnProperty(k)` on a Proxy runs its trap** — the builtin-method
-  lane (vm/builtins.rs) used the trap-less `has_own_property`; it now uses
-  `has_own_property_dyn`, as the native does (testharness.js's
-  `assert_array_equals` reads a NodeList this way).
-- **A function's `prototype` can be made non-writable** — `fn_proto_readonly`
-  (vm/mod.rs; vm/props/define.rs, descriptors.rs, vm/access.rs): a
-  `defineProperty(fn, "prototype", {writable: false})` was accepted and
-  dropped, so WebIDL's `Image` reported a writable prototype.
-- **A class or function in a [[Prototype]] chain is searched** —
-  `proto_member_get` (vm/props/member.rs) skipped class statics and a
-  callable's own properties when one was spliced into a chain
-  (`Reflect.setPrototypeOf(fn, SomeClass)`, Stimulus's `bless`), so
-  `fn.staticOfTheClass` read undefined.
 - **A builtin replaced on the global object is the binding later scripts
   see** — `eval_global_slot` seeded a later script's fresh slot for a builtin
   name (`setTimeout`, `Map`, …) from the boot intrinsic, ignoring an own data
@@ -257,22 +235,6 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   (`host_eval_rich_opts`). Test: `test/zipp_rb_test.rb`
   `test_reentry_does_not_run_microtasks_early`.
 
-- **`typeof name` inside `with`** — `typeof_operand` (src/compile/exprs.rs)
-  loaded a global-resolving name straight from the global, skipping active
-  `with` objects, so `with (o) typeof o.member` read "undefined". It now
-  probes them first (`emit_with_get_chain`). Test: `test/engine_fixes_test.rb`.
-- **`performance` is a real global** — `performance.now()` was a compile-time
-  lowering to `Instr::Now` with no `performance` object behind it, so a host's
-  replacement (dommy's virtual-time `performance`) was never called. Now
-  `performance` is a builtin object (vm/setup.rs) whose `now` is the
-  `PERFORMANCE_NOW` native (vm/native.rs, vm/natives.rs), and the lowering is
-  gone (src/compile/calls.rs). Test: `test/engine_fixes_test.rb`.
-- **A replaced `console` method is called** — the compiler lowered
-  `console.log/info/warn/error/debug(…)` to the `Print` instruction whenever
-  `console` was not shadowed, so `console.warn = wrapper` was never called
-  (test frameworks and pages wrap console methods). The lowering is removed;
-  the calls go through the `CONSOLE_*` natives. Test:
-  `test/zipp_rb_test.rb` `test_a_replaced_console_method_is_called`.
 - **Promise resolving functions inherit `Function.prototype`** — the
   `BoundResolver` / `CombinatorResolver` heap kinds (a `new Promise`
   executor's resolve/reject, `Promise.all`'s element functions) were missing
@@ -285,9 +247,3 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
 `cargo test -p zipp-vm --lib --features instrument` (`rake engine:test` in
 gems/zipp-rb). Local additions include `deadline_stops_execution_like_abort`
 and `host_ctx_reaches_handles_of_its_own_vm_only`.
-
-`codegen/plan_region.rs` `local_sroa_tests` (x86-64 only): the fixture's
-post-loop `console.log(checksum)` became `const result = checksum;`. With the
-`Print` lowering removed (see "A replaced `console` method is called") the
-call compiles to `LoadGlobal` + `CallMethod`, which local SROA rejects
-anywhere in the function, so the fixture no longer exercised the planner.

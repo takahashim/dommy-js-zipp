@@ -408,6 +408,11 @@ struct Frame {
     /// so `function nest(){ return eval("innermost();"); }` must report `nest`
     /// as `innermost`'s caller, not the eval script.
     is_eval: bool,
+    /// Pushed by the interpreter's flat `new F(...)` (`Vm::flat_new_instance`):
+    /// its `this` is the instance under construction, so `pop_frame_with`
+    /// hands the caller that instance unless the body returned an object, as
+    /// [[Construct]] does, and a tail call may not reuse the frame.
+    construct_this: bool,
 }
 
 /// [[ParameterMap]] bookkeeping for a MAPPED arguments object (sloppy callee
@@ -1609,6 +1614,11 @@ pub struct Vm<'p> {
     /// are explicit GC roots because the map is VM-internal. See
     /// `const_cache.rs` for the mutation exclusion and resource bounds.
     const_string_cache: rustc_hash::FxHashMap<u64, Value>,
+    /// The same entries by function and slot (`const_cache::CONST_DENSE_FUNCS`
+    /// functions at most), `UNDEFINED` where none: a loaded literal is two
+    /// indexed reads instead of a hash probe, which was 14% of an interpreted
+    /// `switch (typeof x)` loop. The map stays the owner (and the GC root).
+    const_string_dense: Vec<Vec<Value>>,
     /// The heap string enumeration hands out for a property key, by the key's
     /// stored text (`Vm::alloc_key_str`). `for (k in o)`, `Object.keys` and
     /// their kin made a fresh string for every key of every object on every
@@ -1800,6 +1810,19 @@ pub struct Vm<'p> {
     /// activation, mirroring `pending_yield`. Unlike generators, async activations
     /// PRESERVE handlers across a suspension so `try { await p } catch` works.
     pending_await: Option<(Value, usize, Vec<Handler>)>,
+    /// The frame index of the async activation `drive_async_inner` is running
+    /// as its own `AsyncResume` job with the settled-await trampoline on
+    /// (`usize::MAX`: none). An `Await` in exactly that frame of an
+    /// already-fulfilled promise or a primitive, with the microtask queue
+    /// empty, continues in place instead of suspending (see
+    /// `Vm::await_settled_inline`). Saved and restored around every drive.
+    async_inline_frame: usize,
+    /// Settled awaits that activation may still continue without a round
+    /// trip through the queue, shared by the `Await` arm and the trampoline
+    /// in `drive_async_inner`: at zero the next await suspends for real, and
+    /// the job boundary it reaches is the drain's collector and WeakRef
+    /// checkpoint.
+    async_inline_budget: u32,
     /// Scratch slot for NewPromiseCapability: the capturing executor (CAP_EXECUTOR)
     /// writes its (resolve, reject) arguments here during `new C(executor)`, which
     /// `new_promise_capability` `.take()`s immediately after construction. `Some`
@@ -1823,6 +1846,13 @@ pub struct Vm<'p> {
     /// the interpreter's ordinary safepoints work inside resumed bodies.
     /// Saved/restored around nested drains.
     current_microtask: Option<Microtask>,
+    /// How many jobs at the front of `microtasks` were already queued when
+    /// the last collection finished. Every Value they hold was a root of that
+    /// collection and survived it, so it is OLD now, and a job never changes
+    /// once queued: a minor's root walk skips them (see `Vm::mark_roots`).
+    /// The end of every collection sets it to the queue's length, and each
+    /// pop from the front takes one off. Jobs only ever leave from the front.
+    microtasks_old: usize,
     /// Heap Values held only in Rust by an in-flight Promise abstract operation:
     /// fresh targets, capability functions, and transient constructor results.
     /// Executors/callbacks/`then` getters may re-enter and collect, so keep a
@@ -1847,10 +1877,6 @@ pub struct Vm<'p> {
     pub(crate) interp_pc: u64,
     /// The tz-database zone local time is in (`local_time.rs`); `None` is UTC.
     pub(crate) local_tz: Option<u16>,
-    /// A derived class's pre-made instance whose `prototype` Get waits for the
-    /// base that adopts it: instance heap index -> (newTarget, class). GC
-    /// roots the newTargets; pruned with the instance.
-    pub(crate) deferred_instance_protos: std::collections::HashMap<u32, (Value, u32)>,
     /// The name the host gave the code it is evaluating (a script URL), stamped
     /// on the functions it installs (`FuncProto::script`).
     pub(crate) script_name: Option<std::sync::Arc<str>>,
@@ -1899,6 +1925,28 @@ pub struct Vm<'p> {
     /// dropped freely.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_shape_slot: rustc_hash::FxHashMap<(u32, u32), u32>,
+    /// The last property append each JIT `SetProp` site proved, by IC site
+    /// index (`helpers_misc::AddWay`): a constructor's `this.x = v` adds a
+    /// key to a new object every time, which no identity or shape way can
+    /// serve, and the miss path re-walked the prototype chain and refilled
+    /// every cache for each one. Pure memo: every hit rechecks it live.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_add_ways: Vec<AddWay>,
+    /// Per constructor body: whether it only stores its arguments and
+    /// constants into `this`, and the proof of the last receiver a compiled
+    /// `new` answered that way (`engine::ctor_store`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    ctor_stores: rustc_hash::FxHashMap<u32, engine::ctor_store::CtorStore>,
+    /// Per function: 0 not yet scanned, 1 its body cannot observe its frame's
+    /// `new.target` (so a compiled `new` may run it frame-free), 2 it can
+    /// (`Vm::ctor_body_framefree`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    ctor_framefree: Vec<u8>,
+    /// Each shape's key list as a shared plan, by shape id, for the objects
+    /// the JIT's add ways append to (`helpers_misc::shape_key_plan`): built
+    /// once a way reaches the shape, `None` where the list is too long.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    shape_key_plans: Vec<Option<crate::bytecode::StaticKeyPlan>>,
     /// Prototype objects known to contribute NOTHING to a `for-in`: no own key
     /// is enumerable, and none can shadow a farther level because the walk ends
     /// there. Keyed by heap index, valued by the heap version the answer was
@@ -2261,13 +2309,27 @@ pub struct Vm<'p> {
     /// instance is what `construct` holds). Read+cleared by `construct` /
     /// `run_class_ctor`; transient like `super_called`.
     super_this: crate::slot_table::SlotTable<Value>,
+    /// The `newTarget` of a derived class's construction when it is not the
+    /// class itself, keyed by the pre-allocated instance. `Get(newTarget,
+    /// "prototype")` belongs to OrdinaryCreateFromConstructor in the base that
+    /// creates the object, so it waits here until `super()` reaches that base
+    /// (`settle_pending_ctor_proto`); a Proxy parent makes its own object and
+    /// drops the entry. Transient like `super_this`.
+    pending_ctor_proto: crate::slot_table::SlotTable<Value>,
     /// Private FIELD storage — spec [[PrivateElements]] of kind "field":
-    /// instance heap idx -> ((brand, name) -> value). Keyed by the
-    /// per-evaluation brand so same-named fields of sibling classes or other
-    /// evaluations never collide; invisible to reflection, proxy traps and
-    /// property enumeration by construction. Values are GC roots; entries
-    /// pruned when the instance dies.
-    private_fields: std::collections::HashMap<u32, std::collections::HashMap<(u64, String), Value>>,
+    /// instance heap idx -> its `(brand, name id, value)` list, in definition
+    /// order. Keyed by the per-evaluation brand so same-named fields of
+    /// sibling classes or other evaluations never collide; invisible to
+    /// reflection, proxy traps and property enumeration by construction.
+    /// Values are GC roots; entries pruned when the instance dies.
+    ///
+    /// It was a SipHash map per instance from `(brand, String)`: every
+    /// construction of a class with a private field allocated a map and a
+    /// String per field, and every access hashed the name.
+    private_fields: crate::slot_table::SlotTable<Vec<(u64, u32, Value)>>,
+    /// Private names, interned once (`Vm::private_name_id`): the `u32` the
+    /// field lists store.
+    private_name_ids: rustc_hash::FxHashMap<Box<str>, u32>,
     /// Heap index of the canonical %eval% native — the DirectEval op's runtime
     /// identity check (a REBOUND global `eval` gets an ordinary call).
     eval_fn_idx: u32,
@@ -2848,10 +2910,12 @@ pub struct Vm<'p> {
     abstractmodulesource_ctor: u32,
     abstractmodulesource_proto: u32,
     /// CreateResolvingFunctions [[AlreadyResolved]] records: `resolver_pair_next`
-    /// hands out fresh pair ids; a pair id enters `resolved_pairs` the first time
-    /// either function of the pair fires (ids only — no `Value`s, GC-inert).
+    /// hands out fresh pair ids; a pair id's bit in `resolved_pairs` is set the
+    /// first time either function of the pair fires (ids only — no `Value`s,
+    /// GC-inert). A bit per pair ever created, where a hash set of fired ids
+    /// cost a SipHash insert per resolution and kept about ten bytes for each.
     resolver_pair_next: u32,
-    resolved_pairs: std::collections::HashSet<u32>,
+    resolved_pairs: Vec<u64>,
     /// The intrinsic %Promise% constructor and %Promise.prototype.then% heap
     /// indices (the objects built in setup_globals), independent of later
     /// patches — identity anchors for the adoption fast-path check.
@@ -2863,6 +2927,14 @@ pub struct Vm<'p> {
     /// pristine); validated per call by version compares, re-resolved by the
     /// full proof on any guard mismatch.
     promise_pristine_slots: Option<async_runtime::PromisePristineSlots>,
+    /// `(version + 1, slot)` of %Promise%'s own data property `resolve` when
+    /// last found (0 = not recorded): GetPromiseResolve's Get read straight
+    /// from the slot while the version holds (`Vm::promise_ctor_resolve_get`).
+    promise_resolve_memo: (u32, u32),
+    /// `(version + 1)` of %Array.prototype% and %Object.prototype% when both
+    /// were last proven to have no `then` (0 = not proven): see
+    /// `Vm::array_then_absent`.
+    array_then_memo: (u32, u32),
     /// The prototype/constructor half of `regexp_matchall_fast_ok` resolved
     /// to slot indices plus the versions guarding them (see
     /// [`proxy_regexp::MatchallFastSlots`]). `None` until first proven
@@ -2908,10 +2980,15 @@ pub struct Vm<'p> {
     /// getOwnPropertyDescriptor, so a function whose prototype was set to a
     /// non-object reports it (and OrdinaryCreateFromConstructor then falls back).
     fn_proto_override: std::collections::HashMap<u32, Value>,
-    /// Functions whose `prototype` a `defineProperty` made non-writable. Each
-    /// also has a `fn_proto_override` entry (which roots it), so this needs
-    /// no pruning of its own.
-    pub(crate) fn_proto_readonly: std::collections::HashSet<u32>,
+    /// Ordinary functions whose `prototype` was made non-writable
+    /// (`Object.defineProperty(f, "prototype", {writable: false})`,
+    /// `Object.freeze(f)`). Each also has a `fn_proto_override` entry (its
+    /// value), which roots the function, so no entry outlives it.
+    fn_proto_readonly: std::collections::HashSet<u32>,
+    /// `object_proto_native_resolves`'s memo for `hasOwnProperty`,
+    /// `propertyIsEnumerable` and `isPrototypeOf`: (receiver shape,
+    /// %Object.prototype% version, slot).
+    objproto_method_memo: [(u32, u32, u32); 3],
     /// Heap indices of `[[IsHTMLDDA]]` exotic objects (`$262.IsHTMLDDA`, the
     /// `document.all` emulation): `typeof` is "undefined", loose `== null`/`==
     /// undefined` is true, ToBoolean is false, and calling it returns undefined —
@@ -3012,6 +3089,9 @@ pub struct Vm<'p> {
     /// re-checks every version and the live `next` bits (an in-place
     /// overwrite bumps no version), so nothing has to invalidate it.
     iter_proto_memo: [std::cell::Cell<construct::IterProtoProof>; 4],
+    /// The last proof that a generator's `next` is the intrinsic
+    /// (`Vm::gen_method_pristine`), rechecked on every use.
+    gen_next_memo: std::cell::Cell<construct::GenNextProof>,
     /// The same kind of memo for `builtin_iter_fast`'s holder half: per
     /// Array / Set / Map / String prototype, `(heap version + 1, slot)` of
     /// the own `@@iterator` data property last proven to be the default.
@@ -3316,6 +3396,7 @@ mod values;
 
 pub(crate) use access::htmldda_membership_stats;
 pub(crate) use async_runtime::async_inline_await_stats;
+pub(crate) use async_runtime::async_job_window_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use coerce::concat_pair_stats;
 pub(crate) use coerce::pad2_concat_stats;

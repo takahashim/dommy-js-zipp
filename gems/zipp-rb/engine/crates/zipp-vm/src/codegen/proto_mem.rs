@@ -963,6 +963,41 @@ fn emit_tierc_xorshift_registers(
     }
 }
 
+/// Same-binary switch: `ZIPP_NO_TIERC_ARGUMENTS=1` keeps every function that
+/// uses `arguments` out of Tier C again (it then runs interpreted, as every
+/// such function did).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn tierc_arguments_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_ARGUMENTS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Same-binary switch: `ZIPP_NO_TIERC_REST=1` keeps every function with a rest
+/// parameter out of Tier C again (and so out of every frame-free entry).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn tierc_rest_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_REST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Tier C eligibility: is every op of `proto` in the v1 whole-function mem-path
 /// subset? Stricter than `region_can_compile` (no GetProp/SetProp/StrConcat/
 /// MathOp/Bitwise/Cell/etc. yet — those are later increments). Rejects
@@ -979,10 +1014,21 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         }
         return false;
     }
-    // A rest parameter's array / the `arguments` object are built by the
-    // interpreter's call setup, not by emitted code — the native entry would skip
-    // them. Stay interpreted.
-    if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
+    // The `arguments` object is built by the interpreter's call setup, not by
+    // emitted code, so such a body is compiled without a cross entry (see
+    // `Jit::compile`): every call reaches it through a call setup and the
+    // frame's `try_run_jit`, and every frame-free entry declines it already
+    // (CROSS3 plans, `call_compiled_windowed`, `native_cb_entry`, the leaf
+    // and method inliners; an arrow has no `arguments` of its own). A rest
+    // parameter's array is built by every entry: the call setups that push a
+    // frame, and the generic frame-free cross call (`jit_cross_call_impl`)
+    // from the arguments past the parameters; every other frame-free entry
+    // declines a rest body (CROSS3 plans, the same-prototype arrow lane,
+    // `call_compiled_windowed`, `native_cb_entry`, the leaf and method
+    // inliners).
+    if (proto.arguments_reg.is_some() && !tierc_arguments_enabled())
+        || (proto.rest_reg.is_some() && !tierc_rest_enabled())
+    {
         if crate::jitlog_enabled() {
             eprintln!("[tierC-reject] rest/arguments");
         }
@@ -1031,7 +1077,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         // FuncProtos already obey these bounds; revalidate them here so a
         // malformed internal proto declines at the final native-code boundary.
         if !tierc_operands_in_bounds(instr, proto.reg_count, proto.code.len()) {
-            reject!("[tierC-reject] malformed operands at ip {ip}");
+            reject!("[tierC-reject] malformed operands at ip {ip}: {instr:?}");
             continue;
         }
         if py && (py_op_edges(instr).is_some() || py_body_op(instr)) {
@@ -1282,6 +1328,26 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
             // `new F(…)`: the construct helper, with the call protocol.
             Instr::New { .. } => {}
+            // `Object.assign(…)` and the other statics: the interpreter's
+            // arm through `jit_static_fn_ic`, with the call protocol.
+            Instr::StaticFn { op, argc, .. } => {
+                if !crate::codegen::static_fn_jit_enabled() {
+                    reject!("[tierC-reject] op StaticFn (disabled)");
+                }
+                // `Promise.resolve(x)` and the `Number.is*` tests: a loop of
+                // them runs as a region, whose own arm is faster than this
+                // helper (a whole-body compile made such a loop 40% slower).
+                if crate::codegen::static_fn_region_inline(op, argc) {
+                    reject!("[tierC-reject] op StaticFn {op:?} (the region's)");
+                }
+            }
+            // `v instanceof c`: the operator's helper, with the call protocol.
+            Instr::InstanceOfDyn { .. } => {}
+            // `${v}`: the conversion's helper, with the call protocol.
+            Instr::ToStr { .. } => {}
+            // A method naming its own class (`new C(...)` inside `class C`):
+            // the binding's helper, with the call protocol for its TDZ.
+            Instr::LoadClassValue { .. } => {}
             // Proper-tail-call PREFIX: the compiler always emits `TailCall`
             // immediately before an ordinary `Call`+`Return` of the same site
             // (compile/bindings.rs, compile/exprs.rs), and the interpreter's
@@ -1705,6 +1771,20 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 arg_base,
                 argc,
             } => (Uses::range(arg_base, argc).plus(callee), Some(dst)),
+            Instr::InstanceOfDyn { dst, val, ctor } => (u2(val, ctor), Some(dst)),
+            Instr::StaticFn {
+                dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+                ..
+            } => (
+                Uses::range(arg_base, argc).plus(callee).plus(this_v),
+                Some(dst),
+            ),
+            Instr::ToStr { dst, a } => (u1(a), Some(dst)),
+            Instr::LoadClassValue { dst, .. } => (u0(), Some(dst)),
             Instr::CallWithThis {
                 dst,
                 callee,
@@ -5782,6 +5862,78 @@ pub(crate) fn compile_proto_mem(
                 if cross {
                     dynasm!(ops ; => cross_done);
                 }
+            }
+            Instr::LoadClassValue { dst, class_id } => {
+                // The class binding through `jit_load_class_value_ic`; see
+                // the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_load_class_value_ic as usize,
+                    packed_fip,
+                    class_id as u64,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::ToStr { dst, a } => {
+                // `${a}` through `jit_to_str_ic`; see the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_to_str_ic as usize,
+                    packed_fip,
+                    a as u64,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::InstanceOfDyn { dst, val, ctor } => {
+                // `v instanceof c` through `jit_instanceof_ic`; see the
+                // region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed_args = ((ctor as u64) << 16) | val as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_instanceof_ic as usize,
+                    packed_fip,
+                    packed_args,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::StaticFn { dst, .. } => {
+                // A static through `jit_static_fn_ic`, which reads the
+                // instruction from the bytecode; see the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_static_fn_ic as usize,
+                    packed_fip,
+                    0,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
             }
             Instr::New {
                 dst,

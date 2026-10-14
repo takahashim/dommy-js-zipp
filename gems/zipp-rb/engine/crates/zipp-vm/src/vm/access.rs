@@ -1024,7 +1024,7 @@ impl<'p> Vm<'p> {
     /// Receiver half of the test — checked FIRST so a non-qualifying receiver
     /// (a class instance above all) costs one heap load and nothing else.
     #[inline]
-    fn ordinary_set_recv_ok(&self, oi: u32) -> bool {
+    pub(crate) fn ordinary_set_recv_ok(&self, oi: u32) -> bool {
         // `m.class.is_some()` is load-bearing: a class instance resolves
         // accessors through its ClassData, which `proto_chain_blocks_set` does
         // not walk, so `class C { set x(v){…} }` would be appended over.
@@ -1037,7 +1037,7 @@ impl<'p> Vm<'p> {
     }
 
     #[inline]
-    fn ordinary_set_ok(&self, oi: u32, key: &str) -> bool {
+    pub(crate) fn ordinary_set_ok(&self, oi: u32, key: &str) -> bool {
         if key.is_empty() {
             return false;
         }
@@ -1506,11 +1506,52 @@ impl<'p> Vm<'p> {
                     },
                 );
             }
-            if val.is_number() {
-                let n = val.as_f64();
-                if n >= 0.0 && n.fract() == 0.0 && (n as usize) <= crate::vm::MAX_DENSE_ARRAY_LEN {
+            // What an iteration of the object (`[...arguments]`, `for-of`,
+            // `Array.from`) will take its length to be: ToLength(ToNumber of
+            // the value), which for a number, a string, a boolean, null and
+            // undefined runs no user code, so the dense store can follow it
+            // now. An object or a symbol keeps the store as it is.
+            let iter_len = if val.is_number() {
+                Some(val.as_f64())
+            } else if !val.is_heap() || self.heap.is_str_like(val.heap_index()) {
+                self.to_number(val).ok()
+            } else {
+                None
+            }
+            .map(|x| if x.is_nan() || x <= 0.0 { 0.0 } else { x.floor() });
+            if let Some(n) = iter_len {
+                if (n as usize) <= crate::vm::MAX_DENSE_ARRAY_LEN {
+                    let n = n as usize;
+                    // The elements past a SMALLER length stay own properties
+                    // (`length` here is ordinary, it truncates nothing): they
+                    // move to the side table, where `array_index_override`
+                    // answers them, unless an index there already overrides
+                    // its dense slot. `arguments.length = 1` then
+                    // `arguments[1]` read undefined and Object.keys lost it.
+                    let dropped: Vec<(usize, Value)> = match self.heap.get(idx) {
+                        HeapObj::Array(items) if n < items.len() => items[n..]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| !v.is_hole())
+                            .map(|(k, v)| (n + k, *v))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    if !dropped.is_empty() {
+                        let m = self
+                            .arr_props
+                            .entry(idx)
+                            .or_insert_with(ObjMap::new_side_table);
+                        for (i, v) in dropped {
+                            let mut buf = [0u8; 20];
+                            let key = crate::heap::index_key(&mut buf, i);
+                            if m.pos(key).is_none() {
+                                m.define(key, v, PropAttr::data());
+                            }
+                        }
+                    }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        items.resize(n as usize, Value::HOLE);
+                        items.resize(n, Value::HOLE);
                     }
                 }
             }
@@ -1766,10 +1807,12 @@ impl<'p> Vm<'p> {
             // `.prototype` getter see. ANY value is honoured (incl. a non-object —
             // undefined/null/primitive — which the heap-only `prototypes` cache can't
             // hold), via `fn_proto_override` which the reads consult first.
-            if key == "prototype" && self.fn_proto_readonly.contains(&idx) {
-                return self.reject_write(key, strict);
-            }
             if key == "prototype" {
+                // A non-writable `prototype` (made so by defineProperty or
+                // freeze): a sloppy no-op, a strict TypeError.
+                if self.fn_proto_readonly.contains(&idx) {
+                    return self.reject_write(key, strict);
+                }
                 self.fn_proto_override.insert(idx, val);
                 if val.is_heap() {
                     self.prototypes.insert(idx, val.heap_index());
@@ -1977,6 +2020,10 @@ impl<'p> Vm<'p> {
                 // reporting success; `defineProperty` already used this table.
                 | HeapObj::Generator { .. }
                 | HeapObj::AsyncGenerator(_)
+                // So are a built-in iterator and an iterator helper: `it.foo = 1`
+                // and an own `it.next = f` were dropped the same way.
+                | HeapObj::Iterator { .. }
+                | HeapObj::IterHelper { .. }
                 // An Intl service instance is exotic too, and a subclass of one
                 // must still take ordinary own properties
                 // (`class F extends Intl.ListFormat {}; f.x = 1`).
@@ -2321,9 +2368,11 @@ impl<'p> Vm<'p> {
         // synthesize one, so it need not be materialized here).
         if key == "prototype" && self.callable_has_prototype(obj) {
             let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
-            let writable = (!is_class || self.fn_proto_override.contains_key(&idx))
-                && !self.fn_proto_readonly.contains(&idx);
-            return Some(data(writable));
+            return Some(data(if is_class {
+                self.fn_proto_override.contains_key(&idx)
+            } else {
+                !self.fn_proto_readonly.contains(&idx)
+            }));
         }
         // A String wrapper's index/`length` and a RegExp's `lastIndex`.
         if let Some((_, len)) = self.string_exotic_chars(obj) {
