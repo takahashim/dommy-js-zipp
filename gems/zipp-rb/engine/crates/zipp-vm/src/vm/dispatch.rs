@@ -915,7 +915,12 @@ impl<'p> Vm<'p> {
                         }
                         if self.globals[idx as usize].is_uninitialized() {
                             if let Some(name) = self.global_slot_name(idx) {
-                                let has_own = self.global_this != 0
+                                // See StoreGlobal: a top-level lexical's slot
+                                // takes its initialization whatever the global
+                                // object or its chain has under that name.
+                                let lexical = self.global_name_is_lexical(&name);
+                                let has_own = !lexical
+                                    && self.global_this != 0
                                     && matches!(
                                         self.heap.get(self.global_this),
                                         HeapObj::Object(m) if m.pos(&name).is_some()
@@ -932,7 +937,7 @@ impl<'p> Vm<'p> {
                                 // assigned THROUGH [[Set]] on the global object,
                                 // not as a shadowing slot binding.
                                 let gobj = Value::heap(self.global_this);
-                                let proto = if self.global_this != 0 {
+                                let proto = if self.global_this != 0 && !lexical {
                                     self.object_get_prototype_of(gobj)
                                 } else {
                                     Value::NULL
@@ -945,9 +950,7 @@ impl<'p> Vm<'p> {
                                 // See StoreGlobal: an unresolvable name with a
                                 // Proxy on the global's chain is [[Set]] (a
                                 // lexical declaration's slot is not).
-                                if self.global_proto_chain_has_proxy()
-                                    && !self.global_name_is_lexical(&name)
-                                {
+                                if !lexical && self.global_proto_chain_has_proxy() {
                                     self.set_prop(gobj, &name, v, false)?;
                                     ip += 1;
                                     continue;
@@ -991,7 +994,16 @@ impl<'p> Vm<'p> {
                             // `this.x = v`) is the live binding: write through
                             // it and leave the slot uninitialized.
                             if let Some(name) = self.global_slot_name(idx) {
-                                let has_own = self.global_this != 0
+                                // A top-level `let`/`const`/`class` is
+                                // initialized by this same store, made while
+                                // its slot is still in the TDZ: the value
+                                // belongs in the slot, never on a same-named
+                                // property of the global object or its chain
+                                // (`let name = {}` under a window that has
+                                // `name`), as the strict stores already hold.
+                                let lexical = self.global_name_is_lexical(&name);
+                                let has_own = !lexical
+                                    && self.global_this != 0
                                     && matches!(
                                         self.heap.get(self.global_this),
                                         HeapObj::Object(m) if m.pos(&name).is_some()
@@ -1010,7 +1022,7 @@ impl<'p> Vm<'p> {
                                 // (staging/sm/object/proto-property-change-
                                 // writability-set, staging/sm/Proxy/global-receiver).
                                 let gobj = Value::heap(self.global_this);
-                                let proto = if self.global_this != 0 {
+                                let proto = if self.global_this != 0 && !lexical {
                                     self.object_get_prototype_of(gobj)
                                 } else {
                                     Value::NULL
@@ -1023,14 +1035,9 @@ impl<'p> Vm<'p> {
                                 // Unresolvable: PutValue is Set(globalObject,
                                 // name), and a Proxy on the global's chain gets
                                 // that write through its `set` trap even when
-                                // its `has` trap denied the name. Not a
-                                // top-level `let`/`const`/`class`: its
-                                // initialization is this same store, made while
-                                // the slot is still in its TDZ, and it must
-                                // land in the slot.
-                                if self.global_proto_chain_has_proxy()
-                                    && !self.global_name_is_lexical(&name)
-                                {
+                                // its `has` trap denied the name (not for a
+                                // lexical, see above).
+                                if !lexical && self.global_proto_chain_has_proxy() {
                                     self.set_prop(gobj, &name, v, false)?;
                                     ip += 1;
                                     continue;

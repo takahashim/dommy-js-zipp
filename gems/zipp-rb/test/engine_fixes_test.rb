@@ -57,6 +57,26 @@ class EngineFixesTest < Minitest::Test
     assert_equal [2, 3, "function", 4, "fresh"], result
   end
 
+  # A top-level lexical whose name the global's chain (dommy's unified window:
+  # `name`, `status`, …) or the global object itself already has is still
+  # initialized in its own slot, in sloppy and strict scripts alike.
+  def test_top_level_lexicals_shadow_a_same_named_global_property
+    @vm.eval(<<~JS)
+      var trapped = [];
+      var backing = { name: "win", status: "" };
+      Object.setPrototypeOf(globalThis, new Proxy(backing, {
+        has(t, k) { return k in t; },
+        set(t, k, v, r) { trapped.push(String(k)); t[k] = String(v); return true; },
+      }));
+      Object.defineProperty(globalThis, "ownFirst", { value: 1, writable: true, enumerable: true, configurable: true });
+    JS
+    @vm.load("let name = { a: 1 };")
+    @vm.load("'use strict'; const status = [1];")
+    @vm.load("class ownFirst {}")
+    result = @vm.eval("[typeof name, Array.isArray(status), typeof ownFirst, backing.name, trapped.join(',')]")
+    assert_equal ["object", true, "function", "win", ""], result
+  end
+
   # Reading a builtin finds it as the global object's own property, before a
   # Proxy on the global's chain is asked `has` — in ordinary code and in a
   # function that names `eval` (whose globals resolve dynamically).

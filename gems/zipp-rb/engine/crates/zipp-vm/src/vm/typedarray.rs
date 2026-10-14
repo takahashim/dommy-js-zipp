@@ -641,9 +641,11 @@ impl<'p> Vm<'p> {
         };
         // The safe profile has no truly-shared bytes (they need `unsafe`), so
         // a SharedArrayBuffer keeps agent-local bytes. With one agent — no
-        // `$262.agent` workers — nothing can tell: the brand (`shared_buffers`),
-        // growth (`ab_max`, `grow_bytes`) and Atomics all work on them, and a
-        // waiter can only time out, as no other agent can notify it.
+        // `$262.agent` workers — the brand (`shared_buffers`), growth
+        // (`ab_max`, `grow_bytes`) and Atomics all work on them. No other agent
+        // can wake a waiter: a sync `Atomics.wait` on an equal value returns
+        // "timed-out" at once rather than sleeping out its timeout, and a
+        // `waitAsync` one is woken by this agent's `notify` or times out.
         #[cfg(feature = "safe-sandbox")]
         let data = {
             let mut bytes = Vec::new();

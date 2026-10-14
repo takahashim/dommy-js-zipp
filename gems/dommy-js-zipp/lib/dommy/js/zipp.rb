@@ -34,7 +34,8 @@ module Dommy
       # the first Runtime fills the cache.
       def self.prewarm
         bridge = HostBridge.constants.grep(/_JS\z/).map { HostBridge.const_get(_1) }.grep(String)
-        (bridge + BrowserEnvironment.payloads).each { ::ZippRb.precompile(_1) }
+        unified = Config.unified_global && HostBridge.method_defined?(:unify_global_window)
+        (bridge + BrowserEnvironment.payloads(unified: unified)).each { ::ZippRb.precompile(_1) }
         nil
       end
     end
