@@ -194,13 +194,22 @@ pub struct ScriptState {
     vm_id: u64,
 }
 
+/// What an [`OwnedVm`]'s `Vm` borrows: the compiled program, and the
+/// functions and classes the VM installs at run time (an eval, a loaded
+/// script or module), so dropping the state frees those too rather than
+/// leaking them for the process's life.
+struct VmOwner {
+    program: Program,
+    eval_arena: crate::vm::EvalArena,
+}
+
 self_cell::self_cell!(
     /// The compiled program and the VM borrowing it, dropped in that order.
     /// The pair lives in one heap allocation, so moving a `ScriptState` never
     /// moves the `Vm` (native code keeps deriving VM-relative addresses from
     /// the live VM argument regardless).
     struct OwnedVm {
-        owner: Box<Program>,
+        owner: Box<VmOwner>,
         #[covariant]
         dependent: Vm,
     }
@@ -312,8 +321,13 @@ pub fn compile_script_with_preamble(
 impl ScriptState {
     /// Take ownership of a compiled program and boot a VM over it.
     pub(crate) fn from_program(program: Program) -> ScriptState {
-        let cell = OwnedVm::new(Box::new(program), |program| {
-            let mut vm = Vm::new(program);
+        let owner = Box::new(VmOwner {
+            program,
+            eval_arena: crate::vm::EvalArena::default(),
+        });
+        let cell = OwnedVm::new(owner, |owner| {
+            let mut vm = Vm::new(&owner.program);
+            vm.set_eval_arena(&owner.eval_arena);
             // No test262 host object for embedded code. `$262.agent.start()`
             // spawns a detached OS thread running its own VM — outside any
             // budget, abort flag, trace or timeout the embedder set — and

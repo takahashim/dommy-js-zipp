@@ -159,12 +159,13 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            self.eval_classes.push(Box::leak(Box::new(cd)));
+            let cd = self.alloc_eval_class(cd);
+            self.eval_classes.push(cd);
             self.class_values.push(None);
         }
         // 5. Re-index function-id, global-slot, and class-id operands, leak each
         //    FuncProto (stable address — raw pointers live into it), append.
-        let mut new_funcs: Vec<&'static FuncProto> = Vec::with_capacity(eval_prog.functions.len());
+        let mut new_funcs: Vec<&'p FuncProto> = Vec::with_capacity(eval_prog.functions.len());
         // The script the functions came from, for their Error stacks: the
         // module being installed, else what the host named this evaluation.
         let script = self.installing_module.clone().or_else(|| self.script_name.clone());
@@ -288,7 +289,7 @@ impl<'p> Vm<'p> {
             if f.script.is_none() {
                 f.script = script.clone();
             }
-            new_funcs.push(Box::leak(Box::new(f)));
+            new_funcs.push(self.alloc_eval_func(f));
         }
         for r in new_funcs {
             // New code can bytecode-store slots the main-program scan proved

@@ -1513,7 +1513,11 @@ pub struct Vm<'p> {
     /// `Box<ClassDef>` addressed by a unified class_id (`program.classes` below
     /// `main_class_count`, `eval_classes` beyond). Their func-id members and the
     /// referencing `MakeClass`/`Super*` ops are re-indexed at install time.
-    eval_classes: Vec<&'static crate::bytecode::ClassDef>,
+    eval_classes: Vec<&'p crate::bytecode::ClassDef>,
+    /// Where `eval_funcs` and `eval_classes` live when the VM's owner keeps
+    /// them (a `ScriptState`: freed with it); `None` leaks them, as a VM built
+    /// over a borrowed program for one run (tests, the CLI) always did.
+    eval_arena: Option<&'p EvalArena>,
     /// Number of classes in the compile-time `program` (boundary between program
     /// and runtime `eval_classes` class ids).
     main_class_count: usize,
@@ -3358,6 +3362,8 @@ mod cldr_ja;
 mod cldr_zh;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod closure_make_jit;
+mod eval_arena;
+pub(crate) use eval_arena::EvalArena;
 mod coerce;
 mod collections;
 mod const_cache;

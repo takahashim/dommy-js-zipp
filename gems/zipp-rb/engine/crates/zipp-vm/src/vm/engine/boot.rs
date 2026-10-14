@@ -68,6 +68,28 @@ impl<'p> Vm<'p> {
     }
 
     /// Give a runtime-installed function the next unified id.
+    /// Keep the functions and classes this VM installs at run time in `arena`,
+    /// which its owner drops with the program (see `EvalArena`).
+    pub(crate) fn set_eval_arena(&mut self, arena: &'p crate::vm::EvalArena) {
+        self.eval_arena = Some(arena);
+    }
+
+    /// A run-time function, at an address that stays put for the VM's life.
+    pub(crate) fn alloc_eval_func(&self, f: crate::bytecode::FuncProto) -> &'p crate::bytecode::FuncProto {
+        match self.eval_arena {
+            Some(arena) => arena.funcs.alloc(f),
+            None => Box::leak(Box::new(f)),
+        }
+    }
+
+    /// A run-time class, at an address that stays put for the VM's life.
+    pub(crate) fn alloc_eval_class(&self, c: crate::bytecode::ClassDef) -> &'p crate::bytecode::ClassDef {
+        match self.eval_arena {
+            Some(arena) => arena.classes.alloc(c),
+            None => Box::leak(Box::new(c)),
+        }
+    }
+
     pub(crate) fn install_func(&mut self, f: &'p crate::bytecode::FuncProto) {
         debug_assert_eq!(self.funcs.len(), self.main_func_count + self.eval_funcs.len());
         self.eval_funcs.push(f);
@@ -175,6 +197,7 @@ impl<'p> Vm<'p> {
             static_key_plan_retained_bytes,
             main_func_count: program.functions.len(),
             eval_classes: Vec::new(),
+            eval_arena: None,
             main_class_count: program.classes.len(),
             eval_global_map: std::collections::HashMap::new(),
             eval_global_names: rustc_hash::FxHashMap::default(),
