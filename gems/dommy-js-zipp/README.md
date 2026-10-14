@@ -42,6 +42,16 @@ scripts, import maps and dynamic `import()`.
 
 ## Differences from dommy-js-quickjs
 
+- **The window is the global object.** `window === globalThis`, and `self`,
+  `top`, `parent`, `frames`, `document.defaultView` and a frame's `parent`
+  are all `globalThis`; a sloppy function's `this` is the window, and the
+  window's operations and attributes are own properties of the global, as in
+  a browser. It needs a dommy whose bridge has `HostBridge#unify_global_window`
+  (otherwise the window is a separate proxy, as in dommy-js-quickjs);
+  `DOMMY_JS_UNIFIED_GLOBAL=0` or `Runtime.new(unified_global: false)` keeps
+  them apart. Known differences: the global's own keys include the bridge's
+  `__rb*` names, and `Object.preventExtensions(window)` succeeds.
+
 - **Stack positions are per statement.** An Error's `stack` names the
   statement each frame was executing (and the start of an expression-bodied
   arrow), not the exact expression; names come from declarations, so an

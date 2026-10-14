@@ -66,12 +66,15 @@ module Dommy
         # Everything a real frontend bundle expects to find on its own: the
         # aliased window globals, then the two polyfills, then the built-ins
         # mirrored onto the window. Order matters only in that the window must
-        # already be installed.
-        def install_globals
-          run("browser_globals.js", BROWSER_GLOBALS_JS)
+        # already be installed. When the window is the global object
+        # (`unified:`), there is nothing to alias or mirror: a bare name
+        # reaches the window through the global's prototype chain, and the
+        # built-ins are the window's own properties.
+        def install_globals(unified: false)
+          run("browser_globals.js", BROWSER_GLOBALS_JS) unless unified
           run("intl_polyfill.js", INTL_POLYFILL_JS)
           install_wasm_stub
-          run("window_builtins.js", WINDOW_BUILTINS_JS)
+          run("window_builtins.js", WINDOW_BUILTINS_JS) unless unified
           self
         end
 

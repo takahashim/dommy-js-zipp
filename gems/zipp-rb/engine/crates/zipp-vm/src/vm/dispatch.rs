@@ -751,11 +751,16 @@ impl<'p> Vm<'p> {
                                         HeapObj::Object(m) if m.pos(&name).is_some()
                                     );
                                     let gobj = Value::heap(self.global_this);
-                                    let proto = self.object_get_prototype_of(gobj);
-                                    if has_own
-                                        || (proto.is_heap()
-                                            && self.has_property_str_dyn(proto, &name)?)
+                                    // A slot-backed builtin is an own property of
+                                    // the global object, found before its chain.
+                                    if let Some(own) =
+                                        (!has_own).then(|| self.global_by_name(&name)).flatten()
                                     {
+                                        own
+                                    } else if has_own || {
+                                        let proto = self.object_get_prototype_of(gobj);
+                                        proto.is_heap() && self.has_property_str_dyn(proto, &name)?
+                                    } {
                                         self.get_prop(gobj, &name)?
                                     } else {
                                         Value::UNDEFINED
@@ -791,6 +796,13 @@ impl<'p> Vm<'p> {
                                     HeapObj::Object(m) if m.pos(&name).is_some()
                                 );
                             if !has_own {
+                                // A slot-backed builtin is an own property of
+                                // the global object, found before its chain.
+                                if let Some(val) = self.global_by_name(&name) {
+                                    self.set(base, dst, val);
+                                    ip += 1;
+                                    continue;
+                                }
                                 // Chain fallback, as in LoadGlobal: a Proxy
                                 // prototype's `has` trap / an inherited property
                                 // resolves the name (HasBinding = HasProperty).
@@ -843,11 +855,16 @@ impl<'p> Vm<'p> {
                                         HeapObj::Object(m) if m.pos(&name).is_some()
                                     );
                                     let gobj = Value::heap(self.global_this);
-                                    let proto = self.object_get_prototype_of(gobj);
-                                    if has_own
-                                        || (proto.is_heap()
-                                            && self.has_property_str_dyn(proto, &name)?)
+                                    // A slot-backed builtin is an own property of
+                                    // the global object, found before its chain.
+                                    if let Some(own) =
+                                        (!has_own).then(|| self.global_by_name(&name)).flatten()
                                     {
+                                        own
+                                    } else if has_own || {
+                                        let proto = self.object_get_prototype_of(gobj);
+                                        proto.is_heap() && self.has_property_str_dyn(proto, &name)?
+                                    } {
                                         self.get_prop(gobj, &name)?
                                     } else {
                                         Value::UNDEFINED
@@ -10599,6 +10616,13 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(m) if m.pos(&name).is_some()
                 );
             if !has_own {
+                // A slot-backed builtin is an own property of the
+                // global object: HasProperty finds it before the
+                // chain, so a Proxy prototype's `has` trap never
+                // sees `Array`.
+                if let Some(val) = self.global_by_name(&name) {
+                    return Ok(val);
+                }
                 // HasBinding consults the global object's PROTO
                 // CHAIN too (9.1.1.4.4 -> HasProperty on the
                 // binding object): an inherited property — or a

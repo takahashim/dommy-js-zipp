@@ -57,6 +57,15 @@ module Dommy
           mb = ENV["DOMMY_JS_MEMORY_LIMIT_MB"].to_i
           mb.positive? ? mb * 1024 * 1024 : DEFAULT_MEMORY_LIMIT
         end
+
+        # Whether the engine's global object is the window (`window ===
+        # globalThis`, as in a browser), as against a separate window proxy
+        # whose namespace is kept in step with the global's (dommy-js-quickjs's
+        # model). On unless DOMMY_JS_UNIFIED_GLOBAL is 0, and only against a
+        # dommy whose bridge can (HostBridge#unify_global_window).
+        def unified_global
+          ENV["DOMMY_JS_UNIFIED_GLOBAL"] != "0"
+        end
       end
     end
   end
