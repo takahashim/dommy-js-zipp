@@ -302,6 +302,9 @@ const ABORT_CHECK_MASK: u64 = 0xFFF;
 /// cheap abort poll. New objects and known large buffers are charged eagerly;
 /// this audit catches capacity growth of already-existing collections.
 const HEAP_AUDIT_MASK: u64 = 0xFFFF;
+// The metered fast path tests ABORT_CHECK_MASK alone before a heap poll.
+#[cfg(not(feature = "meter-only"))]
+const _: () = assert!(HEAP_AUDIT_MASK & ABORT_CHECK_MASK == ABORT_CHECK_MASK);
 
 /// Host re-entries between forced full heap audits in the postflight. The
 /// interpreter reconciles on a tick stride; a host that re-enters without
@@ -1847,39 +1850,50 @@ impl super::Vm<'_> {
             None => return Ok(()),
         };
 
-        // The production wasm engine meters without tracing or an abort flag.
-        // Keep that overwhelmingly common path small enough to live beside the
-        // opcode dispatch; trace completion, atomics, and row construction stay
-        // in the out-of-line path below. `pending` is checked independently so
-        // ending a trace can never strand its final row.
-        if rec.tracing || rec.pending.is_some() || rec.abort.is_some() || rec.deadline.is_some() {
+        // Keep the common metering path, a countdown and a tick, small enough
+        // to live beside the opcode dispatch. Everything else goes out of
+        // line, where the slow path handles it in the same order: a trace
+        // (`pending` is checked independently so ending a trace can never
+        // strand its final row), a sticky exhaustion, full output, and a spent
+        // budget (which may still be reclaimed from an enclosing native run).
+        // `remaining` is i64::MAX when unmetered. An abort flag or a deadline
+        // stays on this path: both are polled only every ABORT_CHECK_MASK + 1
+        // ticks, and routing every instruction out of line for them (as
+        // upstream does) cost a metered instruction about as much again.
+        if rec.tracing
+            || rec.pending.is_some()
+            || rec.exhaustion.is_some()
+            || rec.output_exhausted
+            || rec.remaining <= 0
+        {
             return self.instrument_step_slow(base, ip, instr);
         }
-        if let Some(message) = rec.terminal_message() {
-            return Err(message);
-        }
-        if rec.output_exhausted {
-            return Err(rec.exhaust(ResourceExhaustion::Output));
-        }
         if rec.remaining != i64::MAX {
-            if rec.remaining <= 0 {
-                // An enclosing native run may still hold unspent steps.
-                if !self.meter_reclaim() {
-                    return Err(self.instrument_steps_out());
-                }
-            }
-            let Some(rec) = self.instr_rec.as_mut() else {
-                return Ok(());
-            };
             rec.remaining -= 1;
         }
+        rec.ticks = rec.ticks.wrapping_add(1);
+        // HEAP_AUDIT_MASK's low bits include ABORT_CHECK_MASK's, so one test
+        // guards both polls.
+        if rec.ticks & ABORT_CHECK_MASK == 0 {
+            return self.instrument_poll();
+        }
+        Ok(())
+    }
+
+    /// The periodic polls of the metered fast path: the abort flag and the
+    /// deadline, then (on its own stride) the heap reconciliation. The same
+    /// order as `instrument_step_slow`.
+    #[cfg(not(feature = "meter-only"))]
+    #[cold]
+    #[inline(never)]
+    fn instrument_poll(&mut self) -> Tick {
         let Some(rec) = self.instr_rec.as_mut() else {
             return Ok(());
         };
-        rec.ticks = rec.ticks.wrapping_add(1);
-        let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
-
-        if heap_poll {
+        if rec.abort_requested() {
+            return Err(rec.exhaust(ResourceExhaustion::Abort));
+        }
+        if rec.ticks & HEAP_AUDIT_MASK == 0 {
             self.instrument_heap_poll()?;
         }
         Ok(())

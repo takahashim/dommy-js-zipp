@@ -106,8 +106,15 @@ candidate to propose upstream.
 
 - **Run deadline** — `Recorder::deadline`, `ScriptState::set_deadline`. Every
   abort-flag poll goes through `Recorder::abort_requested()` (flag OR passed
-  deadline); the interpreter fast path defers to the slow path when a deadline
-  is set. zipp-rb's `timeout_msec` uses this instead of a timer thread.
+  deadline). zipp-rb's `timeout_msec` uses this instead of a timer thread.
+- **Metered fast path** — `Vm::instrument_step` (non-`meter-only`) keeps an
+  abort flag or a deadline on the inline path and polls both, then the heap
+  stride, every `ABORT_CHECK_MASK + 1` ticks out of line
+  (`Vm::instrument_poll`); only a trace, a sticky exhaustion, full output or
+  a spent budget goes to `instrument_step_slow`. Upstream sends every
+  instruction out of line whenever an abort flag or a deadline is set, which
+  zipp-rb always does (`arm_limits`): a tight loop cost about 1.8x its
+  unlimited time, now within a few percent.
 
 ## Safe profile (crates/zipp-vm/src/vm/typedarray.rs, vm/setup.rs)
 
