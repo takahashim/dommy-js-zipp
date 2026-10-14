@@ -291,6 +291,9 @@ pub(crate) fn forget_vm(ruby: &Ruby, id: u64) {
     BRIDGED.with(|s| {
         s.borrow_mut().remove(&id);
     });
+    HOST_FN_HELPER.with(|s| {
+        s.borrow_mut().remove(&id);
+    });
     FATAL.with(|f| {
         f.borrow_mut().remove(&id);
     });

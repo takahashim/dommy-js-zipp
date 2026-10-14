@@ -11,7 +11,27 @@ thread_local! {
     /// reentry path) instead of the id registry. The raw pointer is valid only
     /// within the callback's dynamic scope; the handler saves and restores it.
     pub(crate) static ACTIVE_CTX: Cell<Option<(u64, *mut (dyn HostCtx + 'static))>> = const { Cell::new(None) };
+    /// VMs that have `__zippDefineHostFunction` (see `define_function`).
+    pub(crate) static HOST_FN_HELPER: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
 }
+
+/// Installs a host function as a global, or at a nested path, creating the
+/// intermediate objects — what `define_function` asks of a VM. Defined once
+/// per VM (and compiled once per process), so a definition is one call rather
+/// than a script compiled for it: a host defining dozens of functions per VM
+/// (dommy's bridge: 31) paid for as many compilations every time.
+const HOST_FN_HELPER_JS: &str = r#"Object.defineProperty(globalThis, "__zippDefineHostFunction", {
+  value: function (path, kind, isAsync) {
+    let base = globalThis;
+    for (let i = 0; i < path.length - 1; i++) base = base[path[i]] = base[path[i]] || {};
+    base[path[path.length - 1]] = isAsync
+      ? function (...args) {
+          try { return Promise.resolve(__zippHostCallValue(kind, ...args)); } catch (e) { return Promise.reject(e); }
+        }
+      : function (...args) { return __zippHostCallValue(kind, ...args); };
+  },
+  writable: true, enumerable: false, configurable: true,
+});"#;
 
 /// Split a `define_function` name (a String/Symbol, or an Array path) into its
 /// segments, each as a String.
@@ -60,35 +80,32 @@ pub(crate) fn define_function(
 
     // A single name installs a global; an Array path installs on a nested
     // object (`["a","b"]` → `a.b`), creating intermediates as needed — the
-    // quickjs.rb `define_function ["a","b"]` shape.
-    let mut js = String::new();
-    let mut base = String::from("globalThis");
-    for seg in &segments[..segments.len() - 1] {
-        let path = format!("{base}[{}]", js_string(seg));
-        js.push_str(&format!("{path} = {path} || {{}};\n"));
-        base = path;
-    }
-    // An `:async` function returns a Promise (resolved with the host result, or
-    // rejected with its throw), matching quickjs.rb's `define_function(:async)`.
-    let body = if is_async {
-        format!(
-            "try {{ return Promise.resolve(__zippHostCallValue({k}, ...args)); }} \
-             catch (e) {{ return Promise.reject(e); }}",
-            k = js_string(&kind),
-        )
-    } else {
-        format!("return __zippHostCallValue({}, ...args);", js_string(&kind))
-    };
-    js.push_str(&format!(
-        "{base}[{}] = function(...args) {{ {body} }};",
-        js_string(&last),
-    ));
+    // quickjs.rb `define_function ["a","b"]` shape. An `:async` function
+    // returns a Promise (resolved with the host result, or rejected with its
+    // throw), matching quickjs.rb's `define_function(:async)`.
+    let path = HostValue::Array(segments.iter().cloned().map(HostValue::String).collect());
+    let args = [path, HostValue::String(kind), HostValue::Bool(is_async)];
+    let first = !HOST_FN_HELPER.with(|s| s.borrow().contains(&id));
     with_entry(ruby, id, |entry| {
         install_handler(ruby, entry)?;
-        entry
-            .run(ruby, |s| s.eval_in_context(&js))?
-            .map_err(|e| runtime_error(ruby, e))
+        entry.run(ruby, |s| -> Result<(), String> {
+            if first {
+                match compiled(HOST_FN_HELPER_JS) {
+                    Some(script) => s.load_compiled(&script),
+                    None => s.load_in_context(HOST_FN_HELPER_JS),
+                }
+                .map_err(|e| e.message)?;
+            }
+            // A definition runs no queued jobs.
+            s.call_global_structured_opts("__zippDefineHostFunction", &args, false)
+                .map(|_| ())
+                .map_err(|e| e.message)
+        })?
+        .map_err(|e| runtime_error(ruby, e))
     })?;
+    if first {
+        HOST_FN_HELPER.with(|s| s.borrow_mut().insert(id));
+    }
     Ok(ruby.to_symbol(last.as_str()))
 }
 
