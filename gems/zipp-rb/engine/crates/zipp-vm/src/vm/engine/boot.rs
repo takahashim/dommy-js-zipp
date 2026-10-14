@@ -177,7 +177,7 @@ impl<'p> Vm<'p> {
             eval_classes: Vec::new(),
             main_class_count: program.classes.len(),
             eval_global_map: std::collections::HashMap::new(),
-            eval_global_names: std::collections::HashMap::new(),
+            eval_global_names: rustc_hash::FxHashMap::default(),
             pool_slot_names: rustc_hash::FxHashMap::default(),
             eval_global_next: program.global_count + FIELD_POOL as u32,
             builtin_globals: std::collections::HashMap::new(),
