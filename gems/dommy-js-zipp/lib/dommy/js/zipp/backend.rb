@@ -59,7 +59,7 @@ module Dommy
           rescue ArgumentError
             nil
           end
-          @vm.load(BOOT_JS)
+          @vm.load(BOOT_JS, cache: true)
         end
 
         # True once the VM can no longer run JS: it was discarded after an engine
