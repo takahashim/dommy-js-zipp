@@ -123,7 +123,9 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   (`shared_buffers`), growth (`ab_max`, `AbData::grow_bytes`) and Atomics
   already handle local bytes; with one agent (no `$262.agent` workers) the
   difference is unobservable, except that `$262.agent.broadcast` refuses such
-  a buffer. Test: `test/engine_fixes_test.rb`.
+  a buffer and a sync `Atomics.wait` on an equal value returns "timed-out" at
+  once instead of sleeping out its timeout (no other agent could wake it).
+  Test: `test/engine_fixes_test.rb`.
 
 ## Global object (crates/zipp-vm/src/vm/dispatch.rs)
 
@@ -134,7 +136,10 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   top-level `let`/`const`/`class` is initialized by that same store while
   its slot is in the TDZ, so `let y = null; y = 2; y` threw "y is not
   defined" (dommy's unified window keeps the window proxy on that chain).
-  The [[Set]] route now skips a lexical global (`global_name_is_lexical`).
+  The [[Set]] route now skips a lexical global (`global_name_is_lexical`),
+  and so do the routes before it, for a name the global object owns or its
+  chain resolves: under the unified window, `let name = {}` otherwise set
+  `window.name` and left the slot in its TDZ.
   Test: `test/engine_fixes_test.rb`.
 
 - **A builtin read finds the global's own property first** — a global slot

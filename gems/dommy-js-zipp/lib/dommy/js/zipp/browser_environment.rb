@@ -39,9 +39,11 @@ module Dommy
         private_constant :TIMER_GLOBALS_JS, :BROWSER_GLOBALS_JS, :WINDOW_BUILTINS_JS,
           :INTL_POLYFILL_JS, :WASM_STUB_JS, :ERROR_REBUILD_JS
 
-        # Every payload's source, for Zipp.prewarm.
-        def self.payloads
-          [TIMER_GLOBALS_JS, BROWSER_GLOBALS_JS, WINDOW_BUILTINS_JS, INTL_POLYFILL_JS, WASM_STUB_JS, ERROR_REBUILD_JS]
+        # The payloads a Runtime loads, for Zipp.prewarm: a unified one (see
+        # #install_globals) never loads the aliasing and mirroring two.
+        def self.payloads(unified: false)
+          aliasing = unified ? [] : [BROWSER_GLOBALS_JS, WINDOW_BUILTINS_JS]
+          [TIMER_GLOBALS_JS, INTL_POLYFILL_JS, WASM_STUB_JS, ERROR_REBUILD_JS, *aliasing]
         end
 
         def initialize(backend)
