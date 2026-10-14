@@ -307,23 +307,20 @@ impl<'p> Vm<'p> {
                         ));
                         break;
                     }
+                    // The global object's slot-backed bindings are own data
+                    // properties its map does not hold: one governs here, and
+                    // the global's prototype chain is never consulted.
+                    if self.global_this != 0 && cur.heap_index() == self.global_this {
+                        if let Some((_, a)) = self.global_slot_binding_descriptor(&key) {
+                            governing = Some((false, a.writable, Value::UNDEFINED));
+                            break;
+                        }
+                    }
                     // A private name is never a prototype property: keep the
                     // class-aware target write for it.
                     if m.class.is_some() && key.starts_with('#') {
                         fell_back = true;
                         break;
-                    }
-                    // A binding that lives only in a global SLOT (a builtin, a
-                    // script `var`) is an own data property of the global
-                    // object (see `global_slot_binding_descriptor`), so it
-                    // governs the write before anything on the global's
-                    // prototype chain — a Proxy there must not see
-                    // `globalThis.Math = m`.
-                    if cur.heap_index() == self.global_this {
-                        if let Some((_, a)) = self.global_slot_binding_descriptor(&key) {
-                            governing = Some((false, a.writable, Value::UNDEFINED));
-                            break;
-                        }
                     }
                 }
                 // A TypedArray on the prototype chain ABSORBS canonical
@@ -403,7 +400,9 @@ impl<'p> Vm<'p> {
                     | HeapObj::Closure { .. }
                     | HeapObj::Bound { .. }
                     | HeapObj::Native(_)
-                    | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
+                    | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. } => self.fn_props.get(&h),
                     _ => self.arr_props.get(&h),
                 };
                 side.and_then(|m| m.pos(&key).map(|i| m.attr_at(i).accessor))
@@ -448,7 +447,9 @@ impl<'p> Vm<'p> {
                         | HeapObj::Closure { .. }
                         | HeapObj::Bound { .. }
                         | HeapObj::Native(_)
-                        | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
+                        | HeapObj::NativeClosure { .. }
+                        | HeapObj::BoundResolver { .. }
+                        | HeapObj::CombinatorResolver { .. } => self.fn_props.get(&h),
                         _ => self.arr_props.get(&h),
                     };
                     match side.and_then(|m| {
@@ -3170,6 +3171,8 @@ impl<'p> Vm<'p> {
                     HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
                     HeapObj::Native(_)
                     | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. }
                     | HeapObj::Bound { .. }
                     | HeapObj::Wrapped { .. } => None,
                     // A constructor global (Array, Date, Temporal.Instant, …) is stored
@@ -3803,6 +3806,8 @@ impl<'p> Vm<'p> {
                                 | HeapObj::Bound { .. }
                                 | HeapObj::Native(_)
                                 | HeapObj::NativeClosure { .. }
+                                | HeapObj::BoundResolver { .. }
+                                | HeapObj::CombinatorResolver { .. }
                         ) {
                             self.fn_props.get(&a0.heap_index())
                         } else {
@@ -4015,6 +4020,8 @@ impl<'p> Vm<'p> {
                                     | HeapObj::Wrapped { .. }
                                     | HeapObj::Native(_)
                                     | HeapObj::NativeClosure { .. }
+                                    | HeapObj::BoundResolver { .. }
+                                    | HeapObj::CombinatorResolver { .. }
                             ) {
                                 if let Some(fm) = self.fn_props.get_mut(&idx) {
                                     match id {

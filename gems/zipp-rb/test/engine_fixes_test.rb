@@ -35,6 +35,28 @@ class EngineFixesTest < Minitest::Test
     assert_equal ["brandNew", 2, "ReferenceError"], result
   end
 
+  # A top-level `let`/`const`/`class` is initialized in its slot even with a
+  # Proxy on the global's chain (whose `set` trap takes unresolvable writes).
+  def test_top_level_lexicals_initialize_with_a_proxy_on_the_global_chain
+    result = @vm.eval(<<~JS)
+      var trapped = [];
+      Object.setPrototypeOf(globalThis, new Proxy({}, {
+        has(t, k) { return false; },
+        set(t, k, v, r) {
+          trapped.push(String(k));
+          return Reflect.defineProperty(r, k, { value: v, writable: true, enumerable: true, configurable: true });
+        },
+      }));
+      let y = null;
+      y = 2;
+      const c = 3;
+      class K {}
+      (0, eval)("fresh = 4");
+      [y, c, typeof K, fresh, trapped.join(",")];
+    JS
+    assert_equal [2, 3, "function", 4, "fresh"], result
+  end
+
   # Reading a builtin finds it as the global object's own property, before a
   # Proxy on the global's chain is asked `has` — in ordinary code and in a
   # function that names `eval` (whose globals resolve dynamically).

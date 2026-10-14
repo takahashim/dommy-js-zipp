@@ -125,16 +125,18 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   difference is unobservable, except that `$262.agent.broadcast` refuses such
   a buffer. Test: `test/engine_fixes_test.rb`.
 
-## Global object (crates/zipp-vm/src/vm/natives.rs, vm/access.rs)
+## Global object (crates/zipp-vm/src/vm/dispatch.rs)
 
-- **Global slot bindings govern a [[Set]]** — a builtin or script `var` lives
-  in a global slot, not the global object's `ObjMap`, so `Reflect.set` and a
-  member assignment (`globalThis.JSON = j`) walked past it to the global's
-  prototype chain, and a Proxy there saw the write (and swallowed it).
-  `ordinary_set_with_receiver` and `set_prop`'s prototype walk now treat a
-  binding `global_slot_binding_descriptor` reports as the own data property
-  it is. dommy-js-zipp's unified window keeps the window proxy on the
-  global's chain. Test: `test/engine_fixes_test.rb`.
+- **A top-level lexical's initialization stays in its slot** — upstream's
+  fix for writes to unresolvable names (f2i-com/zipp.org#47, 5762df5) sends
+  `StoreGlobal` / `StoreGlobalDyn` on an uninitialized slot through [[Set]]
+  on the global object whenever a Proxy is on its prototype chain. A
+  top-level `let`/`const`/`class` is initialized by that same store while
+  its slot is in the TDZ, so `let y = null; y = 2; y` threw "y is not
+  defined" (dommy's unified window keeps the window proxy on that chain).
+  The [[Set]] route now skips a lexical global (`global_name_is_lexical`).
+  Test: `test/engine_fixes_test.rb`.
+
 - **A builtin read finds the global's own property first** — a global slot
   an eval-installed program reads (vm/dispatch.rs: `LoadGlobalOrUndefined`,
   `LoadGlobalOrUndefinedDyn`, `LoadGlobalDyn`, `load_global_slow`) consulted
@@ -143,15 +145,6 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   `has` trap once the window sat on that chain (and walked
   `Object.prototype` before). The builtin is an own property of the global
   object, so it now answers first. Test: `test/engine_fixes_test.rb`.
-
-## Performance: naming a global slot (crates/zipp-vm/src/vm/engine/run.rs, vm/mod.rs, vm/engine/boot.rs)
-
-- `global_slot_name` found an eval-introduced slot's name by scanning all of
-  `eval_global_map`, on every slow global read (a global that is an own
-  property of the global object, not a slot), so the read was linear in the
-  realm's globals. `Vm::eval_global_names` keeps the reverse map, filled where
-  `eval_global_slot` fills the forward one. An element property read through
-  dommy's bridge went from 2.6µs to 2.0µs.
 
 ## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, compile/*, vm/dispatch.rs)
 
@@ -235,12 +228,6 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   (`host_eval_rich_opts`). Test: `test/zipp_rb_test.rb`
   `test_reentry_does_not_run_microtasks_early`.
 
-- **Promise resolving functions inherit `Function.prototype`** — the
-  `BoundResolver` / `CombinatorResolver` heap kinds (a `new Promise`
-  executor's resolve/reject, `Promise.all`'s element functions) were missing
-  from `get_member_slow`'s callable arm, so `resolve.apply` / `.call` /
-  `.bind` read `undefined`. dommy's bridge settles host promises with
-  `resolve.apply(…)`. Test: `test/engine_fixes_test.rb`.
 
 ## Tests
 
