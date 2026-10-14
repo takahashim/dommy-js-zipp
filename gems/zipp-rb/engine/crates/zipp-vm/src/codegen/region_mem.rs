@@ -1176,6 +1176,20 @@ pub(crate) fn compile_region_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
             }
+            Instr::TypeOf { dst, a } => {
+                // `typeof v` → its canonical result string (`jit_typeof`):
+                // total, no user code; refetched after, as Tier C's arm does.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(a)]
+                    ; mov rax, QWORD heap.typeof_str as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+            }
             Instr::LoadNull { dst } => {
                 dynasm!(ops
                     ; mov rax, QWORD Value::NULL.bits() as i64
@@ -3086,6 +3100,25 @@ pub(crate) fn compile_region_mem(
                         dynasm!(ops ; => dv_done);
                     }
                     emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else if argc == 0 && key == "pop" {
+                    // `arr.pop()`: `jit_array_pop` serves a plain dense Array
+                    // in place and declines anything else before any effect.
+                    // The array's storage shrinks, so pinned snapshots are
+                    // re-derived as after a push.
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; mov rax, QWORD crate::vm::jit_array_pop as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if let Some((snap, plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, plan, cache);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
                 } else if argc == 1 && matches!(key, "push" | "charCodeAt") {
                     // The whitelisted 1-arg builtins keep their dedicated win64
                     // helpers: receiver + arg0 bits in, result bits out, deopt
@@ -3412,6 +3445,485 @@ pub(crate) fn compile_region_mem(
                     packed_fip,
                     packed_args,
                     argc,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            // Literal building, as Tier C emits it (`compile_proto_mem`):
+            // one helper call each, with the region's refetch after an
+            // allocation. A loop that built an array or object literal
+            // was declined whole and ran on the interpreter.
+            Instr::NewArray {
+                dst,
+                arg_base,
+                argc,
+            } if !py => {
+                // Fixed-block literal only.  The helper validates that this
+                // entire window lies inside vm.regs, collects before copying
+                // the rooted Values, allocates, and applies current-realm
+                // Array provenance.
+                let helper = crate::vm::jit_new_array as usize;
+                let packed =
+                    ((proto.reg_count as u64) << 32) | ((arg_base as u64) << 16) | argc as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, tplan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::NewObject { dst, hint } if !py => {
+                // Allocation is a GC safe point.  The native frame's Values
+                // live in vm.regs, and the helper reproduces realm_born before
+                // returning the new object's bits.  A defensive decline is
+                // still a pure prefix: the unreachable fresh allocation has
+                // not escaped and the interpreter may replay NewObject.
+                let helper = crate::vm::jit_new_object as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov edx, hint as i32
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                // Heap::alloc can reallocate the version vector.  Functions
+                // with property ICs or leaf guards pin r13/r14 and must refresh
+                // them before the next emitted op.
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, tplan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::NewPlannedObject { dst, plan } if !py => {
+                // The helper validates the unified FuncProto id and plan index
+                // before its GC/allocation commit point. Packing uses the same
+                // immutable-id convention as AppendDataProp.
+                let helper = crate::vm::jit_new_planned_object as usize;
+                let packed = ((heap.func_id as u64) << 32) | plan as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, tplan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::AppendDataProp { obj, name, val } if !py => {
+                // Pack the immutable unified function id with its static
+                // name slot. The helper verifies exact Object kind before
+                // its barrier and interpreter-equivalent push_data.
+                let helper = crate::vm::jit_append_data_prop as usize;
+                let packed_name = ((heap.func_id as u64) << 32) | name as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(obj)]
+                    ; mov r8, QWORD packed_name as i64
+                    ; mov r9, [rbx + dreg(val)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::FinalizeObject {
+                dst,
+                plan,
+                val_base,
+                count,
+            } if !py => {
+                // One helper call allocates AND fully populates the literal
+                // from the staged register block — the values are live window
+                // slots, so the helper's pre-allocation safe point sees them
+                // as ordinary GC roots. Validation is a pure prefix; the
+                // committed object is complete before the helper returns, so
+                // no bail can ever observe partial initialization.
+                // B182: bake the plan address and the shape fold when the
+                // compile can resolve them — the fold over the plan's keys
+                // with data bits is exactly what `finalize_shape` memoizes
+                // (same fold, same thread-local transition tree), so the two
+                // forms are observably identical; the baked helper keeps only
+                // the checks a compile cannot freeze (window bounds, GC poll).
+                let baked = if super::finalize_baked_enabled() {
+                    proto
+                        .static_key_plans
+                        .get(plan as usize)
+                        .filter(|pl| {
+                            pl.runtime_valid()
+                                && pl.len() == count as usize
+                                && !pl.has_element_key()
+                                && (count as usize) < crate::heap::PROP_INDEX_THRESHOLD
+                        })
+                        .map(|pl| {
+                            let data = crate::shape::attr_bits(true, true, true, false);
+                            let mut shape = crate::shape::EMPTY;
+                            for key in pl.keys() {
+                                shape = crate::shape::add(shape, key, data);
+                            }
+                            (pl as *const crate::bytecode::StaticKeyPlan as u64, shape)
+                        })
+                } else {
+                    None
+                };
+                if let Some((plan_ptr, shape)) = baked {
+                    let packed = ((shape as u64) << 32) | ((val_base as u64) << 16) | count as u64;
+                    // B257: the thin helper validates only the slots it
+                    // reads, so the window-bound the baked helper checks per
+                    // call is proved here instead and the 5th (stack)
+                    // argument is gone; the values go window -> slab in one
+                    // copy. `ZIPP_NO_THIN_ALLOC` keeps the baked form.
+                    let thin = crate::heap::thin_alloc_enabled()
+                        && (val_base as usize + count as usize) <= proto.reg_count as usize;
+                    if thin {
+                        let helper = crate::vm::jit_finalize_object_thin as usize;
+                        dynasm!(ops
+                            ; mov rcx, rdi
+                            ; mov rdx, rbx
+                            ; mov r8, QWORD plan_ptr as i64
+                            ; mov r9, QWORD packed as i64
+                            ; mov rax, QWORD helper as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                    } else {
+                        let helper = crate::vm::jit_finalize_object_baked as usize;
+                        dynasm!(ops
+                            ; mov rcx, rdi
+                            ; mov rdx, rbx
+                            ; mov r8, QWORD plan_ptr as i64
+                            ; mov r9, QWORD packed as i64
+                            ; mov DWORD [rsp + 32], proto.reg_count as i32
+                            ; mov rax, QWORD helper as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                    }
+                } else {
+                    let helper = crate::vm::jit_finalize_object as usize;
+                    let packed_plan = ((heap.func_id as u64) << 32) | plan as u64;
+                    let packed_window =
+                        ((proto.reg_count as u64) << 32) | ((val_base as u64) << 16) | count as u64;
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, rbx
+                        ; mov r8, QWORD packed_plan as i64
+                        ; mov r9, QWORD packed_window as i64
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, tplan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::MakeFunc { dst, .. }
+            | Instr::MakeClosure { dst, .. }
+            | Instr::MakeArrow { dst, .. }
+                if !py =>
+            {
+                // `jit_region_make_fn` runs the interpreter's code in this
+                // frame and returns the callable's bits; a decline precedes
+                // every effect and resumes the interpreter at this op.
+                let helper = crate::vm::jit_region_make_fn as usize;
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let window = proto.reg_count.max(1) as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed_fip as i64
+                    ; mov r9, QWORD window as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, tplan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::MakeCell { .. }
+            | Instr::MakeCellTdz { .. }
+            | Instr::MakeCellFnName { .. }
+            | Instr::MarkCellConst { .. }
+                if !py =>
+            {
+                // The same helper writes the fresh cell into the window.
+                let helper = crate::vm::jit_region_make_fn as usize;
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let window = proto.reg_count.max(1) as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed_fip as i64
+                    ; mov r9, QWORD window as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, tplan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::IterToArray { dst, src, count } if !py => {
+                // `[a, b] = v`: `jit_iter_to_array_ic`, with the call protocol.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_to_array_ic as usize,
+                    packed_fip,
+                    src as u64 | (count as u64) << 16,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::ArrayAppend { arr, val, spread: false } if !py => {
+                // `[...v, x]`'s `x`: a plain push (`jit_array_append_plain`).
+                // The literal's storage grows, so pinned snapshots are
+                // re-derived as after a push.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(arr)]          // array bits
+                    ; mov r8, [rbx + dreg(val)]           // value bits
+                    ; mov rax, QWORD crate::vm::jit_array_append_plain as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::ArrayAppend { arr, val, spread } if !py => {
+                // `[...v]`: `jit_array_append_ic`, with the call protocol;
+                // the array's own bits come back into its register.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_array_append_ic as usize,
+                    packed_fip,
+                    arr as u64 | (val as u64) << 16 | (spread as u64) << 32,
+                    0,
+                    arr,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::CallSpread { dst, callee, args } if !py => {
+                // `f(...v)`: `jit_call_spread_ic`, with the call protocol.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_call_spread_ic as usize,
+                    packed_fip,
+                    callee as u64 | (args as u64) << 16,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::ObjectKeys { dst, obj, callee, this_v }
+            | Instr::ObjectValues { dst, obj, callee, this_v }
+            | Instr::ObjectEntries { dst, obj, callee, this_v }
+                if !py =>
+            {
+                // `Object.keys(o)` and friends: `jit_obj_enum_ic`, with the
+                // call protocol.
+                let op: u64 = match proto.code[ip] {
+                    Instr::ObjectKeys { .. } => 0,
+                    Instr::ObjectValues { .. } => 1,
+                    _ => 2,
+                };
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_enum_ic as usize,
+                    packed_fip,
+                    obj as u64 | (callee as u64) << 16 | (this_v as u64) << 32 | op << 56,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::ForInKeys { dst, obj } | Instr::LenOf { dst, obj } if !py => {
+                // A for-in's key snapshot (op 3) and its length (op 4).
+                let op: u64 = if matches!(proto.code[ip], Instr::ForInKeys { .. }) {
+                    3
+                } else {
+                    4
+                };
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_enum_ic as usize,
+                    packed_fip,
+                    obj as u64 | op << 56,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::ObjectSpread { target, src } if !py => {
+                // `{ ...src }`: `jit_obj_init_ic` op 0, with the call protocol;
+                // the literal's own bits come back into its register.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_init_ic as usize,
+                    packed_fip,
+                    target as u64 | (src as u64) << 16,
+                    0,
+                    target,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::InitDataProp { obj, name, val } if !py => {
+                // A literal's named data property (`jit_obj_init_ic` op 1).
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_init_ic as usize,
+                    packed_fip,
+                    obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 1u64 << 56,
+                    0,
+                    obj,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::LoadClassValue { dst, class_id } if !py => {
+                // `jit_load_class_value_ic`: the class binding, or its TDZ
+                // ReferenceError through the call protocol.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_load_class_value_ic as usize,
+                    packed_fip,
+                    class_id as u64,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::ToStr { dst, a } if !py => {
+                // `${a}`: `jit_to_str_ic`, with the call protocol.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_to_str_ic as usize,
+                    packed_fip,
+                    a as u64,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::InstanceOfDyn { dst, val, ctor } => {
+                // `v instanceof c` through `jit_instanceof_ic`, with the call
+                // protocol: it can run user code and throw.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let packed_args = ((ctor as u64) << 16) | val as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_instanceof_ic as usize,
+                    packed_fip,
+                    packed_args,
+                    0,
                     dst,
                     refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                     ta_refetch,
@@ -3913,6 +4425,26 @@ pub(crate) fn compile_region_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
             }
+            Instr::StaticFn { dst, op, argc, .. }
+                if !crate::codegen::static_fn_region_inline(op, argc) =>
+            {
+                // The general static: `jit_static_fn_ic` reads the
+                // instruction from the bytecode.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_static_fn_ic as usize,
+                    packed_fip,
+                    0,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
             Instr::StaticFn {
                 dst,
                 op,
@@ -4007,6 +4539,95 @@ pub(crate) fn compile_region_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::GetIterator { dst, src }
+                if !py && !scalar_matchall.is_some_and(|p| p.get_iterator_ip == ip) =>
+            {
+                // The general protocol: `jit_iter_op_ic` op 0.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as usize,
+                    packed_fip,
+                    src as u64,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::IterPrime { dst, iter }
+                if !py && !scalar_matchall.is_some_and(|p| p.iter_prime_ip == ip) =>
+            {
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as usize,
+                    packed_fip,
+                    iter as u64 | 1u64 << 56,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } if !py => {
+                let op: u64 = if matches!(proto.code[ip], Instr::IterClose { .. }) { 2 } else { 3 };
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as usize,
+                    packed_fip,
+                    iter as u64 | op << 56,
+                    0,
+                    iter,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::IterCloseFinally { iter, kind_reg }
+                if !py && !scalar_matchall.is_some_and(|p| p.close_ip == ip) =>
+            {
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as usize,
+                    packed_fip,
+                    iter as u64 | (kind_reg as u64) << 16 | 4u64 << 56,
+                    0,
+                    iter,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
+            Instr::ArrayCtor { dst, callee, arg_base, argc, is_construct } if !py => {
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let callee = callee.unwrap_or(0xFFFF);
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_array_ctor_ic as usize,
+                    packed_fip,
+                    callee as u64 | (arg_base as u64) << 16 | (is_construct as u64) << 32,
+                    argc,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
             }
             Instr::GetIterator { dst, src } => {
                 let Some(_plan) = scalar_matchall.filter(|p| p.get_iterator_ip == ip) else {
@@ -4169,11 +4790,14 @@ pub(crate) fn compile_region_mem(
                     ; jmp => epilogue
                 );
             }
-            Instr::EndFinally { kind_reg, .. } if py => {
-                // A Python `try`/`finally` (or `except` clause) completing
-                // normally falls through; any abrupt completion leaves the
-                // region at the instruction for the interpreter's routing
-                // (Tier C's arm, `proto_mem`).
+            Instr::EndFinally { kind_reg, .. }
+                if py || !scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) =>
+            {
+                // A `finally` (a Python `try`/`finally` or `except` clause, a
+                // JavaScript `finally`, a for-of's or a destructuring's close
+                // handler) completing normally falls through; any abrupt
+                // completion leaves the region at the instruction for the
+                // interpreter's routing (Tier C's arm, `proto_mem`).
                 let helper = crate::vm::jit_end_finally as usize;
                 dynasm!(ops
                     ; mov rcx, rdi

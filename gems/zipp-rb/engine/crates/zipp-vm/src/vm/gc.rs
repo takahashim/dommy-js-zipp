@@ -67,6 +67,23 @@ use super::{Microtask, Resume, Vm};
 use crate::heap::{GenState, HeapObj};
 use crate::value::Value;
 
+/// `ZIPP_NO_OLD_JOBS_SKIP=1`: a minor walks every queued job again (see
+/// `Vm::mark_roots`). The two sides of a one-binary A/B.
+#[inline]
+fn old_jobs_skip_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_OLD_JOBS_SKIP").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// RAII guard that suspends collection for its scope (decrements on drop, even
 /// across `?` early returns). Held by native built-ins that keep an un-rooted
 /// `Vec<Value>` of freshly-allocated objects while re-entering the interpreter
@@ -439,7 +456,7 @@ impl Vm<'_> {
             marks[idx as usize] = true;
         }
         let free_before = self.heap.free_indices().len();
-        self.mark_roots(&mut marks, &mut stack, n);
+        self.mark_roots(&mut marks, &mut stack, n, false);
         self.gc_major_tail(n, floor, free_before, marks, stack, stats, t_start);
     }
 
@@ -451,7 +468,12 @@ impl Vm<'_> {
     /// holders and pinned built-ins are boundary nodes whose young referents
     /// the remembered set supplies (see the module doc's completeness
     /// argument).
-    fn mark_roots(&mut self, marks: &mut Vec<bool>, stack: &mut Vec<u32>, n: usize) {
+    ///
+    /// `minor`: skip the queued jobs from before the last collection
+    /// (`microtasks_old`). Everything they hold is old, so a minor would find
+    /// every one of them pre-marked; a program that queues a million jobs
+    /// paid for walking all of them at every minor.
+    fn mark_roots(&mut self, marks: &mut Vec<bool>, stack: &mut Vec<u32>, n: usize, minor: bool) {
         let floor = self.gc_floor as usize;
         // Pinned built-ins: marked AND traced (a built-in proto may hold a user
         // object, e.g. `Array.prototype.foo = userObj`).
@@ -614,7 +636,12 @@ impl Vm<'_> {
             root_val!(*v);
         }
         // B214: the queue AND the in-flight task (see `current_microtask`).
-        for mt in self.microtasks.iter().chain(self.current_microtask.iter()) {
+        let fresh = if minor && old_jobs_skip_enabled() {
+            self.microtasks_old.min(self.microtasks.len())
+        } else {
+            0
+        };
+        for mt in self.microtasks.range(fresh..).chain(self.current_microtask.iter()) {
             match mt {
                 Microtask::Reaction {
                     callback,
@@ -672,9 +699,6 @@ impl Vm<'_> {
             root_idx!(promise);
         }
         root_val!(self.promise_rejection_hook);
-        for &(new_target, _) in self.deferred_instance_protos.values() {
-            root_val!(new_target);
-        }
         for &promise in self.reported_rejections.iter().chain(&self.rejections_handled_late) {
             root_idx!(promise);
         }
@@ -766,11 +790,15 @@ impl Vm<'_> {
         for v in self.super_this.values() {
             root_val!(*v);
         }
+        // A derived construction's newTarget, until super() reaches its base.
+        for v in self.pending_ctor_proto.values() {
+            root_val!(*v);
+        }
         // Private field values: an entry keyed by a live instance must keep its
         // payload alive (over-approximate; dead-instance entries pruned below).
         for m in self.private_fields.values() {
-            for v in m.values() {
-                root_val!(*v);
+            for &(_, _, v) in m {
+                root_val!(v);
             }
         }
         for &p in self.prototypes.values() {
@@ -994,6 +1022,7 @@ impl Vm<'_> {
         self.this_tdz.retain_marked(&marks);
         self.super_called.retain_marked(&marks);
         self.super_this.retain_marked(&marks);
+        self.pending_ctor_proto.retain_marked(&marks);
         self.prototypes.retain_marked(&marks);
         self.class_proto_owner.retain_marked(&marks);
         self.ctor_initial_name.retain_marked(&marks);
@@ -1051,7 +1080,6 @@ impl Vm<'_> {
         self.pinned_buffers.retain_marked(&marks);
         self.error_data.retain(|&k| marks[k as usize]);
         self.error_frames.retain_marked(&marks);
-        self.deferred_instance_protos.retain_marked(&marks);
         self.arguments_objs.retain_marked(&marks);
         self.gen_args_obj
             .retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
@@ -1102,6 +1130,9 @@ impl Vm<'_> {
         };
         gcstats::record_major(swept_floated, n);
         self.heap.note_gc_done(n - free_after);
+        // Every queued job's Values were roots of this collection and are
+        // old now.
+        self.microtasks_old = self.microtasks.len();
         if self.heap.oracle_on() {
             // B6 oracle: this collection is now "the last GC" — survivors age out.
             self.heap.oracle_next_epoch();
@@ -1146,7 +1177,7 @@ impl Vm<'_> {
             );
         }
         let mut stack: Vec<u32> = Vec::with_capacity(1024);
-        self.mark_roots(&mut marks, &mut stack, n);
+        self.mark_roots(&mut marks, &mut stack, n, true);
         let t_roots = gcstats::now(stats);
         // Dirty OLD holders: scan their edge lists — the one thing an old
         // object contributes to young liveness. `trace_edges` on a marked
@@ -1222,6 +1253,9 @@ impl Vm<'_> {
         gcstats::record_minor(swept as u64, dirty.len() as u64, n);
         gcstats::record_budget(self.heap.young_budget() as u64);
         self.heap.note_minor_done(n - free_after);
+        // Every queued job's Values were roots of this collection and are
+        // old now (survivors are promoted).
+        self.microtasks_old = self.microtasks.len();
         if self.heap.oracle_on() {
             self.heap.oracle_next_epoch();
         }
@@ -1242,7 +1276,7 @@ impl Vm<'_> {
             marks[idx as usize] = true;
         }
         let mut stack: Vec<u32> = Vec::with_capacity(1024);
-        self.mark_roots(&mut marks, &mut stack, n);
+        self.mark_roots(&mut marks, &mut stack, n, false);
         while let Some(idx) = stack.pop() {
             self.trace_edges(idx, &mut marks, &mut stack, n);
         }
@@ -1314,6 +1348,7 @@ impl Vm<'_> {
         prune_set!(self.this_tdz);
         prune_set!(self.super_called);
         prune_map!(self.super_this);
+        prune_map!(self.pending_ctor_proto);
         prune_map!(self.prototypes);
         prune_map!(self.class_proto_owner);
         prune_map!(self.ctor_initial_name);
@@ -1360,7 +1395,7 @@ impl Vm<'_> {
         }
         prune_map!(self.eval_scope_parent);
         prune_map!(self.shadow_fn_realm);
-        prune_map!(self.private_fields);
+        prune_slots!(self.private_fields);
         // The declared-name recompute (the major runs it whenever the table
         // is non-empty) only shrinks when its source maps did; when no brand
         // entry died this minor it is the identity and is skipped. Deferring it further is safe regardless:
@@ -1391,7 +1426,6 @@ impl Vm<'_> {
             }
         }
         prune_map!(self.error_frames);
-        prune_map!(self.deferred_instance_protos);
         prune_slots!(self.arguments_objs);
         // Dies with EITHER endpoint: the generator (key) or its arguments
         // object (value).

@@ -10,6 +10,172 @@ use super::*;
 const CTOR_FIELD_HINT_MAX: u16 = 32;
 
 impl<'p> Vm<'p> {
+    /// Learn constructor `fid`'s instance size from the instance `obj` it just
+    /// finished, for the next `new` to pre-size (`ctor_field_hint`). Taken as
+    /// a high-water mark so a constructor with a conditional field settles on
+    /// the larger shape rather than oscillating; capacity is cheap and
+    /// regrowth is what we are paying to avoid.
+    pub(crate) fn learn_ctor_field_hint(&mut self, fid: u32, obj: Value) {
+        let n = match self.heap.get(obj.heap_index()) {
+            HeapObj::Object(m) => m.keys.len().min(u16::MAX as usize) as u16,
+            _ => 0,
+        };
+        // CAPPED. A high-water mark is unbounded by construction: one
+        // unusual instance that happens to take 65,535 properties would
+        // teach the mark permanently, and every later instance of that
+        // constructor would then reserve ~3 MiB across the three vectors
+        // — for the whole process lifetime, which is especially bad in a
+        // persistent embedded VM (`embed::ScriptState`). Pre-sizing only
+        // ever saves regrowth, and regrowth past a few dozen properties
+        // is amortised anyway, so the cap costs nothing measurable.
+        let n = n.min(CTOR_FIELD_HINT_MAX);
+        if n > 0 {
+            if self.ctor_field_hint.len() <= fid as usize {
+                self.ctor_field_hint.resize(fid as usize + 1, 0);
+            }
+            if n > self.ctor_field_hint[fid as usize] {
+                self.ctor_field_hint[fid as usize] = n;
+            }
+        }
+    }
+
+    /// The instance `new F(...)` makes for `cv` when it is a plain
+    /// constructor function the interpreter can run flat (its frame pushed in
+    /// the running loop, `Frame::construct_this`): a non-generator,
+    /// non-async, constructable function that is not an arrow, with no
+    /// second realm alive. Allocated and given its [[Prototype]] exactly as
+    /// the Func arm of `construct_with_newtarget_rooted` does. `None`, with
+    /// nothing done, for anything else.
+    pub(crate) fn flat_new_instance(&mut self, cv: Value) -> Option<(u32, u32, Value)> {
+        if !cv.is_heap() || matches!(self.heap.get(cv.heap_index()), HeapObj::Class(_)) {
+            return None;
+        }
+        let (fid, closure) = self.ic_plain_fn(cv)?;
+        {
+            let p = self.func(fid as usize);
+            if p.non_constructable || p.lexical_this {
+                return None;
+            }
+        }
+        if !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.get_function_realm(cv) != 0
+        {
+            return None;
+        }
+        let mut proto = self.prototype_of(cv).unwrap_or(Value::UNDEFINED);
+        if !self.is_object_value(proto) {
+            if let Some(rp) = self.realm_proto_fallback(cv, self.obj_proto) {
+                proto = Value::heap(rp);
+            }
+        }
+        let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
+        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
+            ObjMap::with_capacity(hint as usize),
+        ))));
+        if proto.is_heap() {
+            self.proto_of.insert(obj.heap_index(), proto);
+        }
+        Some((fid, closure, obj))
+    }
+
+    /// The flat `new C(...)` of a BASE class with a constructor of its own,
+    /// no decorators and no private brand to stamp: the instance made as
+    /// `construct`'s class arm makes it, its field initializers run on it
+    /// (fallible: guest code), and the constructor function the caller pushes
+    /// a frame for, `Frame::construct_this` then giving the instance back
+    /// unless an object is returned — what that arm does for such a class
+    /// (a base class ignores a primitive return). `Ok(None)`, with nothing
+    /// done, for any other class or value.
+    /// Make the ordinary function `f`'s `prototype` non-writable, keeping
+    /// its current value (recorded in `fn_proto_override`, which every read
+    /// consults first and which roots `f`).
+    pub(crate) fn make_fn_proto_readonly(&mut self, f: Value) {
+        if !f.is_heap() || !self.callable_has_prototype(f) {
+            return;
+        }
+        let idx = f.heap_index();
+        if matches!(self.heap.get(idx), HeapObj::Class(_)) {
+            return;
+        }
+        if !self.fn_proto_override.contains_key(&idx) {
+            let cur = self.prototype_of(f).unwrap_or(Value::UNDEFINED);
+            self.fn_proto_override.insert(idx, cur);
+        }
+        self.fn_proto_readonly.insert(idx);
+    }
+
+    pub(crate) fn flat_new_class_instance(
+        &mut self,
+        cv: Value,
+    ) -> Result<Option<(u32, u32, Value, Value)>, Thrown> {
+        let Some(target) = self.flat_new_class_target(cv) else {
+            return Ok(None);
+        };
+        self.flat_new_class_make(cv, target).map(Some)
+    }
+
+    /// The tests of [`Vm::flat_new_class_instance`]: whether `cv` is a class
+    /// its flat path takes, and if so its constructor (`fid`, `closure`, the
+    /// function value). Nothing is made.
+    pub(crate) fn flat_new_class_target(&mut self, cv: Value) -> Option<(u32, u32, Value)> {
+        if !cv.is_heap() {
+            return None;
+        }
+        let ci = cv.heap_index();
+        let simple = match self.heap.get(ci) {
+            HeapObj::Class(c) => {
+                c.ctor.is_some()
+                    && c.has_explicit_ctor
+                    && c.parent.is_none()
+                    && !c.extends_null
+                    && c.dec.is_none()
+            }
+            _ => false,
+        };
+        if !simple
+            || !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.get_function_realm(cv) != 0
+        {
+            return None;
+        }
+        // `brand_instance` would stamp nothing.
+        if let Some(own) = self.method_brand.get(&ci).and_then(|b| b.first()) {
+            if self.brand_private_names.contains_key(own) {
+                return None;
+            }
+        }
+        let Some(f) = self.class_body_fn(cv, false) else {
+            return None;
+        };
+        let Some((fid, closure)) = self.ic_plain_fn(f) else {
+            return None;
+        };
+        Some((fid, closure, f))
+    }
+
+    /// The making half of [`Vm::flat_new_class_instance`] for a `target`
+    /// [`Vm::flat_new_class_target`] returned: the instance, with the class's
+    /// field initializers run on it.
+    pub(crate) fn flat_new_class_make(
+        &mut self,
+        cv: Value,
+        (fid, closure, f): (u32, u32, Value),
+    ) -> Result<(u32, u32, Value, Value), Thrown> {
+        let ci = cv.heap_index();
+        let mut map = ObjMap::new();
+        map.class = Some(ci);
+        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
+        // The base class's InitializeInstanceElements, before its body.
+        let rooted = self.host_result_roots.len();
+        self.host_result_roots.push(obj);
+        let thunk = self.run_field_thunk(obj, cv);
+        self.host_result_roots.truncate(rooted);
+        thunk?;
+        Ok((fid, closure, obj, f))
+    }
+
     /// `new cv(args)` with newTarget defaulting to the constructor itself (the
     /// common case for `new` / a plain `Reflect.construct(cv, args)`).
     pub(crate) fn construct(&mut self, cv: Value, args: &[Value]) -> Result<Value, Thrown> {
@@ -62,34 +228,39 @@ impl<'p> Vm<'p> {
         ))
     }
 
+    /// The `Get(newTarget, "prototype")` a derived construction deferred
+    /// (`pending_ctor_proto`), run where `base` creates the instance `obj`, as
+    /// its OrdinaryCreateFromConstructor: `obj` takes `newTarget.prototype`
+    /// when that is an object, else newTarget's realm's intrinsic for `base`.
+    pub(crate) fn settle_pending_ctor_proto(&mut self, obj: Value, base: Value) -> Result<(), Thrown> {
+        if !obj.is_heap() {
+            return Ok(());
+        }
+        let Some(nt) = self.pending_ctor_proto.remove(&obj.heap_index()) else {
+            return Ok(());
+        };
+        let p = self.get_prop(nt, "prototype")?;
+        let p = if self.is_object_value(p) {
+            p
+        } else {
+            let intrinsic = if base.is_heap() {
+                self.class_intrinsic_proto(base.heap_index())
+            } else {
+                self.obj_proto
+            };
+            self.newtarget_intrinsic_fallback(nt, intrinsic)?
+        };
+        self.note_class_instance_reproto(obj.heap_index());
+        self.proto_of.insert(obj.heap_index(), p);
+        Ok(())
+    }
+
     /// The intrinsic default proto for a class constructor's instances: the
     /// base of its `extends` chain allocates `this` (OrdinaryCreateFromConstructor
     /// runs there), so a chain that ends in a built-in constructor
     /// (`class A extends Array`) falls back to that built-in's prototype
     /// (%Array.prototype%), and every other chain to %Object.prototype%.
-    /// The deferred GetPrototypeFromConstructor of a derived class's
-    /// pre-made instance `obj` (see the derived arm of class construction):
-    /// run it now, when a base adopts `obj` as the object it creates.
-    pub(crate) fn apply_deferred_instance_proto(&mut self, obj: Value) -> Result<(), Thrown> {
-        if self.deferred_instance_protos.is_empty() || !obj.is_heap() {
-            return Ok(());
-        }
-        let Some((new_target, class_idx)) = self.deferred_instance_protos.remove(&obj.heap_index()) else {
-            return Ok(());
-        };
-        let p = self.get_prop(new_target, "prototype")?;
-        let proto = if self.is_object_value(p) {
-            p
-        } else {
-            let intrinsic = self.class_intrinsic_proto(class_idx);
-            self.newtarget_intrinsic_fallback(new_target, intrinsic)?
-        };
-        self.note_class_instance_reproto(obj.heap_index());
-        self.proto_of.insert(obj.heap_index(), proto);
-        Ok(())
-    }
-
-    pub(crate) fn class_intrinsic_proto(&self, class_idx: u32) -> u32 {
+    fn class_intrinsic_proto(&self, class_idx: u32) -> u32 {
         let mut cur = class_idx;
         // Bounded: an `extends` chain is acyclic by construction.
         for _ in 0..10_000 {
@@ -1036,32 +1207,8 @@ impl<'p> Vm<'p> {
             // `new.target` for the constructor body (the next frame entered).
             self.pending_new_target = new_target;
             let ret = self.call_value(cv, obj, args)?;
-            // Learn this constructor's instance size for the next `new`. Taken as
-            // a high-water mark so a constructor with a conditional field settles
-            // on the larger shape rather than oscillating; capacity is cheap and
-            // regrowth is what we are paying to avoid.
             if let Some(f) = fid {
-                let n = match self.heap.get(obj.heap_index()) {
-                    HeapObj::Object(m) => m.keys.len().min(u16::MAX as usize) as u16,
-                    _ => 0,
-                };
-                // CAPPED. A high-water mark is unbounded by construction: one
-                // unusual instance that happens to take 65,535 properties would
-                // teach the mark permanently, and every later instance of that
-                // constructor would then reserve ~3 MiB across the three vectors
-                // — for the whole process lifetime, which is especially bad in a
-                // persistent embedded VM (`embed::ScriptState`). Pre-sizing only
-                // ever saves regrowth, and regrowth past a few dozen properties
-                // is amortised anyway, so the cap costs nothing measurable.
-                let n = n.min(CTOR_FIELD_HINT_MAX);
-                if n > 0 {
-                    if self.ctor_field_hint.len() <= f as usize {
-                        self.ctor_field_hint.resize(f as usize + 1, 0);
-                    }
-                    if n > self.ctor_field_hint[f as usize] {
-                        self.ctor_field_hint[f as usize] = n;
-                    }
-                }
+                self.learn_ctor_field_hint(f, obj);
             }
             // A constructor that returns ANY object (TypedArray/Map/Date/… too, not
             // just a plain object/array) replaces the new instance with it.
@@ -1119,15 +1266,12 @@ impl<'p> Vm<'p> {
         // orders it: the `prototype` Get can be a Proxy trap or getter (guest
         // code), and an instance allocated first was only a Rust local across
         // it — a collection there handed the constructor a reused slot as `this`.
+        // A DERIVED class creates no object: the base its `super()` reaches
+        // does, and only that base reads `newTarget.prototype` (a Proxy base's
+        // `construct` trap may never read it), so the Get is deferred to there
+        // (`pending_ctor_proto`).
+        let derived = parent.is_some() || extends_null;
         let mut proto_override: Option<Value> = None;
-        // A DERIVED class creates no object of its own (its [[Construct]] does
-        // no OrdinaryCreateFromConstructor; the base's does). This engine
-        // pre-makes the instance here, so the `prototype` Get is deferred to
-        // the base that adopts it (`apply_deferred_instance_proto`) — and
-        // skipped when the base makes its own object (a Proxy's construct
-        // trap): reading it here was observable, a second Get of a counting
-        // newTarget's `prototype` (WPT custom-elements/HTMLElement-constructor).
-        let derived = parent.is_some() && !extends_null;
         if new_target.is_heap() && new_target != cv && !derived {
             let p = self.get_prop(new_target, "prototype")?;
             proto_override = Some(if self.is_object_value(p) {
@@ -1146,15 +1290,13 @@ impl<'p> Vm<'p> {
         let mut map = ObjMap::new();
         map.class = Some(cv.heap_index());
         let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
-        if derived && new_target.is_heap() && new_target != cv {
-            self.deferred_instance_protos
-                .insert(obj.heap_index(), (new_target, cv.heap_index()));
-        }
         if let Some(p) = proto_override {
             // A class instance with its own proto entry no longer matches the
             // class-shape inline caches.
             self.note_class_instance_reproto(obj.heap_index());
             self.proto_of.insert(obj.heap_index(), p);
+        } else if derived && new_target.is_heap() && new_target != cv {
+            self.pending_ctor_proto.insert(obj.heap_index(), new_target);
         }
         // The instance is a Rust local until a constructor frame holds it as
         // `this` — and a ctor-less class never gives it one: the implicit
@@ -1514,6 +1656,9 @@ impl<'p> Vm<'p> {
             }
             if let Some(v) = self.fn_proto_override.remove(&tvi) {
                 self.fn_proto_override.insert(oidx, v);
+            }
+            if self.fn_proto_readonly.remove(&tvi) {
+                self.fn_proto_readonly.insert(oidx);
             }
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);

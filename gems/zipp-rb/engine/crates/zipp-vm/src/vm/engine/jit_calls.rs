@@ -112,6 +112,7 @@ impl<'p> Vm<'p> {
                 arg_win: u32::MAX,
                 argc: 0,
                 is_eval: false,
+                construct_this: false,
                 func: func_id,
                 base: new_base,
                 ip: bail as usize,
@@ -246,6 +247,7 @@ impl<'p> Vm<'p> {
             arg_win: u32::MAX,
             argc: 0,
             is_eval: false,
+            construct_this: false,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -488,8 +490,8 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let (lexical_this, is_strict, reg_count, params) = if SAME_PROTO_ARROW2 {
-            (true, true, expected_reg_count, 2)
+        let (lexical_this, is_strict, reg_count, params, rest_reg) = if SAME_PROTO_ARROW2 {
+            (true, true, expected_reg_count, 2, None)
         } else {
             let proto = self.func(fid as usize);
             (
@@ -497,8 +499,14 @@ impl<'p> Vm<'p> {
                 proto.is_strict,
                 (proto.reg_count as usize).max(1),
                 proto.param_count as usize,
+                proto.rest_reg,
             )
         };
+        // A rest body (Tier C compiles them): its array register must lie in
+        // the window, or the call takes the framed route, which builds it.
+        if rest_reg.is_some_and(|r| r as usize >= reg_count) {
+            return SELF_CALL_DEOPT;
+        }
         // OrdinaryCallBindThis for a plain `f()` (`this` = undefined): a strict
         // callee binds undefined; a sloppy one binds its realm's global object.
         let this_v = if lexical_this {
@@ -624,6 +632,19 @@ impl<'p> Vm<'p> {
             // staged contiguous arg registers); n ≤ argc.
             self.regs[new_base + 1 + i] = Value::from_bits(unsafe { *args.add(i) });
         }
+        // A rest parameter: the arguments past the parameters, in a fresh
+        // Array, as `setup_call` builds it. Written after the fill (the
+        // must-def analysis sees the register read before any def, so the
+        // fill zeroed it). The window is exposed, so the array is rooted the
+        // moment it lands; no safe point runs before the callee's own.
+        if let Some(rreg) = rest_reg {
+            let extra: Vec<Value> = (n..argc)
+                // SAFETY: as above; i < argc.
+                .map(|i| Value::from_bits(unsafe { *args.add(i) }))
+                .collect();
+            let arr = self.heap.alloc(HeapObj::Array(extra));
+            self.regs[new_base + rreg as usize] = Value::heap(arr);
+        }
         // B272: a handler-op body runs FRAME-BACKED. Its `push_finally` /
         // `pop_finally` helpers write the ACTIVE frame's handler stack, so the
         // callee's own `Frame` — exactly the record the bail path below
@@ -652,6 +673,7 @@ impl<'p> Vm<'p> {
                 arg_win,
                 argc: argc as u16,
                 is_eval: false,
+                construct_this: false,
                 func: fid,
                 base: new_base,
                 ip: 0,
@@ -778,6 +800,7 @@ impl<'p> Vm<'p> {
                 arg_win,
                 argc: argc as u16,
                 is_eval: false,
+                construct_this: false,
                 func: fid,
                 base: new_base,
                 ip: bail as usize,
@@ -1006,7 +1029,42 @@ impl<'p> Vm<'p> {
         let Some((fid, closure)) = self.ic_plain_fn(callee) else {
             return SELF_CALL_DEOPT;
         };
+        // A compiled body with a frame-free entry runs over a fresh window, as
+        // a builtin's callback does; anything else gets its frame.
+        if let Some(this) = self.frame_free_this(fid, callee, recv) {
+            let at = base + arg_base as usize;
+            self.jit_call_depth += 1;
+            let r = self.call_compiled_windowed(callee, this, WinArgs::Regs { at, argc }, fid, closure);
+            self.jit_call_depth -= 1;
+            if let Some(r) = r {
+                return match r {
+                    Ok(v) => v.bits(),
+                    Err(t) => self.jit_thrown_to_sentinel(t),
+                };
+            }
+        }
         self.jit_frame_call(fid, closure, recv, base, arg_base, argc, ip, callee)
+    }
+
+    /// OrdinaryCallBindThis for a frame-free call of the plain function `fid`
+    /// (`callee`) with the receiver `this`, as a frame's call setup binds it:
+    /// a strict function takes it as it is; a sloppy one takes the global
+    /// object of its realm for `undefined` or `null`, and an object as it is.
+    /// `None` for an arrow (its captured `this` is the setup's to bind) and
+    /// for a sloppy function given a primitive (the setup boxes it).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn frame_free_this(&self, fid: u32, callee: Value, this: Value) -> Option<Value> {
+        let proto = self.func(fid as usize);
+        if proto.lexical_this {
+            return None;
+        }
+        if proto.is_strict || self.is_object_value(this) {
+            return Some(this);
+        }
+        if this.is_nullish() && self.global_this != 0 {
+            return Some(Value::heap(self.callee_this_global(callee)));
+        }
+        None
     }
 
     /// The implementation behind `jit_new_ic`: the interpreter's `New` for a
@@ -1018,6 +1076,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn jit_region_new_impl(
         &mut self,
         caller_base_ptr: *const u64,
+        packed_fip: u64,
         packed_args: u64,
         argc: u16,
     ) -> u64 {
@@ -1032,6 +1091,12 @@ impl<'p> Vm<'p> {
         let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;
         let arg_base = (packed_args & 0xFFFF) as u16;
         let cv = self.get(base, callee_reg);
+        if let Some(bits) = self.jit_new_plain_fn(cv, base, arg_base, argc, packed_fip) {
+            return bits;
+        }
+        if let Some(bits) = self.jit_new_base_class(cv, base, arg_base, argc, packed_fip) {
+            return bits;
+        }
         let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
         self.jit_call_depth += 1;
         let r = self.construct(cv, &args);
@@ -1040,6 +1105,652 @@ impl<'p> Vm<'p> {
             Ok(v) => v.bits(),
             Err(t) => self.jit_thrown_to_sentinel(t),
         }
+    }
+
+    /// The implementation behind [`jit_iter_op_ic`]: the interpreter's arms
+    /// for `GetIterator`, `IterPrime`, `IterClose`, `IterCloseQuiet` and
+    /// `IterCloseFinally`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_iter_op_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let op = (packed_args >> 56) as u8;
+        if op > 4 {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let a = (packed_args & 0xFFFF) as u16;
+        if op == 0 {
+            // An iterator object may be allocated: the safe point precedes
+            // the operand read (the window's Values are roots).
+            self.maybe_gc();
+        }
+        self.jit_call_depth += 1;
+        let v = self.get(base, a);
+        let r: Result<Value, Thrown> = match op {
+            0 => self.get_iterator(v),
+            1 => {
+                // As the interpreter's `IterPrime`: a user-object iterator's
+                // `next` is read once; a generator's only when replaced.
+                let read = v.is_heap()
+                    && (matches!(
+                        self.heap.get(v.heap_index()),
+                        HeapObj::Object(_)
+                            | HeapObj::Proxy { .. }
+                            | HeapObj::Iterator { .. }
+                            | HeapObj::IterHelper { .. }
+                            | HeapObj::Intl { .. }
+                    ) || (matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. })
+                        && !self.gen_method_pristine(v.heap_index(), "next")));
+                if read {
+                    self.get_prop(v, "next")
+                } else {
+                    Ok(Value::UNDEFINED)
+                }
+            }
+            2 => self.iterator_close(v).map(|_| v),
+            3 => {
+                let _ = self.iterator_close(v);
+                Ok(v)
+            }
+            _ => {
+                let kind_reg = ((packed_args >> 16) & 0xFFFF) as u16;
+                match self.get(base, kind_reg).as_int() & 3 {
+                    1 => self.iterator_close(v).map(|_| v),
+                    2 => {
+                        let _ = self.iterator_close(v);
+                        Ok(v)
+                    }
+                    _ => Ok(v),
+                }
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind [`jit_static_fn_ic`]: the interpreter's
+    /// `StaticFn` arm for the instruction at `packed_fip` — the intrinsic
+    /// when the callee and receiver captured before the arguments are still
+    /// it (`static_fn_is_intrinsic`), else a call of that captured callee.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_static_fn_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let fid = (packed_fip >> 32) as u32;
+        let ip = (packed_fip as u32) as usize;
+        let crate::bytecode::Instr::StaticFn {
+            op,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } = self.func(fid as usize).code[ip]
+        else {
+            return SELF_CALL_DEOPT;
+        };
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        // Most of these allocate: the safe point precedes the operand reads
+        // (the window's Values are roots).
+        self.maybe_gc();
+        let callee = self.get(base, callee);
+        let this_v = self.get(base, this_v);
+        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        self.jit_call_depth += 1;
+        let r = if self.static_fn_is_intrinsic(op, callee, this_v) {
+            self.static_fn_exec(op, args)
+        } else {
+            self.call_value(callee, this_v, &args)
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind [`jit_array_ctor_ic`]: the interpreter's
+    /// `ArrayCtor` arm (a replaced `Array` is called or constructed through
+    /// the ordinary value paths).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_array_ctor_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+        argc: u16,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let callee = (packed_args & 0xFFFF) as u16;
+        let arg_base = ((packed_args >> 16) & 0xFFFF) as u16;
+        let is_construct = (packed_args >> 32) & 1 != 0;
+        self.maybe_gc();
+        self.jit_call_depth += 1;
+        let r: Result<Value, Thrown> = (|| {
+            if callee != 0xFFFF {
+                let live = self.get(base, callee);
+                if !self.bare_builtin_is_intrinsic(self.array_ctor, live) {
+                    let argv: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                    return if is_construct {
+                        self.construct(live, &argv)
+                    } else {
+                        self.call_value(live, Value::UNDEFINED, &argv)
+                    };
+                }
+            }
+            let mut virtual_len: Option<u32> = None;
+            let arr = if argc == 1 && self.get(base, arg_base).is_number() {
+                // `Array(n)` → n HOLES (absent elements), not n undefineds.
+                let n = self.get(base, arg_base).as_f64();
+                if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
+                    return Err(Thrown("RangeError: Invalid array length".into()));
+                }
+                if n as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
+                    virtual_len = Some(n as u32);
+                    Vec::new()
+                } else {
+                    vec![Value::HOLE; n as usize]
+                }
+            } else {
+                (0..argc).map(|i| self.get(base, arg_base + i)).collect()
+            };
+            let v = Value::heap(self.heap.alloc(HeapObj::Array(arr)));
+            if let Some(n) = virtual_len {
+                self.array_js_len.insert(v.heap_index(), n);
+            }
+            Ok(v)
+        })();
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind [`jit_obj_init_ic`]: the interpreter's
+    /// `ObjectSpread` and `InitDataProp` arms.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_obj_init_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let op = (packed_args >> 56) as u8;
+        let func_id = (packed_fip >> 32) as usize;
+        if op > 1 || func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let a = (packed_args & 0xFFFF) as u16;
+        let b = ((packed_args >> 16) & 0xFFFF) as u16;
+        if op == 0 {
+            // The spread allocates its keys and values: the window's Values
+            // are roots, so the safe point precedes the operand reads.
+            self.maybe_gc();
+        }
+        self.jit_call_depth += 1;
+        let o = self.get(base, a);
+        let r = if op == 0 {
+            let s = self.get(base, b);
+            self.object_spread(o, s)
+        } else {
+            let v = self.get(base, b);
+            let name = ((packed_args >> 32) & 0xFF_FFFF) as usize;
+            let func: &'p crate::bytecode::FuncProto = self.func(func_id);
+            match func.string_constants.get(name) {
+                None => Err(Thrown("InternalError: invalid static property name".to_string())),
+                Some(key) => {
+                    if o.is_heap() && matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+                        let oi = o.heap_index();
+                        // As the interpreter's arm: the holder -> value edge
+                        // is published before the direct ObjMap mutation.
+                        self.heap.write_barrier_val(oi, v);
+                        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                            m.define(key, v, crate::heap::PropAttr::data());
+                        }
+                        Ok(())
+                    } else if o.is_heap() {
+                        let k = key.to_string();
+                        self.set_prop(o, &k, v, false).map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(()) => o.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind [`jit_obj_enum_ic`]: the interpreter's arms
+    /// for `ObjectKeys`/`ObjectValues`/`ObjectEntries` (without the
+    /// interpreter-only whole-loop reductions), `ForInKeys` and `LenOf`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_obj_enum_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        use crate::vm::EnumWhat;
+        let op = (packed_args >> 56) as u8;
+        if op > 4 {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let obj = (packed_args & 0xFFFF) as u16;
+        if op == 4 {
+            // `LenOf`: no user code, no allocation.
+            let o = self.get(base, obj);
+            let v = if o.is_heap() {
+                match self.heap.get(o.heap_index()) {
+                    HeapObj::Array(items) => crate::vm::len_value(
+                        self.array_js_len
+                            .get(&o.heap_index())
+                            .map_or(items.len(), |&n| n as usize),
+                    ),
+                    HeapObj::Str(s) => crate::vm::len_value(s.units()),
+                    HeapObj::Cons { len, .. } => crate::vm::len_value(*len),
+                    HeapObj::Map { .. } | HeapObj::Set(_) => {
+                        crate::vm::len_value(self.coll_live_len(o.heap_index()))
+                    }
+                    _ => Value::int(0),
+                }
+            } else {
+                Value::int(0)
+            };
+            return v.bits();
+        }
+        // Each of the others allocates its list: the window's Values are
+        // roots, so the safe point precedes the operand reads.
+        self.maybe_gc();
+        self.jit_call_depth += 1;
+        let o = self.get(base, obj);
+        let r = if op == 3 {
+            // ForIn/OfHeadEvaluation: a null/undefined receiver iterates
+            // nothing (no ToObject error).
+            if o.is_nullish() {
+                Ok(Value::heap(self.heap.alloc(HeapObj::Array(Vec::new()))))
+            } else {
+                self.to_object(o).and_then(|o| self.for_in_keys(o))
+            }
+        } else {
+            let callee = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
+            let this_v = self.get(base, ((packed_args >> 32) & 0xFFFF) as u16);
+            let (native_id, what) = match op {
+                0 => (crate::vm::native::OBJ_KEYS, EnumWhat::Keys),
+                1 => (crate::vm::native::OBJ_VALUES, EnumWhat::Values),
+                _ => (crate::vm::native::OBJ_ENTRIES, EnumWhat::Entries),
+            };
+            if !self.static_builtin_is_intrinsic("Object", native_id, callee, this_v) {
+                self.call_value(callee, this_v, &[o])
+            } else {
+                self.require_object_coercible(o)
+                    .and_then(|()| self.to_object(o))
+                    .and_then(|o| self.object_enum_own(o, what))
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind [`jit_iter_to_array_ic`] (`op` 0),
+    /// [`jit_array_append_ic`] (1) and [`jit_call_spread_ic`] (2). Every
+    /// decline precedes the first effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_spread_op_impl(
+        &mut self,
+        op: u8,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let a = (packed_args & 0xFFFF) as u16;
+        let b = ((packed_args >> 16) & 0xFFFF) as u16;
+        // The array under construction (`ArrayAppend`) and the spread
+        // arguments (`CallSpread`) are compiler-made Arrays; anything else is
+        // malformed bytecode, which declines.
+        let array_reg = match op {
+            1 => Some(a),
+            2 => Some(b),
+            _ => None,
+        };
+        if let Some(r) = array_reg {
+            let v = self.get(base, r);
+            if !v.is_heap() || !matches!(self.heap.get(v.heap_index()), HeapObj::Array(_)) {
+                return SELF_CALL_DEOPT;
+            }
+        }
+        // The window's Values are roots, so the safe point may precede the
+        // operand reads; an op that allocates every iteration (a fresh array)
+        // then cannot starve the collector.
+        self.maybe_gc();
+        self.jit_call_depth += 1;
+        let r = match op {
+            0 => {
+                let s = self.get(base, a);
+                // A LIVE-mapped arguments source: refresh its dense slots
+                // first (the array fast path reads them directly).
+                if s.is_heap() {
+                    self.args_sync_dense(s.heap_index());
+                }
+                self.iter_to_array(s, (packed_args >> 16) as u32)
+            }
+            1 => {
+                let arr = self.get(base, a);
+                let vv = self.get(base, b);
+                self.array_append_op(arr.heap_index(), vv, (packed_args >> 32) & 1 != 0)
+                    .map(|()| arr)
+            }
+            _ => {
+                let callee = self.get(base, a);
+                let args = self.get(base, b);
+                let argv = self.array_snapshot(args.heap_index());
+                self.call_value(callee, Value::UNDEFINED, &argv)
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind [`jit_to_str_ic`]: `to_str_value` on the
+    /// caller's register, the result's bits.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_to_str_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let v = self.get(base, (packed_args & 0xFFFF) as u16);
+        // A string is its own result: no user code, nothing to count.
+        if v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
+        {
+            return v.bits();
+        }
+        // An Int: its decimal string, polling the collector first when it
+        // allocates (the caller's window is the only holder of live values).
+        if v.is_int() {
+            let n = v.as_int();
+            if !(0..=99).contains(&n) {
+                self.maybe_gc();
+            }
+            return self.int_str_value(n).bits();
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        self.jit_call_depth += 1;
+        let r = self.to_str_value(v);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(s) => s.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind [`jit_instanceof_ic`]: `instance_of_op` on the
+    /// caller's two registers, its result as a boolean's bits.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_instanceof_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let c = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
+        let v = self.get(base, (packed_args & 0xFFFF) as u16);
+        self.jit_call_depth += 1;
+        let r = self.instance_of_op(c, v);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(b) => Value::bool(b).bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// `new C(...)` of a base class with an explicit constructor, from
+    /// compiled code: the interpreter's flat path (`flat_new_class_instance`
+    /// makes the instance and runs its field initializers), then the
+    /// constructor's body with `this` the instance and `new.target` the
+    /// class, frame-free when nothing in it can see `new.target`, else on a
+    /// frame. `None` (nothing done) for every other kind of class.
+    ///
+    /// Once the field initializers have run nothing may replay them, so a
+    /// frame that cannot be set up (only the stack's depth can refuse one)
+    /// throws its RangeError here instead of declining, as the interpreter's
+    /// own flat `new` does.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_new_base_class(
+        &mut self,
+        cv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        packed_fip: u64,
+    ) -> Option<u64> {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        if !cv.is_heap() || !matches!(self.heap.get(cv.heap_index()), HeapObj::Class(_)) {
+            return None;
+        }
+        let target = self.flat_new_class_target(cv)?;
+        // A body that only stores its arguments: the finished instance.
+        if let Some(v) = self.ctor_store_new(target.0, cv.heap_index(), Value::UNDEFINED, base, arg_base, argc) {
+            return Some(v.bits());
+        }
+        self.jit_call_depth += 1;
+        let made = self.flat_new_class_make(cv, target);
+        self.jit_call_depth -= 1;
+        let (fid, closure, obj, f) = match made {
+            Ok(made) => made,
+            Err(t) => {
+                self.osr_deopt_exempt = true;
+                return Some(self.jit_thrown_to_sentinel(t));
+            }
+        };
+        let rooted = self.host_result_roots.len();
+        self.host_result_roots.push(obj);
+        if self.ctor_body_framefree(fid) {
+            let at = base + arg_base as usize;
+            self.jit_call_depth += 1;
+            let r = self.call_compiled_windowed(f, obj, WinArgs::Regs { at, argc }, fid, closure);
+            self.jit_call_depth -= 1;
+            if let Some(r) = r {
+                self.host_result_roots.truncate(rooted);
+                return Some(match r {
+                    Ok(ret) => {
+                        if self.is_object_value(ret) {
+                            ret.bits()
+                        } else {
+                            obj.bits()
+                        }
+                    }
+                    Err(t) => {
+                        self.osr_deopt_exempt = true;
+                        self.jit_thrown_to_sentinel(t)
+                    }
+                });
+            }
+        }
+        self.pending_new_target = cv;
+        let ip = (packed_fip as u32) as usize;
+        let bits = self.jit_frame_call(fid, closure, obj, base, arg_base, argc, ip, f);
+        self.pending_new_target = Value::UNDEFINED;
+        self.host_result_roots.truncate(rooted);
+        if bits == SELF_CALL_DEOPT {
+            self.osr_deopt_exempt = true;
+            return Some(self.jit_thrown_to_sentinel(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            )));
+        }
+        if bits == CALL_THREW {
+            return Some(bits);
+        }
+        let ret = Value::from_bits(bits);
+        Some(if self.is_object_value(ret) { bits } else { obj.bits() })
+    }
+
+    /// `new F(args…)` from a compiled region or Tier C body when `F` is a plain
+    /// constructor function: what `construct` does for one (the instance's
+    /// [[Prototype]] from `F.prototype`, the body run with `this` bound to the
+    /// new object and `new.target` to `F`, an object result replacing the
+    /// instance), with the arguments read from the caller's window and the
+    /// frame pushed as a region call pushes one (`jit_frame_call`). A million
+    /// constructions paid an argument vector, a host-root scope, `construct`'s
+    /// built-in arms and `call_value` around each body. `None`, with nothing
+    /// done, for anything else (a class, a bound function, a proxy, a
+    /// built-in, a function that cannot construct, a second realm alive).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_new_plain_fn(
+        &mut self,
+        cv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        packed_fip: u64,
+    ) -> Option<u64> {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        let (fid, closure) = self.ic_plain_fn(cv)?;
+        {
+            let p = self.func(fid as usize);
+            if p.non_constructable || p.lexical_this {
+                return None;
+            }
+        }
+        if !self.obj_realm.is_empty() || !self.realm_global_objs.is_empty() || self.get_function_realm(cv) != 0
+        {
+            return None;
+        }
+        // OrdinaryCreateFromConstructor with newTarget = F, as the Func arm of
+        // `construct_with_newtarget_rooted` does it.
+        let mut proto = self.prototype_of(cv).unwrap_or(Value::UNDEFINED);
+        if !self.is_object_value(proto) {
+            if let Some(rp) = self.realm_proto_fallback(cv, self.obj_proto) {
+                proto = Value::heap(rp);
+            }
+        }
+        // A body that only stores its arguments: the finished instance.
+        if let Some(v) = self.ctor_store_new(fid, u32::MAX, proto, base, arg_base, argc) {
+            return Some(v.bits());
+        }
+        let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
+        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
+            crate::heap::ObjMap::with_val_capacity(hint as usize),
+        ))));
+        if proto.is_heap() {
+            self.proto_of.insert(obj.heap_index(), proto);
+        }
+        // The instance is a Rust local until the frame's window holds it as
+        // `this`: keep it rooted across the frame setup.
+        let rooted = self.host_result_roots.len();
+        self.host_result_roots.push(obj);
+        // A body nothing in which can see `new.target` runs frame-free, as a
+        // compiled caller's call of it would: no frame for it to read.
+        if self.ctor_body_framefree(fid) {
+            let at = base + arg_base as usize;
+            self.jit_call_depth += 1;
+            let r = self.call_compiled_windowed(cv, obj, WinArgs::Regs { at, argc }, fid, closure);
+            self.jit_call_depth -= 1;
+            if let Some(r) = r {
+                self.host_result_roots.truncate(rooted);
+                return Some(match r {
+                    Ok(ret) => {
+                        self.learn_ctor_field_hint(fid, obj);
+                        if self.is_object_value(ret) {
+                            ret.bits()
+                        } else {
+                            obj.bits()
+                        }
+                    }
+                    Err(t) => {
+                        self.osr_deopt_exempt = true;
+                        self.jit_thrown_to_sentinel(t)
+                    }
+                });
+            }
+        }
+        self.pending_new_target = cv;
+        let ip = (packed_fip as u32) as usize;
+        let bits = self.jit_frame_call(fid, closure, obj, base, arg_base, argc, ip, cv);
+        // A declined frame setup leaves it unconsumed; nothing else may see it.
+        self.pending_new_target = Value::UNDEFINED;
+        self.host_result_roots.truncate(rooted);
+        if bits == SELF_CALL_DEOPT || bits == CALL_THREW {
+            return Some(bits);
+        }
+        self.learn_ctor_field_hint(fid, obj);
+        let ret = Value::from_bits(bits);
+        Some(if self.is_object_value(ret) { bits } else { obj.bits() })
     }
 
     /// The implementation behind the region call helpers `jit_call_method_ic` /
@@ -1312,6 +2023,20 @@ impl<'p> Vm<'p> {
                 return bits;
             }
         }
+        // A compiled body with a frame-free entry runs over a fresh window, as
+        // a builtin's callback does (`call_compiled_windowed`).
+        if let Some(this) = self.frame_free_this(fid, callee_v, this_v) {
+            let at = base + arg_base as usize;
+            self.jit_call_depth += 1;
+            let r = self.call_compiled_windowed(callee_v, this, WinArgs::Regs { at, argc }, fid, closure);
+            self.jit_call_depth -= 1;
+            if let Some(r) = r {
+                return match r {
+                    Ok(v) => v.bits(),
+                    Err(t) => self.jit_thrown_to_sentinel(t),
+                };
+            }
+        }
         // Push the callee frame exactly like the interpreter's Call/CallMethod
         // IC-hit path, and run it to completion.
         self.jit_frame_call(fid, closure, this_v, base, arg_base, argc, ip, callee_v)
@@ -1333,6 +2058,37 @@ impl<'p> Vm<'p> {
         arg_base: u16,
         argc: u16,
     ) -> u64 {
+        // `it.next()` on a generator or a built-in iterator whose `next` is
+        // the intrinsic: the step itself, ahead of `try_builtin_method`'s
+        // cascade of receiver kinds (the same calls it ends in).
+        if argc == 0 && key == "next" && recv.is_heap() {
+            let idx = recv.heap_index();
+            let iter_proto = match self.heap.get(idx) {
+                HeapObj::Generator { .. } => None,
+                HeapObj::Iterator { proto, .. } => Some(*proto),
+                _ => Some(0),
+            };
+            let step = match iter_proto {
+                None if self.gen_method_pristine(idx, "next") => {
+                    Some(self.generator_method(idx, "next", &[]).map(|v| v.unwrap_or(Value::UNDEFINED)))
+                }
+                Some(p)
+                    if p != 0
+                        && self.proto_of.get(&idx).is_none()
+                        && !self.arr_props.get(&idx).is_some_and(|m| m.pos("next").is_some())
+                        && self.builtin_iter_next_pristine(p) =>
+                {
+                    Some(self.call_native(crate::vm::native::ITER_NEXT, recv, &[]))
+                }
+                _ => None,
+            };
+            if let Some(r) = step {
+                return match r {
+                    Ok(v) => v.bits(),
+                    Err(t) => self.jit_thrown_to_sentinel(t),
+                };
+            }
+        }
         match self.try_builtin_method(recv, key, base, arg_base, argc) {
             Ok(Some(v)) => return v.bits(),
             Ok(None) => {}

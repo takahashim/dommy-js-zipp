@@ -236,9 +236,25 @@ pub(crate) fn emit_py_step(
     labels: &PyLabels,
     refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
 ) {
+    emit_py_step_with(ops, crate::vm::Vm::jit_py_op as usize, func_id, ip, None, labels, refetch);
+}
+
+/// [`emit_py_step`] through `helper`, which answers as `Vm::jit_py_op`
+/// does; `arg4`, when given, is its fourth argument (in `r9`).
+fn emit_py_step_with(
+    ops: &mut dynasmrt::x64::Assembler,
+    helper: usize,
+    func_id: u32,
+    ip: usize,
+    arg4: Option<u64>,
+    labels: &PyLabels,
+    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+) {
     let packed = ((func_id as u64) << 32) | ip as u64;
-    let helper = crate::vm::Vm::jit_py_op as usize;
     let cont = ops.new_dynamic_label();
+    if let Some(a) = arg4 {
+        dynasm!(ops ; mov r9, QWORD a as i64);
+    }
     dynasm!(ops
         ; mov rcx, rdi
         ; mov rdx, rbx
@@ -883,6 +899,35 @@ pub(crate) fn emit_py_op(
                 ; jmp => labels.bail
             );
         }
+        // A plain class's construction: likewise through `Vm::jit_py_new`,
+        // which reads the class and the runtime from the window and stores
+        // the instance, the `__init__` entry and its `this` there; 0 is
+        // done, anything but the slow edge's answer bails (nothing done).
+        Instr::PyNew { dst, entry, this_f, cls, rt, n, .. } if !crate::vm::prof_py::on() => {
+            let outs = dst as u64 | (entry as u64) << 16 | (this_f as u64) << 32;
+            let ins = cls as u64 | (rt as u64) << 16 | (n as u64) << 32;
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, rbx
+                ; mov r8, QWORD site(func_id, ip) as i64
+                ; mov r9, QWORD outs as i64
+                ; mov rax, QWORD ins as i64
+                ; mov [rsp + 32], rax
+                ; mov rax, QWORD crate::vm::Vm::jit_py_new as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; test rax, rax
+                ; jz => done
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; jmp => labels.bail
+            );
+        }
         // The instructions that only answer a value or take their slow edge:
         // each through its own helper (`vm/engine/py_jit.rs`), the step's
         // function over the operands with the site for its cache entry,
@@ -900,7 +945,101 @@ pub(crate) fn emit_py_op(
         Instr::PyMethod { dst, obj, rt, key, gb, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_method as usize;
             let keys = key as u64 | (gb as u64) << 32;
+            // A planned site answers inline (`emit_py_method_inline`); a
+            // failed guard calls the helper, which first settles the
+            // class's mirror when the guard found it cleared.
+            let miss = ops.new_dynamic_label();
+            let settle = ops.new_dynamic_label();
+            if emit_py_method_inline(ops, ip, instr, miss, settle, done) {
+                dynasm!(ops ; => settle);
+                let settle_keys = keys | PY_METHOD_SETTLE;
+                emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(settle_keys)], dst, labels, refetch);
+                dynasm!(ops ; jmp => done ; => miss);
+            }
             emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(keys)], dst, labels, refetch);
+        }
+        Instr::PyClassOf { dst, obj, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_class_of as usize;
+            emit_py_value_call(ops, h, [V::Reg(obj), V::None, V::None, V::None], dst, labels, refetch);
+        }
+        Instr::PyCaught { dst, e, line, rt, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_caught as usize;
+            emit_py_value_call(ops, h, [V::Reg(e), V::Reg(line), V::Reg(rt), V::None], dst, labels, refetch);
+        }
+        // An instance dict's entry (`PyDictGet`): as a value helper, with
+        // `PY_ABSENT_BITS` the fall-through that leaves `dst` untouched.
+        Instr::PyDictGet { dst, obj, key, absent, .. } if !crate::vm::prof_py::on() => {
+            let keys = key as u64 | (absent as u64) << 32;
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(obj)]
+                ; mov r8, QWORD site(func_id, ip) as i64
+                ; mov r9, QWORD keys as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_get as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; mov r10, QWORD PY_ABSENT_BITS as i64
+                ; cmp rax, r10
+                ; je => done
+                ; mov r10, QWORD CALL_THREW as i64
+                ; cmp rax, r10
+                ; je => labels.bail
+                ; mov [rbx + dreg(dst)], rax
+            );
+        }
+        // A dict's `.get` (`PyDictLookup`): as `PyGetItem`'s helper, its
+        // `absent` edge the second.
+        Instr::PyDictLookup { dst, d, k, rt, .. } if labels.target.is_some() && !crate::vm::prof_py::on() => {
+            let Some(absent) = labels.target else {
+                unreachable!("PyDictLookup carries an absent label");
+            };
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(d)]
+                ; mov r8, [rbx + dreg(k)]
+                ; mov r9, [rbx + dreg(rt)]
+                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_lookup as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; mov r10, QWORD PY_ABSENT_BITS as i64
+                ; cmp rax, r10
+                ; je => absent
+                ; mov [rbx + dreg(dst)], rax
+            );
+        }
+        // An exception stack's pop (`PyExcPop`): 0 is done.
+        Instr::PyExcPop { rt, .. } if !crate::vm::prof_py::on() => {
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(rt)]
+                ; mov rax, QWORD crate::vm::Vm::jit_py_exc_pop as usize as i64
+                ; call rax
+                ; mov [rsp + 32], rax
+            );
+            refetch(ops);
+            dynasm!(ops
+                ; mov rax, [rsp + 32]
+                ; test rax, rax
+                ; jz => done
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => labels.slow
+                ; jmp => labels.bail
+            );
         }
         Instr::PyIsInstance { dst, v, t, rt, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_isinstance as usize;
@@ -928,6 +1067,20 @@ pub(crate) fn emit_py_op(
         Instr::PyGenNext { dst, next, this, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_gen_next as usize;
             emit_py_value_call(ops, h, [V::Reg(next), V::Reg(this), V::Imm(ip as u64), V::None], dst, labels, refetch);
+        }
+        // A call: through `Vm::jit_py_call` with the operands packed, which
+        // calls a str method's native where it is and hands any other
+        // callee to `Vm::jit_py_op`; the same outcomes as the step's.
+        Instr::PyCall { dst, f, arg_base, argc, .. } if !crate::vm::prof_py::on() => {
+            let regs = f as u64 | (arg_base as u64) << 16 | (argc as u64) << 32 | (dst as u64) << 48;
+            emit_py_step_with(ops, crate::vm::Vm::jit_py_call as usize, func_id, ip, Some(regs), labels, refetch);
+        }
+        // A raise: through `Vm::jit_py_raise` with the operands packed, the
+        // step's own `py_raise_step` without the instruction found and
+        // decoded again; the same outcomes as `jit_py_op`'s.
+        Instr::PyRaise { e, rt, catch, .. } if !crate::vm::prof_py::on() && py_raise_helper_enabled() => {
+            let regs = e as u64 | (rt as u64) << 16 | (catch as u64) << 32;
+            emit_py_step_with(ops, crate::vm::Vm::jit_py_raise as usize, func_id, ip, Some(regs), labels, refetch);
         }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
         // when the body's plan has the site; the ordinary step otherwise.
@@ -1306,6 +1459,12 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_PY_RAISE_HELPER=1` compiles a `PyRaise` to `Vm::jit_py_op`,
+    /// as before (the same-binary A/B for `Vm::jit_py_raise`).
+    fn py_raise_helper_enabled() = "ZIPP_NO_PY_RAISE_HELPER"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_PY_NATIVE_CALLS=1` counts every `PyCall` as a frame call in
     /// the call-bound gate, as before the sites' cache entries were asked
     /// (the same-binary A/B for [`set_py_native_calls`]).
@@ -1427,6 +1586,42 @@ pub(crate) struct PyRegionPlan {
     pub work: usize,
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_PY_HEADER_DOMINANCE=1` plans a Python region whose header
+    /// does not dominate its back-edge, as before (the same-binary A/B for
+    /// [`py_dominates`]'s test in [`py_region_plan`]).
+    fn py_header_dominance_enabled() = "ZIPP_NO_PY_HEADER_DOMINANCE"
+}
+
+/// Whether every path from the code's entry to `b` passes `h` (the code's
+/// own edges: each instruction's targets, a fused instruction's `slow` and
+/// second edges, a `PushHandler`'s catch target, and the fall-through).
+fn py_dominates(proto: &FuncProto, h: usize, b: usize) -> bool {
+    let code = &proto.code;
+    let n = code.len();
+    if h == 0 || b >= n {
+        return true;
+    }
+    let mut seen = vec![false; n];
+    let mut stack = vec![0usize];
+    seen[0] = true;
+    while let Some(ip) = stack.pop() {
+        if ip == b {
+            return false;
+        }
+        let i = &code[ip];
+        let falls = !matches!(i, Instr::Jump { .. } | Instr::Return { .. } | Instr::ReturnUndefined | Instr::Throw { .. });
+        let next = falls.then_some(ip + 1);
+        for t in control_targets(i).into_iter().flatten().map(|t| t as usize).chain(next) {
+            if t < n && t != h && !seen[t] {
+                seen[t] = true;
+                stack.push(t);
+            }
+        }
+    }
+    true
+}
+
 /// Decide whether the Python loop headed at `start` (the dispatcher's
 /// region `[start, end]`) compiles, and as what. Pure: it reads only the
 /// bytecode. A string-constant load counts as compilable here: the
@@ -1448,6 +1643,16 @@ pub(crate) fn py_region_plan(proto: &FuncProto, start: u32, end: u32, native: &[
         .find(|&ip| matches!(proto.code[ip], Instr::Jump { target } if target == start))
         .map(|ip| ip as u32)
         .ok_or_else(|| "no back-edge in the body".to_string())?;
+    // A loop's header comes before its back-edge on every path. A body with
+    // no frame guard (a lambda, a comprehension) has no main end to tell
+    // its out-of-line code by, and a slow path there that rejoins its fast
+    // path at an instruction before itself (a `rec[0]` lambda's subscript
+    // rejoining at its `return`) is a backward jump the code reaches
+    // without passing that instruction: no loop. It used to compile, deopt
+    // on every entry and be evicted.
+    if py_header_dominance_enabled() && !py_dominates(proto, start as usize, end as usize) {
+        return Err("no loop: the back-edge is reached without passing its header".into());
+    }
     // Every string constant counts as loadable (see above).
     let strings: FxHashMap<u32, u64> = proto
         .code

@@ -440,9 +440,9 @@ pub const CONSOLE_INFO: u16 = 945;
 pub const CONSOLE_WARN: u16 = 946;
 pub const CONSOLE_ERROR: u16 = 947;
 pub const CONSOLE_DEBUG: u16 = 948;
-/// `performance.now()`: fractional ms since the VM started. A real method on a
-/// real `performance` global, so a host can replace either.
-pub const PERFORMANCE_NOW: u16 = 1992;
+/// `performance.now()`: fractional ms since the VM started, on the engine's
+/// monotonic clock (the one an embedder can virtualise).
+pub const PERFORMANCE_NOW: u16 = 949;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

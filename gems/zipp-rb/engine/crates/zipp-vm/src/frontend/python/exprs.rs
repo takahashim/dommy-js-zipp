@@ -1,5 +1,5 @@
 //! Expression lowering for the Python emitter.
-use super::emitter::{Emitter, LoopCtx, MAX_DIRECT, R};
+use super::emitter::{py_super_lean, Emitter, LoopCtx, MAX_DIRECT, R};
 use super::stmts::{binop_name, inplace_binop_name, Display, Steps};
 use super::symtable::{ScopeKind, SymKind};
 use crate::bytecode::{Instr, PyArithOp, PyCmpOp, Reg};
@@ -11,6 +11,9 @@ const LONG_CHAIN: usize = 16;
 /// Display and argument lists longer than this are built in chunks of this
 /// many elements, so a large literal needs a bounded number of registers.
 const CHUNK: usize = 256;
+/// The most parts of an f-string joined by the runtime's `R.FJOIN.c<n>`
+/// (its entries go to `c12`); a longer one joins with `Add`s.
+const FJOIN_MAX: usize = 12;
 
 /// What an operand is known to be from its syntax alone, so a fast path the
 /// operand can never take is not emitted (and a guard it always passes is
@@ -643,7 +646,11 @@ impl<'a> Emitter<'a> {
             _ => None,
         };
         let numeric = |k: Known| matches!(k, Known::Int | Known::Float | Known::Unknown);
-        if let (true, Some(pyop)) = (self.fast && numeric(ka) && numeric(kb), fused) {
+        // A str's `%` (`"r%d" % v`) is the fused instruction's too: it
+        // formats what the runtime's `R.mod` formats natively, and takes the
+        // helper for anything else.
+        let pct = matches!(op, ast::Operator::Mod) && ka == Known::Str;
+        if let (true, Some(pyop)) = (self.fast && ((numeric(ka) && numeric(kb)) || pct), fused) {
             // One fused instruction for ints and floats; a str + str tier
             // (for `+`) and the helper out of line.
             let dst = self.alloc()?;
@@ -1080,7 +1087,10 @@ impl<'a> Emitter<'a> {
 
     /// Jumps taken when `value`'s truth equals `when`: a bool, an int or a
     /// str has the truth JavaScript gives it (`0n` and `""` are false, as
-    /// in Python), tested where it is; anything else asks the runtime.
+    /// in Python), tested where it is; an exact list, tuple, dict or set
+    /// has a nonzero length (`PyLen`, whose slow edge is the runtime's
+    /// test: `while heap:`, `if not seen:`); anything else asks the
+    /// runtime.
     pub fn jump_on_truth(&mut self, value: Reg, when: bool) -> R<Vec<usize>> {
         let jump = |e: &mut Self, cond: Reg| if when { e.jump_if_true(cond) } else { e.jump_if_false(cond) };
         let is_bool = self.typeof_is(value, "boolean")?;
@@ -1096,11 +1106,24 @@ impl<'a> Emitter<'a> {
         let over = self.jump()?;
         let here = self.here();
         self.patch(slow, here)?;
+        let mut taken_all = vec![taken];
+        let mut overs = vec![over];
+        if self.fast {
+            let n = self.alloc()?;
+            let rt = self.r_rt;
+            let at = self.emit(Instr::PyLen { dst: n, v: value, rt, slow: 0 })?;
+            taken_all.push(jump(self, n)?);
+            overs.push(self.jump()?);
+            let here = self.here();
+            self.patch_slow(at, here)?;
+        }
         let t = self.helper("truth", &[value])?;
-        let taken2 = jump(self, t)?;
+        taken_all.push(jump(self, t)?);
         let here = self.here();
-        self.patch(over, here)?;
-        Ok(vec![taken, taken2])
+        for j in overs {
+            self.patch(j, here)?;
+        }
+        Ok(taken_all)
     }
 
     /// A single comparison as a branch (see [`Emitter::branch`]).
@@ -1271,10 +1294,17 @@ impl<'a> Emitter<'a> {
         // second when the first is a str, and every later one, since the
         // text joined so far is a str by then. Anything else (`f"{i}"`, the
         // first of `f"{a}{b}"`) still becomes a str of its own.
-        let first_raw = self.fast && values.len() > 1 && known(&values[1]);
+        //
+        // Up to `FJOIN_MAX` parts are joined by the runtime's
+        // `R.FJOIN.c<n>(...parts)` instead, a `PyCall` (the engine's native
+        // joins them in one allocation): every int part may stay an int
+        // there, since that join starts from "".
+        let fjoin = self.fast && !values.is_empty() && values.len() <= FJOIN_MAX && !(values.len() == 1 && known(&values[0]));
+        let first_raw = self.fast && (fjoin || (values.len() > 1 && known(&values[1])));
         let mut parts = Vec::new();
         for (k, v) in values.iter().enumerate() {
             let raw_int = match k {
+                _ if fjoin => true,
                 0 => first_raw,
                 1 => self.fast && (known(&values[0]) || !first_raw),
                 _ => self.fast,
@@ -1291,6 +1321,23 @@ impl<'a> Emitter<'a> {
         if !self.fast {
             let arr = self.array(&parts)?;
             return self.helper("strjoin", &[arr]);
+        }
+        if fjoin {
+            // The record's entry for the count, called with the record as
+            // `this` (as a builtin's is); a record without one (never, short
+            // of the runtime's own code changing it) joins through the
+            // helper, out of line.
+            let f = self.prop(self.r_rt, "FJOIN")?;
+            let (arg_base, argc) = self.arguments(&parts)?;
+            let dst = self.alloc()?;
+            let at = self.emit(Instr::PyCall { dst, f, arg_base, argc, slow: 0 })?;
+            self.defer_cold(Vec::new(), vec![at], move |e| {
+                let arr = e.array(&parts)?;
+                let r = e.helper("strjoin", &[arr])?;
+                e.emit(Instr::Move { dst, src: r })?;
+                Ok(())
+            });
+            return Ok(dst);
         }
         // Every part is a str: concatenate inline, and let the helper raise
         // MemoryError past the runtime's text limit.
@@ -1371,17 +1418,12 @@ impl<'a> Emitter<'a> {
         // parameter of the method it appears in.
         if let ast::Expr::Name(n) = c.func.as_ref() {
             if n.id.as_str() == "super" && c.args.is_empty() && c.keywords.is_empty() {
-                if let (Some(cell), Some(first)) =
-                    (self.cells.get("__class__").copied(), self.first_param_reg())
-                {
+                if let Some(cell) = self.cells.get("__class__").copied() {
+                    let Some(first) = self.first_param_value()? else {
+                        return Err(self.error(node, "super(): no arguments"));
+                    };
                     let cls = self.cell_get(cell)?;
                     return self.helper("superof", &[cls, first]);
-                }
-                if self.cells.contains_key("__class__") {
-                    return Err(self.error(
-                        node,
-                        "super(): the method's first parameter must be a plain local",
-                    ));
                 }
                 return Err(self.error(node, "super(): no enclosing class"));
             }
@@ -1582,7 +1624,10 @@ impl<'a> Emitter<'a> {
         {
             return Ok(None);
         }
-        let (Some(cell), Some(first)) = (self.cells.get("__class__").copied(), self.first_param_reg()) else {
+        let Some(cell) = self.cells.get("__class__").copied() else {
+            return Ok(None);
+        };
+        let Some(first) = self.first_param_value()? else {
             return Ok(None);
         };
         let cls = self.cell_get(cell)?;
@@ -1598,36 +1643,62 @@ impl<'a> Emitter<'a> {
         let (arg_base, argc) = self.arguments(&[cls, first, key])?;
         let rt = self.r_rt;
         self.emit(Instr::CallWithThis { dst: f, callee: native, this_v: rt, arg_base, argc, name: crate::bytecode::NO_NAME })?;
-        let undef = self.undefined()?;
-        let missed = self.alloc()?;
-        self.emit(Instr::Eq { dst: missed, a: f, b: undef })?;
+        // Whether the function is called with the receiver first is
+        // `R.mself`, read before the arguments (which may run a `super()` of
+        // their own). `SMFNATIVE` answers a function only on its cached hit,
+        // having set `R.mself` (`Vm::py_smfind`): there the receiver goes
+        // first, and `missed`, the `undefined` test's result, is `false`.
+        // So `missed` holds `!R.mself` from there on, and only `smfind`, out
+        // of line, reads the flag (into `missed`).
+        let lean = py_super_lean();
+        let missed = if lean {
+            self.typeof_is(f, "undefined")?
+        } else {
+            let undef = self.undefined()?;
+            let missed = self.alloc()?;
+            self.emit(Instr::Eq { dst: missed, a: f, b: undef })?;
+            missed
+        };
         let at = self.jump_if_true(missed)?;
+        let flag = self.string_index("mself");
         self.defer_cold(vec![at], Vec::new(), move |e| {
             let r = e.helper("smfind", &[cls, first, key])?;
             e.emit(Instr::Move { dst: f, src: r })?;
+            if lean {
+                let prepend = e.alloc()?;
+                e.emit(Instr::GetProp { dst: prepend, obj: e.r_rt, name: flag })?;
+                e.emit(Instr::Not { dst: missed, a: prepend })?;
+            }
             Ok(())
         });
-        let flag = self.string_index("mself");
-        let prepend = self.alloc()?;
-        self.emit(Instr::GetProp { dst: prepend, obj: self.r_rt, name: flag })?;
+        // `ZIPP_NO_PY_SUPER_LEAN`: the flag read here on every call.
+        let prepend = if lean {
+            None
+        } else {
+            let prepend = self.alloc()?;
+            self.emit(Instr::GetProp { dst: prepend, obj: self.r_rt, name: flag })?;
+            Some(prepend)
+        };
         let mut regs = Vec::with_capacity(c.args.len());
         for e in &c.args {
             regs.push(self.expr(e, depth)?);
         }
         let dst = self.alloc()?;
-        let unbound = self.jump_if_false(prepend)?;
+        // The call without the receiver (a static method's), out of line.
+        let to_unbound = match prepend {
+            Some(prepend) => self.jump_if_false(prepend)?,
+            None => self.jump_if_true(missed)?,
+        };
         let mut with_self = Vec::with_capacity(regs.len() + 1);
         with_self.push(first);
         with_self.extend_from_slice(&regs);
         let r = self.call_with(f, &with_self)?;
         self.emit(Instr::Move { dst, src: r })?;
-        let done = self.jump()?;
-        let here = self.here();
-        self.patch(unbound, here)?;
-        let r = self.call_with(f, &regs)?;
-        self.emit(Instr::Move { dst, src: r })?;
-        let here = self.here();
-        self.patch(done, here)?;
+        self.defer_cold(vec![to_unbound], Vec::new(), move |e| {
+            let r = e.call_with(f, &regs)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
         Ok(Some(dst))
     }
 

@@ -1950,9 +1950,8 @@ impl<'a> FnCompiler<'a> {
             let n: &str = id;
             if !matches!(n, "undefined" | "NaN" | "Infinity") {
                 if let Binding::Global(idx) = self.resolve(n) {
-                    // A `with` object in scope may supply the name (an inline
-                    // event handler's element/document scopes): probe them
-                    // first, falling back to the non-throwing global load.
+                    // An active `with` object that has the name answers first,
+                    // as for a plain read (`with (o) { typeof member }`).
                     let objs = self.with_obj_regs(n);
                     let end_jumps = if objs.is_empty() {
                         Vec::new()
