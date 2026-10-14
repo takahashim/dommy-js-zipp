@@ -164,6 +164,19 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
 
 ## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, compile/*, vm/dispatch.rs)
 
+- **Run-time code is freed with its state** (vm/eval_arena.rs, embed.rs
+  `VmOwner`, vm/engine/eval_prog.rs, vm/engine/boot.rs `alloc_eval_func` /
+  `alloc_eval_class`) — `prepare_eval_program` `Box::leak`ed every function
+  and class an eval, `new Function`, a loaded script or a module installed,
+  for the stable addresses the run loop and the JIT need, and nothing freed
+  them when the state was dropped: a host making a state per page grew by
+  the compiled form of everything it loaded into each (1.24 MB per state for
+  dommy's 243 KB bridge runtime, reported upstream on #15). `OwnedVm` now
+  owns an `EvalArena` beside the `Program` (append-only `OnceCell` chunks:
+  safe code, addresses fixed until dropped) and the VM installs into it; a
+  `Vm` built over a borrowed program (tests, the CLI) has none and still
+  leaks. Test: `eval_arena::tests`.
+
 - **JIT mirrors only for the x86-64 JIT** — the per-slot `hot_mirror`,
   `this_mirror` and `upvals_mirror` (32 bytes on every slot) were kept
   unless `meter-only`; only the x86-64 JIT (`codegen/`) reads them. They are
