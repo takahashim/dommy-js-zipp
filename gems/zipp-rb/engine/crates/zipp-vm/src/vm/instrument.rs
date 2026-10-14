@@ -1068,7 +1068,21 @@ impl super::Vm<'_> {
 
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn instrument_regex_memory_exhausted(&mut self) -> &'static str {
-        let cause = ResourceExhaustion::RegexMemory;
+        // `instrument_regex_limits` caps a search's storage at the heap's
+        // headroom as well as at the regex's own fixed allowance. When the
+        // headroom was the tighter of the two, the heap is what ran out (a
+        // linear regex in a script that filled its heap is no runaway): report
+        // the heap budget, as the allocation that crossed it would have.
+        let heap_bound = self.instr_rec.as_ref().is_some_and(|rec| {
+            rec.heap_limit != usize::MAX
+                && rec.heap_limit.saturating_sub(self.heap_bytes_estimate())
+                    < regress::MatchLimits::SANDBOX.max_backtrack_bytes
+        });
+        let cause = if heap_bound {
+            ResourceExhaustion::Heap
+        } else {
+            ResourceExhaustion::RegexMemory
+        };
         match self.instr_rec.as_mut() {
             Some(rec) => rec.exhaust(cause),
             None => cause.message(),

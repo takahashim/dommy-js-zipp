@@ -96,4 +96,23 @@ class LimitsTest < Minitest::Test
   ensure
     vm.dispose
   end
+
+  # Filling the heap is reported as the heap budget even when the first
+  # check to see it is a linear regex's (whose storage is capped at the
+  # heap's headroom too), not as a regex backtrack-memory runaway.
+  def test_a_full_heap_is_reported_as_the_memory_budget_even_from_a_regex
+    vm = ZippRb::VM.new(memory_limit: 64 * 1024 * 1024)
+    err = assert_raises(ZippRb::RangeError) do
+      vm.eval(<<~JS)
+        var keep = [];
+        for (let i = 0; i < 3e6; i++) {
+          keep.push({ a: ["x" + i, "y" + i, "z" + i], n: i });
+          if (i % 1000 === 0) /^(0|[1-9][0-9]*)$/.test(String(i));
+        }
+      JS
+    end
+    assert_includes err.message, "memory budget"
+  ensure
+    vm&.dispose
+  end
 end

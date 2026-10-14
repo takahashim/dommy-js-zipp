@@ -127,6 +127,17 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   once instead of sleeping out its timeout (no other agent could wake it).
   Test: `test/engine_fixes_test.rb`.
 
+- **A full heap is reported as the heap budget from a regex too**
+  (vm/instrument.rs `instrument_regex_memory_exhausted`) — a search's
+  storage is capped at the heap's headroom as well as at the regex's fixed
+  allowance, so in a script that filled its heap a linear regex was the
+  first to fail, as "regular expression exceeded its backtrack memory
+  budget". When the headroom is the tighter cap, the exhaustion is recorded
+  as the heap's. This build's heap can cross its ceiling between audits
+  (the slot tables are smaller without the JIT mirrors, which delays
+  `slot_table_growth_reserve`), which is how the regex came to see no
+  headroom at all. Test: `test/limits_test.rb`.
+
 ## Global object (crates/zipp-vm/src/vm/dispatch.rs)
 
 - **A top-level lexical's initialization stays in its slot** — upstream's
