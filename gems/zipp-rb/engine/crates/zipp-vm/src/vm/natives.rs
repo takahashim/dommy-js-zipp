@@ -1207,7 +1207,7 @@ impl<'p> Vm<'p> {
         // Namespace objects: fresh per realm, with the main namespace's props
         // copied (fresh same-id Natives / shared data) so `other.Reflect.construct`
         // etc. are functional.
-        for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl", "console"] {
+        for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl", "console", "performance"] {
             let mut m = ObjMap::new();
             if let Some(&main_ns) = self.builtin_globals.get(ns) {
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ns) {
@@ -3570,6 +3570,9 @@ impl<'p> Vm<'p> {
                 self.push_console_line(line, true);
                 Value::UNDEFINED
             }
+            PERFORMANCE_NOW => {
+                Value::num(crate::vm::clock::now_mono_ms() - self.start_mono_ms)
+            }
             AGENT_SLEEP => {
                 let ms = self
                     .to_number_coerce(args.first().copied().unwrap_or(Value::UNDEFINED))?
@@ -4008,6 +4011,11 @@ impl<'p> Vm<'p> {
                                         OBJ_SEAL => fm.seal(),
                                         _ => {}
                                     }
+                                }
+                                // Freezing also makes the synthesized
+                                // `prototype` non-writable.
+                                if id == OBJ_FREEZE {
+                                    self.make_fn_proto_readonly(o);
                                 }
                             }
                         }
@@ -4781,10 +4789,7 @@ impl<'p> Vm<'p> {
                 // A lazy %RegExpStringIterator%: one RegExpExec per next().
                 if let Some(step) = self.regexp_string_iter_step(it_idx) {
                     let (value, ret_done) = step?;
-                    let mut m = ObjMap::new();
-                    m.set("value", value);
-                    m.set("done", Value::bool(ret_done));
-                    return Ok(self.alloc_object_current_realm(m));
+                    return Ok(self.iter_result(value, ret_done));
                 }
                 // A live TypedArray iterator (keys/values/entries) re-reads the view's
                 // current length each step, so a resizable buffer's grow yields new
@@ -4827,10 +4832,7 @@ impl<'p> Vm<'p> {
                         if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
                             *i = store;
                         }
-                        let mut m = ObjMap::new();
-                        m.set("value", result.0);
-                        m.set("done", Value::bool(result.1));
-                        return Ok(self.alloc_object_current_realm(m));
+                        return Ok(self.iter_result(result.0, result.1));
                     }
                 }
                 // A live ARRAY-LIKE iterator. The step is shared with the
@@ -4838,10 +4840,7 @@ impl<'p> Vm<'p> {
                 // builds the result object — see `array_iter_step`.
                 if let Some(r) = self.array_iter_step(it_idx) {
                     let (v, done) = r?;
-                    let mut m = ObjMap::new();
-                    m.set("value", v);
-                    m.set("done", Value::bool(done));
-                    return Ok(self.alloc_object_current_realm(m));
+                    return Ok(self.iter_result(v, done));
                 }
                 // Live Map/Set, or a snapshot iterator. Shared with the
                 // `IterNext` opcode, which takes the pair and never builds the
@@ -4852,10 +4851,7 @@ impl<'p> Vm<'p> {
                     // handled above and is the only thing that answers `None`.
                     None => (Value::UNDEFINED, true),
                 };
-                let mut m = ObjMap::new();
-                m.set("value", val);
-                m.set("done", Value::bool(done));
-                self.alloc_object_current_realm(m)
+                self.iter_result(val, done)
             }
             ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
             ITER_DISPOSE => {

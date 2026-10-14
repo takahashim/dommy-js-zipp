@@ -194,6 +194,7 @@ impl<'p> Vm<'p> {
             py_rt: None,
             dynamic_ic_bytes: 0,
             const_string_cache: rustc_hash::FxHashMap::default(),
+            const_string_dense: Vec::new(),
             key_str_cache: rustc_hash::FxHashMap::default(),
             enum_key_cache: Vec::new(),
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),
@@ -230,9 +231,12 @@ impl<'p> Vm<'p> {
             pending_yield_eval_scope: u32::MAX,
             pending_yield_raw: false,
             pending_await: None,
+            async_inline_frame: usize::MAX,
+            async_inline_budget: 0,
             cap_capture: None,
             microtasks: std::collections::VecDeque::new(),
             current_microtask: None,
+            microtasks_old: 0,
             promise_resolution_roots: Vec::new(),
             unhandled_rejections: Vec::new(),
             rejecting_thrown_job: false,
@@ -243,6 +247,14 @@ impl<'p> Vm<'p> {
             template_cache: std::collections::HashMap::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_shape_slot: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_add_ways: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            ctor_stores: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            ctor_framefree: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            shape_key_plans: Vec::new(),
             for_in_barren: rustc_hash::FxHashMap::default(),
             regexp_string_iters: rustc_hash::FxHashMap::default(),
             matchall_batches: rustc_hash::FxHashMap::default(),
@@ -299,7 +311,9 @@ impl<'p> Vm<'p> {
             super_called: crate::slot_table::SlotSet::default(),
             this_tdz: crate::slot_table::SlotSet::default(),
             super_this: crate::slot_table::SlotTable::default(),
-            private_fields: std::collections::HashMap::new(),
+            pending_ctor_proto: crate::slot_table::SlotTable::default(),
+            private_fields: crate::slot_table::SlotTable::default(),
+            private_name_ids: rustc_hash::FxHashMap::default(),
             eval_fn_idx: 0,
             closure_eval_scope: crate::vm::JitGuardedMap::new(),
             eval_scope_parent: std::collections::HashMap::new(),
@@ -456,15 +470,19 @@ impl<'p> Vm<'p> {
             abstractmodulesource_ctor: 0,
             abstractmodulesource_proto: 0,
             resolver_pair_next: 1,
-            resolved_pairs: std::collections::HashSet::new(),
+            resolved_pairs: Vec::new(),
             promise_ctor_intrinsic: 0,
             promise_then_intrinsic: 0,
             promise_pristine_slots: None,
+            promise_resolve_memo: (0, 0),
+            array_then_memo: (0, 0),
             matchall_fast_slots: None,
             realms: vec![std::collections::HashMap::new()], // realm 0 = main
             obj_realm: crate::vm::JitGuardedMap::new(),
             realm_ctor_main: std::collections::HashMap::new(),
             fn_proto_override: std::collections::HashMap::new(),
+            fn_proto_readonly: std::collections::HashSet::new(),
+            objproto_method_memo: [(crate::shape::DICT, 0, 0); 3],
             is_htmldda: std::collections::HashSet::new(),
             htmldda_idx: u32::MAX,
             htmldda_scalar_enabled: std::env::var_os("ZIPP_NO_HTMLDDA_SCALAR").is_none(),
@@ -506,6 +524,7 @@ impl<'p> Vm<'p> {
             default_string_iter: Value::UNDEFINED,
             default_ta_iter: Value::UNDEFINED,
             iter_proto_memo: Default::default(),
+            gen_next_memo: Default::default(),
             iter_method_memo: Default::default(),
             throw_type_error: Value::UNDEFINED,
             iterator_ctor: 0,
@@ -714,18 +733,26 @@ impl<'p> Vm<'p> {
     /// name, so one long source identifier can otherwise amplify into an
     /// unmetered allocation per constructed object.
     fn private_side_table_resident_bytes(&self) -> usize {
-        let mut n = Self::hash_map_resident_bytes(&self.private_fields)
+        let mut n = self
+            .private_fields
+            .resident_bytes()
+            .saturating_add(Self::hash_map_resident_bytes(&self.private_name_ids))
             .saturating_add(self.method_brand.resident_bytes())
             .saturating_add(self.instance_brand.resident_bytes())
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_private_names))
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_owner));
 
         for fields in self.private_fields.values() {
-            n = n.saturating_add(Self::hash_map_resident_bytes(fields));
-            n = fields
-                .keys()
-                .fold(n, |n, (_, name)| n.saturating_add(name.capacity()));
+            n = n.saturating_add(
+                fields
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u64, u32, Value)>()),
+            );
         }
+        n = self
+            .private_name_ids
+            .keys()
+            .fold(n, |n, name| n.saturating_add(name.len()));
         for brands in self.method_brand.values() {
             n = n.saturating_add(brands.capacity().saturating_mul(std::mem::size_of::<u64>()));
         }

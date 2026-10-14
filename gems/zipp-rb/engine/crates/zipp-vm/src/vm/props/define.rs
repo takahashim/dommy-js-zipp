@@ -90,6 +90,52 @@ impl<'p> Vm<'p> {
         key: &str,
         desc: Value,
     ) -> Result<(), Thrown> {
+        self.object_define_property_inner(obj, key, desc)?;
+        if self.global_this != 0 && obj.is_heap() && obj.heap_index() == self.global_this {
+            self.sync_global_slot_from_property(key);
+        }
+        Ok(())
+    }
+
+    /// After a define on the global object: a slot-backed binding whose own
+    /// property is now a plain data property gets that value in its slot too,
+    /// with its generation bumped, as an assignment to `globalThis.name`
+    /// does. Compiled code that read the slot directly (a hot loop calling a
+    /// global function, its call spliced on the slot's generation) kept the
+    /// value the slot held before, while the interpreter read the property:
+    /// `Object.defineProperty(globalThis, 'f', {value: g})` in a loop, or in a
+    /// function the loop calls, left the loop calling the old `f`. An
+    /// accessor keeps the property route alone (the slot cannot hold it).
+    fn sync_global_slot_from_property(&mut self, key: &str) {
+        let Some(slot) = self.global_slot_of_name(key) else {
+            return;
+        };
+        let s = slot as usize;
+        if s >= self.globals.len()
+            || self.globals[s].is_uninitialized()
+            || self.global_name_is_lexical(key)
+        {
+            return;
+        }
+        let v = match self.heap.get(self.global_this) {
+            HeapObj::Object(m) => m
+                .pos(key)
+                .filter(|&i| !m.attr_at(i).accessor)
+                .map(|i| m.val_at(i)),
+            _ => None,
+        };
+        if let Some(v) = v.filter(|v| !v.is_uninitialized()) {
+            self.globals[s] = v;
+            self.bump_global_gen(slot);
+        }
+    }
+
+    fn object_define_property_inner(
+        &mut self,
+        obj: Value,
+        key: &str,
+        desc: Value,
+    ) -> Result<(), Thrown> {
         self.defer_check(obj, key)?;
         if !obj.is_heap() {
             return Err(Thrown::from_static(
@@ -648,15 +694,18 @@ impl<'p> Vm<'p> {
                 ));
             }
             let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
-            // A class's `prototype` is also non-writable: it cannot become
-            // writable, and only the same value may be restated.
-            if is_class && wr == Some(true) {
+            // A class's `prototype` is non-writable, and so is a function's
+            // once made so: it cannot become writable again, and only the
+            // same value may be restated (ValidateAndApplyPropertyDescriptor
+            // for a non-configurable, non-writable property).
+            let readonly = is_class || self.fn_proto_readonly.contains(&idx);
+            if readonly && wr == Some(true) {
                 return Err(Thrown::from_static(
                     "TypeError: Cannot redefine property: prototype",
                 ));
             }
             if let Some(v) = v {
-                if is_class {
+                if readonly {
                     let cur = self.prototype_of(obj).unwrap_or(Value::UNDEFINED);
                     if !self.same_value(v, cur) {
                         return Err(Thrown::from_static(
@@ -671,6 +720,9 @@ impl<'p> Vm<'p> {
                         self.prototypes.insert(idx, v.heap_index());
                     }
                 }
+            }
+            if !is_class && wr == Some(false) {
+                self.make_fn_proto_readonly(obj);
             }
             return Ok(());
         }

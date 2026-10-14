@@ -85,18 +85,31 @@ impl<'p> Vm<'p> {
     /// yields. The list of an object in dictionary mode, which no cache can
     /// key.
     fn own_enum_keys_uncached(&mut self, idx: u32, out: &mut Vec<Value>) {
-        let texts: Vec<String> = match self.heap.get(idx) {
-            HeapObj::Object(m) => spec_key_order(&m.keys)
-                .into_iter()
-                .filter(|&i| !is_hidden_key(&m.keys[i]) && m.attr_at(i).enumerable)
-                .map(|i| m.keys[i].clone())
-                .collect(),
+        // A key enumerated before has its string in `key_str_cache`: ask by
+        // the key's text where it lies, and copy the text only for a key not
+        // seen yet (`alloc_key_str` then caches it). Copying every key for
+        // the asking was a malloc and a free per key per for-in.
+        let mut misses: Vec<(usize, String)> = Vec::new();
+        match self.heap.get(idx) {
+            HeapObj::Object(m) => {
+                for i in spec_key_order(&m.keys) {
+                    let k = &m.keys[i];
+                    if is_hidden_key(k) || !m.attr_at(i).enumerable {
+                        continue;
+                    }
+                    match self.key_str_cache.get(k.as_str()) {
+                        Some(&v) => out.push(v),
+                        None => {
+                            misses.push((out.len(), k.clone()));
+                            out.push(Value::UNDEFINED);
+                        }
+                    }
+                }
+            }
             _ => return,
-        };
-        out.reserve(texts.len());
-        for k in texts {
-            let v = self.alloc_key_str(k);
-            out.push(v);
+        }
+        for (pos, k) in misses {
+            out[pos] = self.alloc_key_str(k);
         }
     }
 
@@ -900,6 +913,34 @@ impl<'p> Vm<'p> {
             // bookkeeping becomes eager from here on.
             if seen.is_none() {
                 seen = Some(self.shadow_set_of(&plain_levels));
+            }
+            // A Proxy level: one [[OwnPropertyKeys]] (its `ownKeys` trap)
+            // serves both the enumerable keys and the shadow set, then one
+            // [[GetOwnProperty]] per string key, as V8 does. The two calls
+            // below each ran the trap. (GC is locked for this whole walk.)
+            if let Some(keys) = self.proxy_own_keys(cur)? {
+                for k in keys {
+                    if !(k.is_heap() && self.heap.is_str_like(k.heap_index())) {
+                        continue;
+                    }
+                    let ks = self.key_of(k);
+                    let desc = self.proxy_gopd(cur, &ks)?.unwrap_or(Value::UNDEFINED);
+                    let enumerable = if desc.is_undefined() {
+                        false
+                    } else {
+                        let en = self.get_prop(desc, "enumerable")?;
+                        self.truthy(en)
+                    };
+                    let text = self.display(k);
+                    if seen.as_mut().is_some_and(|s| s.insert(text)) && enumerable {
+                        out.push(k);
+                    }
+                }
+                cur = self.object_get_prototype_of(cur);
+                if cur == Value::NULL {
+                    break;
+                }
+                continue;
             }
             let enum_keys = self.object_enum_own(cur, EnumWhat::Keys)?;
             let enum_snap = self.array_snapshot(enum_keys.heap_index());

@@ -18,6 +18,35 @@ env_off_switch! {
     fn iter_region_enabled() = "ZIPP_NO_ITER_REGION"
 }
 
+/// The statics a memory region answers with its own arm (one argument:
+/// `Promise.resolve` and the four `Number.is*` tests), rather than through
+/// `jit_static_fn_ic`. Tier C leaves a body holding one to the region, whose
+/// arm is the faster.
+pub(crate) fn static_fn_region_inline(op: crate::bytecode::StaticFn, argc: u16) -> bool {
+    use crate::bytecode::StaticFn as S;
+    argc == 1
+        && matches!(
+            op,
+            S::PromiseResolve
+                | S::NumberIsInteger
+                | S::NumberIsNaN
+                | S::NumberIsFinite
+                | S::NumberIsSafeInteger
+        )
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_STATICFN_JIT=1` declines a region or a Tier C body holding a
+    /// `StaticFn` other than the five inline ones again (the same-binary A/B).
+    fn static_fn_jit_enabled() = "ZIPP_NO_STATICFN_JIT"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_GENERAL_ITER_REGION=1` declines a memory region holding the
+    /// general iterator protocol or `ArrayCtor` again (the same-binary A/B).
+    fn general_iter_region_enabled() = "ZIPP_NO_GENERAL_ITER_REGION"
+}
+
 /// Proof token for the deliberately tiny matchAll scalarization V1. The
 /// detector accepts only the compiler's exact 36-op outer-loop shape used by
 /// regex-log-scan; every skipped publication/consumer is named here so the
@@ -724,6 +753,42 @@ pub(crate) fn region_op_admitted(
         Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
         // `new F(…)`: the construct helper, with the call protocol.
         Instr::New { .. } => {}
+        // `v instanceof c`: the operator's helper, with the call protocol (a
+        // `@@hasInstance` method or a Proxy trap is user code).
+        Instr::InstanceOfDyn { .. } => {}
+        // A template literal's `${v}`: `jit_to_str_ic`, with the call protocol
+        // (an object's `toString` is user code).
+        Instr::ToStr { .. } => {}
+        // Array destructuring, array spread and a spread call: the
+        // interpreter's code through `jit_iter_to_array_ic`,
+        // `jit_array_append_ic` and `jit_call_spread_ic`, with the call
+        // protocol (an iterator or the callee is user code). MEM path only.
+        Instr::IterToArray { count, .. } if const_strs.is_some() && count <= 0xFFFF => {}
+        Instr::ArrayAppend { .. } | Instr::CallSpread { .. } if const_strs.is_some() => {}
+        // `Object.keys/values/entries(o)`, a for-in's key snapshot and its
+        // length: the interpreter's code through `jit_obj_enum_ic`, with the
+        // call protocol (a replaced builtin, a Proxy trap or a getter is
+        // user code). MEM path only.
+        Instr::ObjectKeys { .. }
+        | Instr::ObjectValues { .. }
+        | Instr::ObjectEntries { .. }
+        | Instr::ForInKeys { .. }
+        | Instr::LenOf { .. }
+            if const_strs.is_some() => {}
+        // `{ ...src, k: v }`: the spread and the literal's later named
+        // properties, through `jit_obj_init_ic` with the call protocol (the
+        // spread's getters are user code). MEM path only.
+        Instr::ObjectSpread { .. } if const_strs.is_some() => {}
+        // A method naming its own class: `jit_load_class_value_ic`. MEM path.
+        Instr::LoadClassValue { .. } if const_strs.is_some() => {}
+        Instr::InitDataProp { name, .. } if const_strs.is_some() && name <= 0xFF_FFFF => {}
+        // Array and object literals: the helpers Tier C calls (allocation is
+        // a safe point; the emitter refetches after it).
+        Instr::NewArray { .. }
+        | Instr::NewObject { .. }
+        | Instr::NewPlannedObject { .. }
+        | Instr::AppendDataProp { .. }
+        | Instr::FinalizeObject { .. } => {}
         // Logical `!` — MEM path (Bool flips natively; anything else goes
         // through the `jit_truthy` helper).
         Instr::Not { .. } => {}
@@ -760,11 +825,13 @@ pub(crate) fn region_op_admitted(
         Instr::LoadUndefined { .. } | Instr::LoadNull { .. } => {}
         // Fused `typeof` comparisons — MEM paths via PURE classifier
         // helpers. They allocate nothing, run no user code and are total.
-        // helper (no alloc, no user code, total). The UNFUSED `TypeOf` is
-        // still not admitted here: it allocates its result string, and after
-        // this fusion the bare form is rare enough not to be worth the
-        // refetch plumbing.
-        Instr::TypeOfIs { .. } | Instr::TypeOfSame { .. } => {}
+        // helper (no alloc, no user code, total).
+        Instr::TypeOfIs { .. } | Instr::TypeOfSame { .. } | Instr::TypeOf { .. } => {}
+        // The unfused `typeof v` (a `switch (typeof v)`, a stored result):
+        // the canonical result string through `jit_typeof`, which runs no
+        // user code; the emitter refetches after it, as after an allocating
+        // helper, though the canonical strings are made once at setup. A
+        // single one declined the whole region before.
         // `Promise.resolve(x)` / `Number.is*(x)` at exactly one argument —
         // MEM path via `jit_static_fn`. `Promise.resolve` was async-
         // promise-chain's fill-loop's ONLY blocker (`a[j] =
@@ -773,17 +840,11 @@ pub(crate) fn region_op_admitted(
         // microtask) and deopts a heap argument to the interpreter's
         // identity/thenable protocol. Every other StaticFn keeps declining.
         Instr::StaticFn { op, argc, .. } => {
-            use crate::bytecode::StaticFn as S;
-            let ok = argc == 1
-                && matches!(
-                    op,
-                    S::PromiseResolve
-                        | S::NumberIsInteger
-                        | S::NumberIsNaN
-                        | S::NumberIsFinite
-                        | S::NumberIsSafeInteger
-                );
-            if !ok {
+            let inline = static_fn_region_inline(op, argc);
+            // Every other static (`Object.assign`, `String.fromCharCode`, …)
+            // runs the interpreter's arm through `jit_static_fn_ic`, with the
+            // call protocol. MEM path only.
+            if !inline && !(const_strs.is_some() && static_fn_jit_enabled()) {
                 reject!("[decline] StaticFn {op:?}/{argc} at region [{start},{end}]");
             }
         }
@@ -808,6 +869,18 @@ pub(crate) fn region_op_admitted(
         // interpreter replays the op and applies PutValue's throw/no-op
         // semantics. Both hit paths are allocation- and user-code-free.
         Instr::CellSet { .. } | Instr::UpvalSet { .. } => {}
+        // Function, closure and cell creation (`arr.map(x => x + k)`, a
+        // per-iteration `let` a closure captures): `jit_region_make_fn` runs
+        // the interpreter's own code in the region's frame. Allocation is a
+        // safe point; the emitter refetches after it. MEM path only.
+        Instr::MakeFunc { .. }
+        | Instr::MakeClosure { .. }
+        | Instr::MakeArrow { .. }
+        | Instr::MakeCell { .. }
+        | Instr::MakeCellTdz { .. }
+        | Instr::MakeCellFnName { .. }
+        | Instr::MarkCellConst { .. }
+            if const_strs.is_some() && crate::vm::tierc_closure_make_enabled() => {}
         // `+x` — a NUMBER passes straight through (the interpreter returns
         // the Value verbatim); anything else needs observable ToNumber
         // coercion and bails. It was simply absent from this list, which
@@ -893,6 +966,20 @@ pub(crate) fn region_op_admitted(
             if scalar_matchall.is_some_and(|p| p.close_ip == ip) => {}
         Instr::EndFinally { .. }
             if scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) => {}
+        // The general iterator protocol (a for-of nested in the loop, array
+        // destructuring with a default or a rest element) and array
+        // creation: the interpreter's arms through `jit_iter_op_ic` /
+        // `jit_array_ctor_ic`, with the call protocol. A normal completion
+        // falls through `EndFinally`; any other leaves the region at it for
+        // the interpreter's routing. MEM path only.
+        Instr::GetIterator { .. }
+        | Instr::IterPrime { .. }
+        | Instr::IterClose { .. }
+        | Instr::IterCloseQuiet { .. }
+        | Instr::IterCloseFinally { .. }
+        | Instr::EndFinally { .. }
+        | Instr::ArrayCtor { .. }
+            if const_strs.is_some() && general_iter_region_enabled() => {}
         // The for-of close-handler bracket around each iteration. Both
         // are ONE Vec push/pop on the current frame's handler stack via
         // helpers that mirror the interpreter arms exactly, keeping the

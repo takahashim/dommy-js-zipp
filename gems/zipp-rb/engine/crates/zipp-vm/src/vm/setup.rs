@@ -2677,6 +2677,27 @@ impl<'p> Vm<'p> {
             ],
             None,
         );
+        // `performance`, as in node and browsers, with the one member the
+        // engine has a clock for. A real object, so a program or embedder can
+        // read, replace or install it.
+        let performance_obj = build(self, &[("now", native::PERFORMANCE_NOW)], None);
+        // `performance.timeOrigin`: the epoch time `now()` counts from, on the
+        // same clocks (so `timeOrigin + now()` tracks `Date.now()`, and a host's
+        // installed clock governs both). Read-only, as the WebIDL attribute is.
+        let time_origin = crate::vm::clock::now_epoch_ns() as f64 / 1e6
+            - (crate::vm::clock::now_mono_ms() - self.start_mono_ms);
+        self.setup_define(
+            performance_obj,
+            "timeOrigin",
+            Value::num(time_origin),
+            PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            },
+        );
         // The Annex-B call-assignment-target ReferenceError thrower (lib.rs
         // parse-retry rewrite). Resolvable as a global under its reserved name
         // only; hidden from globalThis own-keys reflection (props.rs).
@@ -2815,6 +2836,7 @@ impl<'p> Vm<'p> {
             ("unescape", unescape_fn),
             ("print", print_fn),
             ("console", console_obj),
+            ("performance", performance_obj),
             ("eval", eval_fn),
             ("globalThis", global_this),
             (native::ANNEXB_REF_ERROR_NAME, annexb_ref_error_fn),

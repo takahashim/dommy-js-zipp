@@ -817,6 +817,19 @@ impl<'p> Vm<'p> {
         self.try_builtin_method(recv, key, base, arg_base, argc)
     }
 
+    /// What `Get(s, name)` finds on a primitive string `s` when `name` is one
+    /// of the memoised `String.prototype` methods and that slot still holds
+    /// its intrinsic: the function's bits, from the memo. `None` for any
+    /// other name or state (the caller takes its ordinary lookup). A
+    /// primitive string's own properties are its indices and `length`, so a
+    /// method name always resolves on `String.prototype`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn str_proto_method_memo_bits(&mut self, name: &str) -> Option<u64> {
+        str_memo_id(name)?;
+        self.proto_intrinsic_bits(name, false)
+    }
+
     /// The VALUE of `name` on %Array.prototype% (`is_arr`) / %String.prototype%
     /// when it is provably still the boot intrinsic, else `None` — the same
     /// proof as the two predicates above, returning the callable's bits so a
@@ -1368,6 +1381,21 @@ impl<'p> Vm<'p> {
             };
         }
         // ── Object.prototype methods (available on every object) ──
+        // Each only while `recv[name]` resolves, with nothing run, to the
+        // intrinsic as a plain data property of the chain: an own or nearer
+        // method of that name, a replaced intrinsic, a null-prototype object,
+        // a class instance and a Proxy (its `get` and `getOwnPropertyDescriptor`
+        // traps) take the ordinary Get and call.
+        if matches!(name, "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf") {
+            let id = match name {
+                "hasOwnProperty" => native::PROTO_HAS_OWN,
+                "propertyIsEnumerable" => native::PROTO_PROP_ENUM,
+                _ => native::PROTO_IS_PROTO_OF,
+            };
+            if !self.object_proto_native_resolves(recv, name, id) {
+                return Ok(None);
+            }
+        }
         match name {
             "hasOwnProperty" => {
                 let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -1470,7 +1498,33 @@ impl<'p> Vm<'p> {
                 self.array_method(idx, name, args)
             }
             HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
-            HeapObj::Generator { .. } => self.generator_method(idx, name, args),
+            // Only while the method resolves to the intrinsic: an own one, a
+            // replaced one on the function's `prototype` object or on
+            // %GeneratorPrototype% takes the caller's get + call instead.
+            HeapObj::Generator { .. } => {
+                if matches!(name, "next" | "return" | "throw")
+                    && !self.gen_method_pristine(idx, name)
+                {
+                    return Ok(None);
+                }
+                self.generator_method(idx, name, args)
+            }
+            // `it.next()` on a Map, Set, array or string iterator with no own
+            // `next` or replaced [[Prototype]], whose prototype still has the
+            // intrinsic `next`: the native itself, without the `next` lookup
+            // and the generic call it took. A loop of them was dominated by
+            // those two.
+            HeapObj::Iterator { proto, .. } if name == "next" => {
+                let proto = *proto;
+                if self.proto_of.get(&idx).is_some()
+                    || self.arr_props.get(&idx).is_some_and(|m| m.pos("next").is_some())
+                    || !self.builtin_iter_next_pristine(proto)
+                {
+                    return Ok(None);
+                }
+                self.call_native(crate::vm::native::ITER_NEXT, Value::heap(idx), args)
+                    .map(Some)
+            }
             HeapObj::AsyncGenerator(_) => Ok(self.async_generator_method(idx, name, args)),
             HeapObj::Promise { .. } => {
                 // `then`/`catch`/`finally` must resolve through the receiver's
@@ -1614,6 +1668,126 @@ impl<'p> Vm<'p> {
     /// is NO custom override. Used so the inline fast path only fires for the
     /// default method and a custom `toString`/`valueOf` is actually invoked.
     /// Resolving a method does not invoke it, so this has no observable effect.
+    /// Whether `recv[name]` resolves, without running anything, to the
+    /// `Object.prototype` native `id` held as a plain data property on the
+    /// receiver's chain (no own or nearer property of that name, no declared
+    /// class member of it, no accessor, no Proxy or exotic level on the way).
+    ///
+    /// A plain object on the default chain answers from a memo per method:
+    /// its shape (which says it owns no such key) and %Object.prototype%'s
+    /// version and slot, the slot's value re-read every time (an in-place
+    /// overwrite of the method bumps no version).
+    fn object_proto_native_resolves(&mut self, recv: Value, name: &str, id: u16) -> bool {
+        if !recv.is_heap() {
+            return false;
+        }
+        let idx = recv.heap_index();
+        let memo_i = match id {
+            native::PROTO_HAS_OWN => 0,
+            native::PROTO_PROP_ENUM => 1,
+            _ => 2,
+        };
+        let plain_shape = match self.heap.get(idx) {
+            HeapObj::Object(m)
+                if m.class.is_none()
+                    && !m.is_ctor
+                    && m.shape() != crate::shape::DICT
+                    && idx != self.obj_proto
+                    && !self.proto_of.contains_key(&idx) =>
+            {
+                Some(m.shape())
+            }
+            _ => None,
+        };
+        let op = self.obj_proto;
+        if let Some(shape) = plain_shape {
+            let (ms, mv, mslot) = self.objproto_method_memo[memo_i];
+            if ms == shape && op != 0 && mv == self.heap.version_of(op) {
+                return self.slot_holds_native(op, mslot, id);
+            }
+        }
+        let (holder, slot) = match self.ic_walk(recv, name) {
+            crate::vm::ic::Walked::ChainData { hops, slot, .. } => {
+                let Some(&(holder, _)) = hops.0.get((hops.1 as usize).wrapping_sub(1)) else {
+                    return false;
+                };
+                (holder, slot)
+            }
+            // A class instance: no own property of the name, no declared
+            // member of it, then the plain levels of its live chain (the
+            // proof the add way takes for a store, `class_add_chain`).
+            _ => match self.heap.get(idx) {
+                HeapObj::Object(m) if m.pos(name).is_none() && !m.is_ctor => {
+                    let Some(class) = m.class else {
+                        return false;
+                    };
+                    if self.proto_of.contains_key(&idx)
+                        || !matches!(
+                            self.class_member_lookup(idx, class, name),
+                            crate::vm::props::ClassLookup::Miss
+                        )
+                    {
+                        return false;
+                    }
+                    let mut next = self.class_instance_live_proto(idx, class);
+                    let mut found = None;
+                    for _ in 0..64 {
+                        if !next.is_heap() {
+                            break;
+                        }
+                        let h = next.heap_index();
+                        if !self.ic_obj_ok(h) {
+                            return false;
+                        }
+                        let HeapObj::Object(m2) = self.heap.get(h) else {
+                            return false;
+                        };
+                        if m2.is_ctor || m2.class.is_some() {
+                            return false;
+                        }
+                        if let Some(i) = m2.pos(name) {
+                            if m2.attr_at(i).accessor {
+                                return false;
+                            }
+                            found = Some((h, i as u32));
+                            break;
+                        }
+                        next = match self.proto_of.get(&h) {
+                            Some(p) => *p,
+                            None if self.obj_proto == 0 || h == self.obj_proto => Value::NULL,
+                            None => Value::heap(self.obj_proto),
+                        };
+                    }
+                    match found {
+                        Some(f) => f,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            },
+        };
+        if !self.slot_holds_native(holder, slot, id) {
+            return false;
+        }
+        if let Some(shape) = plain_shape {
+            if holder == op {
+                self.objproto_method_memo[memo_i] = (shape, self.heap.version_of(op), slot);
+            }
+        }
+        true
+    }
+
+    /// Whether slot `slot` of the plain object `holder` holds the native `id`.
+    #[inline]
+    fn slot_holds_native(&self, holder: u32, slot: u32, id: u16) -> bool {
+        match self.heap.get(holder) {
+            HeapObj::Object(m) => m.val_get_ref(slot as usize).is_some_and(|v| {
+                v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == id)
+            }),
+            _ => false,
+        }
+    }
+
     fn method_is_generic(
         &mut self,
         recv: Value,

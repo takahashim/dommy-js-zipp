@@ -131,9 +131,7 @@ to the architecture: regex uses finite automata while regress uses "classical ba
 
 # Architecture
 
-regress has a parser, intermediate representation, optimizer which acts on the IR, bytecode emitter, and two bytecode interpreters, referred to as "backends".
-
-The major interpreter is the "classical backtracking" which uses an explicit backtracking stack, similar to JS implementations. There is also the "PikeVM" pseudo-toy backend which is mainly used for testing and verification.
+regress has a parser, intermediate representation, optimizer which acts on the IR, bytecode emitter, and a bytecode interpreter: a "classical backtracking" matcher with an explicit backtracking stack, similar to JS implementations.
 
 # Crate features
 
@@ -165,12 +163,12 @@ pub use crate::api::*;
 /// the table behind `\p{ID_Start}` and a named group's first character. The
 /// engine's lexer asks here, so a module carries the property once.
 pub fn is_id_start(c: char) -> bool {
-    unicodetables::id_start_ranges().contains_identifier(c.into())
+    unicode::is_id_start_cp(c.into())
 }
 
 /// PATCH (see FORK.md): whether `c` has the Unicode property `ID_Continue`.
 pub fn is_id_continue(c: char) -> bool {
-    unicodetables::id_continue_ranges().contains_identifier(c.into())
+    unicode::is_id_continue_cp(c.into())
 }
 
 /// PATCH (see VENDORED.md): `ZIPP_RXSTATS=1` classical-backtrack counters —
@@ -282,6 +280,3 @@ mod types;
 mod unicode;
 mod unicodetables;
 mod unicodetables_unknown;
-
-#[cfg(feature = "backend-pikevm")]
-mod pikevm;

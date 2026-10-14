@@ -746,6 +746,37 @@ impl<'a> Emitter<'a> {
         })
     }
 
+    /// The runtime's `seqiter(value)` (an exact list, tuple or range as
+    /// itself, anything else its iterator), with the first answer found
+    /// where the loop starts: `value`'s class (`PyClassOf`) compared with
+    /// the three, the runtime's call only for anything else. Every `for`
+    /// over a list made that interpreted call as it began.
+    fn seq_iterable(&mut self, value: Reg) -> R<Reg> {
+        let iter = self.alloc()?;
+        let cls = self.alloc()?;
+        let at = self.emit(Instr::PyClassOf { dst: cls, obj: value, slow: 0 })?;
+        let mut itself = Vec::new();
+        for name in ["TLIST", "TTUPLE", "TRANGE"] {
+            let t = self.prop(self.r_rt, name)?;
+            let same = self.alloc()?;
+            self.emit(Instr::Eq { dst: same, a: cls, b: t })?;
+            itself.push(self.jump_if_true(same)?);
+        }
+        let here = self.here();
+        self.patch_slow(at, here)?;
+        let it = self.helper("seqiter", &[value])?;
+        self.emit(Instr::Move { dst: iter, src: it })?;
+        let done = self.jump()?;
+        let here = self.here();
+        for j in itself {
+            self.patch(j, here)?;
+        }
+        self.emit(Instr::Move { dst: iter, src: value })?;
+        let here = self.here();
+        self.patch(done, here)?;
+        Ok(iter)
+    }
+
     /// Iteration over an evaluated `value`. With fast paths on, an exact
     /// list or tuple is indexed in place (its current `items` and length
     /// re-read every step, so appends during the loop are seen as CPython's
@@ -765,7 +796,7 @@ impl<'a> Emitter<'a> {
                 direct_next: None,
             });
         }
-        let iter = if wrap { self.helper("seqiter", &[value])? } else { value };
+        let iter = if wrap { self.seq_iterable(value)? } else { value };
         // `seqiter` returns an object: a list, tuple or range as itself, or
         // a runtime iterator record.
         let cls = self.prop(iter, "cls")?;
@@ -1645,12 +1676,25 @@ impl<'a> Emitter<'a> {
         Ok(record)
     }
 
-    pub fn first_param_reg(&self) -> Option<Reg> {
-        let first = self.scope().params.first()?;
-        match self.scope().symbols.get(first) {
-            Some(SymKind::Cell) => None,
-            _ => self.locals.get(first).copied(),
+    /// The value of the code's first parameter for a zero-argument
+    /// `super()`: its register, or what its cell holds now when a nested
+    /// scope captures it (CPython takes the cell's contents too). `None`
+    /// for code without parameters.
+    pub fn first_param_value(&mut self) -> R<Option<Reg>> {
+        // In a comprehension, the enclosing code's (see `Scope::super_self`).
+        if let Some(name) = self.scope().super_self.clone() {
+            return self.load_name(&name).map(Some);
         }
+        let Some(first) = self.scope().params.first() else {
+            return Ok(None);
+        };
+        if self.scope().symbols.get(first) != Some(&SymKind::Cell) {
+            return Ok(self.locals.get(first).copied());
+        }
+        let Some(cell) = self.cells.get(first).copied() else {
+            return Ok(None);
+        };
+        self.cell_get(cell).map(Some)
     }
 }
 

@@ -1156,6 +1156,7 @@ impl<'a> IntoIterator for &'a mut PropKeys {
 }
 
 impl PropKeys {
+    #[inline]
     fn resident_bytes(&self) -> usize {
         match self {
             // A planned list is compiler-owned and shared by every object made
@@ -1833,6 +1834,7 @@ impl PropAttr {
 }
 
 impl ObjMap {
+    #[inline]
     pub(crate) fn resident_bytes(&self) -> usize {
         let mut n = self
             .keys
@@ -2168,6 +2170,69 @@ impl ObjMap {
         m
     }
 
+    /// The map `{ ...self }` makes when `self`'s properties can be copied as
+    /// they stand: every one a default data property (writable, enumerable,
+    /// configurable) and none naming an element or a symbol, so the keys'
+    /// insertion order is their [[OwnPropertyKeys]] order. The same keys in
+    /// the same order (a planned list is shared, not copied), the same values,
+    /// the same shape and index. `None` otherwise: the caller copies property
+    /// by property.
+    pub(crate) fn spread_copy(&self) -> Option<ObjMap> {
+        if !matches!(self.attrs, PropAttrs::AllData { .. })
+            || self.has_element_key
+            || self.keys.iter().any(|k| k.starts_with("@@"))
+        {
+            return None;
+        }
+        let mut m = ObjMap::new();
+        m.keys = self.keys.clone();
+        m.vals = ValStore::Vec(self.vals_slice().to_vec());
+        m.attrs = PropAttrs::AllData {
+            len: self.keys.len() as u32,
+        };
+        m.shape = self.shape;
+        m.index = self.index.clone();
+        m.planned_append_failed = self.planned_append_failed;
+        Some(m)
+    }
+
+    /// Take `copy` (a [`ObjMap::spread_copy`]) as this empty literal's whole
+    /// property store, keeping its own object-level flags. A slab value cell
+    /// goes home first, as every structural replacement returns it.
+    pub(crate) fn assign_spread_copy(&mut self, copy: ObjMap) {
+        debug_assert!(self.keys.is_empty());
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.vals.strip_slab();
+        let (is_raw_json, sealed, frozen, extensible) =
+            (self.is_raw_json, self.sealed, self.frozen, self.extensible);
+        *self = copy;
+        self.is_raw_json = is_raw_json;
+        self.sealed = sealed;
+        self.frozen = frozen;
+        self.extensible = extensible;
+    }
+
+    /// [`ObjMap::with_capacity`] without the key vector: for an instance a
+    /// compiled constructor fills through the JIT's add ways, whose keys come
+    /// from the shape's shared list (`append_data_shaped`), so a reserved key
+    /// vector would be allocated only to be dropped.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn with_val_capacity(n: usize) -> ObjMap {
+        let mut m = ObjMap::new();
+        if n > 0 {
+            {
+                #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
+                let ValStore::Vec(v) = &mut m.vals
+                else {
+                    unreachable!("ctor stores are Vec-born")
+                };
+                v.reserve_exact(n);
+            }
+            m.attrs.reserve_exact(n);
+        }
+        m
+    }
+
     /// Empty object storage backed by a compiler-prepared immutable key list.
     /// The explicit mode seam lets tests compare both representations without
     /// racing the process-wide environment latch.
@@ -2376,6 +2441,46 @@ impl ObjMap {
         m
     }
 
+    /// The own properties of an `arguments` object (`Vm::build_arguments_object`):
+    /// `length` and `@@iterator` as hidden writable data, then `callee` with
+    /// `callee_attr`. The map three `define`s on a `new_side_table` leave,
+    /// with the key list shared through one plan instead of three new
+    /// strings and a growing key vector per call (planned keys materialize
+    /// on the first structural change, as a literal's do).
+    pub(crate) fn arguments_side_table(
+        length: Value,
+        iterator: Value,
+        callee: Value,
+        callee_attr: PropAttr,
+    ) -> ObjMap {
+        static PLAN: std::sync::OnceLock<StaticKeyPlan> = std::sync::OnceLock::new();
+        let plan = PLAN.get_or_init(|| {
+            StaticKeyPlan::new(vec![
+                "length".to_string(),
+                "@@iterator".to_string(),
+                "callee".to_string(),
+            ])
+        });
+        let hidden = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let mut m = ObjMap::new_side_table();
+        m.keys = PropKeys::Planned {
+            all: plan.clone(),
+            visible_len: 3,
+        };
+        m.vals = ValStore::Vec(vec![length, iterator, callee]);
+        m.attrs = PropAttrs::Mixed(vec![hidden, hidden, callee_attr]);
+        // `length` counts as an element-shadowing key (`key_names_element`),
+        // which is what makes the element paths decline an arguments object.
+        m.has_element_key = plan.keys().iter().any(|k| key_names_element(k));
+        m
+    }
+
     /// `new_side_table` with pre-sized vectors — for the regex match-result
     /// entry, which appends exactly `index`/`input`/`groups` (+`indices` with
     /// /d) per match. That site used `with_capacity`, whose shape starts at
@@ -2444,6 +2549,13 @@ impl ObjMap {
     #[inline]
     pub fn overlays_elements(&self) -> bool {
         self.has_element_key || !self.extensible
+    }
+
+    /// Whether every property has the default data attributes (writable,
+    /// enumerable, configurable, not an accessor).
+    #[inline]
+    pub(crate) fn attrs_all_data(&self) -> bool {
+        matches!(self.attrs, PropAttrs::AllData { .. })
     }
 
     /// Whether any key here names an element — see [`ObjMap::has_element_key`].
@@ -2560,8 +2672,12 @@ impl ObjMap {
     /// threshold. Every structural append (set/define) funnels through here.
     #[inline]
     fn index_appended(&mut self) {
-        let slot = self.keys.len() - 1;
-        let tag = prop_tag(&self.keys[slot]);
+        // The tag is for an existing index only; below the threshold no
+        // index is kept and the key's hash went unused on every append.
+        let tag = match &self.index {
+            Some(_) => prop_tag(&self.keys[self.keys.len() - 1]),
+            None => 0,
+        };
         self.index_appended_tagged(tag);
     }
 
@@ -2607,6 +2723,55 @@ impl ObjMap {
             self.index_appended();
             true
         }
+    }
+
+    /// The append branch of [`ObjMap::set`] for a caller that has proved `key`
+    /// absent and knows the shape the append reaches: `shape_after` is what
+    /// `crate::shape::add(self.shape(), key, <data bits>)` returned for the same
+    /// shape and key before. The JIT's add ways (`helpers_misc::AddWay`) take
+    /// it, skipping the key scan and the transition lookup; the shape tree is
+    /// never pruned, so a transition once taken names the same node for the
+    /// life of the process.
+    ///
+    /// `plan`, when given, is the key list of `shape_after` itself
+    /// (`shape::keys_of`): the keys this object has are exactly its prefix,
+    /// because they are what `self.shape()` names, so the object takes the
+    /// shared list instead of a new `String` per key.
+    pub(crate) fn append_data_shaped(
+        &mut self,
+        key: &str,
+        val: Value,
+        shape_after: u32,
+        plan: Option<StaticKeyPlan>,
+    ) {
+        debug_assert!(self.pos(key).is_none());
+        debug_assert_eq!(
+            crate::shape::add(
+                self.shape,
+                key,
+                crate::shape::attr_bits(true, true, true, false)
+            ),
+            shape_after
+        );
+        let n = self.keys.len();
+        match plan {
+            Some(all) if all.len() == n + 1 => {
+                debug_assert!(all.keys()[..n] == *self.keys.as_ref() && all.keys()[n] == key);
+                self.keys = PropKeys::Planned {
+                    all,
+                    visible_len: n + 1,
+                };
+            }
+            _ => {
+                self.planned_append_failed |= self.keys.is_planned();
+                self.keys.push(key.to_string());
+            }
+        }
+        self.vals.push(val);
+        self.attrs.push(PropAttr::data());
+        self.shape = shape_after;
+        self.has_element_key |= key_names_element(key);
+        self.index_appended();
     }
 
     /// [`ObjMap::set`] for a caller that already OWNS the key string: on the
@@ -5468,6 +5633,9 @@ impl HeapObj {
                 Reactions::Many(v) => vec_capacity_bytes(v),
                 _ => 0,
             },
+            // Every `new C()` and object literal: three capacity reads, not
+            // the out-of-line forty-arm match.
+            HeapObj::Object(map) => std::mem::size_of::<ObjMap>().saturating_add(map.resident_bytes()),
             _ => self.resident_payload_bytes(),
         }
     }
@@ -9505,6 +9673,35 @@ pub(crate) mod gcoracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ObjMap::arguments_side_table` must leave exactly the map the three
+    /// `define`s it replaces built: every field, both callee forms.
+    #[test]
+    fn arguments_side_table_matches_three_defines() {
+        let hidden = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let poison = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            accessor: true,
+            setter: Value::int(7),
+        };
+        for callee_attr in [hidden, poison] {
+            let (len, iter, callee) = (Value::int(3), Value::int(5), Value::int(7));
+            let mut by_define = ObjMap::new_side_table();
+            by_define.define("length", len, hidden);
+            by_define.define("@@iterator", iter, hidden);
+            by_define.define("callee", callee, callee_attr);
+            let built = ObjMap::arguments_side_table(len, iter, callee, callee_attr);
+            assert_eq!(format!("{built:?}"), format!("{by_define:?}"));
+        }
+    }
 
     #[cfg(not(feature = "safe-sandbox"))]
     #[test]

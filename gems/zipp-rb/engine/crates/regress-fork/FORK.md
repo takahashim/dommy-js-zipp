@@ -288,3 +288,71 @@ tables behind `\p{ID_Start}`, `\p{ID_Continue}` and a named group's name.
 ZIPP's JavaScript lexer calls them instead of linking a crate of its own for
 the same two properties, so a module carries each property once and the
 lexer, the regex properties and group names are on one Unicode version.
+
+## Removed: the PikeVM backend
+
+Upstream ships a second, PikeVM-style executor (`src/pikevm.rs`, feature
+`backend-pikevm`, on by default). Nothing in ZIPP ran it: the engine calls
+the backtracking executor only, and LTO already dropped the PikeVM from
+every artifact. Its one use was the crate's own tests, which ran each case
+on both executors. It is gone, with its feature; the differential fuzzer
+against Node (`fuzz/`) is the independent check now, and the patches above
+that mention `src/pikevm.rs` changed a file that no longer exists.
+
+## Right-to-left instructions: one matcher per input type
+
+Upstream instantiates the backtracking matcher for each input type AND each
+direction (`try_at_pos<Dir>`, `run_lookaround<Dir>`, every one-character
+loop and matcher type under it), because a lookbehind's body runs right to
+left. Here the direction is part of the instruction instead: inside a
+lookbehind the emitter wraps every instruction whose effect depends on the
+direction (consuming ones, backreferences, capture-group ends, one-character
+loops) in `Insn::Back`. `try_at_pos` runs left to right and hands a wrapped
+instruction to `back_step`, which runs it right to left; a right-to-left
+one-character loop tests its body through `scm::Dyn`, one matcher for every
+body type. Each instruction still costs one step: the step counts in
+`tests/step_counts.rs` are those of the per-direction matcher.
+
+## Lazy one-character loops read ahead only as far as the match needs
+
+Upstream ran a lazy one-character loop (`.*?`, `\w+?`) by scanning its
+whole run to the maximum on entry and backtracking through it one position
+at a time. The scan made `/<b>(.*?)<\/b>/g` quadratic over text without a
+line terminator: each match read the rest of the subject. The loop now
+takes its minimum, and each backtrack into it (`NonGreedyLoop1Char`,
+holding the position reached and the iterations left) tests the body at
+one more position. The regex JIT's lazy loops do the same. The positions
+tried, and so every result, are unchanged; the steps charged are not (see
+`tests/step_counts.rs`).
+
+## Property names are tables, not `match`es
+
+The generator wrote each kind of property (binary properties, General
+Category values, Script values, properties of strings) as an enum, a
+function mapping a name to it with a `match` over string literals, and a
+function mapping it to its table with another `match`. The name `match`es
+compiled to comparisons several times the size of the names (the Script
+one alone was 7.7 KB of Lite's code). Each kind is now a byte string of its
+values' names (each name a length byte and the name, a zero byte after each
+value) and an array of tables in the same order;
+`unicode::lookup_property_name` finds the value. After regenerating
+`unicodetables.rs` and running `tools/pack_regex_tables.py`, run
+`python crates/regress-fork/tools/pack_property_names.py`, then
+`python crates/regress-fork/tools/derive_property_tables.py` (below), and
+rustfmt the file.
+
+## Derived and packed identifier tables
+
+Nine property tables are unions of others: the General_Category groups (L,
+LC, M, N, P, S, Z, C) of their categories, and Assigned the complement of
+Unassigned. They are stored as `derived_intervals!`, the tables they are
+made of and whether to complement, and built the first time a regex uses
+them (with `std`, kept in a `OnceLock` per table: merging the parts again
+for every compile made `\p{L}` compile 1.4 times slower); their interval
+literals stay in the source for the round-trip test and for the
+interval count the sandbox's expansion limit charges. ID_Start and
+ID_Continue are packed like every other table: `unicode::is_id_start_cp`
+and `is_id_continue_cp` (behind `regress::is_id_start` for the engine's
+lexer, and a named group's name) decode them once per process and binary
+search the result. `tools/derive_property_tables.py` makes both changes to
+the generator's output, after `pack_property_names.py`.
