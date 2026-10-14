@@ -689,6 +689,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Wrapped { .. }
                 | HeapObj::Native(_)
                 | HeapObj::NativeClosure { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. }
         ) {
             if let Some(m) = self.fn_props.get(&idx) {
                 if let Some(p) = m.pos(key) {
@@ -737,7 +739,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => {
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => {
                 self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key))
             }
             // Every other exotic heap kind (TypedArray, DataView, ArrayBuffer,
@@ -1632,6 +1636,8 @@ impl<'p> Vm<'p> {
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
             | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. }
             | HeapObj::Class(_) => None,
             _ => self
                 .arr_props
@@ -1657,7 +1663,16 @@ impl<'p> Vm<'p> {
         // chains are handled just below via map.class; `__proto__` was handled
         // at the top.) Only when there's no own property with this key.
         let needs_proto_walk = (match self.heap.get(idx) {
-            HeapObj::Object(m) => m.class.is_none() && m.pos(key).is_none(),
+            // The global object's slot-backed bindings (builtins, `var` and
+            // function declarations) are own data properties too, though its
+            // map holds none of them: a write to one never reaches the chain.
+            HeapObj::Object(m) => {
+                m.class.is_none()
+                    && m.pos(key).is_none()
+                    && !(self.global_this != 0
+                        && idx == self.global_this
+                        && self.global_slot_binding_descriptor(key).is_some())
+            }
             // An EXOTIC receiver's inherited getter-only accessor (RegExp
             // global/source/flags, Map/Set size) must govern the write: assigning it
             // is a sloppy no-op / strict TypeError, NOT a new own data property. The
@@ -1700,7 +1715,7 @@ impl<'p> Vm<'p> {
         // function props live in fn_props, so check via has_own_property).
         || (matches!(
             self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::BoundResolver { .. } | HeapObj::CombinatorResolver { .. }
         ) && !self.has_own_property(obj, key));
         if needs_proto_walk {
             let r = self.proto_chain_set(idx, key, val, obj)?;
@@ -1779,6 +1794,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Wrapped { .. }
                 | HeapObj::Native(_)
                 | HeapObj::NativeClosure { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. }
         ) {
             // `caller`/`arguments` on a restricted function (anything but a legacy
             // sloppy ordinary one) are the inherited %ThrowTypeError% accessors —
@@ -2197,6 +2214,8 @@ impl<'p> Vm<'p> {
                     | HeapObj::Wrapped { .. }
                     | HeapObj::Native(_)
                     | HeapObj::NativeClosure { .. }
+                    | HeapObj::BoundResolver { .. }
+                    | HeapObj::CombinatorResolver { .. }
                     | HeapObj::Class(_) => None,
                     _ => self
                         .arr_props
@@ -2415,7 +2434,9 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => self.fn_props.get(&idx).and_then(side),
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => self.fn_props.get(&idx).and_then(side),
             _ => self.arr_props.get(&idx).and_then(side),
         }
     }
