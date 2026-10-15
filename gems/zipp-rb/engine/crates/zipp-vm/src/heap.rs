@@ -19,7 +19,7 @@ use std::cell::Cell;
 use std::cell::UnsafeCell;
 #[cfg(feature = "safe-sandbox")]
 use std::collections::BTreeMap;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 /// Whether two property keys are the same text, compared here.
@@ -94,10 +94,15 @@ fn named_value_vec_payload(v: &Vec<(String, Value)>) -> usize {
 /// rebuilding every time it crosses.
 pub const PROP_INDEX_THRESHOLD: usize = 12;
 
+/// What a heap audit charges a `PropIndex::HashTree` entry: its 12 bytes in
+/// a B-tree node and the node overhead around it, overcounted.
+#[cfg(feature = "safe-sandbox")]
+const HASH_TREE_ENTRY_BYTES: usize = 48;
+
 /// [`Heap`]'s fid-mirror sentinel for "not a plain callable": no real
 /// FuncProto id reaches `u32::MAX` (function tables are bounds-checked far
 /// below it), so the emitted guard can compare against a baked id blindly.
-#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[cfg(feature = "jit")]
 pub(crate) const FID_MIRROR_NONE: u32 = u32::MAX;
 
 /// Slot sentinel for an empty [`PropIndex`] bucket (a real slot is a `keys`
@@ -290,12 +295,26 @@ fn split_propindex_enabled() -> bool {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
 pub enum PropIndex {
-    /// Hostile-code profile: exact string ordering gives a deterministic
+    /// Hostile-code profile: an exact ordering gives a deterministic
     /// logarithmic lookup bound even when wasm32 cannot supply secret hash
-    /// entropy. Keys are cloned only after the map crosses the index threshold;
-    /// the authoritative insertion-ordered vectors remain unchanged.
+    /// entropy. This one orders the keys' seeded 64-bit hashes
+    /// ([`seeded_bytes_hash`]): a lookup compares integers and confirms one
+    /// key, and nothing is cloned. The ordering is exact while no two keys
+    /// share a hash, so the first insert that would make two share one
+    /// reports it and the map rebuilds as [`PropIndex::Tree`]; the bound holds
+    /// either way. Keys of up to eight bytes and one length never share one.
     #[cfg(feature = "safe-sandbox")]
-    Tree { entries: BTreeMap<String, u32> },
+    HashTree { entries: BTreeMap<u64, u32> },
+    /// The hostile-code fallback: exact string ordering. Keys are cloned
+    /// only after the map crosses the index threshold; the authoritative
+    /// insertion-ordered vectors remain unchanged. `key_bytes` is the
+    /// capacity of the cloned keys (each its length), kept in step so a heap
+    /// audit does not walk the tree to size it.
+    #[cfg(feature = "safe-sandbox")]
+    Tree {
+        entries: BTreeMap<String, u32>,
+        key_bytes: usize,
+    },
     /// Pre-W19: one flat `Vec<(tag, slot)>`.
     Inter {
         table: Vec<(u32, u32)>,
@@ -318,7 +337,7 @@ impl PropIndex {
         #[cfg(feature = "safe-sandbox")]
         {
             let _ = n;
-            return PropIndex::Tree {
+            return PropIndex::HashTree {
                 entries: BTreeMap::new(),
             };
         }
@@ -354,9 +373,32 @@ impl PropIndex {
     fn build(keys: &[String]) -> Box<PropIndex> {
         let mut ix = PropIndex::with_capacity(keys.len());
         for (i, k) in keys.iter().enumerate() {
-            ix.insert(k, i as u32);
+            if !ix.insert(k, i as u32) {
+                return Self::collided(keys);
+            }
         }
         Box::new(ix)
+    }
+
+    /// The index for `keys` once two of them have shared a hash: the
+    /// string-ordered tree, which has no hash to share. Only the hash-ordered
+    /// tree ever reports a collision.
+    #[cfg_attr(not(feature = "safe-sandbox"), allow(unused_variables))]
+    fn collided(keys: &[String]) -> Box<PropIndex> {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let mut ix = PropIndex::Tree {
+                entries: BTreeMap::new(),
+                key_bytes: 0,
+            };
+            for (i, k) in keys.iter().enumerate() {
+                let inserted = ix.insert(k, i as u32);
+                debug_assert!(inserted, "the string tree has no collisions");
+            }
+            Box::new(ix)
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        unreachable!("only the safe profile's hash-ordered tree collides")
     }
 
     /// Position in `keys` of the entry equal to `key`, confirmed by compare.
@@ -374,14 +416,24 @@ impl PropIndex {
     #[inline]
     fn find_tagged(&self, keys: &[String], key: &str, tag: u32) -> Option<usize> {
         #[cfg(feature = "safe-sandbox")]
-        if let PropIndex::Tree { entries } = self {
-            let _ = tag;
-            return entries.get(key).copied().map(|slot| slot as usize);
+        match self {
+            PropIndex::HashTree { entries } => {
+                let _ = tag;
+                // No two keys share a hash, so a key that is here is the one
+                // its hash names; any other key that hashes alike is absent.
+                let slot = *entries.get(&seeded_bytes_hash(key.as_bytes()))? as usize;
+                return key_eq(&keys[slot], key).then_some(slot);
+            }
+            PropIndex::Tree { entries, .. } => {
+                let _ = tag;
+                return entries.get(key).copied().map(|slot| slot as usize);
+            }
+            _ => {}
         }
         debug_assert_eq!(tag, prop_tag(key), "find_tagged: caller's tag is wrong");
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => unreachable!(),
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter { table, mask, .. } => {
                 let mut i = tag as usize & mask;
                 loop {
@@ -417,7 +469,9 @@ impl PropIndex {
     fn cap(&self) -> usize {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { entries } => entries.len(),
+            PropIndex::HashTree { entries } => entries.len(),
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { entries, .. } => entries.len(),
             PropIndex::Inter { mask, .. } | PropIndex::Split { mask, .. } => mask + 1,
         }
     }
@@ -426,25 +480,35 @@ impl PropIndex {
     fn len(&self) -> usize {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { entries } => entries.len(),
+            PropIndex::HashTree { entries } => entries.len(),
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { entries, .. } => entries.len(),
             PropIndex::Inter { len, .. } | PropIndex::Split { len, .. } => *len,
         }
     }
 
     fn resident_bytes(&self) -> usize {
         match self {
+            // As for the string tree, below: an overcount of the node
+            // overhead of a 12-byte entry.
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { entries } => {
+            PropIndex::HashTree { entries } => std::mem::size_of::<Self>()
+                .saturating_add(entries.len().saturating_mul(HASH_TREE_ENTRY_BYTES)),
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { entries, key_bytes } => {
                 // std's B-tree node fanout/layout is private. 128 bytes per
                 // entry plus owned string capacity deliberately overcounts its
                 // current node overhead while keeping heap audits stable.
+                debug_assert_eq!(
+                    *key_bytes,
+                    entries
+                        .keys()
+                        .fold(0usize, |n, key| n.saturating_add(key.capacity())),
+                    "the tree's key_bytes drifted from its keys"
+                );
                 std::mem::size_of::<Self>()
                     .saturating_add(entries.len().saturating_mul(128))
-                    .saturating_add(
-                        entries
-                            .keys()
-                            .fold(0usize, |n, key| n.saturating_add(key.capacity())),
-                    )
+                    .saturating_add(*key_bytes)
             }
             PropIndex::Inter { table, .. } => vec_capacity_bytes(table),
             PropIndex::Split { tags, slots, .. } => {
@@ -453,24 +517,61 @@ impl PropIndex {
         }
     }
 
+    /// About what one more entry for a key of `key_len` bytes adds to
+    /// [`Self::resident_bytes`]: the tree's per-entry charge and the clone,
+    /// or a flat table's two buckets at its load factor.
+    #[inline]
+    fn entry_bytes(&self, key_len: usize) -> usize {
+        match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { .. } => {
+                let _ = key_len;
+                HASH_TREE_ENTRY_BYTES
+            }
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { .. } => 128 + key_len,
+            PropIndex::Inter { .. } | PropIndex::Split { .. } => {
+                let _ = key_len;
+                2 * std::mem::size_of::<(u32, u32)>()
+            }
+        }
+    }
+
     /// Record `slot` under `key`. The caller guarantees the key is absent
-    /// (every insertion path misses in `pos()` first).
-    fn insert(&mut self, key: &str, slot: u32) {
-        self.insert_tagged(key, slot, prop_tag(key));
+    /// (every insertion path misses in `pos()` first). `false`: the key was
+    /// not recorded because another key has its hash (see `HashTree`), and
+    /// the caller rebuilds the index with `collided`.
+    #[must_use]
+    fn insert(&mut self, key: &str, slot: u32) -> bool {
+        self.insert_tagged(key, slot, prop_tag(key))
     }
 
     /// B219: `insert` with the key's tag supplied by the caller (see
     /// `find_tagged` for why a wrong tag cannot corrupt a lookup).
-    fn insert_tagged(&mut self, key: &str, slot: u32, tag: u32) {
+    #[must_use]
+    fn insert_tagged(&mut self, key: &str, slot: u32, tag: u32) -> bool {
         #[cfg(feature = "safe-sandbox")]
-        if let PropIndex::Tree { entries } = self {
+        if let PropIndex::HashTree { entries } = self {
+            let _ = tag;
+            return match entries.entry(seeded_bytes_hash(key.as_bytes())) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(slot);
+                    true
+                }
+                std::collections::btree_map::Entry::Occupied(_) => false,
+            };
+        }
+        #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::Tree { entries, key_bytes } = self {
             let _ = tag;
             // The mutation must not live inside `debug_assert!`: its argument
             // is removed in release builds, which would leave every production
             // safe-profile index empty.
-            let previous = entries.insert(key.to_owned(), slot);
+            let key = key.to_owned();
+            *key_bytes = key_bytes.saturating_add(key.capacity());
+            let previous = entries.insert(key, slot);
             debug_assert!(previous.is_none());
-            return;
+            return true;
         }
         if (self.len() + 1) * 4 >= self.cap() * 3 {
             self.grow();
@@ -479,15 +580,16 @@ impl PropIndex {
         self.insert_raw(tag, slot);
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => unreachable!(),
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter { len, .. } | PropIndex::Split { len, .. } => *len += 1,
         }
+        true
     }
 
     fn insert_raw(&mut self, tag: u32, slot: u32) {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => unreachable!(),
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter { table, mask, .. } => {
                 let mut i = tag as usize & *mask;
                 while table[i].1 != PROP_EMPTY {
@@ -519,7 +621,7 @@ impl PropIndex {
     fn remove_slot(&mut self, tag: u32, slot: u32) {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => unreachable!(),
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter {
                 table, mask, len, ..
             } => {
@@ -610,10 +712,24 @@ impl PropIndex {
     /// down in either representation.
     fn remove(&mut self, key: &str, slot: u32) {
         #[cfg(feature = "safe-sandbox")]
-        if let PropIndex::Tree { entries } = self {
-            // As above, perform the state change outside the debug-only check.
-            let removed = entries.remove(key);
+        if let PropIndex::HashTree { entries } = self {
+            let removed = entries.remove(&seeded_bytes_hash(key.as_bytes()));
             debug_assert_eq!(removed, Some(slot));
+            for value in entries.values_mut() {
+                if *value > slot {
+                    *value -= 1;
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::Tree { entries, key_bytes } = self {
+            // As above, perform the state change outside the debug-only check.
+            let removed = entries.remove_entry(key);
+            debug_assert_eq!(removed.as_ref().map(|(_, s)| *s), Some(slot));
+            if let Some((key, _)) = removed {
+                *key_bytes = key_bytes.saturating_sub(key.capacity());
+            }
             for value in entries.values_mut() {
                 if *value > slot {
                     *value -= 1;
@@ -629,7 +745,7 @@ impl PropIndex {
     fn grow(&mut self) {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => return,
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => return,
             PropIndex::Inter { table, mask, .. } => {
                 let cap = table.len() * 2;
                 let old = std::mem::replace(table, vec![(0, PROP_EMPTY); cap]);
@@ -664,7 +780,19 @@ impl PropIndex {
     #[cfg(test)]
     fn verify(&self, keys: &[String]) {
         #[cfg(feature = "safe-sandbox")]
-        if let PropIndex::Tree { entries } = self {
+        if let PropIndex::HashTree { entries } = self {
+            assert_eq!(entries.len(), keys.len());
+            for (slot, key) in keys.iter().enumerate() {
+                assert_eq!(
+                    entries.get(&seeded_bytes_hash(key.as_bytes())),
+                    Some(&(slot as u32))
+                );
+                assert_eq!(self.find(keys, key), Some(slot));
+            }
+            return;
+        }
+        #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::Tree { entries, .. } = self {
             assert_eq!(entries.len(), keys.len());
             for (slot, key) in keys.iter().enumerate() {
                 assert_eq!(entries.get(key), Some(&(slot as u32)));
@@ -684,7 +812,7 @@ impl PropIndex {
         for i in 0..cap {
             let (t, sl) = match self {
                 #[cfg(feature = "safe-sandbox")]
-                PropIndex::Tree { .. } => unreachable!(),
+                PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
                 PropIndex::Inter { table, .. } => table[i],
                 PropIndex::Split { tags, slots, .. } => (tags[i], slots[i]),
             };
@@ -1131,12 +1259,6 @@ impl Deref for PropKeys {
     }
 }
 
-impl DerefMut for PropKeys {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.make_owned().as_mut_slice()
-    }
-}
-
 impl<'a> IntoIterator for &'a PropKeys {
     type Item = &'a String;
     type IntoIter = std::slice::Iter<'a, String>;
@@ -1146,27 +1268,25 @@ impl<'a> IntoIterator for &'a PropKeys {
     }
 }
 
-impl<'a> IntoIterator for &'a mut PropKeys {
-    type Item = &'a mut String;
-    type IntoIter = std::slice::IterMut<'a, String>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.make_owned().iter_mut()
-    }
-}
-
 impl PropKeys {
+    /// The list's own buffer plus `string_bytes`, the caller's count of the
+    /// key strings it owns (see [`ObjMap::key_bytes`]).
     #[inline]
-    fn resident_bytes(&self) -> usize {
+    fn resident_bytes(&self, string_bytes: usize) -> usize {
         match self {
             // A planned list is compiler-owned and shared by every object made
             // from that literal; charging it per object would multiply the same
             // allocation. It is covered by the separate source/code limits.
             Self::Planned { .. } => 0,
-            Self::Owned(keys) => vec_capacity_bytes(keys).saturating_add(
-                keys.iter()
-                    .fold(0usize, |n, key| n.saturating_add(key.capacity())),
-            ),
+            Self::Owned(keys) => vec_capacity_bytes(keys).saturating_add(string_bytes),
+        }
+    }
+
+    /// The capacity of the key strings this list owns, counted. O(keys).
+    fn owned_string_bytes(&self) -> usize {
+        match self {
+            Self::Planned { .. } => 0,
+            Self::Owned(keys) => string_capacity_sum(keys),
         }
     }
 
@@ -1177,31 +1297,23 @@ impl PropKeys {
         }
     }
 
-    fn make_owned(&mut self) -> &mut Vec<String> {
+    /// The owned list, materializing a planned prefix first, and the
+    /// capacity of the strings that materializing cloned (0 if none).
+    fn make_owned(&mut self) -> (&mut Vec<String>, usize) {
         let materialized = match self {
             Self::Owned(_) => None,
             Self::Planned { all, visible_len } => Some(all.keys()[..*visible_len].to_vec()),
         };
+        let mut cloned = 0;
         if let Some(keys) = materialized {
+            cloned = string_capacity_sum(&keys);
             *self = Self::Owned(keys);
             static_key_stats::materialize();
         }
         let Self::Owned(keys) = self else {
             unreachable!("planned keys were materialized")
         };
-        keys
-    }
-
-    fn reserve_exact(&mut self, additional: usize) {
-        self.make_owned().reserve_exact(additional);
-    }
-
-    fn push(&mut self, key: String) {
-        self.make_owned().push(key);
-    }
-
-    fn remove(&mut self, i: usize) -> String {
-        self.make_owned().remove(i)
+        (keys, cloned)
     }
 
     /// Advance an exact compiler-planned key. A mismatch leaves the plan
@@ -1223,8 +1335,35 @@ impl PropKeys {
     }
 }
 
+fn string_capacity_sum(keys: &[String]) -> usize {
+    keys.iter()
+        .fold(0usize, |n, key| n.saturating_add(key.capacity()))
+}
+
+/// [`ObjMap::key_bytes`] for a count of `n`.
+fn key_bytes_count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Add `n` bytes to a [`ObjMap::key_bytes`] count; `u32::MAX` sticks.
+#[inline]
+fn key_bytes_add(count: &mut u32, n: usize) {
+    if *count != u32::MAX {
+        *count = key_bytes_count((*count as usize).saturating_add(n));
+    }
+}
+
+/// Take `n` bytes off a [`ObjMap::key_bytes`] count; `u32::MAX` sticks.
+#[inline]
+fn key_bytes_sub(count: &mut u32, n: usize) {
+    if *count != u32::MAX {
+        debug_assert!(n <= *count as usize, "key_bytes undercounted");
+        *count = count.saturating_sub(key_bytes_count(n));
+    }
+}
+
 /// A JS object: insertion-ordered string-keyed properties.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub struct ObjMap {
     pub keys: PropKeys,
     /// PRIVATE since the B187 stage-1 migration (like `attrs`/`index`): all
@@ -1314,6 +1453,81 @@ pub struct ObjMap {
     /// was deleted, or an existing property's attributes were redefined. Nothing
     /// depends on a shape being present, only on it being correct when it is.
     shape: u32,
+    /// The capacity of the key strings `keys` owns, kept in step by every
+    /// change to the list, so a heap audit sizes the map without visiting
+    /// each key. That visit was most of an audit: a sandbox embedding with
+    /// a heap ceiling spent a quarter of a dictionary-heavy run summing the
+    /// keys of 60-property objects. `u32::MAX` means at least that much,
+    /// and is counted afresh when asked. Fits existing padding.
+    key_bytes: u32,
+}
+
+impl Clone for ObjMap {
+    /// Field by field, except `key_bytes`, which is counted again: a cloned
+    /// `String`'s capacity is its length, not the original's capacity.
+    fn clone(&self) -> Self {
+        let keys = self.keys.clone();
+        ObjMap {
+            key_bytes: key_bytes_count(keys.owned_string_bytes()),
+            keys,
+            vals: self.vals.clone(),
+            attrs: self.attrs.clone(),
+            class: self.class,
+            extensible: self.extensible,
+            is_ctor: self.is_ctor,
+            is_raw_json: self.is_raw_json,
+            sealed: self.sealed,
+            frozen: self.frozen,
+            index: self.index.clone(),
+            numeric_index: self.numeric_index.clone(),
+            has_element_key: self.has_element_key,
+            planned_append_failed: self.planned_append_failed,
+            class_proto: self.class_proto,
+            shape: self.shape,
+        }
+    }
+}
+
+impl std::fmt::Debug for ObjMap {
+    /// Every field but `key_bytes`: two maps with the same properties can
+    /// hold different counts, since a planned key list owns no strings.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ObjMap {
+            keys,
+            vals,
+            attrs,
+            class,
+            extensible,
+            is_ctor,
+            is_raw_json,
+            sealed,
+            frozen,
+            index,
+            numeric_index,
+            has_element_key,
+            planned_append_failed,
+            class_proto,
+            shape,
+            key_bytes: _,
+        } = self;
+        f.debug_struct("ObjMap")
+            .field("keys", keys)
+            .field("vals", vals)
+            .field("attrs", attrs)
+            .field("class", class)
+            .field("extensible", extensible)
+            .field("is_ctor", is_ctor)
+            .field("is_raw_json", is_raw_json)
+            .field("sealed", sealed)
+            .field("frozen", frozen)
+            .field("index", index)
+            .field("numeric_index", numeric_index)
+            .field("has_element_key", has_element_key)
+            .field("planned_append_failed", planned_append_failed)
+            .field("class_proto", class_proto)
+            .field("shape", shape)
+            .finish()
+    }
 }
 
 /// The VALUE column of an [`ObjMap`] (B187 stage 2). Ordinary objects own a
@@ -1836,9 +2050,19 @@ impl PropAttr {
 impl ObjMap {
     #[inline]
     pub(crate) fn resident_bytes(&self) -> usize {
+        let key_bytes = if self.key_bytes == u32::MAX {
+            self.keys.owned_string_bytes()
+        } else {
+            self.key_bytes as usize
+        };
+        debug_assert_eq!(
+            key_bytes,
+            self.keys.owned_string_bytes(),
+            "key_bytes drifted from the keys it counts"
+        );
         let mut n = self
             .keys
-            .resident_bytes()
+            .resident_bytes(key_bytes)
             .saturating_add(self.vals.capacity_bytes())
             .saturating_add(self.attrs.capacity_bytes());
         if let Some(index) = &self.index {
@@ -1854,6 +2078,45 @@ impl ObjMap {
             );
         }
         n
+    }
+
+    /// Append an owned key, counting its string, and any planned prefix the
+    /// append materialized, into `key_bytes`.
+    fn push_key(&mut self, key: String) {
+        let n = key.capacity();
+        let index_entry = self
+            .index
+            .as_ref()
+            .map_or(0, |index| index.entry_bytes(key.len()));
+        let (keys, cloned) = self.keys.make_owned();
+        keys.push(key);
+        key_bytes_add(&mut self.key_bytes, cloned.saturating_add(n));
+        // About what an audit would charge the property: its key, its slots
+        // in the key and value columns, and its index entry.
+        note_grown_in_place(
+            n + std::mem::size_of::<String>() + std::mem::size_of::<Value>() + index_entry,
+        );
+    }
+
+    /// Remove the key at `i`, keeping `key_bytes` in step.
+    fn remove_key(&mut self, i: usize) -> String {
+        let (keys, cloned) = self.keys.make_owned();
+        let key = keys.remove(i);
+        key_bytes_add(&mut self.key_bytes, cloned);
+        key_bytes_sub(&mut self.key_bytes, key.capacity());
+        key
+    }
+
+    fn reserve_keys(&mut self, additional: usize) {
+        let (keys, cloned) = self.keys.make_owned();
+        keys.reserve_exact(additional);
+        key_bytes_add(&mut self.key_bytes, cloned);
+    }
+
+    /// Replace the whole key list, counting what the new one owns.
+    fn set_keys(&mut self, keys: PropKeys) {
+        self.key_bytes = key_bytes_count(keys.owned_string_bytes());
+        self.keys = keys;
     }
 
     // ---- accessors ---------------------------------------------------------
@@ -2156,7 +2419,7 @@ impl ObjMap {
     pub fn with_capacity(n: usize) -> ObjMap {
         let mut m = ObjMap::new();
         if n > 0 {
-            m.keys.reserve_exact(n);
+            m.reserve_keys(n);
             {
                 #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
                 let ValStore::Vec(v) = &mut m.vals
@@ -2185,7 +2448,7 @@ impl ObjMap {
             return None;
         }
         let mut m = ObjMap::new();
-        m.keys = self.keys.clone();
+        m.set_keys(self.keys.clone());
         m.vals = ValStore::Vec(self.vals_slice().to_vec());
         m.attrs = PropAttrs::AllData {
             len: self.keys.len() as u32,
@@ -2242,7 +2505,7 @@ impl ObjMap {
             return ObjMap::with_capacity(n);
         }
         let mut m = ObjMap::new();
-        m.keys = PropKeys::planned(plan);
+        m.set_keys(PropKeys::planned(plan));
         if n > 0 {
             {
                 #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
@@ -2331,7 +2594,10 @@ impl ObjMap {
             planned_append_failed,
             class_proto,
             shape: shape_slot,
+            key_bytes,
         } = self;
+        // Whatever the list was, it is the plan's below, which owns no strings.
+        *key_bytes = 0;
         match keys {
             PropKeys::Planned { all, visible_len } if StaticKeyPlan::ptr_eq(all, plan) => {
                 *visible_len = n;
@@ -2398,10 +2664,10 @@ impl ObjMap {
         let n = plan.len();
         let has_element_key = plan.has_element_key();
         let mut m = ObjMap::new();
-        m.keys = PropKeys::Planned {
+        m.set_keys(PropKeys::Planned {
             all: plan,
             visible_len: n,
-        };
+        });
         m.vals = vals;
         m.attrs = PropAttrs::AllData { len: n as u32 };
         m.shape = shape;
@@ -2469,10 +2735,10 @@ impl ObjMap {
             setter: Value::UNDEFINED,
         };
         let mut m = ObjMap::new_side_table();
-        m.keys = PropKeys::Planned {
+        m.set_keys(PropKeys::Planned {
             all: plan.clone(),
             visible_len: 3,
-        };
+        });
         m.vals = ValStore::Vec(vec![length, iterator, callee]);
         m.attrs = PropAttrs::Mixed(vec![hidden, hidden, callee_attr]);
         // `length` counts as an element-shadowing key (`key_names_element`),
@@ -2491,7 +2757,7 @@ impl ObjMap {
     pub fn side_table_with_capacity(n: usize) -> ObjMap {
         let mut m = ObjMap::new_side_table();
         if n > 0 {
-            m.keys.reserve_exact(n);
+            m.reserve_keys(n);
             {
                 #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
                 let ValStore::Vec(v) = &mut m.vals
@@ -2526,6 +2792,7 @@ impl ObjMap {
             planned_append_failed: false,
             class_proto: false,
             shape: crate::shape::EMPTY,
+            key_bytes: 0,
         }
     }
 
@@ -2692,7 +2959,9 @@ impl ObjMap {
             }
         }
         if let Some(ix) = &mut self.index {
-            ix.insert_tagged(&self.keys[slot], slot as u32, tag);
+            if !ix.insert_tagged(&self.keys[slot], slot as u32, tag) {
+                self.index = Some(PropIndex::collided(&self.keys));
+            }
         } else if self.keys.len() >= PROP_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
         }
@@ -2715,7 +2984,7 @@ impl ObjMap {
             self.vals[i] = val;
             false
         } else {
-            self.keys.push(key.to_string());
+            self.push_key(key.to_string());
             self.vals.push(val);
             self.attrs.push(PropAttr::data());
             self.shape_pushed(key, &PropAttr::data());
@@ -2757,14 +3026,14 @@ impl ObjMap {
         match plan {
             Some(all) if all.len() == n + 1 => {
                 debug_assert!(all.keys()[..n] == *self.keys.as_ref() && all.keys()[n] == key);
-                self.keys = PropKeys::Planned {
+                self.set_keys(PropKeys::Planned {
                     all,
                     visible_len: n + 1,
-                };
+                });
             }
             _ => {
                 self.planned_append_failed |= self.keys.is_planned();
-                self.keys.push(key.to_string());
+                self.push_key(key.to_string());
             }
         }
         self.vals.push(val);
@@ -2825,7 +3094,7 @@ impl ObjMap {
             }
             false
         } else {
-            self.keys.push(key.to_string());
+            self.push_key(key.to_string());
             self.vals.push(val);
             self.attrs.push(attr);
             self.shape_pushed(key, &attr);
@@ -2855,7 +3124,7 @@ impl ObjMap {
         self.planned_append_failed |= self.keys.is_planned();
         self.shape_pushed_owned(&key, &PropAttr::data());
         self.has_element_key |= key_names_element(&key);
-        self.keys.push(key);
+        self.push_key(key);
         self.vals.push(val);
         self.attrs.push(PropAttr::data());
         self.index_appended_tagged(tag);
@@ -2914,7 +3183,7 @@ impl ObjMap {
         // shifts down, so no shape in the tree describes the result.
         self.shape_to_dict();
         self.planned_append_failed |= self.keys.is_planned();
-        let key = self.keys.remove(i);
+        let key = self.remove_key(i);
         self.vals.remove(i);
         self.attrs.remove(i);
         // Removing the last element-naming key must clear the bit, or a
@@ -5196,7 +5465,7 @@ const COURIER_BULK_SWEEP_BYTES: usize = 1 << 20;
 /// fid, and the `vals` base — sized and laid out for the JIT's
 /// `base + idx*16` addressing. `#[repr(C)]` pins the field offsets the
 /// `host_api` asserts check.
-#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[cfg(feature = "jit")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HotMirror {
@@ -5205,7 +5474,7 @@ pub(crate) struct HotMirror {
     pub(crate) vals: u64,
 }
 
-#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[cfg(feature = "jit")]
 impl HotMirror {
     /// The cleared record: unmatchable shape (`DICT`), no callee, null vals.
     pub(crate) const CLEAR: HotMirror = HotMirror {
@@ -5215,33 +5484,33 @@ impl HotMirror {
     };
 }
 
-#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[cfg(feature = "jit")]
 type HotMirrorHint = Option<HotMirror>;
-#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+#[cfg(not(feature = "jit"))]
 type HotMirrorHint = ();
 
-#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[cfg(feature = "jit")]
 #[inline(always)]
 fn no_hot_mirror() -> HotMirrorHint {
     None
 }
 
 /// The hint for an occupant whose hot mirror is CLEAR (see `Heap::alloc`).
-#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[cfg(feature = "jit")]
 #[inline(always)]
 fn clear_hot_mirror() -> HotMirrorHint {
     Some(HotMirror::CLEAR)
 }
 
-#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+#[cfg(not(feature = "jit"))]
 #[inline(always)]
 fn clear_hot_mirror() -> HotMirrorHint {}
 
-#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+#[cfg(not(feature = "jit"))]
 #[inline(always)]
 fn no_hot_mirror() -> HotMirrorHint {}
 
-#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[cfg(feature = "jit")]
 #[inline(always)]
 fn object_hot_mirror(map: &ObjMap, shape: u32) -> HotMirrorHint {
     Some(HotMirror {
@@ -5251,7 +5520,7 @@ fn object_hot_mirror(map: &ObjMap, shape: u32) -> HotMirrorHint {
     })
 }
 
-#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+#[cfg(not(feature = "jit"))]
 #[inline(always)]
 fn object_hot_mirror(_map: &ObjMap, _shape: u32) -> HotMirrorHint {}
 
@@ -5851,19 +6120,19 @@ pub struct Heap {
     /// no invalidation discipline — a callable's proto id is immutable for
     /// the occupant's lifetime — so `bump_version` leaves it alone and only
     /// the settling refresh and `free_slot` maintain it.
-    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    #[cfg(feature = "jit")]
     hot_mirror: Vec<HotMirror>,
     /// ARROW-`this` MIRROR (B189b), parallel to `objs`: a Closure occupant's
     /// captured `this_val` bits (UNDEFINED bits otherwise). Immutable per
     /// occupant like the fid — settling refresh + `free_slot` clear only.
-    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    #[cfg(feature = "jit")]
     this_mirror: Vec<u64>,
     /// UPVALUE-BASE MIRROR (B189b), parallel to `objs`: a Closure occupant's
     /// `upvalues` base pointer (0 when none). The pointer is fixed at closure
     /// creation and the box never moves while live, so the same settling
     /// discipline as `fid_mirror` keeps it exact; the emitted call lane
     /// installs it as the activation's `upvals_raw`.
-    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    #[cfg(feature = "jit")]
     upvals_mirror: Vec<u64>,
     /// CELL-VALUE MIRROR (B189), parallel to `objs`: a live copy of
     /// `HeapObj::Cell` payloads (UNDEFINED bits everywhere else), so the
@@ -5880,7 +6149,7 @@ pub struct Heap {
     /// (`[rdi + offset]`) on every access. Tier-C loads `versions_raw` only on
     /// entry; an allocation or user-code call still re-derives its pinned r13
     /// through the existing helper before any later version read.
-    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    #[cfg(feature = "jit")]
     pub(crate) hot_mirror_raw: u64,
     /// Number of entries addressable through `hot_mirror_raw`.  Emitted
     /// guards check this before dereferencing a heap-tagged value so a
@@ -5889,9 +6158,9 @@ pub struct Heap {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) hot_mirror_len: u32,
     pub(crate) cell_vals_mirror_raw: u64,
-    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    #[cfg(feature = "jit")]
     pub(crate) this_mirror_raw: u64,
-    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    #[cfg(feature = "jit")]
     pub(crate) upvals_mirror_raw: u64,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) versions_raw: u64,
@@ -6175,6 +6444,14 @@ pub struct Heap {
     /// small-object path that the count-based schedule already handles well
     /// pays one size read and nothing else.
     big_bytes_since_gc: usize,
+    /// Payload bytes allocated since the last collection, counted only while
+    /// no allocator reports blocks (`ALLOCATOR_REPORTS`). Without those
+    /// reports the byte schedule never fires and collections ran on slot
+    /// counts alone: a first one at `GC_MIN_THRESHOLD` slots, then one a young
+    /// budget apart, so objects carrying a kilobyte or two each piled up tens
+    /// of megabytes of garbage in an embedded VM between collections (an
+    /// array of 200 values per slot reached 90 MB before the first).
+    payload_since_gc: usize,
     /// Minor collections since the last major (the scheduling backstop).
     minors_since_major: u32,
     /// Maximum consecutive minor collections before the scheduling backstop
@@ -6407,6 +6684,32 @@ pub fn note_every_block(old_size: usize, new_size: usize) {
     note_block(old_size, new_size);
 }
 
+/// Whether the process's global allocator reports its blocks at all
+/// ([`note_large_block`] / [`note_every_block`]): the `zipp` CLI and the
+/// WebAssembly build install such an allocator, which drives the byte schedule
+/// (`footprint_bytes`). A library embedder's allocator usually does not, and
+/// the heap then schedules on the payload it allocates itself
+/// (`Heap::payload_since_gc`).
+static ALLOCATOR_REPORTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// Payload that grew in place since the heap last looked, counted only
+    /// while no allocator reports (`ALLOCATOR_REPORTS`): what an object that
+    /// is born empty and then given its properties carries, which the birth
+    /// payload never saw. Per thread, as a VM is; the next allocation folds
+    /// it into `Heap::payload_since_gc`.
+    static GROWN_IN_PLACE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Count `bytes` of payload grown in place (see `GROWN_IN_PLACE`).
+#[inline]
+fn note_grown_in_place(bytes: usize) {
+    if !ALLOCATOR_REPORTS.load(Ordering::Relaxed) {
+        GROWN_IN_PLACE.with(|grown| grown.set(grown.get().saturating_add(bytes)));
+    }
+}
+
 /// Whether the reports cover every block ([`note_every_block`]): then the
 /// figure is all the memory there is, and its not having risen means nothing
 /// grew.
@@ -6424,6 +6727,9 @@ pub(crate) fn every_block_footprint() -> Option<usize> {
 
 #[inline]
 fn note_block(old_size: usize, new_size: usize) {
+    if !ALLOCATOR_REPORTS.load(Ordering::Relaxed) {
+        ALLOCATOR_REPORTS.store(true, Ordering::Relaxed);
+    }
     if new_size > old_size {
         let grown = new_size - old_size;
         let now = ALLOCATOR_NET_BYTES.fetch_add(grown, Ordering::Relaxed) + grown;
@@ -6641,21 +6947,21 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             shell_cell_stats: [0; 2],
             thin_stats: [0; 6],
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             hot_mirror: vec![HotMirror::CLEAR; versions.len()],
             cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             upvals_mirror: vec![0; versions.len()],
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             hot_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             hot_mirror_len: 0,
             cell_vals_mirror_raw: 0,
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             this_mirror_raw: 0,
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             upvals_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             versions_raw: 0,
@@ -6687,6 +6993,7 @@ impl Heap {
             // terms of collectable survivors rather than total prefix size.
             major_at: GC_MIN_THRESHOLD + INTERN_PREFIX_EXTRA as usize,
             big_bytes_since_gc: 0,
+            payload_since_gc: 0,
             footprint_gc_at: footprint_bytes().saturating_add(FOOTPRINT_STEP),
             footprint_at_look: footprint_bytes(),
             allocs_at_look: live,
@@ -6720,7 +7027,7 @@ impl Heap {
     /// the VM. Called after any growth of the parallel vectors (and at boot).
     #[inline]
     fn recache_mirror_raws(&mut self) {
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         {
             self.hot_mirror_raw = self.hot_mirror.as_ptr() as u64;
             self.this_mirror_raw = self.this_mirror.as_ptr() as u64;
@@ -6766,7 +7073,7 @@ impl Heap {
     /// here instead of an accident of shape non-collision (B178 review).
     #[inline]
     pub fn pin_mirror_dict(&mut self, idx: u32) {
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         {
             self.hot_mirror[idx as usize] = HotMirror::CLEAR;
             self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
@@ -7063,7 +7370,7 @@ impl Heap {
         };
         self.reuse_slot_begin();
         self.reuse_slot_write(idx, HeapObj::Object(boxed));
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         if let Some(hot) = hot {
             self.hot_mirror[idx as usize] = hot;
         }
@@ -7147,7 +7454,7 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
             if let Some(idx) = self.free.pop() {
-                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+                #[cfg(feature = "jit")]
                 debug_assert_eq!(
                     self.hot_mirror[idx as usize],
                     HotMirror::CLEAR,
@@ -7175,7 +7482,7 @@ impl Heap {
             if let Some(idx) = self.free.pop() {
                 self.reuse_slot_begin();
                 self.reuse_slot_write(idx, HeapObj::Func(fid));
-                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+                #[cfg(feature = "jit")]
                 {
                     self.hot_mirror[idx as usize] = HotMirror {
                         shape: crate::shape::DICT,
@@ -7207,7 +7514,7 @@ impl Heap {
         if self.thin_alloc && !self.payload_accounting.get() {
             if let Some(idx) = self.free.pop() {
                 // A Vec's buffer address survives the move into the slot.
-                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+                #[cfg(feature = "jit")]
                 let upvals_raw = if upvalues.is_empty() {
                     0
                 } else {
@@ -7222,7 +7529,7 @@ impl Heap {
                         this_val,
                     },
                 );
-                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+                #[cfg(feature = "jit")]
                 {
                     self.this_mirror[idx as usize] = this_val.bits();
                     self.upvals_mirror[idx as usize] = upvals_raw;
@@ -7292,7 +7599,7 @@ impl Heap {
     /// settling events: allocation, wholesale replace, and the JIT miss
     /// helper's repair after resolving own data (see the field docs for why
     /// `bump_version` must NOT use this).
-    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    #[cfg(feature = "jit")]
     #[inline]
     pub fn refresh_mirror(&mut self, idx: u32) {
         // One pass over the occupant, and — B198 — the cold mirrors
@@ -7347,9 +7654,9 @@ impl Heap {
         self.hot_mirror[idx as usize] = hot;
     }
 
-    /// Meter-only interpreter builds have no native probes that consume the
+    /// Builds without the JIT have no native probes that consume the
     /// hot/closure mirrors, so their settling hook compiles away entirely.
-    #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+    #[cfg(not(feature = "jit"))]
     #[inline(always)]
     pub fn refresh_mirror(&mut self, _idx: u32) {}
 
@@ -7611,7 +7918,7 @@ impl Heap {
     }
 
     fn alloc_settled(&mut self, obj: HeapObj, hot: HotMirrorHint) -> u32 {
-        #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+        #[cfg(not(feature = "jit"))]
         let _ = hot;
         // A BigInt in the immediate range is never a heap object (value.rs).
         debug_assert!(
@@ -7631,6 +7938,19 @@ impl Heap {
         // never arrived in time.
         let big = obj.birth_payload_bytes();
         debug_assert_eq!(big, obj.resident_payload_bytes());
+        // With no allocator reporting, weigh every payload: a minor once a
+        // footprint step of it has been allocated since the last collection.
+        if !ALLOCATOR_REPORTS.load(Ordering::Relaxed) {
+            let grown = GROWN_IN_PLACE.with(|grown| grown.replace(0));
+            self.payload_since_gc = self
+                .payload_since_gc
+                .saturating_add(big)
+                .saturating_add(grown);
+            if self.payload_since_gc >= FOOTPRINT_STEP {
+                self.payload_since_gc = 0;
+                self.gc_requested = true;
+            }
+        }
         if big >= BIG_PAYLOAD_BYTES {
             self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(big);
             if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
@@ -7678,7 +7998,7 @@ impl Heap {
                 self.resident_payload_charged[idx as usize].set(payload);
             }
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             match hot {
                 Some(h) => self.hot_mirror[idx as usize] = h,
                 None => self.refresh_mirror(idx),
@@ -7717,14 +8037,14 @@ impl Heap {
         self.resident_payload_charged.push(Cell::new(payload));
         self.versions.push(0);
         self.cell_vals_mirror.push(Value::UNDEFINED.bits());
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         {
             self.hot_mirror.push(HotMirror::CLEAR);
             self.this_mirror.push(Value::UNDEFINED.bits());
             self.upvals_mirror.push(0);
         }
         self.recache_mirror_raws();
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         match hot {
             Some(h) => self.hot_mirror[idx as usize] = h,
             None => self.refresh_mirror(idx),
@@ -7782,7 +8102,7 @@ impl Heap {
         align(&mut self.resident_payload_charged, cap);
         align(&mut self.versions, cap);
         align(&mut self.cell_vals_mirror, cap);
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         {
             align(&mut self.hot_mirror, cap);
             align(&mut self.this_mirror, cap);
@@ -7818,14 +8138,22 @@ impl Heap {
         }
         let cap = self.objs.capacity();
         let step = (cap / 16).max(4096);
-        if cap.saturating_sub(self.objs.len()) > step {
+        // Free slots are reused before the tables grow: a heap whose last
+        // collection freed most of its slots is far from a doubling however
+        // close `objs.len()` sits to its capacity. Counting only the unused
+        // capacity charged a whole copy of the tables to a heap the collector
+        // had just emptied, so it could never allocate again (#55).
+        let headroom = cap
+            .saturating_sub(self.objs.len())
+            .saturating_add(self.free.len());
+        if headroom > step {
             return 0;
         }
         let mut n = vec_capacity_bytes(&self.objs)
             .saturating_add(vec_capacity_bytes(&self.resident_payload_charged))
             .saturating_add(vec_capacity_bytes(&self.versions))
             .saturating_add(vec_capacity_bytes(&self.cell_vals_mirror));
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         {
             n = n
                 .saturating_add(vec_capacity_bytes(&self.hot_mirror))
@@ -7851,7 +8179,7 @@ impl Heap {
             + std::mem::size_of::<Cell<usize>>()
             + std::mem::size_of::<u32>()
             + std::mem::size_of::<u64>();
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         {
             per += std::mem::size_of::<HotMirror>() + 2 * std::mem::size_of::<u64>();
         }
@@ -7895,7 +8223,7 @@ impl Heap {
         self.resident_payload_charged.reserve_exact(step);
         self.versions.reserve_exact(step);
         self.cell_vals_mirror.reserve_exact(step);
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         {
             self.hot_mirror.reserve_exact(step);
             self.this_mirror.reserve_exact(step);
@@ -8301,12 +8629,43 @@ impl Heap {
         self.objs.len()
     }
 
-    /// O(1) conservative resident-byte high-water estimate. Initial payloads are
-    /// charged at allocation and [`Self::audit_resident_bytes`] periodically
-    /// incorporates capacity growth in existing objects. The payload peak is
-    /// monotonic, while per-slot charges prevent freed/reused allocation churn
+    /// O(1) resident-byte estimate: the slot tables and pools at their capacity
+    /// plus the payload of the objects alive now. Initial payloads are charged
+    /// at allocation, a sweep takes a freed object's charge back, and
+    /// [`Self::audit_resident_bytes`] periodically incorporates capacity growth
+    /// in existing objects; per-slot charges keep freed/reused allocation churn
     /// from being mistaken for simultaneously resident memory.
+    ///
+    /// This is what a heap ceiling is enforced against. It used to carry the
+    /// payload's all-time PEAK instead, so once a script had filled the heap to
+    /// its ceiling and dropped everything, no later allocation fitted again:
+    /// a long-lived embedded VM that hit its limit once could never allocate
+    /// again (f2i-com/zipp.org#55). The peak is still reported, through
+    /// [`Self::resident_peak_bytes`].
     pub fn resident_bytes(&self) -> usize {
+        self.resident_table_bytes()
+            .saturating_add(self.resident_payload_current.get())
+    }
+
+    /// [`Self::resident_bytes`] with the payload's high-water mark in place of
+    /// the live payload: the most the heap has held at once. Monotonic.
+    pub fn resident_peak_bytes(&self) -> usize {
+        self.resident_table_bytes()
+            .saturating_add(self.resident_payload_high_water.get())
+    }
+
+    /// Ask for the next collection to be a major one (and for one to run at
+    /// the next safe point): what a heap ceiling's conviction waits for, since
+    /// only a major reclaims old garbage.
+    #[cfg(feature = "instrument")]
+    pub(crate) fn request_major(&mut self) {
+        self.major_due = true;
+        self.gc_requested = true;
+    }
+
+    /// The slot tables and pools at their capacity: every resident byte but
+    /// the objects' payloads.
+    fn resident_table_bytes(&self) -> usize {
         vec_capacity_bytes(&self.objs)
             .saturating_add(vec_capacity_bytes(&self.resident_payload_charged))
             .saturating_add({
@@ -8353,13 +8712,13 @@ impl Heap {
             .saturating_add(vec_capacity_bytes(&self.versions))
             .saturating_add(vec_capacity_bytes(&self.cell_vals_mirror))
             .saturating_add({
-                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+                #[cfg(feature = "jit")]
                 {
                     vec_capacity_bytes(&self.hot_mirror)
                         + vec_capacity_bytes(&self.this_mirror)
                         + vec_capacity_bytes(&self.upvals_mirror)
                 }
-                #[cfg(not(any(not(feature = "meter-only"), feature = "jit")))]
+                #[cfg(not(feature = "jit"))]
                 {
                     0
                 }
@@ -8372,7 +8731,6 @@ impl Heap {
             .saturating_add(vec_capacity_bytes(&self.scan_roots))
             .saturating_add(self.nonyoung_cache.capacity().div_ceil(8))
             .saturating_add(vec_capacity_bytes(&self.vremset))
-            .saturating_add(self.resident_payload_high_water.get())
     }
 
     /// Reconcile in-place payload growth into the current and peak caches. This
@@ -8438,7 +8796,7 @@ impl Heap {
             } | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. }
         ) {
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             {
                 self.hot_mirror[idx as usize] = HotMirror::CLEAR;
             }
@@ -8471,18 +8829,15 @@ impl Heap {
         // (survival's minors measured +5.8ms from those field reads).
         #[cfg(all(
             not(feature = "safe-sandbox"),
-            any(not(feature = "meter-only"), feature = "jit")
+            feature = "jit"
         ))]
         let was_settled = self.hot_mirror[idx as usize].shape != crate::shape::DICT;
-        // Mirrorless meter-only builds conservatively skip the optional object
-        // shell pool; collection, reclamation, and accounting are unchanged.
-        #[cfg(all(
-            not(feature = "safe-sandbox"),
-            feature = "meter-only",
-            not(feature = "jit")
-        ))]
+        // Mirrorless builds (any without the JIT) conservatively skip the
+        // optional object shell pool; collection, reclamation, and
+        // accounting are unchanged.
+        #[cfg(all(not(feature = "safe-sandbox"), not(feature = "jit")))]
         let was_settled = false;
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         {
             self.hot_mirror[idx as usize] = HotMirror::CLEAR;
         }
@@ -8514,7 +8869,7 @@ impl Heap {
             HeapObj::Cell => {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             HeapObj::Closure { .. } => {
                 self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
                 self.upvals_mirror[idx as usize] = 0;
@@ -8566,6 +8921,7 @@ impl Heap {
                                 self.key_pool.push(k);
                             }
                         }
+                        m.key_bytes = 0;
                     }
                 }
                 // B187 stage 3: recycle a drop-cheap shell instead of
@@ -8890,6 +9246,7 @@ impl Heap {
         self.minors_since_major = 0;
         self.major_due = false;
         self.big_bytes_since_gc = 0;
+        self.payload_since_gc = 0;
         if self.nursery {
             // Every survivor of a major is OLD (and the remembered set is
             // stale — its young referents were just promoted or swept).
@@ -8915,6 +9272,7 @@ impl Heap {
     /// one young budget of where today's collector would have collected.
     #[inline]
     pub fn note_minor_done(&mut self, live: usize) {
+        self.payload_since_gc = 0;
         self.courier_flush();
         self.swept_total = self.swept_total.wrapping_add(self.live.saturating_sub(live));
         self.live = live;
@@ -8992,7 +9350,7 @@ impl Heap {
             HeapObj::Cell => {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
-            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+            #[cfg(feature = "jit")]
             HeapObj::Closure { .. } => {
                 self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
                 self.upvals_mirror[idx as usize] = 0;
@@ -9030,7 +9388,7 @@ impl Heap {
         // The next miss on the object repairs the mirror from the settled map.
         // (`fid_mirror` deliberately survives the bump: a callable's proto id
         // is immutable for the occupant's lifetime, so no bump can stale it.)
-        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        #[cfg(feature = "jit")]
         {
             self.hot_mirror[idx as usize].shape = crate::shape::DICT;
             self.hot_mirror[idx as usize].vals = 0;
@@ -10067,7 +10425,7 @@ mod tests {
     /// hand — and agree with `refresh_mirror` on every mirror line.
     #[cfg(all(
         not(feature = "safe-sandbox"),
-        any(not(feature = "meter-only"), feature = "jit")
+        feature = "jit"
     ))]
     #[test]
     fn thin_paths_reuse_swept_slots_with_settled_mirrors() {
@@ -10575,8 +10933,8 @@ mod tests {
                     }
                     keys.push(k);
                     let slot = (keys.len() - 1) as u32;
-                    inter.insert(&keys[slot as usize], slot);
-                    split.insert(&keys[slot as usize], slot);
+                    assert!(inter.insert(&keys[slot as usize], slot));
+                    assert!(split.insert(&keys[slot as usize], slot));
                 } else {
                     let i = rng.below(keys.len());
                     let k = keys.remove(i);
@@ -10638,7 +10996,7 @@ mod tests {
         }
 
         let index = PropIndex::build(&keys);
-        assert!(matches!(&*index, PropIndex::Tree { .. }));
+        assert!(matches!(&*index, PropIndex::HashTree { .. }));
         for (slot, key) in keys.iter().enumerate() {
             assert_eq!(index.find(&keys, key), Some(slot));
         }
@@ -10648,6 +11006,32 @@ mod tests {
         for (slot, key) in keys.iter().enumerate() {
             assert_eq!(cloned.find(&keys, key), Some(slot));
         }
+    }
+
+    /// Two keys sharing a seeded hash cannot be made without the seed, so
+    /// this plants one: `prop_0`'s entry under `prop_1`'s hash.
+    #[cfg(feature = "safe-sandbox")]
+    #[test]
+    fn safe_propindex_hash_tree_falls_back_to_strings_on_a_shared_hash() {
+        let keys: Vec<String> = (0..20).map(|i| format!("prop_{i}")).collect();
+        let mut planted = PropIndex::HashTree {
+            entries: BTreeMap::new(),
+        };
+        if let PropIndex::HashTree { entries } = &mut planted {
+            entries.insert(seeded_bytes_hash(keys[1].as_bytes()), 0);
+        }
+        // A hit on another key's entry is confirmed against the key itself.
+        assert_eq!(planted.find(&keys, &keys[1]), None);
+        // An insert that would share a hash reports it rather than record it.
+        assert!(!planted.insert(&keys[1], 1));
+        let rebuilt = PropIndex::collided(&keys);
+        assert!(matches!(&*rebuilt, PropIndex::Tree { .. }));
+        rebuilt.verify(&keys);
+
+        // And the ordinary path never collides on honest keys.
+        let built = PropIndex::build(&keys);
+        assert!(matches!(&*built, PropIndex::HashTree { .. }));
+        built.verify(&keys);
     }
 
     /// `remove_at` is `remove` with the slot pre-resolved (W19 M2 uses it to
@@ -11388,7 +11772,7 @@ mod tests {
         assert_eq!(h.cell_get(cell_again), Value::int(99));
     }
 
-    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    #[cfg(feature = "jit")]
     #[test]
     fn shape_mirror_settles_at_alloc_invalidates_at_bump_repairs_on_demand() {
         let mut h = Heap::new();
@@ -11576,6 +11960,7 @@ pub fn bench_append_decompose(objs: u32, keys_per: u32) -> Vec<String> {
                     pool.push(k);
                 }
             }
+            m.key_bytes = 0;
         }
     }
     let pooled = t.elapsed();
@@ -11592,7 +11977,7 @@ pub fn bench_append_decompose(objs: u32, keys_per: u32) -> Vec<String> {
     let t = Instant::now();
     for _ in 0..objs {
         let mut m = ObjMap::new();
-        m.keys = PropKeys::planned(plan.clone());
+        m.set_keys(PropKeys::planned(plan.clone()));
         for nm in &names {
             m.push_static_data(nm, Value::int(1));
         }

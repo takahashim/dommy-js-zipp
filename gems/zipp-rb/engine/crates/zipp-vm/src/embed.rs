@@ -132,11 +132,19 @@ self_cell::self_cell!(
     /// moves the `Vm` (native code keeps deriving VM-relative addresses from
     /// the live VM argument regardless).
     struct OwnedVm {
-        owner: Box<Program>,
+        owner: Box<VmOwner>,
         #[covariant]
         dependent: Vm,
     }
 );
+
+/// What an [`OwnedVm`]'s `Vm` borrows: the compiled program and the arena the
+/// VM installs its run-time code in (`eval`, `new Function`, modules), so that
+/// code is freed with the state rather than leaked (f2i-com/zipp.org#53).
+struct VmOwner {
+    program: Program,
+    arena: crate::vm::eval_arena::EvalArena,
+}
 
 /// Parse and compile `src` as a classic script, returning a VM ready to run it.
 ///
@@ -244,8 +252,12 @@ pub fn compile_script_with_preamble(
 impl ScriptState {
     /// Take ownership of a compiled program and boot a VM over it.
     pub(crate) fn from_program(program: Program) -> ScriptState {
-        let cell = OwnedVm::new(Box::new(program), |program| {
-            let mut vm = Vm::new(program);
+        let owner = Box::new(VmOwner {
+            program,
+            arena: crate::vm::eval_arena::EvalArena::default(),
+        });
+        let cell = OwnedVm::new(owner, |owner| {
+            let mut vm = Vm::new_with_arena(&owner.program, &owner.arena);
             // No test262 host object for embedded code. `$262.agent.start()`
             // spawns a detached OS thread running its own VM — outside any
             // budget, abort flag, trace or timeout the embedder set — and
@@ -783,9 +795,19 @@ impl ScriptState {
         self.with_vm(|vm| {
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.heap_limit = bytes;
+                rec.ceiling_gc_pending = false;
             }
             // Let the slot table refuse to double past the ceiling too.
             vm.set_resident_ceiling(bytes);
+            // Re-arming between entries starts a budget on what is alive, not
+            // on what a previous entry left for the collector: a heap past half
+            // the ceiling is collected now, while no frame runs. After a script
+            // filled the heap and dropped it, the next entry would otherwise
+            // need a slot-table doubling before any collection had freed the
+            // dead objects' slots (f2i-com/zipp.org#55).
+            if bytes != usize::MAX && vm.heap_bytes_live_estimate() > bytes / 2 {
+                vm.collect_major_now();
+            }
         });
     }
 
@@ -798,8 +820,16 @@ impl ScriptState {
                 rec.output_limit = bytes;
                 rec.output_used = 0;
                 rec.output_exhausted = false;
+                rec.refresh_slow();
             }
         });
+    }
+
+    /// How many functions this state has compiled at run time (`eval`,
+    /// `new Function`, [`Self::eval_in_context`], modules): code it keeps until
+    /// it is dropped. A repeated `new Function` source compiles once.
+    pub fn runtime_function_count(&self) -> usize {
+        self.vm().map_or(0, |vm| vm.runtime_function_count())
     }
 
     /// Payload-aware resident heap estimate, in bytes.
@@ -894,6 +924,7 @@ impl ScriptState {
             let mut rec = crate::vm::instrument::Recorder::new();
             rec.set_step_limit(max_steps);
             rec.abort = abort;
+            rec.refresh_slow();
             vm.set_instrumentation(rec);
         });
     }

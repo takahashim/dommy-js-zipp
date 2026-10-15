@@ -384,9 +384,9 @@ impl<'p> Vm<'p> {
             if ip == 0
                 && self.jit_enabled
                 && self.jit_recurse_depth == 0
-                // Main-program functions and loader-recorded ES-module ranges
-                // are immutable and JIT-safe. Ordinary `eval`/`new Function`
-                // ids share the runtime table but remain interpreter-only.
+                // Main-program, module and installed eval/new Function protos
+                // are immutable and JIT-safe (each runtime kind has an off
+                // switch; see `jit_func_eligible`).
                 && self.jit_func_eligible(func_id)
                 // Dense tier check first: a known-ineligible (FN_DEAD) function
                 // pays ONE array read per call here, not 2-3 hash probes.
@@ -481,7 +481,7 @@ impl<'p> Vm<'p> {
                             _ => true,
                         });
                         if !globals_ok {
-                            self.jit.compile_defer(func_id);
+                            self.jit.compile_defer_globals(func_id);
                         } else {
                             // The self-function's current global Value (a heap Func),
                             // stable since hoist_functions ran at startup. Embedded so a
@@ -776,7 +776,9 @@ impl<'p> Vm<'p> {
                         let v = self.globals[idx as usize];
                         if v.is_uninitialized() {
                             let name = self.global_slot_name(idx).unwrap_or_default();
-                            let has_own = self.global_this != 0
+                            let lexical = self.global_name_is_lexical(&name);
+                            let has_own = !lexical
+                                && self.global_this != 0
                                 && matches!(
                                     self.heap.get(self.global_this),
                                     HeapObj::Object(m) if m.pos(&name).is_some()
@@ -791,7 +793,7 @@ impl<'p> Vm<'p> {
                                 } else {
                                     Value::NULL
                                 };
-                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                                if !lexical && proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
                                     let val = self.get_prop(gobj, &name)?;
                                     self.set(base, dst, val);
                                     ip += 1;
@@ -883,7 +885,15 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         if self.globals[idx as usize].is_uninitialized() {
-                            if let Some(name) = self.global_slot_name(idx) {
+                            // A script lexical's slot is in its TDZ: this store is
+                            // its initialization, which a same-named own property
+                            // of the global object (a configurable global the
+                            // lexical shadows) or the global's chain must not
+                            // absorb.
+                            if let Some(name) = self
+                                .global_slot_name(idx)
+                                .filter(|n| !self.global_name_is_lexical(n))
+                            {
                                 let has_own = self.global_this != 0
                                     && matches!(
                                         self.heap.get(self.global_this),
@@ -955,8 +965,13 @@ impl<'p> Vm<'p> {
                         if self.globals[idx as usize].is_uninitialized() {
                             // An own-prop-backed binding (eval-created /
                             // `this.x = v`) is the live binding: write through
-                            // it and leave the slot uninitialized.
-                            if let Some(name) = self.global_slot_name(idx) {
+                            // it and leave the slot uninitialized. Not for a
+                            // script lexical's slot, whose TDZ store is its
+                            // initialization (see StoreGlobalDyn).
+                            if let Some(name) = self
+                                .global_slot_name(idx)
+                                .filter(|n| !self.global_name_is_lexical(n))
+                            {
                                 let has_own = self.global_this != 0
                                     && matches!(
                                         self.heap.get(self.global_this),
@@ -1264,6 +1279,25 @@ impl<'p> Vm<'p> {
                                     "ReferenceError: {name} is not defined"
                                 )));
                             }
+                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
+                            // A REAL own property of the global object shadows
+                            // the live slot (a defineProperty'd `var`): it is the
+                            // binding, and a strict write to a non-writable one is
+                            // a TypeError, never a slot write. StoreGlobal and
+                            // StoreGlobalStrict route the same way; this arm
+                            // (strict `x = v` after CheckGlobalResolvable, `x++`)
+                            // did not, so `"use strict"; x = 1` wrote through a
+                            // read-only `x`. The JIT gates refuse a shadowed slot
+                            // for this op (`global_store_slot_directly_routable`),
+                            // so compiled code never reaches one.
+                            let name = self.global_slot_name(idx).unwrap_or_default();
+                            if !self.global_name_is_lexical(&name) {
+                                let v = self.get(base, src);
+                                let gobj = Value::heap(self.global_this);
+                                self.set_prop(gobj, &name, v, true)?;
+                                ip += 1;
+                                continue;
+                            }
                         }
                         if !self.eval_const_globals.is_empty()
                             && self.eval_const_globals.contains(&idx)
@@ -1528,14 +1562,19 @@ impl<'p> Vm<'p> {
                             B::Shr => BigOp::Shr,
                             B::Ushr => BigOp::Ushr,
                         };
-                        // Int fast path (the hot `x & 31` shapes); everything else
-                        // takes the full ToNumeric path: BigInt &/|/^/<</>> on two
-                        // BigInts (incl. wrappers/objects whose ToPrimitive yields
-                        // one); `>>>` on BigInts is a TypeError AFTER coercion;
-                        // mixing is a TypeError.
-                        let r = if va.is_int() && vb.is_int() {
-                            let x = va.as_int();
-                            let y = vb.as_int();
+                        // Number fast path (the hot `x & 31` and `(r * n) | 0`
+                        // shapes: two ints, or a finite double whose ToInt32 is
+                        // a truncate and a wrap); everything else takes the
+                        // full ToNumeric path: BigInt &/|/^/<</>> on two BigInts
+                        // (incl. wrappers/objects whose ToPrimitive yields one);
+                        // `>>>` on BigInts is a TypeError AFTER coercion; mixing
+                        // is a TypeError.
+                        let ints = if va.is_int() && vb.is_int() {
+                            Some((va.as_int(), vb.as_int()))
+                        } else {
+                            number_int32(va).zip(number_int32(vb))
+                        };
+                        let r = if let Some((x, y)) = ints {
                             match op {
                                 B::And => Value::int(x & y),
                                 B::Or => Value::int(x | y),
@@ -1873,12 +1912,25 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::Eq { dst, a, b } => {
-                        let r = self.strict_eq(base, a, b);
+                        // Two small integers (one bit pattern per value) are
+                        // the loop counters and indices this compares most:
+                        // decided here instead of in `strict_eq`'s call.
+                        let (va, vb) = (self.get(base, a), self.get(base, b));
+                        let r = if va.is_int() && vb.is_int() {
+                            va.bits() == vb.bits()
+                        } else {
+                            self.strict_eq(base, a, b)
+                        };
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
                     Instr::Ne { dst, a, b } => {
-                        let r = self.strict_eq(base, a, b);
+                        let (va, vb) = (self.get(base, a), self.get(base, b));
+                        let r = if va.is_int() && vb.is_int() {
+                            va.bits() == vb.bits()
+                        } else {
+                            self.strict_eq(base, a, b)
+                        };
                         self.set(base, dst, Value::bool(!r));
                         ip += 1;
                     }
@@ -3932,10 +3984,28 @@ impl<'p> Vm<'p> {
                         // an own property regardless of side tables/prototypes.
                         // Misses (hole / out of range / overlay) take the full path.
                         if !brand && k.is_number() && o.is_heap() {
-                            if let HeapObj::Array(items) = self.heap.get(o.heap_index()) {
+                            let aidx = o.heap_index();
+                            if let HeapObj::Array(items) = self.heap.get(aidx) {
                                 if let Some(i) = array_index(k) {
                                     if i < items.len() && !items[i].is_hole() {
                                         self.set(base, dst, Value::bool(true));
+                                        ip += 1;
+                                        continue;
+                                    }
+                                    // A hole, or an index past the dense end, is
+                                    // absent unless an overlay holds it or the
+                                    // chain can supply an index: the shortcut a
+                                    // hole read takes (`get_index`), under the
+                                    // same protector. It walked the full
+                                    // HasProperty, key text and all.
+                                    if crate::codegen::hole_undef_enabled()
+                                        && !self.array_proto_has_index
+                                        && !self.proto_of.contains_key(&aidx)
+                                        && (self.arguments_objs.is_empty()
+                                            || !self.arguments_objs.contains_key(&aidx))
+                                        && self.array_index_override(aidx, i).is_none()
+                                    {
+                                        self.set(base, dst, Value::bool(false));
                                         ip += 1;
                                         continue;
                                     }
@@ -4213,9 +4283,9 @@ impl<'p> Vm<'p> {
                             // A global op whose slot is still UNINITIALIZED may
                             // be own-prop-backed (eval-created / `this.x` bindings):
                             // raw JIT slot accesses would bypass the own property.
-                            // Don't compile yet — once the slot holds a real value
-                            // it can never go back, so a later attempt is safe
-                            // (region_defer re-arms the threshold). Checked ONLY
+                            // Don't compile yet; a later attempt re-checks
+                            // (`region_defer_globals` re-arms the threshold a
+                            // bounded number of times). Checked ONLY
                             // when the back-edge counter trips, so a rejected /
                             // still-counting loop never pays the body scan.
                             if self.jit.record_region(func_id, t as u32) {
@@ -4270,9 +4340,10 @@ impl<'p> Vm<'p> {
                                     })
                                 };
                                 if !region_globals_ok {
-                                    // Re-arm: a later back-edge re-checks once
-                                    // the global slot is initialized.
-                                    self.jit.region_defer(func_id, t as u32);
+                                    // Re-arm (bounded): a later threshold
+                                    // re-checks in case the slot was
+                                    // initialized meanwhile.
+                                    self.jit.region_defer_globals(func_id, t as u32);
                                     ip = t;
                                     continue;
                                 }
@@ -4602,7 +4673,13 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfFalse { cond, target } => {
                         let v = self.get(base, cond);
-                        if !self.truthy(v) {
+                        // A comparison's boolean, nearly always: no call.
+                        let t = if v.is_bool() {
+                            v.bits() == Value::TRUE.bits()
+                        } else {
+                            self.truthy(v)
+                        };
+                        if !t {
                             // A taken BACKWARD conditional closes a loop
                             // (`do … while`): the same GC safe point as the
                             // `Jump` back-edge, or an allocating loop with no
@@ -4617,7 +4694,12 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfTrue { cond, target } => {
                         let v = self.get(base, cond);
-                        if self.truthy(v) {
+                        let t = if v.is_bool() {
+                            v.bits() == Value::TRUE.bits()
+                        } else {
+                            self.truthy(v)
+                        };
+                        if t {
                             // See `JumpIfFalse`: a backward taken branch is a
                             // loop back-edge.
                             if (target as usize) < ip {
@@ -6246,6 +6328,10 @@ impl<'p> Vm<'p> {
                             || self.program.hoisted_globals.contains(&slot)
                             || self.program.decl_globals.contains(&slot)
                             || self.program.lexical_globals.contains(&slot)
+                            // A later SCRIPT's var/function declaration is as
+                            // non-configurable as the main program's (an eval
+                            // `var` is not recorded here, and deletes).
+                            || self.eval_var_globals.contains(&slot)
                             // An evalScript-created LEXICAL binding lives in the
                             // declarative record — DeleteBinding returns false
                             // and the binding persists (only eval VARs delete).
@@ -9304,6 +9390,7 @@ impl<'p> Vm<'p> {
                 || obj.heap_index() != p.obj_idx
                 || self.heap.version_of(p.obj_idx) != p.obj_version
             {
+                self.jit.note_region_entry_refused(func_id, entry_ip);
                 return None;
             }
             for &(name_idx, slot) in &p.fields {
@@ -10510,8 +10597,7 @@ impl<'p> Vm<'p> {
         let steps = 13u64.checked_mul(b)?.checked_sub(10)?;
         if let Some(rec) = self.instr_rec.as_ref() {
             let steps_i64 = i64::try_from(steps).ok()?;
-            if rec.exhaustion.is_some() || (rec.remaining != i64::MAX && rec.remaining < steps_i64)
-            {
+            if rec.exhaustion.is_some() || rec.remaining_now() < steps_i64 {
                 // The finite error path must still stop at its historical child
                 // opcode (and retain every scheduled resource audit), so only a
                 // completely payable pure activation is collapsed.
@@ -10660,7 +10746,12 @@ impl<'p> Vm<'p> {
             // resolves to it. Slot-only names (`global_by_name`)
             // are excluded by checking the ObjMap directly,
             // preserving their uninitialized ReferenceError.
-            let has_own = self.global_this != 0
+            // A script lexical's uninitialized slot is in its TDZ: neither a
+            // same-named own property of the global object (a configurable
+            // global it shadows) nor the global's chain resolves it.
+            let lexical = self.global_name_is_lexical(&name);
+            let has_own = !lexical
+                && self.global_this != 0
                 && matches!(
                     self.heap.get(self.global_this),
                     HeapObj::Object(m) if m.pos(&name).is_some()
@@ -10680,7 +10771,7 @@ impl<'p> Vm<'p> {
                 } else {
                     Value::NULL
                 };
-                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                if !lexical && proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
                     let val = self.get_prop(gobj, &name)?;
                     return Ok(val);
                 }
@@ -10781,10 +10872,7 @@ impl<'p> Vm<'p> {
         if gidx != crate::bytecode::BARE_MATH_BY_NAME as u32 {
             return Some(gidx);
         }
-        self.program
-            .global_names
-            .iter()
-            .position(|n| n == "Math")
+        self.main_global_pos("Math")
             .map(|i| i as u32)
             .or_else(|| self.eval_global_map.get("Math").copied())
     }
@@ -10845,4 +10933,24 @@ impl<'p> Vm<'p> {
             && matches!(self.heap.get(v.heap_index()), HeapObj::Native(id) if *id == native_id)
             && (self.obj_realm.is_empty() || self.get_function_realm(v) == 0)
     }
+}
+
+/// ToInt32 of a Number value without the general coercion: an int is its
+/// own value, and a finite double below 2^63 in magnitude truncates toward
+/// zero and wraps to 32 bits, which is ToInt32's modulo exactly. `None` for
+/// NaN, the infinities, larger magnitudes and every non-number: those take
+/// the full ToNumeric path.
+#[inline(always)]
+fn number_int32(v: Value) -> Option<i32> {
+    if v.is_int() {
+        return Some(v.as_int());
+    }
+    if v.is_double() {
+        let d = v.as_f64();
+        // NaN fails the comparison.
+        if d.abs() < 9_223_372_036_854_775_808.0 {
+            return Some(d as i64 as i32);
+        }
+    }
+    None
 }

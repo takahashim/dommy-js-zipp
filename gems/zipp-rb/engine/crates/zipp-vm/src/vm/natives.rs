@@ -2059,6 +2059,10 @@ impl<'p> Vm<'p> {
                     self.require_object_coercible(this)?;
                     return Ok(Value::bool(b));
                 }
+                // An object receiver: ToObject cannot throw.
+                if let Some(b) = self.has_own_str_fast(this, a0) {
+                    return Ok(Value::bool(b));
+                }
                 let k = self.to_property_key(a0)?;
                 self.require_object_coercible(this)?; // ToObject(this)
                 Value::bool(self.has_own_property_dyn(this, &k)?)
@@ -3932,6 +3936,11 @@ impl<'p> Vm<'p> {
                             // writes: retire the class's member tables.
                             if id == OBJ_FREEZE && m.class_proto {
                                 self.note_class_proto_mutation(idx, None);
+                            }
+                            // The global object's slot-backed bindings get real
+                            // properties first, so the walk below reaches them.
+                            if id != OBJ_PREVENT_EXT && idx == self.global_this && idx != 0 {
+                                self.materialize_global_slot_bindings();
                             }
                             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                                 match id {
