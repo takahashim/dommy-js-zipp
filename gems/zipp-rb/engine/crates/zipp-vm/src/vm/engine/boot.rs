@@ -67,29 +67,12 @@ impl<'p> Vm<'p> {
         self.funcs[id]
     }
 
+    /// Functions installed at run time (`eval`, `new Function`, modules).
+    pub(crate) fn runtime_function_count(&self) -> usize {
+        self.eval_funcs.len()
+    }
+
     /// Give a runtime-installed function the next unified id.
-    /// Keep the functions and classes this VM installs at run time in `arena`,
-    /// which its owner drops with the program (see `EvalArena`).
-    pub(crate) fn set_eval_arena(&mut self, arena: &'p crate::vm::EvalArena) {
-        self.eval_arena = Some(arena);
-    }
-
-    /// A run-time function, at an address that stays put for the VM's life.
-    pub(crate) fn alloc_eval_func(&self, f: crate::bytecode::FuncProto) -> &'p crate::bytecode::FuncProto {
-        match self.eval_arena {
-            Some(arena) => arena.funcs.alloc(f),
-            None => Box::leak(Box::new(f)),
-        }
-    }
-
-    /// A run-time class, at an address that stays put for the VM's life.
-    pub(crate) fn alloc_eval_class(&self, c: crate::bytecode::ClassDef) -> &'p crate::bytecode::ClassDef {
-        match self.eval_arena {
-            Some(arena) => arena.classes.alloc(c),
-            None => Box::leak(Box::new(c)),
-        }
-    }
-
     pub(crate) fn install_func(&mut self, f: &'p crate::bytecode::FuncProto) {
         debug_assert_eq!(self.funcs.len(), self.main_func_count + self.eval_funcs.len());
         self.eval_funcs.push(f);
@@ -107,12 +90,15 @@ impl<'p> Vm<'p> {
 
     /// Whether `func_id` belongs to immutable code the native tiers may compile.
     ///
-    /// Main-program functions have always been eligible. Loader-installed ES
-    /// modules are eligible too: `prepare_eval_program` leaks their protos at
-    /// stable addresses and `module_func_ranges` records the exact half-open id
-    /// range for each module. Ordinary `eval`/`new Function` can be interleaved
-    /// in the same `eval_funcs` table, so accepting every id past
-    /// `main_func_count` would be unsound; only a recorded module range passes.
+    /// Main-program functions have always been eligible. Runtime-installed
+    /// functions are too: `prepare_eval_program` leaks their protos at stable
+    /// addresses and assigns ids only after the remap, and an id past
+    /// `main_func_count` names one installed function for the life of the VM.
+    /// Loader-installed ES modules (their exact ranges in `module_func_ranges`)
+    /// and ordinary `eval` / `new Function` code each keep an off switch
+    /// (`ZIPP_NO_MODULE_JIT`, `ZIPP_NO_EVAL_JIT`). Until the eval switch
+    /// existed, a script an embedder ran through `eval_in_context` never left
+    /// the interpreter: a pure loop took 35 ms there and 2 ms as main code.
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub(crate) fn jit_func_eligible(&self, func_id: u32) -> bool {
@@ -124,15 +110,37 @@ impl<'p> Vm<'p> {
         if (func_id as usize) < self.main_func_count {
             return true;
         }
-        if !jit_module_functions_enabled() {
+        self.jit_installed_func_eligible(func_id)
+    }
+
+    /// The runtime-installed half of `jit_func_eligible`, out of line so the
+    /// main-code check stays one compare at every call and backedge.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[inline(never)]
+    fn jit_installed_func_eligible(&self, func_id: u32) -> bool {
+        if (func_id as usize).wrapping_sub(self.main_func_count) >= self.eval_funcs.len() {
             return false;
         }
-
         // Ranges are appended as the monotonically-growing runtime function
         // table is installed. Failed eval/module preparations can leave gaps,
         // but cannot reorder later ids, so binary search is valid and avoids a
         // module-count-linear tax at every hot backedge.
-        self.loader_module_func(func_id)
+        if self.loader_module_func(func_id) {
+            jit_module_functions_enabled()
+        } else {
+            // A metered VM keeps eval code in the interpreter, as it always
+            // ran there: the native tiers charge a step budget only roughly
+            // (a counted loop with a branch is charged four steps more than
+            // the interpreter counts, a self-recursive function a quarter
+            // less) and poll a heap ceiling per native entry, so code run
+            // through `eval_in_context` under limits overshot by tens of
+            // megabytes and stopped at a different step.
+            #[cfg(feature = "instrument")]
+            if self.instr_rec.is_some() {
+                return false;
+            }
+            jit_eval_functions_enabled()
+        }
     }
 
     /// Resolve a (unified) class id to its ClassDef: a compile-time program class
@@ -146,7 +154,24 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// A VM over `program` whose run-time code (`eval`, `new Function`,
+    /// modules) lives in an arena of its own that is never freed. An embedder's
+    /// state owns its arena instead (`Vm::new_with_arena`), so dropping the
+    /// state frees that code.
     pub fn new(program: &'p Program) -> Vm<'p> {
+        Self::new_with_arena(
+            program,
+            Box::leak(Box::new(crate::vm::eval_arena::EvalArena::default())),
+        )
+    }
+
+    /// A VM over `program` that installs its run-time functions and classes
+    /// in `eval_arena`, which must outlive it (the embedding keeps both in
+    /// one owner).
+    pub(crate) fn new_with_arena(
+        program: &'p Program,
+        eval_arena: &'p crate::vm::eval_arena::EvalArena,
+    ) -> Vm<'p> {
         let mut heap = Heap::new();
         // Pre-load string constants of every function into the heap so
         // `LoadConst` of a string resolves to a stable heap index. We rewrite
@@ -197,10 +222,20 @@ impl<'p> Vm<'p> {
             static_key_plan_retained_bytes,
             main_func_count: program.functions.len(),
             eval_classes: Vec::new(),
-            eval_arena: None,
+            eval_arena,
+            eval_func_tail: None,
+            eval_class_tail: None,
             main_class_count: program.classes.len(),
             eval_global_map: std::collections::HashMap::new(),
             eval_global_names: rustc_hash::FxHashMap::default(),
+            main_global_index: {
+                let mut m = rustc_hash::FxHashMap::default();
+                m.reserve(program.global_names.len());
+                for (i, n) in program.global_names.iter().enumerate() {
+                    m.entry(n.as_str()).or_insert(i as u32);
+                }
+                m
+            },
             pool_slot_names: rustc_hash::FxHashMap::default(),
             eval_global_next: program.global_count + FIELD_POOL as u32,
             builtin_globals: std::collections::HashMap::new(),
@@ -260,6 +295,7 @@ impl<'p> Vm<'p> {
             pending_new_target: Value::UNDEFINED,
             pending_eval_frame: false,
             pending_fn_ctor_eval: false,
+            fn_ctor_cache: rustc_hash::FxHashMap::default(),
             external_code_disabled: false,
             pending_yield: None,
             pending_yield_handlers: Vec::new(),
@@ -299,6 +335,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             shape_key_plans: Vec::new(),
             for_in_barren: rustc_hash::FxHashMap::default(),
+            for_in_silent: rustc_hash::FxHashMap::default(),
             regexp_string_iters: rustc_hash::FxHashMap::default(),
             matchall_batches: rustc_hash::FxHashMap::default(),
             matchall_caps_scratch: Vec::new(),
@@ -928,6 +965,11 @@ impl<'p> Vm<'p> {
             n.saturating_add(Self::hash_map_resident_bytes(&self.eval_global_names)),
             |n, name| n.saturating_add(name.capacity()),
         );
+        n = n.saturating_add(Self::hash_map_resident_bytes(&self.main_global_index));
+        n = self.fn_ctor_cache.keys().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.fn_ctor_cache)),
+            |n, key| n.saturating_add(key.len()),
+        );
         n = self.pool_slot_names.values().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.pool_slot_names)),
             |n, name| match name {
@@ -964,11 +1006,18 @@ impl<'p> Vm<'p> {
         n
     }
 
-    /// Payload-aware resident VM estimate — see `embed::ScriptState::heap_bytes`.
-    /// Kept as a named entry point for cheap call-site readability; the audit
-    /// itself takes `&self` and is the single source of truth.
+    /// Payload-aware resident VM estimate — see `embed::ScriptState::heap_bytes`:
+    /// the audit with the heap's payload at its high-water mark, so the figure
+    /// an embedder reads stays monotonic. A ceiling is enforced against the
+    /// audit itself, which counts the payload alive now
+    /// ([`crate::heap::Heap::resident_bytes`]).
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.audit_heap_bytes()
+        let live = self.audit_heap_bytes();
+        live.saturating_add(
+            self.heap
+                .resident_peak_bytes()
+                .saturating_sub(self.heap.resident_bytes()),
+        )
     }
 
     /// The O(1) resident figure for headroom checks that run per operation
@@ -1016,7 +1065,10 @@ impl<'p> Vm<'p> {
     /// actually goes off: a trace has to be a complete instruction-by-instruction
     /// record, and native code produces no rows at all.
     #[cfg(feature = "instrument")]
-    pub(crate) fn set_instrumentation(&mut self, rec: super::super::instrument::Recorder) {
+    pub(crate) fn set_instrumentation(&mut self, mut rec: super::super::instrument::Recorder) {
+        // Whatever was set on the recorder before it was installed decides
+        // whether the dispatch hook may take its short path.
+        rec.refresh_slow();
         self.instr_rec = Some(Box::new(rec));
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {

@@ -324,7 +324,7 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "meter-only")]
         if let Some(rec) = self.instr_rec.as_ref() {
             let steps = plan.steps();
-            if rec.exhaustion.is_some() || (rec.remaining != i64::MAX && rec.remaining < steps) {
+            if rec.exhaustion.is_some() || rec.remaining_now() < steps {
                 return None;
             }
         }
@@ -413,7 +413,7 @@ impl<'p> Vm<'p> {
             .filter(|&n| n <= MAX_STRING_BYTES)
             .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
         #[cfg(feature = "instrument")]
-        self.instrument_preflight_heap_growth(total)
+        self.instrument_preflight_builder_growth(total, additional)
             .map_err(|message| Thrown(message.into()))?;
         #[cfg(not(feature = "instrument"))]
         let _ = total;
