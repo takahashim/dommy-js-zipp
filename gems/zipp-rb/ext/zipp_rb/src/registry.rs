@@ -47,7 +47,7 @@ pub(crate) fn gvl_free_ok(id: u64) -> bool {
 /// otherwise hides behind a small Ruby object. Called where the heap figure is
 /// already at hand — creation, `gc!`, `memory_usage` — never per entry: the
 /// engine computes `heap_bytes` with an audit walk of the heap.
-pub(crate) fn account_memory(id: u64, heap_bytes: usize) {
+pub(crate) fn account_memory(_ruby: &Ruby, id: u64, heap_bytes: usize) {
     let now = VM_BASE_BYTES + heap_bytes as i64;
     let delta = GC_ACCOUNTED.with(|m| {
         let mut m = m.borrow_mut();
@@ -55,13 +55,16 @@ pub(crate) fn account_memory(id: u64, heap_bytes: usize) {
         now - prev
     });
     if delta != 0 {
+        // SAFETY: `_ruby` shows this thread holds the GVL, as the call
+        // requires; it takes a plain integer and does not raise.
         unsafe { rb_sys::rb_gc_adjust_memory_usage(delta as _) };
     }
 }
 
 /// Withdraw everything reported for VM `id` from the Ruby GC.
-pub(crate) fn unaccount_memory(id: u64) {
+pub(crate) fn unaccount_memory(_ruby: &Ruby, id: u64) {
     if let Some(prev) = GC_ACCOUNTED.with(|m| m.borrow_mut().remove(&id)) {
+        // SAFETY: as in `account_memory`.
         unsafe { rb_sys::rb_gc_adjust_memory_usage(-prev as _) };
     }
 }
@@ -113,7 +116,13 @@ impl Entry {
     /// (otherwise as [`Self::run`]). An interrupt pending on entry is
     /// delivered (as `Err`) instead of running; a spurious one is retried, and
     /// after a few in a row the work runs with the GVL held instead.
-    pub(crate) fn run_nogvl<R>(&mut self, ruby: &Ruby, mut f: impl FnMut(&mut ScriptState) -> R) -> Result<R, Error> {
+    ///
+    /// # Safety
+    ///
+    /// `f` must not use the Ruby API itself: it may run without the GVL. The
+    /// engine work it drives cannot reach Ruby on that path, since only a VM
+    /// with no Ruby bridge (`gvl_free_ok`) takes it.
+    pub(crate) unsafe fn run_nogvl<R>(&mut self, ruby: &Ruby, mut f: impl FnMut(&mut ScriptState) -> R) -> Result<R, Error> {
         if !gvl_free_ok(self.id) {
             return self.run(ruby, f);
         }
@@ -121,18 +130,21 @@ impl Entry {
         for _ in 0..3 {
             let state = self.state.as_mut().expect("an entry holds its VM until it drops");
             let work = &mut f;
-            match unsafe { without_gvl(move || work(state), interrupter.as_deref()) } {
+            // SAFETY: `f` uses no Ruby API (this function's contract), and the
+            // VM has no Ruby bridge (`gvl_free_ok` above), so the engine work
+            // it drives cannot call into Ruby either.
+            match unsafe { without_gvl(ruby, move || work(state), interrupter.as_deref()) } {
                 Nogvl::Done(r) => {
                     // The engine stopped because Ruby interrupted the thread:
                     // deliver that interrupt (Interrupt, Thread#kill, …)
                     // rather than the engine's abort error.
                     if interrupter.as_ref().is_some_and(|it| it.interrupted.load(Ordering::Relaxed)) {
-                        deliver_interrupts()?;
+                        deliver_interrupts(ruby)?;
                     }
                     return Ok(r);
                 }
                 Nogvl::Panicked => return Err(self.poison(ruby)),
-                Nogvl::NotRun => deliver_interrupts()?,
+                Nogvl::NotRun => deliver_interrupts(ruby)?,
             }
         }
         self.run(ruby, f)
@@ -184,7 +196,7 @@ pub(crate) fn create(ruby: &Ruby) -> Result<u64, Error> {
     // Process-global id: unique across threads, so a VM can never be confused
     // with a same-numbered VM on another thread.
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    account_memory(id, state.heap_bytes());
+    account_memory(ruby, id, state.heap_bytes());
     put_vm(id, state);
     Ok(id)
 }
@@ -304,7 +316,7 @@ pub(crate) fn forget_vm(ruby: &Ruby, id: u64) {
             RELEASE_QUEUED.store(!q.is_empty(), Ordering::Release);
         }
     }
-    unaccount_memory(id);
+    unaccount_memory(ruby, id);
 }
 
 /// Look up a `ZippRb` constant that is a Hash, or `None`.

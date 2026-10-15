@@ -95,7 +95,10 @@ pub(crate) fn to_host(ruby: &Ruby, v: Value, path: &mut Vec<rb_sys::VALUE>) -> H
         // Bytes that are not valid UTF-8 (a binary string, or a UTF-8 one with
         // a stray byte): each invalid sequence becomes U+FFFD, as quickjs.rb
         // does — not an empty string, which hid what the page was given.
-        // SAFETY: the slice is copied out before any Ruby code can run.
+        // SAFETY: `as_slice` borrows the string's buffer, valid until Ruby
+        // modifies or frees the string. `v` is on this stack (so the GC keeps
+        // it), and no Ruby code runs while the slice is borrowed:
+        // `from_utf8_lossy` copies it out without calling Ruby.
         let bytes = unsafe { rs.as_slice() };
         return HostValue::String(String::from_utf8_lossy(bytes).into_owned());
     }

@@ -22,17 +22,26 @@ pub(crate) struct Interrupter {
     pub(crate) interrupted: AtomicBool,
 }
 
+/// The unblocking function [`without_gvl`] hands Ruby with an [`Interrupter`].
+///
+/// # Safety
+///
+/// `data` must point to an `Interrupter` that stays alive for the call. Ruby
+/// calls this from another thread, so it does nothing but atomic stores.
 pub(crate) unsafe extern "C" fn ubf_interrupt(data: *mut std::os::raw::c_void) {
-    // Valid for the whole GVL-free run: the caller holds an `Arc` to it.
+    // SAFETY: `without_gvl` passes `data` as a pointer to the `Interrupter`
+    // its caller borrowed for the whole call, and Ruby calls the unblocking
+    // function only while that call is in progress. A shared reference is
+    // enough: both fields are atomics, so another thread may hold one too.
     let it = unsafe { &*(data as *const Interrupter) };
     it.interrupted.store(true, Ordering::Relaxed);
     it.abort.store(true, Ordering::Relaxed);
 }
 
 /// Run `f` with the GVL released, so other Ruby threads can run while a pure
-/// engine evaluation proceeds. The caller MUST guarantee `f` touches no Ruby
-/// API (it only drives the engine); a VM with any Ruby bridge installed is not
-/// run through this path.
+/// engine evaluation proceeds. A VM with any Ruby bridge installed is not run
+/// through this path. `_ruby` shows the caller is on a Ruby thread holding
+/// the GVL, which `rb_thread_call_without_gvl2` requires.
 ///
 /// `rb_thread_call_without_gvl2` is used deliberately: `..._without_gvl` checks
 /// interrupts while re-acquiring the GVL and can raise there, which would unwind
@@ -48,7 +57,12 @@ pub(crate) unsafe extern "C" fn ubf_interrupt(data: *mut std::os::raw::c_void) {
 /// With an `interrupter`, a Ruby interrupt stops the engine (see
 /// [`Interrupter`]); without one the run cannot be interrupted, and a pending
 /// interrupt is delivered after it returns.
-pub(crate) unsafe fn without_gvl<F, R>(f: F, interrupter: Option<&Interrupter>) -> Nogvl<R>
+///
+/// # Safety
+///
+/// `f` must not use the Ruby API, directly or through anything it calls (a
+/// Ruby callback, a Ruby object's method): it runs without the GVL.
+pub(crate) unsafe fn without_gvl<F, R>(_ruby: &Ruby, f: F, interrupter: Option<&Interrupter>) -> Nogvl<R>
 where
     F: FnOnce() -> R,
 {
@@ -60,6 +74,9 @@ where
     where
         F: FnOnce() -> R,
     {
+        // SAFETY: `data` is the `Slot<F, R>` on `without_gvl`'s stack, which
+        // does not touch it until `rb_thread_call_without_gvl2` returns; Ruby
+        // calls this at most once, on the calling thread, within that call.
         let slot = unsafe { &mut *(data as *mut Slot<F, R>) };
         if let Some(f) = slot.f.take() {
             slot.out = Some(std::panic::catch_unwind(AssertUnwindSafe(f)));
@@ -74,6 +91,11 @@ where
         ),
         None => (None, std::ptr::null_mut()),
     };
+    // SAFETY: `_ruby` shows this thread holds the GVL, as the call requires.
+    // `trampoline` gets a pointer to `slot`, alive across the call; it uses no
+    // Ruby API (`f` does not, by this function's contract) and catches any
+    // panic, so nothing unwinds into Ruby. `ubf_interrupt` gets a pointer to
+    // `interrupter`, borrowed for the whole call (see there).
     unsafe {
         rb_sys::rb_thread_call_without_gvl2(
             Some(trampoline::<F, R>),
@@ -91,9 +113,13 @@ where
 
 /// Deliver any interrupt pending on this thread (`Thread#raise`, `Thread#kill`,
 /// a trapped signal, `Timeout`) as an `Err`, without a longjmp through Rust
-/// frames. Returning that error to Ruby re-raises (or re-jumps) it.
-pub(crate) fn deliver_interrupts() -> Result<(), Error> {
+/// frames. Returning that error to Ruby re-raises (or re-jumps) it. `_ruby`
+/// shows the caller holds the GVL.
+pub(crate) fn deliver_interrupts(_ruby: &Ruby) -> Result<(), Error> {
     magnus::rb_sys::protect(|| {
+        // SAFETY: `_ruby` shows this thread holds the GVL, as the call
+        // requires, and `protect` turns the raise or throw it may make into
+        // an `Err` rather than a longjmp through Rust frames.
         unsafe { rb_sys::rb_thread_check_ints() };
         rb_sys::Qnil as rb_sys::VALUE
     })
@@ -103,7 +129,8 @@ pub(crate) fn deliver_interrupts() -> Result<(), Error> {
 /// Sleep for `d` with the GVL released, then deliver any interrupt that
 /// arrived meanwhile, so a waiting event loop stays responsive to
 /// `Thread#raise`/`Timeout`/signals and does not stall other threads.
-pub(crate) fn sleep_without_gvl(d: Duration) -> Result<(), Error> {
-    let _ = unsafe { without_gvl(|| std::thread::sleep(d), None) };
-    deliver_interrupts()
+pub(crate) fn sleep_without_gvl(ruby: &Ruby, d: Duration) -> Result<(), Error> {
+    // SAFETY: the closure only sleeps.
+    let _ = unsafe { without_gvl(ruby, || std::thread::sleep(d), None) };
+    deliver_interrupts(ruby)
 }

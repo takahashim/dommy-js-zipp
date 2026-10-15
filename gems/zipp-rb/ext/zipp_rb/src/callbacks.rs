@@ -9,7 +9,8 @@ thread_local! {
     /// VM currently being evaluated. Lets a nested `vm.eval`/`vm.call` from a
     /// callback drive the SAME VM through the engine's `HostCtx` (the supported
     /// reentry path) instead of the id registry. The raw pointer is valid only
-    /// within the callback's dynamic scope; the handler saves and restores it.
+    /// within the callback's dynamic scope; `ActiveCtx` publishes it and puts
+    /// the previous value back, and `with_active_ctx` is its only reader.
     pub(crate) static ACTIVE_CTX: Cell<Option<(u64, *mut (dyn HostCtx + 'static))>> = const { Cell::new(None) };
     /// VMs that have `__zippDefineHostFunction` (see `define_function`).
     pub(crate) static HOST_FN_HELPER: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
@@ -223,7 +224,7 @@ pub(crate) fn call_listener(ruby: &Ruby, vm_id: u64, key: &str, args: &[Value]) 
 /// While the proc runs it publishes `ctx` as the active reentry context for
 /// `vm_id`, so a nested `vm.eval`/`vm.call` drives this same VM through the
 /// engine's `HostCtx`. `ctx` is moved into a raw pointer (the only handle for
-/// its dynamic scope) and restored on return, including on error.
+/// its dynamic scope), withdrawn again on every exit, a panic included.
 pub(crate) fn rb_handler(vm_id: u64) -> HostCallValues {
     Rc::new(move |ctx: &mut dyn HostCtx, kind: &str, args: &[HostValue]| -> Result<HostValue, String> {
         // Timer registrations and promise settlements are handled in Rust, not
@@ -234,12 +235,37 @@ pub(crate) fn rb_handler(vm_id: u64) -> HostCallValues {
         if kind == "zipp:settle" {
             return handle_settle(args);
         }
-        let ctx_ptr: *mut (dyn HostCtx + 'static) = unsafe { std::mem::transmute(ctx) };
-        let prev = ACTIVE_CTX.with(|c| c.replace(Some((vm_id, ctx_ptr))));
-        let result = call_ruby_back(vm_id, kind, args);
-        ACTIVE_CTX.with(|c| c.set(prev));
-        result
+        let raw: *mut (dyn HostCtx + '_) = ctx;
+        // SAFETY: a raw pointer to raw pointer cast that changes only the
+        // trait object's lifetime bound; the layout is the same. Nothing
+        // dereferences it beyond this frame: `ActiveCtx` withdraws it before
+        // the frame ends, by return or by unwinding.
+        let ctx_ptr = unsafe {
+            std::mem::transmute::<*mut (dyn HostCtx + '_), *mut (dyn HostCtx + 'static)>(raw)
+        };
+        let _active = ActiveCtx::publish(vm_id, ctx_ptr);
+        call_ruby_back(vm_id, kind, args)
     })
+}
+
+/// `ACTIVE_CTX` holding a callback's context for the callback's dynamic
+/// scope. Dropping it puts back what was there before (an outer callback's
+/// context, or none) on every exit, a panic included: a context left behind
+/// would be a dangling pointer the next entry for that VM dereferences.
+struct ActiveCtx {
+    prev: Option<(u64, *mut (dyn HostCtx + 'static))>,
+}
+
+impl ActiveCtx {
+    fn publish(vm_id: u64, ctx: *mut (dyn HostCtx + 'static)) -> ActiveCtx {
+        ActiveCtx { prev: ACTIVE_CTX.with(|c| c.replace(Some((vm_id, ctx)))) }
+    }
+}
+
+impl Drop for ActiveCtx {
+    fn drop(&mut self) {
+        ACTIVE_CTX.with(|c| c.set(self.prev));
+    }
 }
 
 pub(crate) fn call_ruby_back(vm_id: u64, kind: &str, args: &[HostValue]) -> Result<HostValue, String> {
@@ -271,12 +297,24 @@ pub(crate) fn call_ruby_back(vm_id: u64, kind: &str, args: &[HostValue]) -> Resu
     }
 }
 
-/// The active reentry context for `vm_id`, if a callback for that VM is on the
-/// stack.
-pub(crate) fn active_ctx(vm_id: u64) -> Option<*mut (dyn HostCtx + 'static)> {
-    ACTIVE_CTX
+/// Run `f` on the active reentry context for `vm_id`, if a callback for that
+/// VM is on the stack (`None` otherwise): how a nested `vm.eval`, `vm.call` or
+/// handle operation from a callback drives the same VM. The context is lent
+/// to `f` only, so no reference to it outlives the call.
+pub(crate) fn with_active_ctx<R>(vm_id: u64, f: impl FnOnce(&mut dyn HostCtx) -> R) -> Option<R> {
+    let ptr = ACTIVE_CTX
         .with(|c| c.get())
-        .and_then(|(id, ptr)| (id == vm_id).then_some(ptr))
+        .and_then(|(id, ptr)| (id == vm_id).then_some(ptr))?;
+    // SAFETY: `rb_handler` published `ptr` from the `&mut dyn HostCtx` the
+    // engine lent it, gave up that reference in doing so, and withdraws `ptr`
+    // (`ActiveCtx`) before its frame ends, so while `ptr` is in the slot the
+    // context is alive and nothing else holds a reference to it. Only this
+    // thread sees the slot (it is thread-local, as the VM is). A reference
+    // made here lives for `f` alone; a callback nested inside `f` publishes
+    // its own context and restores this one on return, so two references to
+    // one context never overlap.
+    let ctx: &mut dyn HostCtx = unsafe { &mut *ptr };
+    Some(f(ctx))
 }
 
 /// Install the JS function `expression` evaluates to (once, in global scope)

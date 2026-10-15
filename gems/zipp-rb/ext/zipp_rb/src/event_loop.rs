@@ -212,14 +212,14 @@ pub(crate) fn eval_async(ruby: &Ruby, id: u64, src: String, max_ms: u64) -> Resu
             if now_ms() >= deadline || fatal_pending(id) {
                 return Ok(None);
             }
-            deliver_interrupts()?;
+            deliver_interrupts(ruby)?;
             if fire_due_timers(ruby, entry)? {
                 continue;
             }
             // No timers: the promise can never settle here.
             let Some(due) = next_timer_due(id) else { return Ok(None) };
             let wait = due.min(deadline).saturating_sub(now_ms()).clamp(1, 20);
-            sleep_without_gvl(Duration::from_millis(wait))?;
+            sleep_without_gvl(ruby, Duration::from_millis(wait))?;
         }
     });
     SETTLED.with(|m| m.borrow_mut().remove(&key));
