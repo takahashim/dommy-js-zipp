@@ -248,17 +248,23 @@ pub(crate) fn rb_handler(vm_id: u64) -> HostCallValues {
     })
 }
 
-/// `ACTIVE_CTX` holding a callback's context for the callback's dynamic
-/// scope. Dropping it puts back what was there before (an outer callback's
-/// context, or none) on every exit, a panic included: a context left behind
+/// A change to `ACTIVE_CTX` for a dynamic scope. Dropping it puts back what
+/// was there before on every exit, a panic included: a context left behind
 /// would be a dangling pointer the next entry for that VM dereferences.
 struct ActiveCtx {
     prev: Option<(u64, *mut (dyn HostCtx + 'static))>,
 }
 
 impl ActiveCtx {
+    /// Make `ctx` the active context (a callback's, for its duration).
     fn publish(vm_id: u64, ctx: *mut (dyn HostCtx + 'static)) -> ActiveCtx {
         ActiveCtx { prev: ACTIVE_CTX.with(|c| c.replace(Some((vm_id, ctx)))) }
+    }
+
+    /// Take the active context out of the slot while it is lent (see
+    /// `with_active_ctx`).
+    fn withdraw() -> ActiveCtx {
+        ActiveCtx { prev: ACTIVE_CTX.with(|c| c.take()) }
     }
 }
 
@@ -300,19 +306,22 @@ pub(crate) fn call_ruby_back(vm_id: u64, kind: &str, args: &[HostValue]) -> Resu
 /// Run `f` on the active reentry context for `vm_id`, if a callback for that
 /// VM is on the stack (`None` otherwise): how a nested `vm.eval`, `vm.call` or
 /// handle operation from a callback drives the same VM. The context is lent
-/// to `f` only, so no reference to it outlives the call.
+/// to `f` only, so no reference to it outlives the call, and it is out of the
+/// slot meanwhile: Ruby that `f` runs without a callback of its own (an
+/// `on_log` listener) finds no context and is refused as the VM is busy,
+/// rather than getting a second reference to the one `f` holds.
 pub(crate) fn with_active_ctx<R>(vm_id: u64, f: impl FnOnce(&mut dyn HostCtx) -> R) -> Option<R> {
     let ptr = ACTIVE_CTX
         .with(|c| c.get())
         .and_then(|(id, ptr)| (id == vm_id).then_some(ptr))?;
+    let _lent = ActiveCtx::withdraw();
     // SAFETY: `rb_handler` published `ptr` from the `&mut dyn HostCtx` the
     // engine lent it, gave up that reference in doing so, and withdraws `ptr`
     // (`ActiveCtx`) before its frame ends, so while `ptr` is in the slot the
-    // context is alive and nothing else holds a reference to it. Only this
-    // thread sees the slot (it is thread-local, as the VM is). A reference
-    // made here lives for `f` alone; a callback nested inside `f` publishes
-    // its own context and restores this one on return, so two references to
-    // one context never overlap.
+    // context is alive and nobody holds a reference to it. Only this thread
+    // sees the slot (it is thread-local, as the VM is). `_lent` keeps `ptr`
+    // out of the slot until `f` returns, so the reference made here is the
+    // only one: a callback nested inside `f` publishes a context of its own.
     let ctx: &mut dyn HostCtx = unsafe { &mut *ptr };
     Some(f(ctx))
 }

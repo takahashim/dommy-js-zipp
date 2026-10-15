@@ -121,8 +121,14 @@ impl Entry {
     ///
     /// `f` must not use the Ruby API itself: it may run without the GVL. The
     /// engine work it drives cannot reach Ruby on that path, since only a VM
-    /// with no Ruby bridge (`gvl_free_ok`) takes it.
-    pub(crate) unsafe fn run_nogvl<R>(&mut self, ruby: &Ruby, mut f: impl FnMut(&mut ScriptState) -> R) -> Result<R, Error> {
+    /// with no Ruby bridge (`gvl_free_ok`) takes it. `f` being `Send` rules
+    /// out the common slip, capturing a Ruby value or `&Ruby` (neither is
+    /// `Send`), but not a call that obtains one (`Ruby::get`).
+    pub(crate) unsafe fn run_nogvl<R>(
+        &mut self,
+        ruby: &Ruby,
+        mut f: impl FnMut(&mut ScriptState) -> R + Send,
+    ) -> Result<R, Error> {
         if !gvl_free_ok(self.id) {
             return self.run(ruby, f);
         }
