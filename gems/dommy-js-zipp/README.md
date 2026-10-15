@@ -47,7 +47,8 @@ scripts, import maps and dynamic `import()`.
   are all `globalThis`; a sloppy function's `this` is the window, and the
   window's operations and attributes are own properties of the global, as in
   a browser. It needs a dommy whose bridge has `HostBridge#unify_global_window`
-  (otherwise the window is a separate proxy, as in dommy-js-quickjs);
+  (dommy's main since takahashim/dommy#163; with an older dommy the window is
+  a separate proxy, as in dommy-js-quickjs);
   `DOMMY_JS_UNIFIED_GLOBAL=0` or `Runtime.new(unified_global: false)` keeps
   them apart. Known differences: the global's own keys include the bridge's
   `__rb*` names, and `Object.preventExtensions(window)` succeeds.
