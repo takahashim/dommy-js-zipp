@@ -38,6 +38,7 @@ use zipp_vm::embed::{
     ScriptState,
 };
 
+mod alloc;
 mod nogvl;
 mod registry;
 mod errors;
