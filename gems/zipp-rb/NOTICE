@@ -1,0 +1,23 @@
+zipp-rb
+Copyright (c) 2026 Masayoshi Takahashi
+
+zipp-rb's own code (lib/, ext/, test/) is under the MIT License; see
+LICENSE.txt.
+
+This gem also contains the source code of the Zipp JavaScript engine, under
+engine/:
+
+- engine/crates/zipp-vm and engine/crates/zipp-numparse are from Zipp
+  (https://github.com/f2i-com/zipp.org), licensed under the Apache License,
+  Version 2.0; see engine/LICENSE-APACHE.
+- engine/crates/regress-fork is Zipp's fork of the regress regular
+  expression engine, dual-licensed under the MIT License or the Apache
+  License, Version 2.0; see engine/crates/regress-fork/LICENSE-MIT and
+  LICENSE-APACHE.
+- The Unicode and CLDR data compiled into the engine are under the Unicode
+  License v3; see engine/LICENSE-UNICODE.
+
+The engine sources have been modified from the upstream revision named in
+engine/UPSTREAM. engine/LOCAL_CHANGES.md describes every modification and
+the files it touches, and the complete difference is the diff between that
+revision's crates and engine/crates.

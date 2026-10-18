@@ -23,6 +23,6 @@ Gem::Specification.new do |spec|
                   .select { |f| File.file?(File.join(__dir__, f)) }
   spec.require_paths = ["lib"]
 
-  spec.add_dependency "zipp-rb"
+  spec.add_dependency "zipp-rb", "~> 0.1"
   spec.add_dependency "dommy", ">= 0.16.0", "< 0.17"
 end

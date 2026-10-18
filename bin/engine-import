@@ -58,6 +58,10 @@ present = git("ls-tree", "--name-only", sha, "crates/", chdir: CACHE).lines.map 
               "(remove it from #{ENGINE_REL}/Cargo.toml's members)"
 end
 crates &= present
+# Upstream's license texts sit at its root, beside crates/; they ship with the
+# engine sources (the gem redistributes them).
+licenses = git("ls-tree", "--name-only", sha, chdir: CACHE).lines.map(&:chomp)
+                                                         .grep(/\A(LICENSE|NOTICE|COPYING)/)
 
 Dir.mktmpdir("engine-import") do |tmp|
   worktree = File.join(tmp, "wt")
@@ -66,7 +70,8 @@ Dir.mktmpdir("engine-import") do |tmp|
     dest = File.join(worktree, ENGINE_REL)
     FileUtils.rm_rf(File.join(dest, "crates"))
     FileUtils.mkdir_p(dest)
-    archive = run("git", "archive", "--format=tar", sha, *crates.map { "crates/#{_1}" }, chdir: CACHE)
+    licenses.each { FileUtils.rm_f(File.join(dest, _1)) }
+    archive = run("git", "archive", "--format=tar", sha, *crates.map { "crates/#{_1}" }, *licenses, chdir: CACHE)
     Open3.capture2("tar", "-x", "-C", dest, stdin_data: archive, binmode: true)
     File.write(File.join(worktree, UPSTREAM_REL),
                "repository: #{repo}\ncommit: #{sha}\ncrates: #{crates.join(" ")}\n")
@@ -76,7 +81,7 @@ Dir.mktmpdir("engine-import") do |tmp|
       exit
     end
     git("commit", "--quiet", "-m", "Import zipp upstream #{sha[0, 8]}\n\n" \
-        "Pristine crates/{#{crates.join(",")}} from #{repo} at #{sha}.", chdir: worktree)
+        "Pristine crates/{#{crates.join(",")}} and #{licenses.join(", ")} from #{repo} at #{sha}.", chdir: worktree)
   ensure
     git("worktree", "remove", "--force", worktree)
   end
