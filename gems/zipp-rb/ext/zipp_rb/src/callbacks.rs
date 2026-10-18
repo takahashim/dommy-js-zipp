@@ -20,8 +20,10 @@ thread_local! {
 /// intermediate objects — what `define_function` asks of a VM. Defined once
 /// per VM (and compiled once per process), so a definition is one call rather
 /// than a script compiled for it: a host defining dozens of functions per VM
-/// (dommy's bridge: 31) paid for as many compilations every time.
-const HOST_FN_HELPER_JS: &str = r#"Object.defineProperty(globalThis, "__zippDefineHostFunction", {
+/// (dommy's bridge: 31) paid for as many compilations every time. Neither
+/// writable nor configurable, so page script can neither delete it (later
+/// definitions would fail) nor replace it (they would go to its function).
+pub(crate) const HOST_FN_HELPER_JS: &str = r#"Object.defineProperty(globalThis, "__zippDefineHostFunction", {
   value: function (path, kind, isAsync) {
     let base = globalThis;
     for (let i = 0; i < path.length - 1; i++) base = base[path[i]] = base[path[i]] || {};
@@ -31,7 +33,7 @@ const HOST_FN_HELPER_JS: &str = r#"Object.defineProperty(globalThis, "__zippDefi
         }
       : function (...args) { return __zippHostCallValue(kind, ...args); };
   },
-  writable: true, enumerable: false, configurable: true,
+  writable: false, enumerable: false, configurable: false,
 });"#;
 
 /// Split a `define_function` name (a String/Symbol, or an Array path) into its
@@ -85,9 +87,9 @@ pub(crate) fn define_function(
     // returns a Promise (resolved with the host result, or rejected with its
     // throw), matching quickjs.rb's `define_function(:async)`.
     let path = HostValue::Array(segments.iter().cloned().map(HostValue::String).collect());
-    let args = [path, HostValue::String(kind), HostValue::Bool(is_async)];
+    let args = [path, HostValue::String(kind.clone()), HostValue::Bool(is_async)];
     let first = !HOST_FN_HELPER.with(|s| s.borrow().contains(&id));
-    with_entry(ruby, id, |entry| {
+    let defined = with_entry(ruby, id, |entry| {
         install_handler(ruby, entry)?;
         entry.run(ruby, |s| -> Result<(), String> {
             if first {
@@ -103,7 +105,13 @@ pub(crate) fn define_function(
                 .map_err(|e| e.message)
         })?
         .map_err(|e| runtime_error(ruby, e))
-    })?;
+    });
+    if let Err(e) = defined {
+        // Nothing in the VM refers to the proc: drop it rather than root it
+        // for the VM's life.
+        let _ = callbacks.delete::<_, Value>(kind);
+        return Err(e);
+    }
     if first {
         HOST_FN_HELPER.with(|s| s.borrow_mut().insert(id));
     }
