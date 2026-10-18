@@ -334,12 +334,13 @@ const PREFLIGHT_AUDIT_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// The walk is O(slots) and a fixed byte window is independent of the heap,
 /// so on its own the byte stride still taxes a string-building loop in
-/// proportion to everything the guest retains. `join` is the sharp case:
-/// each part preflights the builder's running total, so a 4,000-part join
-/// of a 23 KB result preflights about 46 MB and walked the heap six times
-/// whatever that heap held -- 5 ms per join on a small heap, and on the
-/// wasm build with 300,000 objects live the walk alone was most of the
-/// call. Widening the window with the slot count (4 KiB of preflighted
+/// proportion to everything the guest retains. `join` was the sharp case
+/// while each part advanced the stride by the builder's running total: a
+/// 4,000-part join of a 23 KB result preflighted about 46 MB and walked the
+/// heap six times whatever that heap held -- 5 ms per join on a small heap,
+/// and on the wasm build with 300,000 objects live the walk alone was most
+/// of the call. (A part now advances it by its own bytes; see
+/// `instrument_preflight_builder_growth`.) Widening the window with the slot count (4 KiB of preflighted
 /// allocation per slot, the same reasoning `heap_walk_stride_for` applies
 /// to the dispatch poll) holds the walk's share of such a loop near a
 /// constant few percent. Every call still convicts on the O(1) estimate,
@@ -446,6 +447,10 @@ pub(crate) struct Recorder {
     /// so noticing a few thousand instructions late costs a bounded overshoot
     /// and keeps the per-instruction path free of an extra memory read.
     pub(crate) heap_limit: usize,
+    /// A poll found the heap over `heap_limit` and asked for a major
+    /// collection instead of convicting: the poll that follows that
+    /// collection decides. See `instrument_heap_poll_inner`.
+    pub(crate) ceiling_gc_pending: bool,
     /// Combined UTF-8 bytes retained for stdout/stderr lines, including the
     /// newline written for each line; `usize::MAX` means unlimited.
     pub(crate) output_limit: usize,
@@ -470,6 +475,24 @@ pub(crate) struct Recorder {
     truncated: bool,
     #[cfg(not(feature = "meter-only"))]
     pending: Option<Pending>,
+    /// Whether the dispatch hook must take its full path: a trace is being
+    /// recorded or a row is open, an abort flag is installed, or a terminal
+    /// state is set. One test on the common edge instead of five; every
+    /// writer of those fields calls [`Self::refresh_slow`] (`exhaust` sets it
+    /// directly, a terminal state being sticky).
+    #[cfg(not(feature = "meter-only"))]
+    slow: bool,
+    /// The general profile's step countdown: dispatches the hook may still
+    /// take on its one-compare path before anything is due -- the next heap
+    /// poll, the budget's last step, or (at zero, whenever `slow` holds) every
+    /// step. `ticks` and a finite `remaining` lag behind by `window -
+    /// countdown` steps until [`Self::settle`] folds them in; every reader
+    /// that needs them exact settles first or reads [`Self::remaining_now`].
+    #[cfg(not(feature = "meter-only"))]
+    countdown: i64,
+    /// `countdown` as last scheduled; see there.
+    #[cfg(not(feature = "meter-only"))]
+    window: i64,
     /// The call depth the emitted rows imply. The prover recomputes this from
     /// the opcodes, so the two must agree — never emit a RETURN at depth 0.
     #[cfg(not(feature = "meter-only"))]
@@ -539,6 +562,7 @@ impl Recorder {
             abort: None,
             deadline: None,
             heap_limit: usize::MAX,
+            ceiling_gc_pending: false,
             output_limit: usize::MAX,
             output_used: 0,
             output_exhausted: false,
@@ -560,6 +584,12 @@ impl Recorder {
             #[cfg(not(feature = "meter-only"))]
             tracing: false,
             #[cfg(not(feature = "meter-only"))]
+            slow: false,
+            #[cfg(not(feature = "meter-only"))]
+            countdown: 0,
+            #[cfg(not(feature = "meter-only"))]
+            window: 0,
+            #[cfg(not(feature = "meter-only"))]
             max_steps: usize::MAX,
             #[cfg(not(feature = "meter-only"))]
             truncated: false,
@@ -569,6 +599,94 @@ impl Recorder {
             depth: 0,
             ticks: 0,
         }
+    }
+
+    /// Recompute [`Self::slow`] from the fields it summarises. A slow state
+    /// stops the countdown, so the very next step takes the full path.
+    #[inline]
+    pub(crate) fn refresh_slow(&mut self) {
+        #[cfg(not(feature = "meter-only"))]
+        {
+            // An abort flag or a deadline is not a slow state: `schedule`
+            // ends the countdown on the abort-poll stride instead, so a
+            // metered host that always sets one keeps the countdown.
+            self.slow = self.tracing
+                || self.pending.is_some()
+                || self.exhaustion.is_some()
+                || self.output_exhausted;
+            if self.slow {
+                self.settle();
+            }
+        }
+    }
+
+    /// Steps taken on the countdown since the last [`Self::settle`].
+    #[inline]
+    fn elapsed(&self) -> i64 {
+        #[cfg(not(feature = "meter-only"))]
+        {
+            self.window - self.countdown
+        }
+        #[cfg(feature = "meter-only")]
+        {
+            0
+        }
+    }
+
+    /// Fold the countdown's steps into `ticks` and a finite `remaining`, and
+    /// stop it: the next step takes the full path, which schedules the next
+    /// countdown from the exact figures. Every change to the budget from
+    /// outside the dispatch hook (a native loan or refund, an off-loop
+    /// charge, a new limit, a terminal state) settles first.
+    #[inline]
+    pub(crate) fn settle(&mut self) {
+        #[cfg(not(feature = "meter-only"))]
+        {
+            let elapsed = self.window - self.countdown;
+            self.ticks = self.ticks.wrapping_add(elapsed as u64);
+            if self.remaining != i64::MAX {
+                self.remaining -= elapsed;
+            }
+            self.countdown = 0;
+            self.window = 0;
+        }
+    }
+
+    /// `remaining` with the countdown's steps taken off: exact at any point,
+    /// `i64::MAX` when unlimited.
+    #[inline]
+    pub(crate) fn remaining_now(&self) -> i64 {
+        if self.remaining == i64::MAX {
+            i64::MAX
+        } else {
+            self.remaining - self.elapsed()
+        }
+    }
+
+    /// After a full-path step: how many steps may follow on the countdown.
+    /// None while a slow state holds. Otherwise up to the step before the
+    /// next heap poll (`ticks & HEAP_AUDIT_MASK == 0`, which the full path
+    /// runs) and no more than a finite budget's remaining steps, so the step
+    /// that finds it empty is a full-path step too, exactly as before.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline]
+    fn schedule(&mut self) {
+        let mut steps = 0;
+        if !self.slow {
+            // The full path polls the abort flag and the deadline on the
+            // ABORT_CHECK_MASK stride and the heap on HEAP_AUDIT_MASK's.
+            let stride = if self.abort.is_some() || self.deadline.is_some() {
+                ABORT_CHECK_MASK
+            } else {
+                HEAP_AUDIT_MASK
+            };
+            steps = (stride - (self.ticks & stride)) as i64;
+            if self.remaining != i64::MAX {
+                steps = steps.min(self.remaining.max(0));
+            }
+        }
+        self.countdown = steps;
+        self.window = steps;
     }
 
     /// Begin recording. `max_steps` bounds memory: at ~64 bytes a row, a hot
@@ -582,6 +700,7 @@ impl Recorder {
         self.truncated = false;
         self.pending = None;
         self.depth = 0;
+        self.refresh_slow();
     }
 
     #[cfg(not(feature = "meter-only"))]
@@ -593,6 +712,7 @@ impl Recorder {
     /// the immutable finite starting balance; all other profiles keep its
     /// historical role as the interpreter-dispatch counter.
     pub(crate) fn set_step_limit(&mut self, max_steps: u64) {
+        self.settle();
         // Saturating, so `u64::MAX` keeps meaning "unlimited".
         self.remaining = max_steps.min(i64::MAX as u64) as i64;
         #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
@@ -630,13 +750,21 @@ impl Recorder {
             return self.used.wrapping_add((i64::MAX - self.remaining).max(0) as u64);
         }
         #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
-        self.used.wrapping_add(self.ticks).saturating_sub(self.steps_base)
+        self.used
+            .wrapping_add(self.ticks)
+            .wrapping_add(self.elapsed() as u64)
+            .saturating_sub(self.steps_base)
     }
 
     #[inline]
     fn exhaust(&mut self, cause: ResourceExhaustion) -> &'static str {
         // A terminal state is sticky: make the very next dispatch stop.
         self.stop = i64::MAX;
+        self.settle();
+        #[cfg(not(feature = "meter-only"))]
+        {
+            self.slow = true;
+        }
         self.exhaustion.get_or_insert(cause).message()
     }
 
@@ -650,7 +778,7 @@ impl Recorder {
         if self.remaining == i64::MAX {
             return None;
         }
-        Some(self.remaining.max(0) as u64)
+        Some(self.remaining_now().max(0) as u64)
     }
 
     /// Whether the host asked this run to stop: the abort flag is set, or the
@@ -758,6 +886,7 @@ impl Recorder {
         if let Some(p) = self.pending.take() {
             blank(&mut self.steps[p.row]);
         }
+        self.refresh_slow();
         if self.truncated || self.steps.len() < 2 {
             self.steps.clear();
             return None;
@@ -870,6 +999,12 @@ impl super::Vm<'_> {
             return heap_now;
         };
         heap_now.saturating_add(rec.heap_audit_non_heap.get())
+    }
+
+    /// [`Vm::instrument_heap_estimate`] for the embedding API: the O(1)
+    /// resident figure with the payload alive now.
+    pub(crate) fn heap_bytes_live_estimate(&self) -> usize {
+        self.instrument_heap_estimate()
     }
 
     /// The estimate with the RegExp programs admitted since the latest walks
@@ -1119,6 +1254,22 @@ impl super::Vm<'_> {
     /// lets an ArrayBuffer exceed a small budget by gigabytes before the next
     /// bytecode poll.
     pub(crate) fn instrument_preflight_heap_growth(&mut self, bytes: usize) -> Tick {
+        self.instrument_preflight_builder_growth(bytes, bytes)
+    }
+
+    /// [`Self::instrument_preflight_heap_growth`] for a buffer that is not in
+    /// the heap yet and grows by appends: `in_flight`, its whole size after
+    /// this one, must fit under the ceiling, while only `fresh`, what this
+    /// append adds, advances the walk stride. Charging the running total to
+    /// the stride made a builder's walks quadratic in its parts: a
+    /// 150,000-part join of 22 MB preflighted about 1.7 TB and walked the
+    /// heap at each window of it, 1.76 s against 18 ms without a ceiling.
+    pub(crate) fn instrument_preflight_builder_growth(
+        &mut self,
+        in_flight: usize,
+        fresh: usize,
+    ) -> Tick {
+        let bytes = in_flight;
         // Recorder check FIRST: `heap_bytes()` below is a full O(heap-slots)
         // audit walk, and this preflight sits on per-part/per-result string
         // paths (join, builders, regex results). An un-instrumented run — the
@@ -1177,7 +1328,7 @@ impl super::Vm<'_> {
             .instr_rec
             .as_mut()
             .expect("recorder checked present above");
-        rec.preflight_bytes_since_audit = rec.preflight_bytes_since_audit.saturating_add(bytes);
+        rec.preflight_bytes_since_audit = rec.preflight_bytes_since_audit.saturating_add(fresh);
         if rec.preflight_bytes_since_audit < preflight_audit_bytes_for(self.heap.len()) {
             return Ok(());
         }
@@ -1187,7 +1338,8 @@ impl super::Vm<'_> {
             .expect("recorder checked present above");
         rec.preflight_bytes_since_audit = 0;
 
-        let resident = self.heap_bytes();
+        // The live audit, not the reported peak (`heap_bytes`).
+        let resident = self.audit_heap_bytes();
         let rec = self
             .instr_rec
             .as_mut()
@@ -1410,6 +1562,7 @@ impl super::Vm<'_> {
         let Some(rec) = self.instr_rec.as_mut() else {
             return 0;
         };
+        rec.settle();
         // Whole-function native entry happens before the interpreter's
         // `instrument_step` hook. Refuse the loan here as well, or a caught
         // dynamic/output failure from a prior entry could execute another
@@ -1452,7 +1605,7 @@ impl super::Vm<'_> {
             if !self.heap.payload_accounting_enabled() {
                 rec.external_heap_dirty = true;
             }
-            if self.instrument_heap_poll_inner(polls).is_err() {
+            if self.instrument_heap_poll_inner(polls, true).is_err() {
                 self.jit_steps = 0;
                 return 0;
             }
@@ -1518,6 +1671,7 @@ impl super::Vm<'_> {
         let Some(rec) = self.instr_rec.as_mut() else {
             return false;
         };
+        rec.settle();
         if rec.remaining == i64::MAX {
             return false;
         }
@@ -1553,6 +1707,7 @@ impl super::Vm<'_> {
             self.jit_steps = outer;
             return;
         };
+        rec.settle();
         let back = rec.remaining.clamp(0, outer);
         rec.remaining -= back;
         rec.used = rec.used.wrapping_add(back as u64);
@@ -1568,6 +1723,7 @@ impl super::Vm<'_> {
     pub(crate) fn meter_return(&mut self) {
         let unspent = self.jit_steps.max(0);
         if let Some(rec) = self.instr_rec.as_mut() {
+            rec.settle();
             if rec.remaining != i64::MAX {
                 rec.remaining += unspent;
                 // Zero means native code consumed its final permitted block
@@ -1681,6 +1837,7 @@ impl super::Vm<'_> {
     /// charges itself, and charging both would be double-counting.
     pub(crate) fn charge_steps(&mut self, n: i64) {
         if let Some(rec) = self.instr_rec.as_mut() {
+            rec.settle();
             let n = n.max(0);
             #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
             {
@@ -1850,27 +2007,60 @@ impl super::Vm<'_> {
             None => return Ok(()),
         };
 
-        // Keep the common metering path, a countdown and a tick, small enough
-        // to live beside the opcode dispatch. Everything else goes out of
-        // line, where the slow path handles it in the same order: a trace
-        // (`pending` is checked independently so ending a trace can never
-        // strand its final row), a sticky exhaustion, full output, and a spent
-        // budget (which may still be reclaimed from an enclosing native run).
-        // `remaining` is i64::MAX when unmetered. An abort flag or a deadline
-        // stays on this path: both are polled only every ABORT_CHECK_MASK + 1
-        // ticks, and routing every instruction out of line for them (as
-        // upstream does) cost a metered instruction about as much again.
-        if rec.tracing
-            || rec.pending.is_some()
-            || rec.exhaustion.is_some()
-            || rec.output_exhausted
-            || rec.remaining <= 0
-        {
+        // The common edge is one decrement and one test: nothing is due for
+        // `countdown` more steps (see the field). When it runs out, the full
+        // path settles the count, runs the step exactly as before and
+        // schedules the next countdown.
+        rec.countdown -= 1;
+        if rec.countdown >= 0 {
+            return Ok(());
+        }
+        rec.countdown += 1;
+        self.instrument_step_due(base, ip, instr)
+    }
+
+    /// The general hook's full path: a heap poll, the budget's last step, or
+    /// a slow state is due.
+    #[cfg(not(feature = "meter-only"))]
+    #[cold]
+    #[inline(never)]
+    fn instrument_step_due(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
+        let result = self.instrument_step_full(base, ip, instr);
+        if let Some(rec) = self.instr_rec.as_mut() {
+            rec.schedule();
+        }
+        result
+    }
+
+    /// One step on the full path, from settled figures.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline]
+    fn instrument_step_full(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
+        let rec = match self.instr_rec.as_mut() {
+            Some(rec) => rec,
+            None => return Ok(()),
+        };
+        rec.settle();
+        // Trace rows and the terminal states are handled out of line (the
+        // terminal states first).
+        if rec.slow {
             return self.instrument_step_slow(base, ip, instr);
         }
         if rec.remaining != i64::MAX {
+            if rec.remaining <= 0 {
+                // An enclosing native run may still hold unspent steps.
+                if !self.meter_reclaim() {
+                    return Err(self.instrument_steps_out());
+                }
+            }
+            let Some(rec) = self.instr_rec.as_mut() else {
+                return Ok(());
+            };
             rec.remaining -= 1;
         }
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return Ok(());
+        };
         rec.ticks = rec.ticks.wrapping_add(1);
         // HEAP_AUDIT_MASK's low bits include ABORT_CHECK_MASK's, so one test
         // guards both polls.
@@ -1970,6 +2160,7 @@ impl super::Vm<'_> {
         if rec.steps.len() >= rec.max_steps {
             rec.truncated = true;
             rec.tracing = false;
+            rec.refresh_slow();
             return Ok(());
         }
         self.instrument_open(base, ip, instr);
@@ -1989,7 +2180,7 @@ impl super::Vm<'_> {
     #[cold]
     #[inline(never)]
     pub(crate) fn instrument_heap_poll(&mut self) -> Tick {
-        self.instrument_heap_poll_inner(1)
+        self.instrument_heap_poll_inner(1, true)
     }
 
     /// The same reconciliation, driven by a collection rather than by the
@@ -2017,13 +2208,27 @@ impl super::Vm<'_> {
         if self.heap.take_growth_walk_due() {
             self.instrument_mark_external_heap_growth();
         }
+        // A conviction that waited for this collection is decided now.
+        if let Some(rec) = self.instr_rec.as_mut() {
+            rec.ceiling_gc_pending = false;
+        }
         let force = !self.heap.payload_accounting_enabled();
-        self.instrument_heap_poll_inner(u32::from(force))
+        self.instrument_heap_poll_inner(u32::from(force), false)
     }
 
+    ///
+    /// `may_defer`: a heap found over the ceiling may first ask for a major
+    /// collection rather than convict. The figure counts the payload alive
+    /// NOW, but garbage stays in it until a collection sweeps it, and this
+    /// poll runs where collecting is not safe (the top of an instruction, or
+    /// inside one with a value held in a Rust local). So it requests a major,
+    /// which the next safe point runs, and `instrument_heap_poll_after_gc`
+    /// decides on what survived. Without this, a script that dropped a full
+    /// heap was convicted by its own garbage. A drain that holds the collector
+    /// off, and the post-collection poll, decide at once.
     #[cold]
     #[inline(never)]
-    fn instrument_heap_poll_inner(&mut self, advance_walk_stride: u32) -> Tick {
+    fn instrument_heap_poll_inner(&mut self, advance_walk_stride: u32, may_defer: bool) -> Tick {
         let ceiling = match self.instr_rec.as_ref() {
             Some(rec) => rec.heap_limit,
             None => return Ok(()),
@@ -2100,11 +2305,18 @@ impl super::Vm<'_> {
         };
         if convicted || reconcile {
             let total = self.audit_heap_bytes();
+            let collectable = may_defer && self.gc_can_run_now();
             let rec = self.instr_rec.as_mut().expect("recorder checked above");
             if let Some(now) = crate::heap::every_block_footprint() {
                 rec.walk_footprint_floor = now;
             }
             if total.saturating_add(growth) > ceiling {
+                if collectable && !rec.ceiling_gc_pending {
+                    rec.ceiling_gc_pending = true;
+                    self.heap.request_major();
+                    return Ok(());
+                }
+                rec.ceiling_gc_pending = false;
                 return Err(rec.exhaust(ResourceExhaustion::Heap));
             }
         }
@@ -2127,7 +2339,7 @@ impl super::Vm<'_> {
         if steps & 1023 != 0 {
             return Ok(());
         }
-        self.instrument_heap_poll_inner(0)
+        self.instrument_heap_poll_inner(0, false)
             .map_err(|message| super::Thrown(message.into()))
     }
 
@@ -2148,6 +2360,7 @@ impl super::Vm<'_> {
 
         let rec = self.instr_rec.as_mut().expect("checked above");
         rec.pending = None;
+        rec.refresh_slow();
         let depth_before = rec.depth;
         let row = &mut rec.steps[row_idx];
         let dst_u64 = dst_val.map(enc).unwrap_or(0);
@@ -2291,6 +2504,7 @@ impl super::Vm<'_> {
             frames,
             claim,
         });
+        rec.refresh_slow();
     }
 
     #[cfg(not(feature = "meter-only"))]
@@ -2764,7 +2978,7 @@ mod tests {
         exact
             .run()
             .expect("the final permitted instruction may halt");
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
         let mut short = crate::vm::Vm::new(program(src));
@@ -2931,7 +3145,7 @@ mod tests {
                 .expect("the exact final allowance succeeds"),
             crate::value::Value::int(832_040)
         );
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
         let mut short = ready(SRC, expected_steps as i64 - 1);
@@ -3060,7 +3274,7 @@ mod tests {
 
         let (mut exact, result) = exercise(exact_steps as i64, false);
         assert_eq!(result.expect("exact native call succeeds"), Value::int(9));
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
         let slot = exact.func(1).name_global.unwrap();
@@ -3100,8 +3314,8 @@ mod tests {
             (1..=ABORT_POLL).contains(&used),
             "the interpreter poll or an earlier native-entry poll must stop execution; used {used}"
         );
-        assert_eq!(abort_rec.remaining, ABORT_BUDGET - used as i64);
-        assert_eq!(used + abort_rec.remaining as u64, ABORT_BUDGET as u64);
+        assert_eq!(abort_rec.remaining_now(), ABORT_BUDGET - used as i64);
+        assert_eq!(used + abort_rec.remaining_now() as u64, ABORT_BUDGET as u64);
         assert_eq!(aborted.instrument_resource_limit_error(), Some(ABORT_MSG));
     }
 

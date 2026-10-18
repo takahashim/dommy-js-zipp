@@ -440,7 +440,7 @@ impl<'p> Vm<'p> {
             .ok_or_else(|| self.json_key_snapshot_limit_error())?;
         #[cfg(feature = "instrument")]
         if self.instr_rec.is_some() {
-            self.instrument_preflight_heap_growth(projected)
+            self.instrument_preflight_builder_growth(projected, additional)
                 .map_err(|message| Thrown(message.into()))?;
         }
         #[cfg(not(feature = "instrument"))]
@@ -470,7 +470,7 @@ impl<'p> Vm<'p> {
             .ok_or_else(|| self.json_key_snapshot_limit_error())?;
         #[cfg(feature = "instrument")]
         if self.instr_rec.is_some() {
-            self.instrument_preflight_heap_growth(projected)
+            self.instrument_preflight_builder_growth(projected, additional)
                 .map_err(|message| Thrown(message.into()))?;
         }
         #[cfg(not(feature = "instrument"))]
@@ -985,6 +985,15 @@ impl<'p> Vm<'p> {
         // The snapshot used to be a `Vec`, allocated and freed on EVERY fused
         // `Math.*` -- and four of the thirteen benchmark rows call `Math.imul`
         // once per element in their mixing functions.
+        //
+        // Those calls are nearly always two int32s, whose ToUint32 is their
+        // own bits: the product needs no snapshot and no coercion.
+        if matches!(op, crate::bytecode::MathFn::Imul) && argc >= 2 {
+            let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
+            if a.is_int() && b.is_int() {
+                return Ok(a.as_int().wrapping_mul(b.as_int()) as f64);
+            }
+        }
         self.with_argv(base, arg_base, argc, |vm, args| vm.eval_math_args(op, args))
     }
 
@@ -1007,19 +1016,27 @@ impl<'p> Vm<'p> {
         Ok(match op {
             M::Min | M::Max | M::Hypot => {
                 // ToNumber EVERY argument (observable valueOf/toString, left-to-right)
-                // before reducing.
-                let mut nums = Vec::with_capacity(args.len());
-                for &v in args {
-                    nums.push(self.to_number_strict(v)?);
+                // before reducing. Up to eight go in a stack buffer: a `Vec`
+                // per call was most of what `Math.max(a, b)` cost.
+                let mut small = [0f64; 8];
+                let mut large = Vec::new();
+                let nums: &mut [f64] = if args.len() <= small.len() {
+                    &mut small[..args.len()]
+                } else {
+                    large.resize(args.len(), 0.0);
+                    &mut large
+                };
+                for (slot, &v) in nums.iter_mut().zip(args) {
+                    *slot = self.to_number_strict(v)?;
                 }
                 if matches!(op, M::Hypot) {
-                    return Ok(crate::vm::helpers_num2::hypot_scaled(&nums));
+                    return Ok(crate::vm::helpers_num2::hypot_scaled(nums));
                 }
                 let mut acc = match op {
                     M::Min => f64::INFINITY,
                     _ => f64::NEG_INFINITY,
                 };
-                for v in nums {
+                for &v in nums.iter() {
                     acc = match op {
                         // f64 min/max treat -0 and +0 as equal; spec orders -0 < +0,
                         // so tie-break on the sign (Min prefers -0, Max prefers +0).

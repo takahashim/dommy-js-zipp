@@ -1,92 +1,103 @@
-//! Storage for the functions and classes a state installs at run time (an
-//! `eval`, `new Function`, a script or module a host loads into it), owned by
-//! the state itself so that dropping it frees them.
+//! Storage for the code a VM installs at run time — the functions and classes
+//! `eval`, `new Function` and loaded modules compile — owned beside the
+//! `Program` so it is freed with the VM.
 //!
-//! They used to be `Box::leak`ed: the run loop and the JIT keep raw pointers
-//! into a `FuncProto`, so it must never move, and a leaked box never does. But
-//! a leak is never freed, so a host that creates and drops a state per page
-//! grew by the compiled form of everything it loaded into each (about 1.2 MB a
-//! page for dommy's bridge runtime). An [`Arena`] gives the same stable
-//! addresses for as long as its owner lives, and frees them with it.
+//! Each installed `FuncProto` / `ClassDef` must keep its address for the VM's
+//! whole life: the function table hands out `&'p` references and the JIT holds
+//! raw pointers into them. They used to be `Box::leak`ed for that, so a state
+//! an embedder dropped left all of its evaluated code behind
+//! (f2i-com/zipp.org#53: a host that evaluates a 243 KB runtime into each
+//! page's state grew by about 1.2 MB a page).
 //!
-//! Safe code only (`safe-sandbox` forbids `unsafe` in this crate): values sit
-//! in `OnceCell<Box<T>>` slots of fixed-size chunks linked through further
-//! `OnceCell`s, so `alloc(&self)` never moves anything it handed out before.
+//! The arena is a chain of boxed nodes linked through `OnceCell`, which takes
+//! its value through a shared reference, so a VM holding `&'p EvalArena`
+//! appends with safe code and gets `&'p` references back. Nodes never move
+//! (each lives in its own `Box`) and are never removed until the arena drops,
+//! which it does iteratively, so a long chain cannot overflow the stack.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::OnceCell;
 
-/// Slots per chunk. A slot is one pointer wide (the value is boxed), so an
-/// unused chunk costs 2 KiB; reaching slot `n` walks `n / CHUNK` links.
-const CHUNK: usize = 256;
+use crate::bytecode::{ClassDef, FuncProto};
 
-struct Chunk<T> {
-    items: Box<[OnceCell<Box<T>>]>,
-    next: OnceCell<Box<Chunk<T>>>,
+/// One installed value and the link to the next.
+pub(crate) struct Node<T> {
+    pub(crate) value: T,
+    next: OnceCell<Box<Node<T>>>,
 }
 
-impl<T> Chunk<T> {
-    fn new() -> Self {
-        Chunk {
-            items: (0..CHUNK).map(|_| OnceCell::new()).collect(),
-            next: OnceCell::new(),
-        }
-    }
+/// An append-only chain of nodes.
+pub(crate) struct Chain<T> {
+    head: OnceCell<Box<Node<T>>>,
 }
 
-/// An append-only store whose values keep their addresses until it is dropped.
-pub(crate) struct Arena<T> {
-    head: Chunk<T>,
-    len: Cell<usize>,
-}
-
-impl<T> Default for Arena<T> {
+impl<T> Default for Chain<T> {
     fn default() -> Self {
-        Arena {
-            head: Chunk::new(),
-            len: Cell::new(0),
+        Chain {
+            head: OnceCell::new(),
         }
     }
 }
 
-impl<T> Arena<T> {
-    /// Store `value` and return it, borrowed for as long as the arena lives.
-    pub(crate) fn alloc(&self, value: T) -> &T {
-        let i = self.len.get();
-        self.len.set(i + 1);
-        let mut chunk = &self.head;
-        for _ in 0..i / CHUNK {
-            chunk = chunk.next.get_or_init(|| Box::new(Chunk::new()));
+impl<T> Chain<T> {
+    /// Append `value` after `tail` (`None`: the chain is empty as far as the
+    /// caller knows) and return its node. A stale `tail` only costs a walk to
+    /// the real end.
+    pub(crate) fn push<'a>(&'a self, tail: Option<&'a Node<T>>, value: T) -> &'a Node<T> {
+        let mut slot = match tail {
+            Some(node) => &node.next,
+            None => &self.head,
+        };
+        while let Some(node) = slot.get() {
+            slot = &node.next;
         }
-        let slot = &chunk.items[i % CHUNK];
-        if slot.set(Box::new(value)).is_err() {
-            unreachable!("eval arena slot {i} filled twice");
+        if slot.set(Box::new(Node {
+            value,
+            next: OnceCell::new(),
+        }))
+        .is_err()
+        {
+            unreachable!("the walk above ended on an empty link");
         }
-        slot.get().expect("just filled")
+        slot.get().expect("just set")
     }
 }
 
-/// What a [`crate::vm::Vm`] installs at run time, owned beside its `Program`.
+impl<T> Drop for Chain<T> {
+    fn drop(&mut self) {
+        let mut next = self.head.take();
+        while let Some(mut node) = next {
+            next = node.next.take();
+        }
+    }
+}
+
+/// The functions and classes a VM installs at run time.
 #[derive(Default)]
-pub(crate) struct EvalArena {
-    pub(crate) funcs: Arena<crate::bytecode::FuncProto>,
-    pub(crate) classes: Arena<crate::bytecode::ClassDef>,
+pub struct EvalArena {
+    pub(crate) funcs: Chain<FuncProto>,
+    pub(crate) classes: Chain<ClassDef>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Arena;
+    use super::Chain;
 
     #[test]
-    fn values_keep_their_addresses_across_chunks() {
-        let arena = Arena::default();
-        let first: *const String = arena.alloc(String::from("first"));
-        let refs: Vec<&String> = (0..1000).map(|i| arena.alloc(i.to_string())).collect();
-        assert_eq!(first, arena_first(&arena));
-        assert_eq!(refs[999], "999");
-        assert_eq!(refs[256], "256");
-    }
-
-    fn arena_first(arena: &Arena<String>) -> *const String {
-        &**arena.head.items[0].get().unwrap()
+    fn references_stay_valid_and_a_long_chain_drops_without_recursion() {
+        let chain: Chain<Vec<u32>> = Chain::default();
+        let mut tail = None;
+        let mut refs = Vec::new();
+        for i in 0..200_000u32 {
+            let node = chain.push(tail, vec![i, i + 1]);
+            refs.push(&node.value);
+            tail = Some(node);
+        }
+        assert_eq!(refs[0], &vec![0, 1]);
+        assert_eq!(refs[199_999], &vec![199_999, 200_000]);
+        // A stale tail still appends at the end.
+        let late = chain.push(None, vec![7]);
+        assert_eq!(late.value, vec![7]);
+        drop(refs);
+        drop(chain);
     }
 }

@@ -1509,15 +1509,17 @@ pub struct Vm<'p> {
     /// Number of functions in the compile-time `program` (the boundary between
     /// program function ids and runtime `eval_funcs` ids).
     main_func_count: usize,
-    /// Classes compiled at runtime by `eval`. Like `eval_funcs`: each is a leaked
-    /// `Box<ClassDef>` addressed by a unified class_id (`program.classes` below
+    /// Classes compiled at runtime by `eval`. Like `eval_funcs`: each lives in
+    /// `eval_arena`, addressed by a unified class_id (`program.classes` below
     /// `main_class_count`, `eval_classes` beyond). Their func-id members and the
     /// referencing `MakeClass`/`Super*` ops are re-indexed at install time.
     eval_classes: Vec<&'p crate::bytecode::ClassDef>,
-    /// Where `eval_funcs` and `eval_classes` live when the VM's owner keeps
-    /// them (a `ScriptState`: freed with it); `None` leaks them, as a VM built
-    /// over a borrowed program for one run (tests, the CLI) always did.
-    eval_arena: Option<&'p EvalArena>,
+    /// Where the functions and classes installed at run time live (see
+    /// `eval_arena`): beside the `Program` in an embedder's state, so they are
+    /// freed with it. The tails make an append one step.
+    eval_arena: &'p eval_arena::EvalArena,
+    eval_func_tail: Option<&'p eval_arena::Node<crate::bytecode::FuncProto>>,
+    eval_class_tail: Option<&'p eval_arena::Node<crate::bytecode::ClassDef>>,
     /// Number of classes in the compile-time `program` (boundary between program
     /// and runtime `eval_classes` class ids).
     main_class_count: usize,
@@ -1531,6 +1533,11 @@ pub struct Vm<'p> {
     /// scanning the whole map made it linear in the globals earlier scripts
     /// introduced.
     eval_global_names: rustc_hash::FxHashMap<u32, String>,
+    /// `program.global_names` by name (first position, as `position()` found
+    /// it): the main program's slot for a name in one lookup. Every
+    /// global-object property path (`globalThis.x` reads and writes, its
+    /// descriptors, deletes and key listings) used to scan the whole table.
+    main_global_index: rustc_hash::FxHashMap<&'p str, u32>,
     /// Pool slots that deliberately have NO `eval_global_map` entry, by what
     /// they bind: a loaded module's own declarations (per-module, so two
     /// modules' same-named bindings never collide) and ShadowRealm names.
@@ -1785,6 +1792,9 @@ pub struct Vm<'p> {
     /// `pending_eval_frame`). Suppresses the "anonymous" wrapper's self-name
     /// binding (constructor-binding.js).
     pending_fn_ctor_eval: bool,
+    /// `new Function` & kin, by the exact source they assembled: the installed
+    /// eval program's base function, re-run on a repeat (see `do_eval`).
+    fn_ctor_cache: rustc_hash::FxHashMap<Box<[u8]>, u32>,
     /// Host policy for a VM that may execute its already-compiled main program
     /// but must not compile or load any additional source. This is independent
     /// of instrumentation and leaves every JIT tier enabled. All runtime source
@@ -1965,6 +1975,11 @@ pub struct Vm<'p> {
     /// each key. Measured, `for (k in o)` on a one-key object cost 185ns against
     /// node's 3.
     for_in_barren: rustc_hash::FxHashMap<u32, u32>,
+    /// Prototype levels a `for-in` has found to contribute no key, keyed as
+    /// `for_in_barren` is, without its requirement that the level end the
+    /// chain: `%Array.prototype%`, below which an Array's own keys are the
+    /// whole list when `%Object.prototype%` is barren too.
+    for_in_silent: rustc_hash::FxHashMap<u32, u32>,
     /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index —
     /// see [`proxy_regexp::RegexpIterRec`] for the record's fields.
     // W11 (B124): FxHashMap — the fused matchAll step probes this map once
@@ -3329,6 +3344,7 @@ mod access;
 mod async_runtime;
 mod builtins;
 pub(crate) mod clock;
+pub(crate) mod eval_arena;
 mod dispatch;
 mod engine;
 pub(crate) use engine::compile_host_script;
@@ -3362,8 +3378,6 @@ mod cldr_ja;
 mod cldr_zh;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod closure_make_jit;
-mod eval_arena;
-pub(crate) use eval_arena::EvalArena;
 mod coerce;
 mod collections;
 mod const_cache;

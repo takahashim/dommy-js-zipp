@@ -97,14 +97,12 @@ pub(crate) fn lookup_handle(ruby: &Ruby, id: u64, handle_id: u64) -> Result<Host
 pub(crate) fn call_handle(ruby: &Ruby, id: u64, handle_id: u64, args: RArray) -> Result<Value, Error> {
     let engine_handle = lookup_handle(ruby, id, handle_id)?;
     let host_args: Vec<HostValue> = args.into_iter().map(|a| ruby_to_host(ruby, a)).collect();
-    if let Some(ptr) = active_ctx(id) {
-        let ctx: &mut dyn HostCtx = unsafe { &mut *ptr };
-        let result = ctx.call_handle_value(engine_handle, &host_args);
+    if let Some(result) = with_active_ctx(id, |ctx| ctx.call_handle_value(engine_handle, &host_args)) {
         return nested_result(ruby, id, result);
     }
     with_entry(ruby, id, |entry| {
-        entry
-            .run_nogvl(ruby, |s| s.call_handle(engine_handle, &host_args))?
+        // SAFETY: the closure only drives the engine.
+        unsafe { entry.run_nogvl(ruby, |s| s.call_handle(engine_handle, &host_args)) }?
             .map(|hv| host_to_ruby(ruby, &hv))
             .map_err(|e| js_error_from_message(ruby, id, &e))
     })
@@ -113,9 +111,7 @@ pub(crate) fn call_handle(ruby: &Ruby, id: u64, handle_id: u64, args: RArray) ->
 /// Read the value a binding handle roots.
 pub(crate) fn get_handle(ruby: &Ruby, id: u64, handle_id: u64) -> Result<Value, Error> {
     let engine_handle = lookup_handle(ruby, id, handle_id)?;
-    if let Some(ptr) = active_ctx(id) {
-        let ctx: &mut dyn HostCtx = unsafe { &mut *ptr };
-        let result = ctx.read_handle_value(engine_handle);
+    if let Some(result) = with_active_ctx(id, |ctx| ctx.read_handle_value(engine_handle)) {
         return nested_result(ruby, id, result);
     }
     with_entry(ruby, id, |entry| {
@@ -135,9 +131,8 @@ pub(crate) fn release_handle(ruby: &Ruby, id: u64, handle_id: u64) -> Result<boo
         Err(_) if HANDLES.with(|h| !h.borrow().contains_key(&handle_id)) => return Ok(false),
         Err(e) => return Err(e),
     };
-    let released = if let Some(ptr) = active_ctx(id) {
-        let ctx: &mut dyn HostCtx = unsafe { &mut *ptr };
-        ctx.release_handle_value(engine_handle)
+    let released = if let Some(released) = with_active_ctx(id, |ctx| ctx.release_handle_value(engine_handle)) {
+        released
     } else {
         with_entry(ruby, id, |entry| entry.run(ruby, |s| s.release_handle(engine_handle)))?
     };

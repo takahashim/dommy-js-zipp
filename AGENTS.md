@@ -27,6 +27,7 @@ gems/zipp-rb/
     src/convert.rs        # HostValue <-> Ruby values
     src/evaluate.rs       # eval / load / call / gc / memory_usage
     src/compile_cache.rs  # process-wide compiled-script cache (load cache: true)
+    src/alloc.rs          # global allocator reporting large blocks to the engine's GC schedule
     src/callbacks.rs      # define_function, listeners, same-VM re-entry
     src/event_loop.rs     # timers, eval_async, import, drain_jobs
     src/handles.rs        # durable JS handles held by Ruby

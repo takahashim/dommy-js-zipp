@@ -107,14 +107,15 @@ candidate to propose upstream.
 - **Run deadline** — `Recorder::deadline`, `ScriptState::set_deadline`. Every
   abort-flag poll goes through `Recorder::abort_requested()` (flag OR passed
   deadline). zipp-rb's `timeout_msec` uses this instead of a timer thread.
-- **Metered fast path** — `Vm::instrument_step` (non-`meter-only`) keeps an
-  abort flag or a deadline on the inline path and polls both, then the heap
-  stride, every `ABORT_CHECK_MASK + 1` ticks out of line
-  (`Vm::instrument_poll`); only a trace, a sticky exhaustion, full output or
-  a spent budget goes to `instrument_step_slow`. Upstream sends every
-  instruction out of line whenever an abort flag or a deadline is set, which
-  zipp-rb always does (`arm_limits`): a tight loop cost about 1.8x its
-  unlimited time, now within a few percent.
+- **Metered fast path with an abort flag or a deadline** — upstream's
+  step countdown (`Recorder::countdown`, `schedule`) counts an abort flag as
+  a slow state (`refresh_slow`), so every instruction takes the full path
+  while one is set, and zipp-rb always sets one (`arm_limits`): a tight loop
+  cost about 1.8x its unlimited time. Here neither the flag nor a deadline
+  is a slow state; `schedule` ends the countdown on the
+  `ABORT_CHECK_MASK` stride while either is set, and the full path polls
+  them there (`Vm::instrument_poll`), then the heap on its own stride.
+  `set_deadline` settles the countdown so the stride takes effect at once.
 
 ## Safe profile (crates/zipp-vm/src/vm/typedarray.rs, vm/setup.rs)
 
@@ -140,25 +141,12 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   allowance, so in a script that filled its heap a linear regex was the
   first to fail, as "regular expression exceeded its backtrack memory
   budget". When the headroom is the tighter cap, the exhaustion is recorded
-  as the heap's. This build's heap can cross its ceiling between audits
-  (the slot tables are smaller without the JIT mirrors, which delays
+  as the heap's. A build without the JIT's slot mirrors (upstream d2886b1)
+  can cross its ceiling between audits (smaller slot tables delay
   `slot_table_growth_reserve`), which is how the regex came to see no
   headroom at all. Test: `test/limits_test.rb`.
 
 ## Global object (crates/zipp-vm/src/vm/dispatch.rs)
-
-- **A top-level lexical's initialization stays in its slot** — upstream's
-  fix for writes to unresolvable names (f2i-com/zipp.org#47, 5762df5) sends
-  `StoreGlobal` / `StoreGlobalDyn` on an uninitialized slot through [[Set]]
-  on the global object whenever a Proxy is on its prototype chain. A
-  top-level `let`/`const`/`class` is initialized by that same store while
-  its slot is in the TDZ, so `let y = null; y = 2; y` threw "y is not
-  defined" (dommy's unified window keeps the window proxy on that chain).
-  The [[Set]] route now skips a lexical global (`global_name_is_lexical`),
-  and so do the routes before it, for a name the global object owns or its
-  chain resolves: under the unified window, `let name = {}` otherwise set
-  `window.name` and left the slot in its TDZ.
-  Test: `test/engine_fixes_test.rb`.
 
 - **A builtin read finds the global's own property first** — a global slot
   an eval-installed program reads (vm/dispatch.rs: `LoadGlobalOrUndefined`,
@@ -171,26 +159,6 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
 
 ## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, compile/*, vm/dispatch.rs)
 
-- **Run-time code is freed with its state** (vm/eval_arena.rs, embed.rs
-  `VmOwner`, vm/engine/eval_prog.rs, vm/engine/boot.rs `alloc_eval_func` /
-  `alloc_eval_class`) — `prepare_eval_program` `Box::leak`ed every function
-  and class an eval, `new Function`, a loaded script or a module installed,
-  for the stable addresses the run loop and the JIT need, and nothing freed
-  them when the state was dropped: a host making a state per page grew by
-  the compiled form of everything it loaded into each (1.24 MB per state for
-  dommy's 243 KB bridge runtime, reported upstream on #15). `OwnedVm` now
-  owns an `EvalArena` beside the `Program` (append-only `OnceCell` chunks:
-  safe code, addresses fixed until dropped) and the VM installs into it; a
-  `Vm` built over a borrowed program (tests, the CLI) has none and still
-  leaks. Test: `eval_arena::tests`.
-
-- **JIT mirrors only for the x86-64 JIT** — the per-slot `hot_mirror`,
-  `this_mirror` and `upvals_mirror` (32 bytes on every slot) were kept
-  unless `meter-only`; only the x86-64 JIT (`codegen/`) reads them. They are
-  now `cfg(all(feature = "jit", target_arch = "x86_64"))`, with the
-  mirrorless fallbacks (the `meter-only` ones) for every other build. zipp-rb
-  builds without `jit` (ext/zipp_rb/Cargo.toml), so a slot is 101 bytes, not
-  133. `rake engine:test` runs both feature sets.
 - **Unwritten captured bindings are captured by value** — a captured
   binding took a heap cell (a whole slot) even when nothing ever wrote it,
   and dommy's per-node proxy handler closes over dozens of `const`s.

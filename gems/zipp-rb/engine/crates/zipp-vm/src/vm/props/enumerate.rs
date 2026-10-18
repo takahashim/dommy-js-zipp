@@ -470,22 +470,40 @@ impl<'p> Vm<'p> {
                     .map(|i| m.keys[i].clone())
                     .filter(|k| !is_hidden_key(k))
                     .collect();
-                // The global object's SCRIPT-declared var/function bindings are
-                // enumerable slot-backed own properties (builtins stay
+                // The global object's slot-backed var/function bindings and
+                // implicit globals are enumerable own properties, the main
+                // program's and later scripts' alike (builtins stay
                 // non-enumerable and excluded).
                 let mut slot_names: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 if obj.heap_index() == self.global_this && self.global_this != 0 {
+                    let listed: std::collections::HashSet<&str> =
+                        names.iter().map(String::as_str).collect();
+                    let mut add: Vec<String> = Vec::new();
                     for (i, n) in self.program.global_names.iter().enumerate() {
                         let iu = i as u32;
-                        if (self.program.hoisted_globals.contains(&iu)
-                            || self.program.decl_globals.contains(&iu))
-                            && !self.globals[i].is_uninitialized()
+                        if !self.globals[i].is_uninitialized()
+                            && !self.program.lexical_globals.contains(&iu)
+                            && !self.builtin_globals.contains_key(n.as_str())
+                            && !self.deleted_globals.contains(n.as_str())
+                            && !is_hidden_key(n)
+                            && n != crate::vm::native::ANNEXB_REF_ERROR_NAME
+                            && n != crate::vm::native::HOST_CALL_NAME
+                            && n != crate::vm::native::PY_TENSOR_NAME
                             && m.pos(n).is_none()
-                            && !names.iter().any(|k| k == n)
+                            && !listed.contains(n.as_str())
                         {
-                            names.push(n.clone());
-                            slot_names.insert(n.clone());
+                            add.push(n.clone());
+                        }
+                    }
+                    for n in self.eval_pool_property_names() {
+                        if m.pos(n).is_none() && !listed.contains(n) {
+                            add.push(n.to_string());
+                        }
+                    }
+                    for n in add {
+                        if slot_names.insert(n.clone()) {
+                            names.push(n);
                         }
                     }
                 }
@@ -791,6 +809,22 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // An Array whose prototypes yield no key: its own enumerable keys are
+        // the whole list and none can shadow another, so no shadow set. The
+        // walk below built one from every key, listed twice, and from the
+        // prototype's forty names besides: about 300ns a key over a sparse
+        // array.
+        if obj.is_heap() && self.for_in_array_own_only(obj.heap_index()) {
+            let keys = self.object_enum_own(obj, EnumWhat::Keys)?;
+            let mut out: Vec<Value> =
+                vec![Value::UNDEFINED; crate::bytecode::FORIN_SNAPSHOT_PREFIX];
+            out[0] = obj;
+            if let HeapObj::Array(items) = self.heap.get(keys.heap_index()) {
+                out.extend_from_slice(items);
+            }
+            self.for_in_array_licence(obj, &mut out);
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+        }
         // The key Array is engine-private. Prefix it with receiver/version and
         // the two default-prototype anchor/version pairs so `ForInLive` can prove
         // that THIS snapshot's keyset is still live without re-parsing/probing
@@ -969,11 +1003,16 @@ impl<'p> Vm<'p> {
                 break;
             }
         }
-        // Narrow V1 licence: a genuine non-arguments Array on the untouched
-        // %Array.prototype% -> %Object.prototype% chain. Receiver and both anchor
-        // versions cover every deletion, descriptor/keyset change and
-        // setPrototypeOf that can make a snapshotted key disappear. Exotic/custom
-        // chains retain the exact old liveness walk.
+        self.for_in_array_licence(obj, &mut out);
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
+    /// Narrow V1 licence: a genuine non-arguments Array on the untouched
+    /// %Array.prototype% -> %Object.prototype% chain. Receiver and both anchor
+    /// versions cover every deletion, descriptor/keyset change and
+    /// setPrototypeOf that can make a snapshotted key disappear. Exotic/custom
+    /// chains retain the exact old liveness walk.
+    fn for_in_array_licence(&self, obj: Value, out: &mut [Value]) {
         if crate::codegen::forin_version_fast_enabled()
             && obj.is_heap()
             && matches!(self.heap.get(obj.heap_index()), HeapObj::Array(_))
@@ -994,7 +1033,39 @@ impl<'p> Vm<'p> {
             out[4] = Value::heap(self.obj_proto);
             out[5] = Value::int(self.heap.version_of(self.obj_proto) as i32);
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
+    /// Whether a `for-in` over the Array at `idx` lists exactly its own
+    /// enumerable keys: it has the default prototype, `%Array.prototype%`
+    /// contributes no key, and `%Object.prototype%` beyond it is barren.
+    /// Nothing farther yields a key, so none needs checking against the
+    /// nearer levels' names.
+    fn for_in_array_own_only(&mut self, idx: u32) -> bool {
+        matches!(self.heap.get(idx), HeapObj::Array(_))
+            && !self.arguments_objs.contains_key(&idx)
+            && !self.proto_of.contains_key(&idx)
+            && self.arr_proto != 0
+            && self.obj_proto != 0
+            && !self.proto_of.contains_key(&self.arr_proto)
+            && self.for_in_level_silent(self.arr_proto)
+            && self.for_in_level_barren(self.obj_proto)
+    }
+
+    /// Whether the plain-object prototype level `idx` has no enumerable own
+    /// key, memoised against its heap version as `for_in_level_barren` is.
+    fn for_in_level_silent(&mut self, idx: u32) -> bool {
+        let ver = self.heap.version_of(idx);
+        if self.for_in_silent.get(&idx) == Some(&ver) {
+            return true;
+        }
+        let silent = match self.heap.get(idx) {
+            HeapObj::Object(m) => (0..m.len()).all(|i| !m.attr_at(i).enumerable),
+            _ => false,
+        };
+        if silent {
+            self.for_in_silent.insert(idx, ver);
+        }
+        silent
     }
 
     /// Reconstruct the for-in shadow set from already-walked PLAIN levels:

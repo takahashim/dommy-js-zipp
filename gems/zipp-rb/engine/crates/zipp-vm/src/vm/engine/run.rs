@@ -157,6 +157,11 @@ console.log("module-rec:" + sum);
     }
 }
 
+/// The largest assembled `new Function` source the compile cache keeps, and
+/// how many sources it keeps (see `Vm::do_eval`).
+const FN_CTOR_CACHE_MAX_SOURCE: usize = 64 * 1024;
+const FN_CTOR_CACHE_MAX_ENTRIES: usize = 4096;
+
 impl<'p> Vm<'p> {
     /// Run the top-level function (id 0) to completion.
     pub fn run(&mut self) -> Result<Value, Thrown> {
@@ -1535,7 +1540,7 @@ impl<'p> Vm<'p> {
                 return self.realm_global_slot(rid, name);
             }
         }
-        if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
+        if let Some(i) = self.main_global_pos(name) {
             return Ok(i as u32);
         }
         if let Some(&s) = self.eval_global_map.get(name) {
@@ -1569,7 +1574,34 @@ impl<'p> Vm<'p> {
             (None, Some(&v)) if !deleted => Value::heap(v),
             _ => Value::UNINITIALIZED,
         };
+        // A plain {w, e, c} data property the global object already holds
+        // (`globalThis.d = v` before any code named `d`) moves into the new
+        // slot, which presents exactly that descriptor: every read and write
+        // of `d` from the code being compiled is then a slot access, in every
+        // tier, instead of the global-object fallback. Anything else (an
+        // accessor, other attributes, a ShadowRealm's binding) stays put.
+        let migrate = seed.is_uninitialized()
+            && self.active_realm.is_none()
+            && self.global_this != 0
+            && matches!(
+                self.heap.get(self.global_this),
+                HeapObj::Object(m) if m.pos(name).is_some_and(|i| {
+                    let a = m.attr_at(i);
+                    !a.accessor && a.writable && a.enumerable && a.configurable
+                })
+            );
+        // Allocate first: an exhausted pool must leave the property where it is.
         let s = self.alloc_global_pool_slot(seed, "global names introduced by eval")?;
+        if migrate {
+            if let HeapObj::Object(m) = self.heap.get_mut(self.global_this) {
+                if let Some(v) = m.get(name) {
+                    m.remove(name);
+                    self.globals[s as usize] = v;
+                }
+            }
+            self.heap.bump_version(self.global_this);
+            self.bump_global_gen(s);
+        }
         self.eval_global_map.insert(name.to_string(), s);
         self.eval_global_names.insert(s, name.to_string());
         Ok(s)
@@ -1595,10 +1627,17 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The main program's slot for `name` (its first position in
+    /// `program.global_names`), in one lookup.
+    #[inline]
+    pub(crate) fn main_global_pos(&self, name: &str) -> Option<usize> {
+        self.main_global_index.get(name).map(|&i| i as usize)
+    }
+
     /// The global SLOT behind a name — the inverse of `global_slot_name`. Main-program
     /// compile-time names first, then bindings a later script/eval introduced.
     pub(crate) fn global_slot_of_name(&self, name: &str) -> Option<u32> {
-        if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
+        if let Some(i) = self.main_global_pos(name) {
             return Some(i as u32);
         }
         self.eval_global_map.get(name).copied()
@@ -1624,9 +1663,9 @@ impl<'p> Vm<'p> {
     /// The three classifications, which is why this is one function and not three:
     /// a SCRIPT-declared `var`/function binding is `{writable, enumerable,
     /// NON-configurable}`; an IMPLICIT global (sloppy assignment to an undeclared name)
-    /// is CreateDataProperty — `{writable, enumerable, configurable}`; a BUILT-IN is
-    /// `{writable, non-enumerable, configurable}`; and `NaN`/`Infinity`/`undefined` are
-    /// frozen.
+    /// and an `eval`-declared `var`/function are CreateDataProperty-shaped —
+    /// `{writable, enumerable, configurable}`; a BUILT-IN is `{writable,
+    /// non-enumerable, configurable}`; and `NaN`/`Infinity`/`undefined` are frozen.
     pub(crate) fn global_slot_binding_descriptor(
         &self,
         key: &str,
@@ -1635,15 +1674,26 @@ impl<'p> Vm<'p> {
             return None;
         }
         let v = self.global_by_name(key)?;
-        let named = self.program.global_names.iter().position(|n| n == key);
+        // The slot behind the name: the main program's, else one a later
+        // script or eval introduced (`eval_global_map`).
+        let named = self.main_global_pos(key);
+        let pool = if named.is_none() {
+            self.eval_global_map.get(key).copied()
+        } else {
+            None
+        };
         let script_decl = named.is_some_and(|i| {
             self.program.hoisted_globals.contains(&(i as u32))
                 || self.program.decl_globals.contains(&(i as u32))
-        });
+        }) || pool.is_some_and(|s| self.eval_var_globals.contains(&s));
+        // An eval `var`/function binding and an implicit global (`x = 1` in
+        // sloppy code) are CreateDataProperty-shaped: {w, e, c}. Both live in
+        // their slot; for a later script's name that slot is an eval pool one.
+        let slot = named.map(|i| i as u32).or(pool);
         let implicit = !script_decl
             && !self.builtin_globals.contains_key(key)
-            && named
-                .and_then(|i| self.globals.get(i))
+            && slot
+                .and_then(|s| self.globals.get(s as usize))
                 .is_some_and(|v| !v.is_uninitialized());
         let attr = |writable, enumerable, configurable| crate::heap::PropAttr {
             writable,
@@ -1658,6 +1708,139 @@ impl<'p> Vm<'p> {
             _ if implicit => (v, attr(true, true, true)),
             _ => (v, attr(true, false, true)),
         })
+    }
+
+    /// The global-object properties held in eval POOL slots (an eval
+    /// `var`/function, an implicit global a later script created, a prelude's
+    /// declarations), in slot order. Key listings walk the main program's
+    /// slot-backed properties from `program.global_names`; these have no
+    /// entry there. Builtins (listed from `builtin_globals`), lexicals (not
+    /// properties at all), deleted names and internal names are left out.
+    pub(crate) fn eval_pool_property_names(&self) -> Vec<&str> {
+        if self.eval_global_names.is_empty() {
+            return Vec::new();
+        }
+        let mut v: Vec<(u32, &str)> = self
+            .eval_global_names
+            .iter()
+            .filter(|&(&s, name)| {
+                self.globals
+                    .get(s as usize)
+                    .is_some_and(|g| !g.is_uninitialized())
+                    && !self.eval_lexical_globals.contains(&s)
+                    && !self.builtin_globals.contains_key(name.as_str())
+                    && !self.deleted_globals.contains(name.as_str())
+                    && !crate::vm::helpers_numeric::is_hidden_key(name)
+                    && name.as_str() != crate::vm::native::ANNEXB_REF_ERROR_NAME
+                    && name.as_str() != crate::vm::native::HOST_CALL_NAME
+                    && name.as_str() != crate::vm::native::PY_TENSOR_NAME
+            })
+            .map(|(&s, n)| (s, n.as_str()))
+            .collect();
+        v.sort_unstable_by_key(|&(s, _)| s);
+        v.into_iter().map(|(_, n)| n).collect()
+    }
+
+    /// [[Set]] on the global object, with the global object as the receiver,
+    /// for a name that has a global slot: `Some(true)` once the slot holds the
+    /// value, `None` to take the general path.
+    ///
+    /// * An existing slot-backed binding that no real own property shadows is
+    ///   a writable data property, and OrdinarySet replaces its value in place
+    ///   and keeps its attributes: the slot takes the value.
+    /// * An ABSENT name becomes CreateDataProperty's {w, e, c}, the shape a
+    ///   slot presents for it (`global_slot_binding_descriptor`), when the
+    ///   global object is extensible and nothing on its prototype chain could
+    ///   govern the write (no Proxy, no property of that name).
+    ///
+    /// The general path added a real own property instead, and from then on
+    /// `global_real_own_route` sent every bare read and write of the name
+    /// through [[Get]]/[[Set]]: one `globalThis.x = v` made each later `x`
+    /// about fifty times slower in both tiers, and an embedder's
+    /// `window.x = v` is the common way to publish a global.
+    pub(crate) fn global_slot_set(&mut self, key: &str, val: Value) -> Option<bool> {
+        if matches!(key, "NaN" | "Infinity" | "undefined") {
+            return None;
+        }
+        let gi = self.global_this;
+        let (has_own, extensible) = match self.heap.get(gi) {
+            HeapObj::Object(m) => (m.pos(key).is_some(), m.extensible),
+            _ => return None,
+        };
+        if has_own {
+            return None;
+        }
+        let slot = self.global_slot_of_name(key)?;
+        if self.global_name_is_lexical(key) {
+            return None;
+        }
+        let cur = *self.globals.get(slot as usize)?;
+        if cur.is_uninitialized() {
+            if !extensible || self.global_by_name(key).is_some() || self.global_proto_chain_has_proxy() {
+                return None;
+            }
+            let proto = self.object_get_prototype_of(Value::heap(gi));
+            if proto.is_heap() && !matches!(self.has_property_str_dyn(proto, key), Ok(false)) {
+                return None;
+            }
+            if !self.deleted_globals.is_empty() {
+                self.deleted_globals.remove(key);
+            }
+        }
+        self.globals[slot as usize] = val;
+        // A Rust-side store: the slot-generation guard's bytecode scan cannot
+        // see it (the `globalThis.f = g` rebind).
+        self.bump_global_gen(slot);
+        Some(true)
+    }
+
+    /// Give every slot-backed binding of the global object a real own property
+    /// carrying the descriptor it presents (`global_slot_binding_descriptor`),
+    /// as `defineProperty` does for one key. SetIntegrityLevel needs it: its
+    /// per-key walk changes attributes, and a binding that lives only in a slot
+    /// has nowhere to keep them, so `Object.freeze(globalThis)` left every
+    /// `var`, function and builtin writable. Afterwards each property shadows
+    /// its slot and the global-route machinery sends access through it.
+    pub(crate) fn materialize_global_slot_bindings(&mut self) {
+        if self.global_this == 0 {
+            return;
+        }
+        let mut names: Vec<String> = Vec::new();
+        for (i, n) in self.program.global_names.iter().enumerate() {
+            if self.globals.get(i).is_some_and(|v| !v.is_uninitialized())
+                && !self.program.lexical_globals.contains(&(i as u32))
+            {
+                names.push(n.clone());
+            }
+        }
+        names.extend(self.eval_pool_property_names().into_iter().map(str::to_string));
+        names.extend(self.builtin_globals.keys().cloned());
+        for name in names {
+            if matches!(name.as_str(), "NaN" | "Infinity" | "undefined")
+                || crate::vm::helpers_numeric::is_hidden_key(&name)
+                || name == crate::vm::native::ANNEXB_REF_ERROR_NAME
+                || name == crate::vm::native::HOST_CALL_NAME
+                || name == crate::vm::native::PY_TENSOR_NAME
+            {
+                continue;
+            }
+            let absent = matches!(
+                self.heap.get(self.global_this),
+                HeapObj::Object(m) if m.pos(&name).is_none()
+            );
+            if !absent {
+                continue;
+            }
+            let Some((v, a)) = self.global_slot_binding_descriptor(&name) else {
+                continue;
+            };
+            if let HeapObj::Object(m) = self.heap.get_mut(self.global_this) {
+                m.define(&name, v, a);
+            }
+            self.heap.write_barrier_val(self.global_this, v);
+            self.note_global_own_property_change(self.global_this, &name);
+        }
+        self.heap.bump_version(self.global_this);
     }
 
     /// Whether the global object's prototype chain holds a Proxy. Found
@@ -1912,6 +2095,43 @@ impl<'p> Vm<'p> {
             self.instrument_dynamic_code_attempt(code.len())
                 .map_err(|message| Thrown(message.into()))?;
         }
+        // `new Function(...)` compiles a fresh wrapper program around a
+        // function expression and runs it for the function object, so the
+        // same parameters and body compiled, installed and retained the same
+        // code again on every call: a loop doing `new Function(src)` (a syntax
+        // check, a template engine) grew the VM without bound
+        // (f2i-com/zipp.org#53). Outside any caller context (CreateDynamic-
+        // Function is never direct, sloppy unless its body says otherwise, and
+        // global-scoped) the result depends only on the assembled source, so
+        // a repeat re-runs the installed program, which makes a fresh function
+        // object over the same code, without parsing or compiling. Main realm
+        // only; bounded in source size and entries.
+        let fn_ctor_key: Option<&[u8]> = (fn_ctor
+            && !direct
+            && !force_strict
+            && this_override.is_none()
+            && inherit_super.is_none()
+            && caller_home_obj.is_none()
+            && caller_scope.is_none()
+            && eval_scope_idx.is_none()
+            && !var_env_global
+            && self.active_realm.is_none()
+            && self.realm_global_objs.is_empty())
+        .then(|| exact_src.unwrap_or(code.as_bytes()))
+        .filter(|key| key.len() <= FN_CTOR_CACHE_MAX_SOURCE);
+        if let Some(key) = fn_ctor_key {
+            if let Some(&base_func) = self.fn_ctor_cache.get(key) {
+                return self.execute_eval_program(
+                    base_func,
+                    None,
+                    None,
+                    caller_new_target,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
         // 1. Parse: the true Script goal plus what only the call site knows
         // (caller strictness, new.target / super validity). `import`/`export`
         // are rejected by the parser itself under this goal, so the old
@@ -2047,6 +2267,30 @@ impl<'p> Vm<'p> {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
+        if let Some(key) = fn_ctor_key {
+            let (_, base_func) = self.prepare_eval_program(
+                eval_prog,
+                false,
+                None,
+                var_env_global,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            if self.fn_ctor_cache.len() < FN_CTOR_CACHE_MAX_ENTRIES {
+                self.fn_ctor_cache.insert(key.into(), base_func);
+            }
+            return self.execute_eval_program(
+                base_func,
+                None,
+                caller_chain,
+                caller_new_target,
+                None,
+                None,
+                None,
+            );
+        }
         self.run_eval_program(
             eval_prog,
             this_override,

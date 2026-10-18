@@ -136,6 +136,22 @@ class ZippRbTest < Minitest::Test
     assert_equal ["eval", "after host call", "microtask"], vm.eval("order")
   end
 
+  # A listener runs while a nested evaluation holds the VM's reentry context,
+  # so its own evaluation of the same VM is refused, as it is at top level,
+  # rather than handed a second reference to that context.
+  def test_listener_cannot_reenter_a_nested_evaluation
+    vm = ZippRb::VM.new
+    seen = []
+    vm.on_log do |_severity, message|
+      seen << message
+      seen << (vm.eval("40 + 2") rescue $!.class)
+    end
+    vm.define_function("nested") { vm.eval("console.log('inside'); 1") }
+    assert_equal 1, vm.eval("nested()")
+    assert_equal ["inside", RuntimeError], seen
+    assert_equal 42, vm.eval("40 + 2")
+  end
+
   def test_invoke_leaves_microtasks_for_the_host
     vm = ZippRb::VM.new
     vm.load("globalThis.order = []; globalThis.step = (n) => { order.push(n); Promise.resolve().then(() => order.push('micro' + n)); };")
