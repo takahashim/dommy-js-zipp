@@ -49,6 +49,16 @@ end
 git("fetch", "--quiet", "origin", chdir: CACHE)
 sha = git("rev-parse", "--verify", "#{ref}^{commit}", chdir: CACHE).strip
 
+# A crate upstream removed or moved (zipp-pyparse went into zipp-vm's tree)
+# is dropped from the import, and from UPSTREAM's crates:, with a warning.
+warnings = []
+present = git("ls-tree", "--name-only", sha, "crates/", chdir: CACHE).lines.map { File.basename(_1.chomp) }
+(crates - present).each do |gone|
+  warnings << "crates/#{gone} is gone upstream and was dropped from the import " \
+              "(remove it from #{ENGINE_REL}/Cargo.toml's members)"
+end
+crates &= present
+
 Dir.mktmpdir("engine-import") do |tmp|
   worktree = File.join(tmp, "wt")
   git("worktree", "add", "--quiet", worktree, BRANCH)
@@ -73,7 +83,6 @@ Dir.mktmpdir("engine-import") do |tmp|
 end
 
 # Things the merge will not tell you about.
-warnings = []
 crates.each do |crate|
   manifest = run("git", "show", "#{sha}:crates/#{crate}/Cargo.toml", chdir: CACHE)
   manifest.scan(%r{path\s*=\s*"\.\./([^"/]+)"}).flatten.uniq.each do |dep|
