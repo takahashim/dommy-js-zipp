@@ -26,16 +26,20 @@ require_relative "zipp/runtime"
 module Dommy
   module Js
     module Zipp
-      # Compile the JS every Runtime loads (the bridge's bundles and the
-      # browser environment's payloads) into zipp-rb's process-wide compile
-      # cache now rather than in the first Runtime. Call it before forking
-      # workers (parallel tests, a preforking server) so they share the
-      # compilation instead of each compiling its own. Optional: without it
-      # the first Runtime fills the cache.
+      # Compile the JS every Runtime loads (the backend's boot script and
+      # zipp-rb's host-function helper, the bridge's bundles, and the browser
+      # environment's payloads for both window models, since each Runtime
+      # picks its own) into zipp-rb's process-wide compile cache now rather
+      # than in the first Runtime. Call it before forking workers (parallel
+      # tests, a preforking server) so they share the compilation instead of
+      # each compiling its own. Optional: without it the first Runtime fills
+      # the cache.
       def self.prewarm
+        ::ZippRb.prewarm
+        Backend.prewarm
         bridge = HostBridge.constants.grep(/_JS\z/).map { HostBridge.const_get(_1) }.grep(String)
-        unified = Config.unified_global && HostBridge.method_defined?(:unify_global_window)
-        (bridge + BrowserEnvironment.payloads(unified: unified)).each { ::ZippRb.precompile(_1) }
+        payloads = [false, true].flat_map { BrowserEnvironment.payloads(unified: _1) }.uniq
+        (bridge + payloads).each { ::ZippRb.precompile(_1) }
         nil
       end
     end

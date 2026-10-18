@@ -64,6 +64,12 @@ pub(crate) fn precompile(ruby: &Ruby, src: String) -> Result<bool, Error> {
         .map_err(|_| base_error(ruby, "zipp: internal engine error while compiling"))
 }
 
+/// `ZippRb.prewarm`: compile the binding's own scripts (the host-function
+/// helper every VM with a `define_function` loads) into the cache.
+pub(crate) fn prewarm(ruby: &Ruby) -> Result<bool, Error> {
+    precompile(ruby, HOST_FN_HELPER_JS.to_string())
+}
+
 /// `ZippRb.compile_cache_stats`: entries, source bytes, hits and misses.
 pub(crate) fn compile_cache_stats(ruby: &Ruby) -> RHash {
     let c = cache();
