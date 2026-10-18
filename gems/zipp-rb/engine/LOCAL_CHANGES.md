@@ -34,7 +34,11 @@ candidate to propose upstream.
   installed as `globalThis[name]` is found.
 - **Unhandled-rejection sink** — `set_unhandled_rejection_sink`
   (vm/async_runtime.rs: with a sink installed, every unhandled rejection is
-  reported, not only Test262's narrow case).
+  reported, not only Test262's narrow case), and
+  `set_promise_rejection_hook(expression)`: HTML's
+  HostPromiseRejectionTracker, calling the JS function `expression` yields
+  with `("unhandledrejection" | "rejectionhandled", promise, reason)`.
+  zipp-rb's `VM#promise_rejection_hook=`.
 - **Lifecycle** — `ScriptState::dispose` / `disposed` (idempotent teardown),
   `gc_now` (`Vm::force_gc`, a no-op while a host conversion holds the GC lock).
 - **Module resolver and `import.meta.url`** — `ModuleResolver`,
