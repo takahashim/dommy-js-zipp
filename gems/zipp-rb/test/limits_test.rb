@@ -99,17 +99,24 @@ class LimitsTest < Minitest::Test
 
   # Entries do not re-apply the heap ceiling: doing so collects the whole heap
   # whenever the live heap is past half the ceiling, which made every call
-  # into such a VM pay a major collection.
+  # into such a VM pay a major collection (650 ms for 300 calls here, against
+  # a few ms). Timed against the same calls into a VM with no ceiling, so a
+  # slow machine slows both.
   def test_entries_into_a_half_full_heap_do_not_each_collect
-    vm = ZippRb::VM.new(memory_limit: 64 * 1024 * 1024)
-    vm.load("globalThis.keep = []; for (let i = 0; i < 8e4; i++) keep.push({ a: ['x' + i, i], n: i }); globalThis.f = () => 1;")
-    assert_operator vm.memory_usage[:heap_bytes], :>, 32 * 1024 * 1024
-    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    300.times { vm.call("f") }
-    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
-    assert_operator elapsed, :<, 0.25, "300 calls took #{(elapsed * 1000).round} ms"
-  ensure
-    vm&.dispose
+    time_calls = lambda do |**opts|
+      vm = ZippRb::VM.new(**opts)
+      vm.load("globalThis.keep = []; for (let i = 0; i < 8e4; i++) keep.push({ a: ['x' + i, i], n: i }); globalThis.f = () => 1;")
+      assert_operator vm.memory_usage[:heap_bytes], :>, 32 * 1024 * 1024
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      300.times { vm.call("f") }
+      Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    ensure
+      vm&.dispose
+    end
+    unlimited = time_calls.call
+    limited = time_calls.call(memory_limit: 64 * 1024 * 1024)
+    assert_operator limited, :<, [unlimited * 20, 0.05].max,
+      "300 calls took #{(limited * 1000).round} ms (#{(unlimited * 1000).round} ms without a ceiling)"
   end
 
   # A limit that was hit does not outlive its entry: the next one runs.
