@@ -1,6 +1,6 @@
 # Workspace root for the in-tree Zipp engine crates (not part of the upstream
 # import). Upstream's root manifest spans crates this repository does not
-# vendor, so this one lists only the four that zipp-rb builds and mirrors the
+# vendor, so this one lists only the three that zipp-rb builds and mirrors the
 # `[workspace.package]` / `[workspace.dependencies]` entries they inherit.
 # bin/engine-import reports when upstream changes those entries.
 [workspace]
@@ -9,11 +9,10 @@ members = [
     "crates/zipp-vm",
     "crates/regress-fork",
     "crates/zipp-numparse",
-    "crates/zipp-pyparse",
 ]
 
 [workspace.package]
-version = "0.0.24"
+version = "0.0.26"
 edition = "2021"
 license = "Apache-2.0"
 

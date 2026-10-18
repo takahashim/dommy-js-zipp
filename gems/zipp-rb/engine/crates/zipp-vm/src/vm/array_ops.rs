@@ -324,7 +324,7 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "meter-only")]
         if let Some(rec) = self.instr_rec.as_ref() {
             let steps = plan.steps();
-            if rec.exhaustion.is_some() || rec.remaining_now() < steps {
+            if rec.exhaustion.is_some() || rec.remaining_now(self.meter_hot()) < steps {
                 return None;
             }
         }
@@ -496,7 +496,7 @@ impl<'p> Vm<'p> {
         // target — the ordinary-array answer (`None`) keeps the dense `out` Vec,
         // so the hot path is unchanged.
         let species_target = match mode {
-            EachMode::Map => self.array_species_create(receiver, snapshot_len)?,
+            EachMode::Map => self.array_species_create(receiver, snapshot_len as u64)?,
             EachMode::Filter => self.array_species_create(receiver, 0)?,
             EachMode::ForEach => None,
         };
@@ -728,7 +728,7 @@ impl<'p> Vm<'p> {
                     if let Some(val) = keep {
                         match species_target {
                             Some(a) => {
-                                if let Err(e) = self.create_data_property_or_throw(a, n, val) {
+                                if let Err(e) = self.create_data_property_or_throw(a, n as u64, val) {
                                     err = Some(e);
                                     break;
                                 }
@@ -809,10 +809,13 @@ impl<'p> Vm<'p> {
     /// CreateDataPropertyOrThrow. A non-object (non-undefined) constructor, or a
     /// non-constructor `@@species`, throws a TypeError (matching the spec step
     /// "If IsConstructor(C) is false, throw a TypeError exception").
+    ///
+    /// `len` is u64: a generic receiver's ToLength runs to 2^53-1, which a
+    /// `usize` cannot hold on a 32-bit host (wasm32, armv7).
     pub(crate) fn array_species_create(
         &mut self,
         original: Value,
-        len: usize,
+        len: u64,
     ) -> Result<Option<Value>, Thrown> {
         // ArraySpeciesCreate step 1-2: if IsArray(originalArray) is false, return
         // ArrayCreate(length) — `constructor`/`@@species` are NOT consulted for a
@@ -876,7 +879,7 @@ impl<'p> Vm<'p> {
         match target {
             Some(a) => {
                 if !v.is_hole() {
-                    self.create_data_property_or_throw(a, *n, v)?;
+                    self.create_data_property_or_throw(a, *n as u64, v)?;
                 }
             }
             None => out.push(v),
@@ -888,11 +891,12 @@ impl<'p> Vm<'p> {
     /// CreateDataPropertyOrThrow(O, ToString(index), value): install a fresh
     /// enumerable, writable, configurable data property (overwriting a configurable
     /// existing one), throwing a TypeError when the define fails — a non-extensible
-    /// target, or a non-configurable existing property.
+    /// target, or a non-configurable existing property. `index` is u64 for the
+    /// same reason as `array_species_create`'s length.
     pub(crate) fn create_data_property_or_throw(
         &mut self,
         target: Value,
-        index: usize,
+        index: u64,
         value: Value,
     ) -> Result<(), Thrown> {
         let mut m = ObjMap::new();
@@ -923,7 +927,7 @@ impl<'p> Vm<'p> {
         set_length: bool,
     ) -> Result<Value, Thrown> {
         let _gc = self.gc_lock_guard();
-        match self.array_species_create(original, species_len)? {
+        match self.array_species_create(original, species_len as u64)? {
             // ArrayCreate in the CURRENT realm — see alloc_array_current_realm.
             None => Ok(self.alloc_array_current_realm(out)),
             Some(target) => {
@@ -932,7 +936,7 @@ impl<'p> Vm<'p> {
                     // A HOLE marks an ABSENT source index: it is skipped (not
                     // defined as undefined) — the result keeps the gap.
                     if !v.is_hole() {
-                        self.create_data_property_or_throw(target, i, v)?;
+                        self.create_data_property_or_throw(target, i as u64, v)?;
                     }
                 }
                 if set_length {
@@ -952,7 +956,7 @@ impl<'p> Vm<'p> {
         &mut self,
         out: &mut Vec<Value>,
         source: Value,
-        source_len: usize,
+        source_len: u64,
         depth: i64,
         mapper: Option<(Value, Value)>,
     ) -> Result<(), Thrown> {
@@ -980,7 +984,7 @@ impl<'p> Vm<'p> {
     fn flatten_into_array_result(
         &mut self,
         source: Value,
-        source_len: usize,
+        source_len: u64,
         depth: i64,
         mapper: Option<(Value, Value)>,
         target: Option<Value>,
@@ -1006,7 +1010,7 @@ impl<'p> Vm<'p> {
                         HeapObj::Array(items) => items[i],
                         _ => Value::UNDEFINED,
                     };
-                    vm.create_data_property_or_throw(a, i, v)?;
+                    vm.create_data_property_or_throw(a, i as u64, v)?;
                 }
                 Ok(a)
             })
@@ -1029,18 +1033,20 @@ impl<'p> Vm<'p> {
             && matches!(self.heap.get(v.heap_index()), HeapObj::Array(_))
     }
 
+    /// `source_len` is a ToLength (up to 2^53-1), so the walk counts in u64;
+    /// only a dense store is indexed by `usize`.
     fn flatten_into_array_at(
         &mut self,
         out: &mut Vec<Value>,
         source: Value,
-        source_len: usize,
+        source_len: u64,
         depth: i64,
         mapper: Option<(Value, Value)>,
         active_depth: u32,
         work: &mut u64,
     ) -> Result<(), Thrown> {
         *work = work
-            .checked_add(source_len as u64)
+            .checked_add(source_len)
             .ok_or_else(|| Thrown::from_static("RangeError: native builtin iteration limit exceeded"))?;
         self.preflight_native_iteration_work(*work)?;
         // Hoisted out of the loop: `array_iter_get`'s per-element side-table
@@ -1052,9 +1058,10 @@ impl<'p> Vm<'p> {
         // below would do is unobservable here.)
         if depth <= 0 && mapper.is_none() && dense {
             let clean = matches!(self.heap.get(sidx), HeapObj::Array(items)
-                    if items.len() == source_len && !items.iter().any(|v| v.is_hole()));
+                    if items.len() as u64 == source_len && !items.iter().any(|v| v.is_hole()));
             if clean {
-                self.reserve_array_result(out, source_len, false)?;
+                // (`clean` proved it the length of a Vec, so it fits.)
+                self.reserve_array_result(out, source_len as usize, false)?;
                 if let HeapObj::Array(items) = self.heap.get(sidx) {
                     out.extend_from_slice(items);
                 }
@@ -1064,11 +1071,15 @@ impl<'p> Vm<'p> {
         for k in 0..source_len {
             let got = if dense {
                 match self.heap.get(sidx) {
-                    HeapObj::Array(items) => items.get(k).copied().filter(|v| !v.is_hole()),
+                    HeapObj::Array(items) => usize::try_from(k)
+                        .ok()
+                        .and_then(|k| items.get(k))
+                        .copied()
+                        .filter(|v| !v.is_hole()),
                     _ => None,
                 }
             } else {
-                self.array_iter_get(source, k)?
+                self.array_iter_get_u64(source, k)?
             };
             let Some(got) = got else {
                 continue;
@@ -1091,14 +1102,14 @@ impl<'p> Vm<'p> {
                 // property no overlay redefines, so `js_array_len` IS its Get.
                 // (The walk's work budget bounds how much of it is read.)
                 let n = if self.flatten_dense(v) {
-                    self.js_array_len(v.heap_index())
+                    self.js_array_len(v.heap_index()) as u64
                 } else {
                     let lv = self.get_prop(v, "length")?;
                     let lf = self.to_number_strict(lv)?;
                     if lf.is_nan() || lf <= 0.0 {
-                        0usize
+                        0u64
                     } else {
-                        lf.trunc().min(9_007_199_254_740_991.0) as usize
+                        lf.trunc().min(9_007_199_254_740_991.0) as u64
                     }
                 };
                 let next_depth = active_depth.checked_add(1).ok_or_else(|| {
@@ -1205,6 +1216,27 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `array_iter_get` for an index of the generic array-like protocol, whose
+    /// ToLength runs to 2^53-1. An index past `usize` (only on a 32-bit host:
+    /// wasm32, armv7) addresses no dense store, so it is the plain HasProperty
+    /// + Get; a `k as usize` there truncated, and `slice`/`findLast` near
+    /// 2^53 read index 2^32-1 instead. On a 64-bit host this IS `array_iter_get`.
+    pub(crate) fn array_iter_get_u64(
+        &mut self,
+        this: Value,
+        k: u64,
+    ) -> Result<Option<Value>, Thrown> {
+        if let Ok(k) = usize::try_from(k) {
+            return self.array_iter_get(this, k);
+        }
+        let kv = Value::num(k as f64);
+        if self.has_property_dyn(this, kv)? {
+            Ok(Some(self.get_index(this, kv)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// A snapshot that resolves every index through the `[[Get]]` protocol, so a hole
     /// reads its PROTOTYPE-inherited value (or `undefined` when truly absent) exactly as
     /// `fromValue = Get(O, from)` requires. The change-by-copy methods (toReversed /
@@ -1276,9 +1308,11 @@ impl<'p> Vm<'p> {
         // array, and `filter()` dropped the tail. Probing an absent index is
         // just a miss, so the full bound is also what V8 does (measurably: it
         // is O(length) on a sparse array too).
-        // (`as usize` on an f64 saturates, so a huge/­infinite length cannot wrap.)
-        let len: usize = if lenf > 0.0 { lenf as usize } else { 0 };
-        let full_len: u64 = if lenf > 0.0 {
+        // The length and every index are u64, never `usize`: ToLength runs to
+        // 2^53-1, and on a 32-bit host (wasm32, armv7) a `usize` bound
+        // saturated at 2^32-1 — `findLast` on a 2^53-1 length started at
+        // index 2^32-2, and `map` constructed its species with 2^32-1.
+        let len: u64 = if lenf > 0.0 {
             lenf.trunc().min(9_007_199_254_740_991.0) as u64
         } else {
             0
@@ -1290,13 +1324,13 @@ impl<'p> Vm<'p> {
             )));
         }
         let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-        let idxv = |k: usize| Value::num(k as f64);
-        self.preflight_native_iteration_work(full_len)?;
+        let idxv = |k: u64| Value::num(k as f64);
+        self.preflight_native_iteration_work(len)?;
 
         match name {
             "forEach" => {
                 for k in 0..len {
-                    if let Some(val) = self.array_iter_get(this, k)? {
+                    if let Some(val) = self.array_iter_get_u64(this, k)? {
                         self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                     }
                 }
@@ -1309,10 +1343,9 @@ impl<'p> Vm<'p> {
                 // defineProperty, are observable and may mutate the source. (The
                 // buffer-then-define shape ran every Get and every callback
                 // first, then the `constructor` lookup.) The species length is
-                // the ToLength-clamped value (full_len), NOT the host iteration
-                // bound: a +Infinity length is 2^53-1 for the constructor, not
-                // the `as usize` saturation of `len`.
-                let target = self.array_species_create(this, full_len as usize)?;
+                // the ToLength-clamped value: a +Infinity length is 2^53-1 for
+                // the constructor.
+                let target = self.array_species_create(this, len)?;
                 // The ArrayCreate(len) inside ArraySpeciesCreate requires
                 // len <= 2^32-1; a larger finite length OR a non-finite one
                 // (Infinity, via ToLength → 2^53-1) is a RangeError. It only
@@ -1329,25 +1362,25 @@ impl<'p> Vm<'p> {
                 // The bound is the largest array the engine builds eagerly
                 // elsewhere, so every length that `new Array(n)` accepts still
                 // maps successfully.
-                if len > MAX_EAGER_ITER_RESULT {
+                if len > MAX_EAGER_ITER_RESULT as u64 {
                     return Err(Thrown::from_static(
                         "RangeError: array length exceeds the engine's dense-array limit",
                     ));
                 }
                 // A HOLE placeholder keeps an ABSENT source index absent in the
                 // result (`1 in [1,,3].map(f)` is false); an UNDEFINED one made
-                // the result dense.
+                // the result dense. (`len` is within the eager bound here.)
                 let mut out = if target.is_some() {
                     Vec::new()
                 } else {
-                    vec![Value::HOLE; len]
+                    vec![Value::HOLE; len as usize]
                 };
                 for k in 0..len {
-                    if let Some(val) = self.array_iter_get(this, k)? {
+                    if let Some(val) = self.array_iter_get_u64(this, k)? {
                         let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                         match target {
                             Some(a) => self.create_data_property_or_throw(a, k, r)?,
-                            None => out[k] = r,
+                            None => out[k as usize] = r,
                         }
                     }
                 }
@@ -1361,9 +1394,9 @@ impl<'p> Vm<'p> {
                 // and each kept element is defined as it is selected.
                 let target = self.array_species_create(this, 0)?;
                 let mut out = Vec::new();
-                let mut n = 0usize;
+                let mut n = 0u64;
                 for k in 0..len {
-                    if let Some(val) = self.array_iter_get(this, k)? {
+                    if let Some(val) = self.array_iter_get_u64(this, k)? {
                         let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                         if self.truthy(r) {
                             match target {
@@ -1381,7 +1414,7 @@ impl<'p> Vm<'p> {
             }
             "some" => {
                 for k in 0..len {
-                    if let Some(val) = self.array_iter_get(this, k)? {
+                    if let Some(val) = self.array_iter_get_u64(this, k)? {
                         let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                         if self.truthy(r) {
                             return Ok(Some(Value::bool(true)));
@@ -1392,7 +1425,7 @@ impl<'p> Vm<'p> {
             }
             "every" => {
                 for k in 0..len {
-                    if let Some(val) = self.array_iter_get(this, k)? {
+                    if let Some(val) = self.array_iter_get_u64(this, k)? {
                         let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                         if !self.truthy(r) {
                             return Ok(Some(Value::bool(false)));
@@ -1406,15 +1439,10 @@ impl<'p> Vm<'p> {
                 // throwing index getter on an array-like propagates and an absent index is
                 // undefined. find/findIndex go forward; findLast/findLastIndex backward.
                 let backward = name == "findLast" || name == "findLastIndex";
-                let total: u64 = if backward { full_len } else { len as u64 };
                 let mut i: u64 = 0;
-                while i < total {
-                    let k = if backward {
-                        (total - 1 - i) as usize
-                    } else {
-                        i as usize
-                    };
-                    let val = self.array_iter_get(this, k)?.unwrap_or(Value::UNDEFINED);
+                while i < len {
+                    let k = if backward { len - 1 - i } else { i };
+                    let val = self.array_iter_get_u64(this, k)?.unwrap_or(Value::UNDEFINED);
                     let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                     if self.truthy(r) {
                         return Ok(Some(match name {
@@ -1431,17 +1459,16 @@ impl<'p> Vm<'p> {
             }
             "reduce" | "reduceRight" => {
                 let right = name == "reduceRight";
-                if full_len > crate::vm::MAX_DENSE_ARRAY_LEN as u64
+                if len > crate::vm::MAX_DENSE_ARRAY_LEN as u64
                     && matches!(self.heap.get(this.heap_index()), HeapObj::Object(_))
                 {
                     let mut keys: Vec<u64> = match self.heap.get(this.heap_index()) {
                         HeapObj::Object(m) => m
-                            .keys
-                            .iter()
+                            .keys_iter()
                             .filter_map(|k| {
                                 k.parse::<u64>()
                                     .ok()
-                                    .filter(|n| n.to_string() == *k && *n < full_len)
+                                    .filter(|n| n.to_string() == *k && *n < len)
                             })
                             .collect(),
                         _ => Vec::new(),
@@ -1469,15 +1496,13 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(Some(acc));
                 }
-                let order: Vec<usize> = if right {
-                    (0..len).rev().collect()
-                } else {
-                    (0..len).collect()
-                };
                 let mut acc = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let mut started = args.len() >= 2;
-                for k in order {
-                    let val = match self.array_iter_get(this, k)? {
+                // The visit order is counted, not collected: a Vec of every
+                // index was `len` words up front, before the first callback.
+                for step in 0..len {
+                    let k = if right { len - 1 - step } else { step };
+                    let val = match self.array_iter_get_u64(this, k)? {
                         Some(v) => v,
                         None => continue,
                     };
@@ -1636,7 +1661,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         if let Some(m) = self.arr_props.get(&idx) {
-            for (i, k) in m.keys.iter().enumerate() {
+            for (i, k) in m.slot_keys() {
                 let Some(ki) = canonical_index_str(k) else {
                     continue;
                 };
@@ -2044,8 +2069,10 @@ impl<'p> Vm<'p> {
                 // Step 9: ArraySpeciesCreate(O, actualDeleteCount) runs BEFORE any
                 // element read; the no-species ArrayCreate path rejects > 2^32-1
                 // immediately (a 2^32-length receiver must not loop 4e9 reads).
+                // The count goes over as u64: `as usize` truncated it on a
+                // 32-bit host (2^32 to 0, 2^53-1 to 2^32-1).
                 let species_target =
-                    self.array_species_create(this, actual_delete.max(0) as usize)?;
+                    self.array_species_create(this, actual_delete.max(0) as u64)?;
                 if species_target.is_none() && actual_delete > 4_294_967_295 {
                     return Err(Thrown::from_static("RangeError: Invalid array length"));
                 }
@@ -2058,7 +2085,7 @@ impl<'p> Vm<'p> {
                             let from = actual_start + k;
                             if self.al_has(this, from)? {
                                 let v = self.al_get(this, from)?;
-                                self.create_data_property_or_throw(a, k as usize, v)?;
+                                self.create_data_property_or_throw(a, k as u64, v)?;
                             }
                             k += 1;
                         }
@@ -2358,13 +2385,16 @@ impl<'p> Vm<'p> {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
                     let lenf = self.to_number_strict(lv)?;
                     let len = if lenf.is_nan() || lenf <= 0.0 {
-                        0usize
+                        0.0
                     } else {
-                        lenf.trunc().min(9_007_199_254_740_991.0) as usize
+                        lenf.trunc().min(9_007_199_254_740_991.0)
                     };
-                    if len as f64 > 4_294_967_295.0 {
+                    // ArrayCreate's bound, checked before narrowing: a `usize`
+                    // saturates at exactly 2^32-1 on a 32-bit host.
+                    if len > 4_294_967_295.0 {
                         return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
+                    let len = len as usize;
                     self.preflight_materialized_array(len)?;
                     let mut out = Vec::with_capacity(len);
                     for k in 0..len {
@@ -2405,11 +2435,12 @@ impl<'p> Vm<'p> {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
                     let lf = self.to_number_strict(lv)?;
                     // The full ToLength (the walk preflights its own work); a
-                    // clamp here silently skipped every index past 2^20.
+                    // clamp here silently skipped every index past 2^20. (u64:
+                    // a `usize` stops at 2^32-1 on a 32-bit host.)
                     let source_len = if lf.is_nan() || lf <= 0.0 {
-                        0usize
+                        0u64
                     } else {
-                        lf.trunc().min(9_007_199_254_740_991.0) as usize
+                        lf.trunc().min(9_007_199_254_740_991.0) as u64
                     };
                     let (depth, mapper) = if name == "flatMap" {
                         if !self.is_callable(arg0) {
@@ -2441,11 +2472,12 @@ impl<'p> Vm<'p> {
                         let lv = vm.get_prop(Value::heap(idx), "length")?;
                         let lenf = vm.to_number_strict(lv)?;
                         // The full ToLength: a clamp here joined only the first
-                        // 2^20 elements of a longer array without a word.
+                        // 2^20 elements of a longer array without a word. (u64:
+                        // a `usize` stops at 2^32-1 on a 32-bit host.)
                         let len = if lenf.is_nan() || lenf <= 0.0 {
-                            0usize
+                            0u64
                         } else {
-                            lenf.trunc().min(9_007_199_254_740_991.0) as usize
+                            lenf.trunc().min(9_007_199_254_740_991.0) as u64
                         };
                         // Separator and parts as EXACT strings (see the dense
                         // `join` below): a lone surrogate is itself, not U+FFFD.
@@ -2457,12 +2489,12 @@ impl<'p> Vm<'p> {
                         // The separators alone past the string cap: the result
                         // cannot exist, so fail before walking the length.
                         if len > 1
-                            && (len - 1).saturating_mul(sep.as_bytes().len())
-                                > crate::vm::MAX_STRING_BYTES
+                            && (len - 1).saturating_mul(sep.as_bytes().len() as u64)
+                                > crate::vm::MAX_STRING_BYTES as u64
                         {
                             return Err(Thrown::from_static("RangeError: Invalid string length"));
                         }
-                        vm.preflight_native_iteration_work(len as u64)?;
+                        vm.preflight_native_iteration_work(len)?;
                         let mut out: Vec<u8> = Vec::new();
                         for k in 0..len {
                             let v = vm.get_index(Value::heap(idx), Value::num(k as f64))?;
@@ -2596,14 +2628,17 @@ impl<'p> Vm<'p> {
                         return Err(Thrown::from_static("RangeError: Invalid array length"));
                     }
                     self.preflight_native_iteration_work(count as u64)?;
-                    let target = self.array_species_create(Value::heap(idx), count as usize)?;
+                    let target = self.array_species_create(Value::heap(idx), count as u64)?;
+                    // The source index `kf` reaches 2^53-1: it is read as a
+                    // u64 (`kf as usize` saturated at 2^32-1 on a 32-bit host,
+                    // so a slice near 2^53 read that index over and over).
                     return match target {
                         Some(a) => {
-                            let mut n = 0usize;
+                            let mut n = 0u64;
                             let mut kf = k0;
                             while kf < fin {
                                 if let Some(v) =
-                                    self.array_iter_get(Value::heap(idx), kf as usize)?
+                                    self.array_iter_get_u64(Value::heap(idx), kf as u64)?
                                 {
                                     self.create_data_property_or_throw(a, n, v)?;
                                 }
@@ -2618,7 +2653,7 @@ impl<'p> Vm<'p> {
                             let mut out = Vec::with_capacity((count as usize).min(4096));
                             let mut kf = k0;
                             while kf < fin {
-                                match self.array_iter_get(Value::heap(idx), kf as usize)? {
+                                match self.array_iter_get_u64(Value::heap(idx), kf as u64)? {
                                     Some(v) => out.push(v),
                                     None => out.push(Value::HOLE),
                                 }
@@ -2911,7 +2946,9 @@ impl<'p> Vm<'p> {
                 };
                 let i = self.to_integer_or_zero(arg0)?;
                 let abs = if i < 0 { i + len as i64 } else { i };
-                let v = if abs >= 0 && (abs as usize) < len {
+                // Bounds-checked in i64: a cast first truncates 2^32 to 0 on a
+                // 32-bit host.
+                let v = if abs >= 0 && abs < len as i64 {
                     // Get(O, k): a hole resolves through the prototype chain
                     // (`Array.prototype[k]`), as a plain `a[k]` does, and an
                     // index accessor in the side table runs its getter.
@@ -2991,7 +3028,9 @@ impl<'p> Vm<'p> {
                 let (found, live_len) = match self.heap.get(idx) {
                     HeapObj::Array(items) => {
                         let hi = items.len().min(len as usize);
-                        let from = (from.max(0) as usize).min(hi);
+                        // Clamped in i64: `as usize` first wraps 2^32 to 0 on
+                        // a 32-bit host.
+                        let from = from.clamp(0, hi as i64) as usize;
                         let found = items[from..hi].iter().any(|&v| {
                             // includes Gets each index: a hole reads as undefined
                             // (so `[,].includes(undefined)` is true).
@@ -3189,7 +3228,7 @@ impl<'p> Vm<'p> {
                 // and the result's growth is admitted as it is built. The
                 // snapshot-and-clone flattener did none of these.
                 let receiver = Value::heap(idx);
-                let source_len = self.js_array_len(idx);
+                let source_len = self.js_array_len(idx) as u64;
                 // An absent OR explicitly-`undefined` depth defaults to 1
                 // (ToIntegerOrInfinity is only applied to a provided depth;
                 // Infinity saturates -> deep flatten).
@@ -3260,9 +3299,18 @@ impl<'p> Vm<'p> {
                     HeapObj::Array(items) => items.len() as i32,
                     _ => 0,
                 };
+                // Only a hole inside the range is read through the prototype
+                // chain, so only the range is scanned: scanning the whole
+                // array made a 16-element slice of a 160k-element array cost
+                // the 160k.
                 let clean = live_len == len
                     && !self.arr_props.contains_key(&idx)
-                    && !self.array_has_holes(idx);
+                    && match self.heap.get(idx) {
+                        HeapObj::Array(items) => {
+                            start >= end || !items[start as usize..end as usize].iter().any(|v| v.is_hole())
+                        }
+                        _ => false,
+                    };
                 let slice: Vec<Value> = if start < end {
                     if clean {
                         match self.heap.get(idx) {
@@ -3699,9 +3747,9 @@ impl<'p> Vm<'p> {
                 let lv = self.get_prop(receiver, "length")?;
                 let lf = self.to_number_strict(lv)?;
                 let source_len = if lf.is_nan() || lf <= 0.0 {
-                    0usize
+                    0u64
                 } else {
-                    lf.trunc().min(9_007_199_254_740_991.0) as usize
+                    lf.trunc().min(9_007_199_254_740_991.0) as u64
                 };
                 let cb = arg0;
                 if !self.is_callable(cb) {
@@ -3789,10 +3837,12 @@ impl<'p> Vm<'p> {
                     _ => 0,
                 };
                 let s = self.to_integer_or_zero(arg0)?;
+                // start and deleteCount clamp in i64 before narrowing: `as
+                // usize` first wraps 2^32 to 0 on a 32-bit host.
                 let start = if s < 0 {
                     (len as i64 + s).max(0) as usize
                 } else {
-                    (s as usize).min(len)
+                    s.min(len as i64) as usize
                 };
                 // deleteCount: 0 args → 0; 1 arg → len-start; else ToInteger(arg1).
                 let del = if args.is_empty() {
@@ -3801,14 +3851,14 @@ impl<'p> Vm<'p> {
                     len - start
                 } else {
                     let d = self.to_integer_or_zero(args[1])?;
-                    (d.max(0) as usize).min(len - start)
+                    d.clamp(0, (len - start) as i64) as usize
                 };
                 let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
                 // Step 8: ArraySpeciesCreate(O, actualDeleteCount) precedes every
                 // element read and the mutation itself — a `constructor`/@@species
                 // getter, and the species constructor, must observe the array as it
                 // was BEFORE the splice (they ran after it, seeing the new length).
-                let species_target = self.array_species_create(Value::heap(idx), del)?;
+                let species_target = self.array_species_create(Value::heap(idx), del as u64)?;
                 // Nursery barrier for the inserted values.
                 for &v in &insert {
                     self.heap.write_barrier_val(idx, v);
@@ -3834,7 +3884,7 @@ impl<'p> Vm<'p> {
                             // A HOLE marks an ABSENT source index: it stays absent
                             // on A rather than being defined as undefined.
                             if !v.is_hole() {
-                                self.create_data_property_or_throw(a, i, v)?;
+                                self.create_data_property_or_throw(a, i as u64, v)?;
                             }
                         }
                         // Step 10: Set(A, "length", actualDeleteCount, true).
@@ -3923,10 +3973,11 @@ impl<'p> Vm<'p> {
                 } else {
                     0
                 };
+                // Clamped in i64, as in `splice`.
                 let start = if s < 0 {
                     (len as i64 + s).max(0) as usize
                 } else {
-                    (s as usize).min(len)
+                    s.min(len as i64) as usize
                 };
                 let del = if args.is_empty() {
                     // No start argument: skipCount/actualSkipCount are 0 — the
@@ -3940,7 +3991,7 @@ impl<'p> Vm<'p> {
                     } else {
                         0
                     };
-                    (d.max(0) as usize).min(len - start)
+                    d.clamp(0, (len - start) as i64) as usize
                 };
                 let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
                 out.splice(start..start + del, insert);
@@ -4083,13 +4134,24 @@ impl<'p> Vm<'p> {
     /// (on `<= 0`, and on the NaN that SortCompare maps to +0) the LEFT run's
     /// element wins, preserving original order. The comparator re-enters the VM
     /// (`call_value`) and may throw — from the call or from its own ToNumber.
-    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
     fn exact_numeric_sub_sort_cmp(&mut self, cmp: Value, items: &[Value]) -> Option<&'p [Instr]> {
-        // This is deliberately an artifact-profile specialization, not a
+        // This is deliberately an exact-bytecode specialization, not a
         // source-text heuristic. Only a real immutable user Func/Closure can
         // enter; Bound/Proxy/native callables and closures with lexical cells
         // retain the ordinary callback path.
         if !cmp.is_heap() {
+            return None;
+        }
+        // Outside the WebAssembly artifact profile a recorder traces each
+        // instruction's function and register base, which an elided frame
+        // cannot reproduce: a metered or traced VM keeps the real callback.
+        // (The artifact profile's hook keeps only the tick and heap-poll
+        // schedule, which `run_exact_numeric_sub_sort_cmp` replays.)
+        #[cfg(all(
+            feature = "instrument",
+            not(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))
+        ))]
+        if self.instr_rec.is_some() {
             return None;
         }
         let fid = match self.heap.get(cmp.heap_index()) {
@@ -4139,8 +4201,11 @@ impl<'p> Vm<'p> {
         Some(p.code.as_slice())
     }
 
-    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
     #[inline(always)]
+    #[cfg_attr(
+        not(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit"))),
+        allow(unused_variables)
+    )]
     fn run_exact_numeric_sub_sort_cmp(
         &mut self,
         code: &'p [Instr],
@@ -4155,11 +4220,15 @@ impl<'p> Vm<'p> {
         // register base/instruction identity and retains just the exact tick and
         // heap-poll schedule. The comparator bytecode IPs remain exact (0, 1);
         // there is no trace/fid location channel in this artifact profile.
+        // Every other profile admits the fast path only with no recorder
+        // (`exact_numeric_sub_sort_cmp`), so it has no tick to replay.
+        #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
         if self.instr_rec.is_some() {
             self.instrument_step(0, 0, &code[0])
                 .map_err(|msg| Thrown(msg.to_string()))?;
         }
         let result = left.as_f64() - right.as_f64();
+        #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
         if self.instr_rec.is_some() {
             self.instrument_step(0, 1, &code[1])
                 .map_err(|msg| Thrown(msg.to_string()))?;
@@ -4183,7 +4252,6 @@ impl<'p> Vm<'p> {
         // Classify and preflight before moving or merging any elements. If the
         // exact call/meter contract cannot be reproduced, the complete sort
         // stays on the established callback implementation.
-        #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
         let numeric_sub_code = self.exact_numeric_sub_sort_cmp(cmp, items);
         // Native-callback fast path: a compiled non-capturing comparator is called
         // directly over one reused register window (skipping a per-comparison frame
@@ -4214,25 +4282,8 @@ impl<'p> Vm<'p> {
                 // Merge a[lo..mid] and a[mid..hi] into b[lo..hi], stably.
                 let (mut l, mut r, mut k) = (lo, mid, lo);
                 while l < mid && r < hi {
-                    let fast_ord: Option<Result<f64, Thrown>> = {
-                        #[cfg(all(
-                            feature = "safe-sandbox",
-                            feature = "meter-only",
-                            not(feature = "jit")
-                        ))]
-                        {
-                            numeric_sub_code
-                                .map(|code| self.run_exact_numeric_sub_sort_cmp(code, a[l], a[r]))
-                        }
-                        #[cfg(not(all(
-                            feature = "safe-sandbox",
-                            feature = "meter-only",
-                            not(feature = "jit")
-                        )))]
-                        {
-                            None
-                        }
-                    };
+                    let fast_ord: Option<Result<f64, Thrown>> = numeric_sub_code
+                        .map(|code| self.run_exact_numeric_sub_sort_cmp(code, a[l], a[r]));
                     let ord = match fast_ord {
                         Some(Ok(n)) => n,
                         Some(Err(e)) => {
@@ -4305,7 +4356,6 @@ impl<'p> Vm<'p> {
     }
 }
 
-#[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
 fn exact_numeric_sub_sort_proto(p: &crate::bytecode::FuncProto) -> bool {
     // A simple two-parameter function has no default/destructuring prologue.
     // Rest/arguments, generators and async functions all have observable call

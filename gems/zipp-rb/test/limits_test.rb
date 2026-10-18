@@ -97,6 +97,33 @@ class LimitsTest < Minitest::Test
     vm.dispose
   end
 
+  # Entries do not re-apply the heap ceiling: doing so collects the whole heap
+  # whenever the live heap is past half the ceiling, which made every call
+  # into such a VM pay a major collection.
+  def test_entries_into_a_half_full_heap_do_not_each_collect
+    vm = ZippRb::VM.new(memory_limit: 64 * 1024 * 1024)
+    vm.load("globalThis.keep = []; for (let i = 0; i < 8e4; i++) keep.push({ a: ['x' + i, i], n: i }); globalThis.f = () => 1;")
+    assert_operator vm.memory_usage[:heap_bytes], :>, 32 * 1024 * 1024
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    300.times { vm.call("f") }
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    assert_operator elapsed, :<, 0.25, "300 calls took #{(elapsed * 1000).round} ms"
+  ensure
+    vm&.dispose
+  end
+
+  # A limit that was hit does not outlive its entry: the next one runs.
+  def test_a_vm_runs_again_after_each_kind_of_limit
+    vm = ZippRb::VM.new(timeout_msec: 100, memory_limit: 64 * 1024 * 1024)
+    assert_raises(ZippRb::InterruptedError) { vm.eval("for (;;) {}") }
+    assert_equal 2, vm.eval("1 + 1")
+    assert_raises(ZippRb::RangeError) { vm.eval("var big = []; for (;;) big.push({ s: 'x'.repeat(64) });") }
+    assert_equal 3, vm.eval("big = null; 1 + 2")
+    assert_equal 4, vm.eval("2 + 2")
+  ensure
+    vm&.dispose
+  end
+
   # Filling the heap is reported as the heap budget even when the first
   # check to see it is a linear regex's (whose storage is capped at the
   # heap's headroom too), not as a regex backtrack-memory runaway.

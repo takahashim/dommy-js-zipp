@@ -1292,7 +1292,7 @@ impl<'p> Vm<'p> {
         }
         let prototypes_barren = [self.arr_proto, self.obj_proto].into_iter().all(|idx| {
             matches!(self.heap.get(idx), HeapObj::Object(map) if map.class.is_none()
-                && map.keys.iter().zip(map.attrs_iter())
+                && map.keys_iter().zip(map.attrs_iter())
                     .all(|(key, attr)| is_hidden_key(key) || !attr.enumerable))
         });
         if !prototypes_barren {
@@ -1303,7 +1303,7 @@ impl<'p> Vm<'p> {
         // overhead on ordinary small for-in loops, the threshold means a failed
         // recognition never scans a million-slot dense prefix for one property.
         let side = self.arr_props.get(&source_idx)?;
-        if side.len() < 512 {
+        if side.live_len() < 512 {
             return None;
         }
         let dense = match self.heap.get(source_idx) {
@@ -1321,9 +1321,9 @@ impl<'p> Vm<'p> {
             }
             dense_entries.push((index as u32, value));
         }
-        let mut sparse_entries: Vec<(u32, Value)> = Vec::with_capacity(side.len());
-        for slot in 0..side.len() {
-            let key = &side.keys[slot];
+        let mut sparse_entries: Vec<(u32, Value)> = Vec::with_capacity(side.live_len());
+        for slot in side.slots() {
+            let key = side.key_at(slot);
             if is_hidden_key(key) {
                 continue;
             }
@@ -1467,7 +1467,27 @@ impl<'p> Vm<'p> {
         if !in_probe_reduce_enabled() || !self.enum_loop_observation_free() {
             return None;
         }
-        let proto = self.program.functions.get(func_id as usize)?;
+        let f = func_id as usize;
+        let proto = self.program.functions.get(f)?;
+        if self.in_probe_sites.get(f).is_none_or(Option::is_none) {
+            if self.in_probe_sites.len() <= f {
+                self.in_probe_sites.resize(f + 1, None);
+            }
+            let sites: Vec<u32> = proto
+                .code
+                .iter()
+                .enumerate()
+                .filter(|&(i, ins)| {
+                    matches!(ins, Instr::HasProp { brand: false, .. })
+                        && recognize_in_probe_reduce(proto, i).is_some()
+                })
+                .map(|(i, _)| i as u32)
+                .collect();
+            self.in_probe_sites[f] = Some(sites.into_boxed_slice());
+        }
+        if !self.in_probe_sites[f].as_deref().is_some_and(|s| s.contains(&(ip as u32))) {
+            return None;
+        }
         let plan = recognize_in_probe_reduce(proto, ip)?;
         let mut globals = vec![plan.source_global, plan.i_global, plan.limit_global];
         globals.extend(plan.probes.iter().map(|p| p.counter_global));
@@ -1706,8 +1726,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         if object_proto
-            .keys
-            .iter()
+            .keys_iter()
             .zip(object_proto.attrs_iter())
             .any(|(key, attr)| !is_hidden_key(key) && attr.enumerable)
             || self
@@ -1719,8 +1738,8 @@ impl<'p> Vm<'p> {
         }
         let mut cycle = 0u32;
         let mut last_key = None;
-        for slot in spec_key_order(&map.keys) {
-            let key = &map.keys[slot];
+        for slot in spec_key_order_map(&map) {
+            let key = map.key_at(slot);
             let attr = map.attr_at(slot);
             if is_hidden_key(key) || !attr.enumerable {
                 continue;
@@ -1729,7 +1748,7 @@ impl<'p> Vm<'p> {
                 return None;
             }
             cycle = cycle.wrapping_add(map.val_at(slot).as_int() as u32);
-            last_key = Some(key.clone());
+            last_key = Some(key.to_owned());
         }
         // Drop immutable map borrows before allocating the final key string.
         let final_key = last_key.map(|key| self.alloc_key_str(key));
@@ -1783,8 +1802,7 @@ impl<'p> Vm<'p> {
         let source = self.globals[plan.source_global as usize];
         let (_, map) = self.enum_plain_object(source)?;
         let count = map
-            .keys
-            .iter()
+            .keys_iter()
             .zip(map.attrs_iter())
             .filter(|(key, attr)| !is_hidden_key(key) && attr.enumerable)
             .count() as u32;

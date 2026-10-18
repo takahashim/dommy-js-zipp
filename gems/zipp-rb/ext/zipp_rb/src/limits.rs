@@ -52,20 +52,32 @@ pub(crate) fn configure_limits(
     Ok(())
 }
 
-/// Arm the limits for an entry: a fresh recorder (step budget, abort flag),
-/// the entry's deadline, and the heap ceiling.
+/// Arm the limits for an entry: a renewed step budget, the entry's deadline,
+/// and, the first time and after a limit was hit, a fresh recorder with the
+/// heap ceiling.
+///
+/// The recorder is kept across entries while no limit has been hit: renewing
+/// the step budget is all an entry needs. Re-applying the heap ceiling every
+/// entry would cost a major collection per entry once the live heap passes
+/// half the ceiling (`set_heap_limit` collects then, so a VM that filled its
+/// heap can allocate again): 11 ms a call at 265 MB under 512 MB. A limit
+/// that was hit is sticky in the recorder (`renew_step_budget` refuses), so
+/// the next entry gets a fresh one, and that collection is the recovery the
+/// VM needs to run again.
 pub(crate) fn arm_limits(state: &mut ScriptState, id: u64) {
     LIMITS.with(|m| {
         if let Some(l) = m.borrow().get(&id) {
             l.interrupter.abort.store(false, Ordering::Relaxed);
             l.interrupter.interrupted.store(false, Ordering::Relaxed);
-            // set_limits replaces the recorder, so the deadline and the heap
-            // ceiling are re-applied after it.
-            state.set_limits(l.max_steps, Some(l.interrupter.abort.clone()));
-            state.set_deadline(l.timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms)));
-            if let Some(bytes) = l.memory_limit {
-                state.set_heap_limit(bytes);
+            if !state.renew_step_budget(l.max_steps) {
+                // No recorder yet, or a limit was hit: set_limits installs a
+                // fresh one, so the heap ceiling is re-applied after it.
+                state.set_limits(l.max_steps, Some(l.interrupter.abort.clone()));
+                if let Some(bytes) = l.memory_limit {
+                    state.set_heap_limit(bytes);
+                }
             }
+            state.set_deadline(l.timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms)));
         }
     });
 }

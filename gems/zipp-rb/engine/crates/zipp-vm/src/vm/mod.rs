@@ -98,15 +98,12 @@ const FIELD_POOL: usize = 64;
 /// top-level binding of a loader-loaded ES module (exported or not) plus its
 /// namespace/source bookkeeping slots.
 ///
-/// The CAPACITY is reserved once at startup so `globals` (and `global_gens`)
-/// never reallocate at runtime — the JIT pins both base pointers — while the
-/// LENGTH grows as slots are handed out (`Vm::alloc_global_pool_slot`), so GC
-/// root scans and resident-byte accounting see only slots in use. Exhaustion
-/// throws rather than growing the Vec. Native builds reserve address space
-/// generously (one bundled module can declare thousands of top-level
-/// functions; a 1024-slot pool failed real module graphs outright); the
-/// hardened and wasm profiles, whose reservation is real committed memory,
-/// keep the small pool.
+/// The LENGTH grows as slots are handed out (`Vm::alloc_global_pool_slot`), so
+/// GC root scans and resident-byte accounting see only slots in use, and
+/// exhaustion throws. One bundled module can declare thousands of top-level
+/// functions, and an embedder that runs each script through `eval_in_context`
+/// gives every script's `var` and function declarations a pool slot: a
+/// 1024-slot pool failed real module graphs and script sets outright.
 ///
 /// NOT LARGER than this without fixing eval-global rooting first: past about
 /// 21,000 pool slots a function declared by one `eval` is collected while its
@@ -114,10 +111,23 @@ const FIELD_POOL: usize = 64;
 /// clean "too many global bindings" error into silent wrong results. The
 /// defect is older than the pool size — reproduced by raising this constant
 /// alone on the base commit — but only a large pool makes it reachable.
-#[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
 const EVAL_POOL: usize = 1 << 14;
+
+/// Pool slots whose CAPACITY is reserved at startup. The x86-64 JIT pins the
+/// base pointers of `globals` and `global_gens`, so a JIT build reserves the
+/// whole pool and the two never reallocate; a native build's reservation is
+/// untouched address space either way. The hardened and wasm profiles, where
+/// a reservation is real committed memory, have no JIT: they reserve a small
+/// pool and let the two vectors grow past it as slots are handed out.
+#[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+const EVAL_POOL_RESERVE: usize = EVAL_POOL;
 #[cfg(any(feature = "safe-sandbox", target_arch = "wasm32"))]
-const EVAL_POOL: usize = 1024;
+const EVAL_POOL_RESERVE: usize = 1024;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = assert!(
+    EVAL_POOL_RESERVE == EVAL_POOL,
+    "the JIT pins `globals`: reserve the whole eval pool"
+);
 
 /// What an unnamed run-time pool slot binds (see `Vm::pool_slot_names`).
 pub(crate) enum PoolSlotName {
@@ -268,6 +278,12 @@ pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 22;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
 
+/// The most holes one write past an array's dense end opens in the Vec. A
+/// write further out puts the element in the sparse overlay (V8's `kMaxGap`
+/// is the same 1024); see `Vm::array_new_index_sparse`, which also takes the
+/// array back to the Vec once its elements would fill half of it.
+pub const MAX_DENSE_GAP: usize = 1024;
+
 /// Largest dense array one native operation builds from a LENGTH rather than
 /// from elements that already exist: materializing a virtual array (see
 /// [`MAX_DENSE_ARRAY_LEN`]), draining an iterator eagerly, or copying an
@@ -347,6 +363,9 @@ pub(crate) const MAX_REGEX_PROGRAM_BYTES: usize = usize::MAX;
 pub const MAX_EAGER_ITER_RESULT: usize = 1 << 17;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_EAGER_ITER_RESULT: usize = 1 << 24;
+
+/// A module's export names and the global slots holding their live bindings.
+pub(crate) type ExportSlots = rustc_hash::FxHashMap<String, u32>;
 
 /// An active `try` handler within a frame.
 /// One activation record.
@@ -989,15 +1008,23 @@ impl RegisterFile {
         Self::from_vec(Vec::new())
     }
 
-    /// The live prefix.
+    /// The live prefix. Every safe `regs[i]` goes through it, so it does not
+    /// check what the invariant guarantees: an index is then checked once,
+    /// against the live length, instead of the prefix within the storage
+    /// first.
     #[inline(always)]
     fn live(&self) -> &[Value] {
-        &self.storage[..self.logical_len]
+        debug_assert!(self.logical_len <= self.storage.len());
+        // SAFETY: `logical_len <= storage.len()` after every operation (the
+        // type's invariant; `set_len` asserts it).
+        unsafe { self.storage.get_unchecked(..self.logical_len) }
     }
 
     #[inline(always)]
     fn live_mut(&mut self) -> &mut [Value] {
-        &mut self.storage[..self.logical_len]
+        debug_assert!(self.logical_len <= self.storage.len());
+        // SAFETY: as `live`.
+        unsafe { self.storage.get_unchecked_mut(..self.logical_len) }
     }
 
     #[inline]
@@ -1051,6 +1078,8 @@ impl RegisterFile {
         feature = "jit",
         all(feature = "instrument", not(feature = "meter-only"))
     ))]
+    // The plan builders are x86-64 only; an aarch64 test build has no reader.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn get(&self, index: usize) -> Option<&Value> {
         self.storage[..self.logical_len].get(index)
     }
@@ -1058,16 +1087,22 @@ impl RegisterFile {
     #[inline(always)]
     #[cfg(not(feature = "safe-sandbox"))]
     pub(crate) unsafe fn get_unchecked(&self, index: usize) -> &Value {
-        // SAFETY: forwarded from the caller; the slice limits the contract to
-        // the live prefix rather than the initialized inactive tail.
-        unsafe { self.storage[..self.logical_len].get_unchecked(index) }
+        // SAFETY: forwarded from the caller, who proves `index < logical_len`;
+        // `logical_len <= storage.len()` always, so the slot is initialized
+        // storage. Indexing the whole storage rather than the live slice
+        // matters: the slice is bounds-checked itself, two loads, a compare
+        // and a branch on every register read and write of the interpreter,
+        // which the optimizer cannot prove away.
+        debug_assert!(index < self.logical_len, "register read past the live prefix");
+        unsafe { self.storage.get_unchecked(index) }
     }
 
     #[inline(always)]
     #[cfg(not(feature = "safe-sandbox"))]
     pub(crate) unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut Value {
-        // SAFETY: forwarded from the caller; callers prove index < logical_len.
-        unsafe { self.storage[..self.logical_len].get_unchecked_mut(index) }
+        // SAFETY: as `get_unchecked`; callers prove `index < logical_len`.
+        debug_assert!(index < self.logical_len, "register write past the live prefix");
+        unsafe { self.storage.get_unchecked_mut(index) }
     }
 
     /// Set the live length, preserving all backing elements as initialized.
@@ -1077,8 +1112,10 @@ impl RegisterFile {
     /// a semantically valid `Value`. The hard bound check keeps this operation
     /// memory-safe in release builds as well as debug builds.
     #[inline(always)]
-    // Only the x86-64 JIT call protocol resizes the file without initialising.
+    // Only the x86-64 JIT call protocol resizes the file without initialising;
+    // elsewhere (an aarch64 build has no JIT) its unit test is the one caller.
     #[cfg(all(not(feature = "safe-sandbox"), feature = "jit"))]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) unsafe fn set_len(&mut self, new_len: usize) {
         assert!(
             new_len <= self.storage.len(),
@@ -1089,7 +1126,25 @@ impl RegisterFile {
 
     /// Vec-compatible resize of the live prefix. Revived inactive slots are
     /// overwritten with `fill`; shrinking never reduces the initialized extent.
+    ///
+    /// Every interpreted call grows the live prefix by the callee's window,
+    /// almost always inside the initialized extent a previous call left: that
+    /// case only overwrites the revived slots (no reallocation, so the pointer
+    /// mirror stands) and stays inline at the call site. It was an out-of-line
+    /// call costing 7% of an interpreted recursive call.
+    #[inline(always)]
     pub(crate) fn resize(&mut self, new_len: usize, fill: Value) {
+        let old_logical = self.logical_len;
+        if new_len > old_logical && new_len <= self.storage.len() {
+            self.storage[old_logical..new_len].fill(fill);
+            self.logical_len = new_len;
+            return;
+        }
+        self.resize_general(new_len, fill);
+    }
+
+    #[inline(never)]
+    fn resize_general(&mut self, new_len: usize, fill: Value) {
         let old_logical = self.logical_len;
         if new_len > old_logical {
             let old_high_water = self.storage.len();
@@ -1547,7 +1602,7 @@ pub struct Vm<'p> {
     pool_slot_names: rustc_hash::FxHashMap<u32, PoolSlotName>,
     /// Next free EVAL_POOL slot — always `globals.len()`. Starts at
     /// `global_count + FIELD_POOL`; bumped as pool slots are handed out, capped
-    /// at `+ EVAL_POOL` (the reserved capacity).
+    /// at `+ EVAL_POOL` (the reserved capacity in a JIT build).
     eval_global_next: u32,
     /// Every builtin global NAME → its heap value, recorded at setup regardless of
     /// whether the running program referenced it. Lets `eval`'d code resolve
@@ -1685,6 +1740,15 @@ pub struct Vm<'p> {
     /// pointer in the hot struct rather than the recorder's whole footprint.
     #[cfg(feature = "instrument")]
     pub(crate) instr_rec: Option<Box<instrument::Recorder>>,
+    /// The dispatch hook's countdown, held here rather than in the boxed
+    /// recorder so the per-instruction cost is one decrement and one test
+    /// with no load through the box. With a recorder installed the real
+    /// countdown is `Recorder::countdown + step_hot`; every other reader of
+    /// the recorder folds this in first (`rec_mut!`) or passes it along, and
+    /// the hook's slow path, taken when this goes negative, folds it, steps
+    /// exactly as before and reloads it. `i64::MAX` without a recorder.
+    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+    pub(crate) step_hot: i64,
     /// B269: what the last exact heap audit counted BEYOND the heap's own O(1)
     /// resident figure (VM-owned side tables, frames, regex programs). The
     /// per-operation headroom checks add it to the cheap figure, so between
@@ -1795,6 +1859,19 @@ pub struct Vm<'p> {
     /// `new Function` & kin, by the exact source they assembled: the installed
     /// eval program's base function, re-run on a repeat (see `do_eval`).
     fn_ctor_cache: rustc_hash::FxHashMap<Box<[u8]>, u32>,
+    /// Declaration-free direct evals, by (caller function, eval site, which of
+    /// the site's caller bindings were live, compile flags, source hash), each
+    /// with its exact sources and the installed program's base function: a
+    /// repeat re-runs that program over the caller's cells instead of
+    /// parsing, compiling and installing the same code again (see the
+    /// `DirectEval` arm of `dispatch_cold`).
+    direct_eval_cache: rustc_hash::FxHashMap<(u32, u16, u64, u8, u64), Vec<(Box<str>, u32)>>,
+    direct_eval_cache_len: usize,
+    /// One-shot request from that arm to `do_eval`: report in
+    /// `direct_eval_installed` the base function of the program it installs,
+    /// if the program declares nothing.
+    direct_eval_want: bool,
+    direct_eval_installed: Option<u32>,
     /// Host policy for a VM that may execute its already-compiled main program
     /// but must not compile or load any additional source. This is independent
     /// of instrumentation and leaves every JIT tier enabled. All runtime source
@@ -2081,6 +2158,15 @@ pub struct Vm<'p> {
     /// Holds no `Value`s; cleared wholesale when it exceeds a small cap.
     regex_compile_cache:
         rustc_hash::FxHashMap<(String, String, bool), std::sync::Arc<regress::Regex>>,
+    /// Short-subject ASCII execs each RegExp without a byte-optimized twin
+    /// has run on its base program (`ensure_regexp_ascii_twin_deferred`),
+    /// keyed by heap index; an entry leaves when its twin is built. A reused
+    /// index only moves when a twin gets built. Holds no `Value`s; cleared
+    /// wholesale at a small cap.
+    regex_twin_defer: rustc_hash::FxHashMap<u32, u8>,
+    /// Emptied `Frame::handlers` buffers for the next frame's first `try`
+    /// push (see `handler_pool`). Holds no `Value`s.
+    handler_pool: Vec<Vec<Handler>>,
     /// Reusable pointer/size pairs for deduplicating shared compiled RegExp
     /// programs during the periodic resident-memory audit. Regex literals,
     /// species clones, the compile cache, and inline ASCII twins can all hold
@@ -2104,6 +2190,11 @@ pub struct Vm<'p> {
     /// class's brand. A private access threaded with lexical DEPTH d checks the
     /// receiver against `chain[d]` — the SPECIFIC declaring class's brand. Pruned by GC.
     method_brand: crate::slot_table::SlotTable<Vec<u64>>,
+    /// The class a kept constructor or field-thunk callable (`class_body_fn`)
+    /// belongs to, for a class with a brand chain: what `running_class_value`
+    /// finds through `method_brand` and `brand_owner`, in one load. Pruned
+    /// when either the callable or the class dies.
+    pub(crate) ctor_owner: crate::slot_table::SlotTable<u32>,
     /// Extra private brands installed on a specific INSTANCE that its `map.class`
     /// chain does not cover — namely a constructor RETURN-OVERRIDE object, which
     /// receives a class's private fields/brand without becoming an instanceof that
@@ -2121,6 +2212,10 @@ pub struct Vm<'p> {
     /// getter/setter errors). NOT a GC root: pruned when the class dies (no
     /// live accessor can then need it).
     brand_owner: rustc_hash::FxHashMap<u64, u32>,
+    /// Remembered answers of `resolve_private_in`, keyed by the innermost
+    /// brand of the accessing chain and the private name's id (see
+    /// `Vm::resolve_private_memo`).
+    private_memo: Box<[values::PrivateMemo]>,
     /// Lazily-created `.prototype` object for a function/class value, keyed by the
     /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on
@@ -2140,6 +2235,9 @@ pub struct Vm<'p> {
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
     proto_of: crate::slot_table::SlotTable<Value>,
+    /// The lite loop's tables (`vm/lite.rs`).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    lite: lite::LiteState<'p>,
     /// Per-function-id LEARNED own-property count of the instances a user
     /// constructor produces, used to pre-size the next instance's `ObjMap`.
     ///
@@ -2288,8 +2386,11 @@ pub struct Vm<'p> {
     /// keys (GC-traced there); this table holds no Values — sweep-only. Absent
     /// for every fully-materialized array, so dense behavior is unchanged
     /// (`js_array_len` falls back to `items.len()`). Values are `1..=u32::MAX`
-    /// (a JS length is at most 2^32-1) and always exceed both the dense length
-    /// and `MAX_DENSE_ARRAY_LEN` at insertion time.
+    /// (a JS length is at most 2^32-1) and always exceed the dense length: a
+    /// write past `MAX_DENSE_ARRAY_LEN` or more than `MAX_DENSE_GAP` past the
+    /// dense end, a `length` past the cap, or a shrink that stays past the
+    /// dense prefix inserts one, and the Vec growing to it removes it
+    /// (`Vm::array_dense_grew`).
     array_js_len: crate::slot_table::SlotTable<u32>,
     /// The INDEXED-PROTOTYPE PROTECTOR, inverted: `false` means "nothing in a plain
     /// array's prototype chain can supply an integer index", which is the state every
@@ -2370,6 +2471,11 @@ pub struct Vm<'p> {
     /// closure-stamp time, so closures made before the eval call share the
     /// scope the eval later populates.
     sloppy_eval_memo: Vec<u8>,
+    /// Per func id, once computed: the ips of the `HasProp` sites whose
+    /// loop `recognize_in_probe_reduce` accepts (its answer depends on the
+    /// code alone), usually none. `try_in_probe_reduce` ran the recognizer
+    /// on every `in` it saw.
+    pub(crate) in_probe_sites: Vec<Option<Box<[u32]>>>,
     /// Heap indices of the built-in prototype objects (`Object.prototype`,
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods
@@ -2428,6 +2534,9 @@ pub struct Vm<'p> {
     /// version cache sound here, exactly as the string-method doc warns).
     /// Pure cache: entries self-validate, nothing invalidates them.
     coll_intrinsic_memo: [[Option<(u32, u32, u64)>; COLL_MEMO_NAMES]; 2],
+    /// The same memo for %WeakMap.prototype%'s get/set/has/delete
+    /// (`weakmap_method_is_intrinsic`).
+    weakmap_intrinsic_memo: [Option<(u32, u32, u64)>; 4],
     /// B191: boot-time snapshots of %String.prototype% / %Array.prototype%'s
     /// own method slots (`name` → the installed native's Value bits, captured
     /// at the end of `setup_globals`, when the native heap slots are pinned
@@ -2507,6 +2616,13 @@ pub struct Vm<'p> {
     /// function object (a native id alone would not prove realm identity).
     dataview_proto_shape: u32,
     dataview_numeric_getter_bits: [u64; 8],
+    /// The same for the numeric setters (`setInt8`..`setFloat64`, the
+    /// prototype's entries 10..18), proving `dataview_interp_set_fast`'s
+    /// callee.
+    dataview_numeric_setter_bits: [u64; 8],
+    /// The BigInt accessors' boot bits (prototype entries 8, 9, 18 and 19),
+    /// proving `dataview_interp_big_fast`'s callee as the numeric ones do.
+    dataview_bigint_bits: [u64; 4],
     /// `SharedArrayBuffer` ctor + prototype. A SharedArrayBuffer reuses the
     /// `HeapObj::ArrayBuffer` representation; its heap index is recorded in
     /// `shared_buffers` so property/prototype/`instanceof` resolution treats it as
@@ -2673,14 +2789,17 @@ pub struct Vm<'p> {
     /// global slots (see run_eval_program module mode), so a namespace's [[Get]]
     /// reads the LIVE binding without colliding with another module's same-named
     /// export. [[Set]] is a no-op. Pruned on GC sweep.
-    module_namespaces: std::collections::HashMap<u32, std::collections::HashMap<String, u32>>,
+    ///
+    /// Fx-hashed, both levels: every property cache check asks whether its
+    /// receiver is a namespace (`ic_obj_ok`) once any module is loaded, and
+    /// SipHash there was a fifth of a module program's run.
+    module_namespaces: rustc_hash::FxHashMap<u32, ExportSlots>,
     /// Modules CURRENTLY being linked (cycle detection): resolved path → its OWN
     /// export name→live-slot map (re-exports not yet resolved). Present only during
     /// `import_module`; a re-export back into an in-progress module (a self/mutual
     /// cycle) resolves against this own-exports snapshot instead of recursing. Holds
     /// only slot indices into `globals` (a GC root), so it needs no separate rooting.
-    module_own:
-        std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<String, u32>>,
+    module_own: std::collections::HashMap<std::path::PathBuf, ExportSlots>,
     /// Per-namespace AMBIGUOUS export names (a name supplied by two different
     /// `export *` sources): excluded from the namespace; resolving one by name
     /// through `export {x} from` / `import {x}` is a SyntaxError.
@@ -2930,6 +3049,9 @@ pub struct Vm<'p> {
     /// called/constructed and the prototype carries the @@toStringTag accessor.
     abstractmodulesource_ctor: u32,
     abstractmodulesource_proto: u32,
+    /// The prototype of the ModuleSource objects `import source` yields: its own
+    /// [[Prototype]] is `abstractmodulesource_proto`.
+    module_source_proto: u32,
     /// CreateResolvingFunctions [[AlreadyResolved]] records: `resolver_pair_next`
     /// hands out fresh pair ids; a pair id's bit in `resolved_pairs` is set the
     /// first time either function of the pair fires (ids only — no `Value`s,
@@ -3275,8 +3397,8 @@ pub struct Vm<'p> {
 }
 
 /// B191 memo widths (hot names; anything else takes the full per-call proof).
-pub(crate) const STR_MEMO_NAMES: usize = 16;
-pub(crate) const ARR_MEMO_NAMES: usize = 8;
+pub(crate) const STR_MEMO_NAMES: usize = 32;
+pub(crate) const ARR_MEMO_NAMES: usize = 32;
 
 /// Method-name arity of [`Vm::coll_intrinsic_memo`]: get/set/has/add/delete/clear.
 pub(crate) const COLL_MEMO_NAMES: usize = 6;
@@ -3339,6 +3461,17 @@ impl<'p> Vm<'p> {
     }
 }
 
+/// The recorder for a mutable use outside the dispatch hook: the hook's
+/// `step_hot` folded into it first (`Vm::meter_fold`), then the field
+/// itself, so the borrow is of the field alone, as `instr_rec.as_mut()` was.
+#[cfg(feature = "instrument")]
+macro_rules! rec_mut {
+    ($vm:expr) => {{
+        $vm.meter_fold();
+        $vm.instr_rec.as_mut()
+    }};
+}
+
 // submodules (split from the former monolithic vm.rs)
 mod access;
 mod async_runtime;
@@ -3346,6 +3479,7 @@ mod builtins;
 pub(crate) mod clock;
 pub(crate) mod eval_arena;
 mod dispatch;
+mod dispatch_cold;
 mod engine;
 pub(crate) use engine::compile_host_script;
 mod error_stack;
@@ -3387,6 +3521,8 @@ mod counted_loop;
 mod dtf_locale;
 mod dtf_pattern;
 mod enum_stream;
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+mod lite;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod field_stream;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -3464,30 +3600,45 @@ pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_c
 pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 mod handler_pool;
 pub(crate) mod prof;
+// ── Python's half of the VM ── its instructions' semantics, runtime
+// tables and library natives. The files live with the rest of the language
+// in `lang/python/vm/`; they are modules of `vm` because they implement the
+// VM itself and work on its private state.
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/prof_py.rs"]
 pub(crate) mod prof_py;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_attr.rs"]
 mod py_attr;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_ops.rs"]
 mod py_ops;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_rt.rs"]
 mod py_rt;
 #[cfg(feature = "python")]
 #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(unused_imports))]
 pub(crate) use py_rt::py_frame_guard_start;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_gen.rs"]
 mod py_gen;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_in.rs"]
 mod py_in;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_json.rs"]
 mod py_json;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_lazy.rs"]
 mod py_lazy;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_str.rs"]
 mod py_str;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_table.rs"]
 pub(crate) mod py_table;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_tensor.rs"]
 mod py_tensor;
 pub(crate) use prof::dump as prof_stats;
 pub(crate) use temporal::tzdb_version;

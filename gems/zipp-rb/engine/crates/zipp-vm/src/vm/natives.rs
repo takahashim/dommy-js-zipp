@@ -192,6 +192,67 @@ impl<'p> Vm<'p> {
     /// literally `GetSuperBase().[[Set]](x, v, this)` — can share it instead of
     /// approximating it with `Set(this, …)`. `kv` is the ALREADY-coerced
     /// property key (ToPropertyKey runs once, at the call site).
+    /// `Reflect.set(o, k, v, receiver)` writing a property `o` already has:
+    /// `o` a plain object, `k` a flat string, the property a writable data
+    /// property, and `receiver` either `o` or a Proxy over `o` with neither
+    /// a `getOwnPropertyDescriptor` nor a `defineProperty` trap (the shape a
+    /// forwarding `set` trap passes). OrdinarySet then finds the property on
+    /// `o` and the receiver's own descriptor is the same one, so the write
+    /// is a store into its slot. The general path spelled `k` as a fresh
+    /// String first. `None` for anything else.
+    fn reflect_set_present_fast(&mut self, o: Value, kv: Value, value: Value, receiver: Value) -> Option<bool> {
+        if !o.is_heap() || !kv.is_heap() || !self.deferred_ns_state.is_empty() {
+            return None;
+        }
+        let oi = o.heap_index();
+        if (oi == self.global_this && self.global_this != 0)
+            || (oi == self.arr_proto && self.arr_proto != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oi))
+            || (!self.realm_global_objs.is_empty() && self.realm_global_objs.contains_key(&oi))
+        {
+            return None;
+        }
+        if receiver != o {
+            if !receiver.is_heap() {
+                return None;
+            }
+            let (target, handler, revoked) = self.proxy_parts(receiver.heap_index())?;
+            if revoked
+                || target != o
+                || !self.proxy_handler_lacks(handler, "getOwnPropertyDescriptor")
+                || !self.proxy_handler_lacks(handler, "defineProperty")
+            {
+                return None;
+            }
+        }
+        let slot = {
+            let HeapObj::Str(js) = self.heap.get(kv.heap_index()) else {
+                return None;
+            };
+            if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+                return None;
+            }
+            let key = js.as_str_wf();
+            let HeapObj::Object(m) = self.heap.get(oi) else {
+                return None;
+            };
+            if m.is_ctor || m.class.is_some() || m.class_proto {
+                return None;
+            }
+            let i = m.pos(key)?;
+            let a = m.attr_at(i);
+            if a.accessor || !a.writable || m.val_at(i).is_uninitialized() {
+                return None;
+            }
+            i
+        };
+        self.store_barrier(crate::heap::gcoracle::SET_PROP, oi, value);
+        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+            m.set_val_at(slot, value);
+        }
+        Some(true)
+    }
+
     pub(crate) fn ordinary_set_with_receiver(
         &mut self,
         a0: Value,
@@ -199,6 +260,9 @@ impl<'p> Vm<'p> {
         value: Value,
         receiver: Value,
     ) -> Result<bool, Thrown> {
+        if let Some(done) = self.reflect_set_present_fast(a0, kv, value, receiver) {
+            return Ok(done);
+        }
         let key = self.key_of(kv);
         // Module Namespace exotic [[Set]]: always false.
         if self.module_namespaces.contains_key(&a0.heap_index()) {
@@ -531,7 +595,6 @@ impl<'p> Vm<'p> {
         if !self.is_object_value(receiver) {
             return Ok(false);
         }
-        let key = self.key_of(kv);
         let ridx = receiver.heap_index();
         // OrdinarySetWithOwnDescriptor on a Proxy receiver: read its own
         // descriptor ([[GetOwnProperty]] → the gopd trap), then define
@@ -539,7 +602,22 @@ impl<'p> Vm<'p> {
         // trap. A trap that calls `Reflect.set(target, k, v, proxy)` (the
         // forwarding shape every logging proxy uses) would otherwise re-enter
         // itself forever.
-        if self.proxy_parts(ridx).is_some() {
+        if let Some((target, handler, revoked)) = self.proxy_parts(ridx) {
+            // With neither trap, both steps forward to the target, so this
+            // is OrdinarySetWithOwnDescriptor with the target as its own
+            // receiver. When neither trap lookup can find anything or run
+            // code, skipping them is unobservable, and so is the descriptor
+            // object built and read back below for every forwarded write.
+            if !revoked
+                && self.is_object_value(target)
+                && self.proxy_handler_lacks(handler, "getOwnPropertyDescriptor")
+                && self.proxy_handler_lacks(handler, "defineProperty")
+            {
+                return self.with_native_recursion_guard(|vm| {
+                    vm.reflect_set_on_receiver(target, kv, value)
+                });
+            }
+            let key = self.key_of(kv);
             let existing = self.proxy_gopd(receiver, &key)?.unwrap_or(Value::UNDEFINED);
             let mut m = crate::heap::ObjMap::new();
             m.set("value", value);
@@ -578,6 +656,7 @@ impl<'p> Vm<'p> {
                 Err(e) => Err(e),
             };
         }
+        let key = self.key_of(kv);
         self.materialize_regexp_result_prop_for_key(ridx, &key);
         if matches!(self.heap.get(ridx), HeapObj::TypedArray { .. })
             && self.is_canonical_numeric_index(&key)
@@ -844,16 +923,13 @@ impl<'p> Vm<'p> {
                 self.realm_ctor_main.insert(ctor_idx, main_ctor);
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ctor) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .filter(|((k, _), _)| {
-                            k.as_str() != "prototype"
-                                && k.as_str() != "name"
-                                && k.as_str() != "length"
+                        .filter(|&(k, _, _)| {
+                            k != "prototype"
+                                && k != "name"
+                                && k != "length"
                         })
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -875,12 +951,9 @@ impl<'p> Vm<'p> {
             if main_proto != 0 {
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_proto) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .filter(|((k, _), _)| k.as_str() != "constructor")
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .filter(|&(k, _, _)| k != "constructor")
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -960,19 +1033,15 @@ impl<'p> Vm<'p> {
                 }
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(src) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .filter(|((k, _), _)| {
-                            let k = k.as_str();
+                        .filter(|&(k, _, _)| {
                             if skip_ctor {
                                 k != "constructor"
                             } else {
                                 k != "prototype" && k != "name" && k != "length"
                             }
                         })
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1074,14 +1143,11 @@ impl<'p> Vm<'p> {
                 let fnp_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_fn_proto) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .filter(|((k, _), _)| {
-                            k.as_str() != "constructor" && k.as_str() != "prototype"
+                        .filter(|&(k, _, _)| {
+                            k != "constructor" && k != "prototype"
                         })
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1128,12 +1194,9 @@ impl<'p> Vm<'p> {
                     for srcp in sources {
                         let props: Vec<(String, Value, PropAttr)> = match self.heap.get(srcp) {
                             HeapObj::Object(mm) => mm
-                                .keys
                                 .iter()
-                                .zip(mm.vals_slice().iter())
-                                .zip(mm.attrs_iter())
-                                .filter(|((k, _), _)| k.as_str() != "constructor")
-                                .map(|((k, v), a)| (k.clone(), *v, a))
+                                .filter(|&(k, _, _)| k != "constructor")
+                                .map(|(k, v, a)| (k.to_owned(), v, a))
                                 .collect(),
                             _ => Vec::new(),
                         };
@@ -1192,11 +1255,8 @@ impl<'p> Vm<'p> {
                 }
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_proto) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1225,11 +1285,8 @@ impl<'p> Vm<'p> {
             if let Some(&main_ns) = self.builtin_globals.get(ns) {
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ns) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1302,12 +1359,9 @@ impl<'p> Vm<'p> {
         if self.dollar262 != 0 {
             let props: Vec<(String, Value, PropAttr)> = match self.heap.get(self.dollar262) {
                 HeapObj::Object(mm) => mm
-                    .keys
                     .iter()
-                    .zip(mm.vals_slice().iter())
-                    .zip(mm.attrs_iter())
-                    .filter(|((k, _), _)| k.as_str() != "global" && k.as_str() != "evalScript")
-                    .map(|((k, v), a)| (k.clone(), *v, a))
+                    .filter(|&(k, _, _)| k != "global" && k != "evalScript")
+                    .map(|(k, v, a)| (k.to_owned(), v, a))
                     .collect(),
                 _ => Vec::new(),
             };
@@ -1541,6 +1595,25 @@ impl<'p> Vm<'p> {
         }
         self.finalize_shapes.insert((func_id, plan_idx), shape);
         shape
+    }
+
+    /// Allocate a `FinalizeObject` literal from `plan`, an entry of one of
+    /// this VM's own `FuncProto` plan tables. Those outlive the VM and the
+    /// heap it owns, so the object's keys borrow the plan instead of counting
+    /// it (`PlanHandle`).
+    #[inline]
+    pub(crate) fn alloc_finalized_site(
+        &mut self,
+        plan: &'p crate::bytecode::StaticKeyPlan,
+        vals: &[Value],
+        shape: u32,
+    ) -> u32 {
+        // SAFETY: `plan` is borrowed for `'p`, which outlives `self` and so
+        // the heap `self` owns (the heap is never moved out of its VM).
+        #[cfg(not(feature = "safe-sandbox"))]
+        return unsafe { self.heap.alloc_finalized_borrowed(plan, vals, shape) };
+        #[cfg(feature = "safe-sandbox")]
+        self.heap.alloc_finalized(plan, vals, shape)
     }
 
     /// Tag a freshly-created function/class with the realm whose code created it
@@ -2059,7 +2132,11 @@ impl<'p> Vm<'p> {
                     self.require_object_coercible(this)?;
                     return Ok(Value::bool(b));
                 }
-                // An object receiver: ToObject cannot throw.
+                // An object receiver: ToObject cannot throw. A rope key is
+                // flattened first so that it too is read in place.
+                if a0.is_heap() {
+                    self.heap.flatten(a0.heap_index());
+                }
                 if let Some(b) = self.has_own_str_fast(this, a0) {
                     return Ok(Value::bool(b));
                 }
@@ -2392,7 +2469,8 @@ impl<'p> Vm<'p> {
                 // bits = ToIndex(bits) (RangeError if negative / > 2^53-1) FIRST,
                 // then x = ToBigInt(value) — STRICT: a Number value is a TypeError
                 // (unlike the lenient BigInt() ctor coercion `to_bigint` allows).
-                let bits = self.to_index(a0)?;
+                // (The exact u64: a 32-bit `usize` saturates 2^32 to 2^32-1.)
+                let bits = self.to_index_u64(a0)?;
                 if a1.is_number() {
                     return Err(Thrown::from_static(
                         "TypeError: cannot convert a Number to a BigInt",
@@ -2400,9 +2478,9 @@ impl<'p> Vm<'p> {
                 }
                 let x = self.to_bigint(a1)?;
                 if id == BIGINT_AS_INTN {
-                    self.bigint_as_intn_val(bits as u64, x)?
+                    self.bigint_as_intn_val(bits, x)?
                 } else {
-                    self.bigint_as_uintn_val(bits as u64, x)?
+                    self.bigint_as_uintn_val(bits, x)?
                 }
             }
             REGEXP_EXEC => {
@@ -2946,10 +3024,10 @@ impl<'p> Vm<'p> {
                 let li_v = self.get_prop(this, "lastIndex")?;
                 let li_u64 = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
                 // A value beyond the host's addressable string range is still
-                // just an out-of-range RegExp index; saturate instead of
-                // wrapping 2^32 to zero on wasm32.
-                let li = usize::try_from(li_u64).unwrap_or(usize::MAX);
-                self.set_regexp_last_index(matcher_idx, li);
+                // just an out-of-range RegExp index, and the matcher's
+                // lastIndex is that exact value: kept as u64, never narrowed
+                // (wrapping 2^32 to zero, or saturating at 2^32-1, on wasm32).
+                self.set_regexp_last_index(matcher_idx, li_u64);
                 // Build a LAZY %RegExpStringIterator%: an empty Iterator object whose
                 // `next()` runs one RegExpExec (honouring a user `exec`) at a time —
                 // exec/lastIndex side effects are observable per step, not up front.
@@ -3258,7 +3336,7 @@ impl<'p> Vm<'p> {
                     let _gc = self.gc_lock_guard();
                     let target = self.construct(this, &[Value::num(n as f64)])?;
                     for (i, v) in items.into_iter().enumerate() {
-                        self.create_data_property_or_throw(target, i, v)?;
+                        self.create_data_property_or_throw(target, i as u64, v)?;
                     }
                     self.set_prop(target, "length", Value::num(n as f64), true)?;
                     target
@@ -3705,8 +3783,21 @@ impl<'p> Vm<'p> {
             }
             OBJ_HAS_OWN => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let p = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // hasOwnProperty's fast paths: both take an object `o`, for
+                // which ToObject cannot throw, and a key whose ToPropertyKey
+                // runs no code.
+                if let Some(b) = self.has_own_index_fast(o, p) {
+                    return Ok(Value::bool(b));
+                }
+                if p.is_heap() {
+                    self.heap.flatten(p.heap_index());
+                }
+                if let Some(b) = self.has_own_str_fast(o, p) {
+                    return Ok(Value::bool(b));
+                }
                 self.require_object_coercible(o)?; // ToObject(O): null/undefined throw
-                let k = self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let k = self.to_property_key(p)?;
                 Value::bool(self.has_own_property_dyn(o, &k)?)
             }
             OBJ_SET_PROTO_OF => {
@@ -3751,8 +3842,7 @@ impl<'p> Vm<'p> {
                 } else if a0.is_heap() {
                     if let HeapObj::Object(m) = self.heap.get(a0.heap_index()) {
                         let keys: Vec<String> = m
-                            .keys
-                            .iter()
+                            .keys_iter()
                             .filter(|k| k.starts_with("@@"))
                             .cloned()
                             .collect();
@@ -3768,8 +3858,7 @@ impl<'p> Vm<'p> {
                         let mut keys: Vec<String> = Vec::new();
                         for k in c
                             .statics
-                            .keys
-                            .iter()
+                            .keys_iter()
                             .chain(c.static_getters.iter().map(|(n, _)| n))
                             .chain(c.static_setters.iter().map(|(n, _)| n))
                         {
@@ -3788,8 +3877,7 @@ impl<'p> Vm<'p> {
                             self.arr_props
                                 .get(&a0.heap_index())
                                 .map_or(Vec::new(), |m| {
-                                    m.keys
-                                        .iter()
+                                    m.keys_iter()
                                         .filter(|k| k.starts_with("@@"))
                                         .cloned()
                                         .collect()
@@ -3818,8 +3906,7 @@ impl<'p> Vm<'p> {
                             self.arr_props.get(&a0.heap_index())
                         };
                         let keys: Vec<String> = table.map_or(Vec::new(), |m| {
-                            m.keys
-                                .iter()
+                            m.keys_iter()
                                 .filter(|k| k.starts_with("@@"))
                                 .cloned()
                                 .collect()
@@ -4045,6 +4132,18 @@ impl<'p> Vm<'p> {
                                     self.make_fn_proto_readonly(o);
                                 }
                             }
+                            // A class's own static properties live in its
+                            // `statics` map: their attributes too (the
+                            // extensible flag stays in arr_props). Without
+                            // this a frozen class reported frozen while its
+                            // statics stayed writable.
+                            if let HeapObj::Class(c) = self.heap.get_mut(idx) {
+                                match id {
+                                    OBJ_FREEZE => c.statics.freeze(),
+                                    OBJ_SEAL => c.statics.seal(),
+                                    _ => {}
+                                }
+                            }
                         }
                     }
                 }
@@ -4266,9 +4365,14 @@ impl<'p> Vm<'p> {
                 self.alloc_object_current_realm(map)
             }
             PROMISE_TRY => {
-                if !self.is_constructor(this) {
+                // Promise.try(callbackfn, ...args): C must be an Object; the
+                // callback runs first. A normal completion is PromiseResolve(C,
+                // value), so a promise of C comes back unwrapped; a throw
+                // rejects a NewPromiseCapability(C) (either rejects a C that is
+                // not a constructor, after the callback ran).
+                if !self.is_object_value(this) {
                     return Err(Thrown::from_static(
-                        "TypeError: Promise.try called on a non-constructor",
+                        "TypeError: Promise.try called on a non-object",
                     ));
                 }
                 let rest: Vec<Value> = if args.len() > 1 {
@@ -4276,43 +4380,29 @@ impl<'p> Vm<'p> {
                 } else {
                     Vec::new()
                 };
-                if this == self.promise_ctor_value() {
-                    let p = self.alloc_promise();
-                    self.with_promise_resolution_root(p, |vm| {
-                        match vm.call_value(a0, Value::UNDEFINED, &rest) {
-                            Ok(v) => vm.resolve(p, v),
-                            Err(Thrown(msg)) => {
-                                // Preserve the actual thrown VALUE, not a reconstructed
-                                // error from its message string.
-                                let e = match vm.pending_throw.take() {
-                                    Some(v) => v,
-                                    None => vm.alloc_error_from_message(&msg),
-                                };
-                                vm.reject(p, e);
-                            }
+                match self.call_value(a0, Value::UNDEFINED, &rest) {
+                    Ok(v) => self.with_host_roots(&[v], |vm| vm.promise_resolve_with(this, v))?,
+                    Err(Thrown(msg)) => {
+                        // Preserve the actual thrown VALUE, not a reconstructed
+                        // error from its message string.
+                        let e = match self.pending_throw.take() {
+                            Some(v) => v,
+                            None => self.alloc_error_from_message(&msg),
+                        };
+                        if this == self.promise_ctor_value() {
+                            let p = self.alloc_promise();
+                            self.reject(p, e);
+                            Value::heap(p)
+                        } else {
+                            self.with_host_roots(&[e], |vm| -> Result<Value, Thrown> {
+                                let (promise, _, reject) = vm.new_promise_capability(this)?;
+                                vm.with_promise_operation_roots(&[promise, reject], |vm| {
+                                    vm.call_value(reject, Value::UNDEFINED, &[e])
+                                })?;
+                                Ok(promise)
+                            })?
                         }
-                    });
-                    Value::heap(p)
-                } else {
-                    // NewPromiseCapability(C): settle through C's captured resolve/reject.
-                    let (promise, resolve, reject) = self.new_promise_capability(this)?;
-                    let roots = [promise, resolve, reject];
-                    self.with_promise_operation_roots(&roots, |vm| -> Result<(), Thrown> {
-                        match vm.call_value(a0, Value::UNDEFINED, &rest) {
-                            Ok(v) => {
-                                vm.call_value(resolve, Value::UNDEFINED, &[v])?;
-                            }
-                            Err(Thrown(msg)) => {
-                                let e = match vm.pending_throw.take() {
-                                    Some(v) => v,
-                                    None => vm.alloc_error_from_message(&msg),
-                                };
-                                vm.call_value(reject, Value::UNDEFINED, &[e])?;
-                            }
-                        }
-                        Ok(())
-                    })?;
-                    promise
+                    }
                 }
             }
             // Reflect namespace. apply/construct accept any callable target; the
@@ -4375,6 +4465,14 @@ impl<'p> Vm<'p> {
                 let receiver = args.get(2).copied().unwrap_or(a0);
                 if receiver == a0 {
                     self.get_index(a0, a1)?
+                } else if let Some(found) = self.plain_chain_get(a0, a1) {
+                    match found {
+                        crate::vm::values::PlainGet::Data(v) => v,
+                        crate::vm::values::PlainGet::Getter(g) if g != Value::UNDEFINED => {
+                            self.call_value(g, receiver, &[])?
+                        }
+                        _ => Value::UNDEFINED,
+                    }
                 } else {
                     let key = self.to_property_key(a1)?;
                     self.get_member(a0, &key, receiver)?
@@ -4897,7 +4995,8 @@ impl<'p> Vm<'p> {
             }
             // ES2025 Iterator Helpers (%Iterator.prototype%).
             ITER_MAP | ITER_FILTER | ITER_TAKE | ITER_DROP | ITER_FLATMAP | ITER_REDUCE
-            | ITER_TOARRAY | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND | ITER_JOIN => {
+            | ITER_TOARRAY | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND | ITER_JOIN | ITER_CHUNKS
+            | ITER_WINDOWS | ITER_INCLUDES => {
                 self.iter_helper_method(id, this, args)?
             }
             ITER_HELPER_NEXT => {
@@ -5441,9 +5540,9 @@ impl<'p> Vm<'p> {
                 // coercion above hides it (U+FFFD) — check the exact bytes.
                 self.uri_check_wellformed(a0)?;
                 self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
-                let out_len = uri_encode_output_len(&s, b"#;/?:@&=+$,")?;
+                let out_len = uri_encode_output_len(&s, URI_KEEP)?;
                 let mut out = self.guest_string_with_capacity(out_len)?;
-                uri_encode_into(&s, b"#;/?:@&=+$,", &mut out);
+                uri_encode_into(&s, URI_KEEP, &mut out);
                 debug_assert_eq!(out.len(), out_len);
                 self.alloc_str(out)
             }
@@ -5451,9 +5550,9 @@ impl<'p> Vm<'p> {
                 let s = self.to_js_string(a0)?;
                 self.uri_check_wellformed(a0)?; // lone surrogate -> URIError
                 self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
-                let out_len = uri_encode_output_len(&s, b"")?;
+                let out_len = uri_encode_output_len(&s, URI_COMPONENT_KEEP)?;
                 let mut out = self.guest_string_with_capacity(out_len)?;
-                uri_encode_into(&s, b"", &mut out);
+                uri_encode_into(&s, URI_COMPONENT_KEEP, &mut out);
                 debug_assert_eq!(out.len(), out_len);
                 self.alloc_str(out)
             }
@@ -5842,33 +5941,7 @@ impl<'p> Vm<'p> {
                         // path; a custom `this` runs NewPromiseCapability(this) and
                         // observably Calls its resolve — returning x unchanged when x
                         // is already a promise whose .constructor === this.
-                        if this == self.promise_ctor_value() {
-                            // PromiseResolve step 2: x is returned AS-IS only when
-                            // Get(x, "constructor") is C — a promise whose
-                            // constructor was changed gets a fresh adopting promise.
-                            let is_native_promise = a.is_heap()
-                                && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. });
-                            if is_native_promise && self.get_prop(a, "constructor")? != this {
-                                let p = self.alloc_promise();
-                                self.resolve_fresh_promise(p, a);
-                                Value::heap(p)
-                            } else {
-                                Value::heap(self.to_promise(a))
-                            }
-                        } else {
-                            let already = a.is_heap()
-                                && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. })
-                                && self.get_prop(a, "constructor")? == this;
-                            if already {
-                                a
-                            } else {
-                                let (promise, resolve, _) = self.new_promise_capability(this)?;
-                                self.with_promise_operation_roots(&[promise, resolve], |vm| {
-                                    vm.call_value(resolve, Value::UNDEFINED, &[a])
-                                })?;
-                                promise
-                            }
-                        }
+                        self.promise_resolve_with(this, a)?
                     }
                     PROMISE_REJECT => {
                         // As PROMISE_RESOLVE: a custom `this` settles through its own
@@ -7864,34 +7937,51 @@ fn unescape_str(s: &str) -> Result<crate::heap::JsStr, Thrown> {
     Ok(crate::heap::JsStr::from_wtf8(out))
 }
 
-fn uri_encode_output_len(s: &str, extra: &[u8]) -> Result<usize, Thrown> {
-    let mut total = 0usize;
-    for c in s.chars() {
-        let additional =
-            if c.is_ascii() && (URI_UNESCAPED.contains(&(c as u8)) || extra.contains(&(c as u8))) {
-                1
-            } else {
-                c.len_utf8()
-                    .checked_mul(3)
-                    .ok_or_else(invalid_native_string_length)?
-            };
-        total = checked_native_output_add(total, additional)?;
+/// The ASCII bytes of `URI_UNESCAPED` and of `extra` as a bit set, bit `b`
+/// for byte `b`: what an encoder keeps as itself.
+const fn uri_keep_mask(extra: &[u8]) -> u128 {
+    let mut mask = 0u128;
+    let mut i = 0;
+    while i < URI_UNESCAPED.len() {
+        mask |= 1 << URI_UNESCAPED[i];
+        i += 1;
     }
-    Ok(total)
+    let mut i = 0;
+    while i < extra.len() {
+        mask |= 1 << extra[i];
+        i += 1;
+    }
+    mask
 }
 
-fn uri_encode_into(s: &str, extra: &[u8], out: &mut String) {
-    let mut buf = [0u8; 4];
-    for c in s.chars() {
-        if c.is_ascii() && (URI_UNESCAPED.contains(&(c as u8)) || extra.contains(&(c as u8))) {
-            out.push(c);
+/// What encodeURIComponent keeps, and encodeURI (uriReserved and "#" too).
+const URI_COMPONENT_KEEP: u128 = uri_keep_mask(b"");
+const URI_KEEP: u128 = uri_keep_mask(b"#;/?:@&=+$,");
+
+#[inline]
+fn uri_keeps(keep: u128, b: u8) -> bool {
+    b < 0x80 && keep >> b & 1 != 0
+}
+
+/// The length of `uri_encode_into`'s output. A character outside `keep` is
+/// its UTF-8 bytes each as `%XX`, so the encoding is per byte.
+fn uri_encode_output_len(s: &str, keep: u128) -> Result<usize, Thrown> {
+    let kept = s.bytes().filter(|&b| uri_keeps(keep, b)).count();
+    let escaped = (s.len() - kept)
+        .checked_mul(3)
+        .ok_or_else(invalid_native_string_length)?;
+    checked_native_output_add(escaped, kept)
+}
+
+fn uri_encode_into(s: &str, keep: u128, out: &mut String) {
+    for b in s.bytes() {
+        if uri_keeps(keep, b) {
+            out.push(b as char);
         } else {
-            for &b in c.encode_utf8(&mut buf).as_bytes() {
-                let h = hex_upper(b);
-                out.push('%');
-                out.push(h[0] as char);
-                out.push(h[1] as char);
-            }
+            let h = hex_upper(b);
+            out.push('%');
+            out.push(h[0] as char);
+            out.push(h[1] as char);
         }
     }
 }

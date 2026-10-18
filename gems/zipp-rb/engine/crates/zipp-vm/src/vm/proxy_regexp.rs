@@ -1019,6 +1019,44 @@ fn slim_exec_enabled() -> bool {
     }
 }
 
+/// Short-subject ASCII execs a RegExp runs on its base program before its
+/// byte-optimized twin is built (`Vm::ensure_regexp_ascii_twin_deferred`).
+const TWIN_DEFER_EXECS: u8 = 3;
+/// Subjects this long or longer build the twin at their first exec.
+const TWIN_DEFER_MAX_SUBJECT: usize = 4096;
+/// Entries `Vm::regex_twin_defer` holds before it is cleared.
+const TWIN_DEFER_TABLE_CAP: usize = 1024;
+
+/// Whether the pattern `src` under `flags` can only name ASCII code points,
+/// so that its base program's byte search over an ASCII subject answers as
+/// the twin's does (`Vm::ensure_regexp_ascii_twin_deferred`): ASCII text, no
+/// `u` or `v` flag, and no escape that can spell a non-ASCII code point or a
+/// lone surrogate (`\u`, `\x`, `\p`, `\P`, `\c`, a digit escape longer than
+/// one digit, which may be an octal one). Errs towards `false`.
+fn twin_deferrable(src: &[u8], flags: &[u8]) -> bool {
+    if flags.iter().any(|&f| f == b'u' || f == b'v') {
+        return false;
+    }
+    let mut i = 0;
+    while i < src.len() {
+        match src[i] {
+            0x80.. => return false,
+            b'\\' => {
+                match src.get(i + 1) {
+                    None | Some(b'u' | b'x' | b'p' | b'P' | b'c') => return false,
+                    Some(d) if d.is_ascii_digit() && src.get(i + 2).is_some_and(u8::is_ascii_digit) => {
+                        return false
+                    }
+                    _ => {}
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    true
+}
+
 /// `ZIPP_NO_TWIN_AT_CREATE=1` stops the fused matchAll creation arm from
 /// building the SOURCE regex's `ascii_twin` up front: the first slim step's
 /// cold arm builds it on the per-call MATCHER instead — which dies with the
@@ -1363,8 +1401,13 @@ impl<'p> Vm<'p> {
                 return sym;
             }
         }
-        // An escaped guest string key reads back as the string it was.
-        self.alloc_str(guest_key_text(key).to_string())
+        // An escaped guest string key reads back as the string it was, one
+        // shared heap string per key text (`alloc_key_str`): a Proxy trap
+        // receives its key through here on every access.
+        if let Some(v) = self.cached_key_str(key) {
+            return v;
+        }
+        self.alloc_key_str(key.to_string())
     }
 
     /// Look up a Proxy handler trap by name; `Ok(Some(fn))` if it's callable,
@@ -1387,7 +1430,8 @@ impl<'p> Vm<'p> {
         }
     }
 
-    pub(crate) fn set_regexp_last_index(&mut self, idx: u32, n: usize) {
+    /// `n` is u64: `lastIndex` holds a ToLength, up to 2^53.
+    pub(crate) fn set_regexp_last_index(&mut self, idx: u32, n: u64) {
         if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
             *last_index = Value::num(n as f64);
         }
@@ -1666,7 +1710,7 @@ impl<'p> Vm<'p> {
         // re-proof, never a wrong answer.
         let pinned = |m: &ObjMap, key: &str, accessor: bool, (slot, idx, ver): (u32, u32, u32)| {
             let s = slot as usize;
-            m.keys.get(s).is_some_and(|k| k == key)
+            m.key_get(s).is_some_and(|k| k == key)
                 && m.attr_at(s).accessor == accessor
                 && m.val_at(s).is_heap()
                 && m.val_at(s).heap_index() == idx
@@ -1690,7 +1734,7 @@ impl<'p> Vm<'p> {
             return false;
         }
         let cs = c.ctor_slot as usize;
-        if m.keys.get(cs).map_or(true, |k| k != "constructor")
+        if m.key_get(cs).map_or(true, |k| k != "constructor")
             || m.attr_at(cs).accessor
             || !m.val_at(cs).is_heap()
             || m.val_at(cs).heap_index() != self.regexp_ctor
@@ -2113,10 +2157,8 @@ impl<'p> Vm<'p> {
             if match_is_empty {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 // ToLength: clamp to 2^53-1 BEFORE the advance.
-                let this_index = host_index_saturating(
-                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1),
-                );
-                let next = advance_string_index(&u16s, this_index, full_unicode);
+                let this_index = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+                let next = advance_string_index_u64(&u16s, this_index, full_unicode);
                 self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
         }
@@ -2544,10 +2586,8 @@ impl<'p> Vm<'p> {
             if is_empty {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 // ToLength: clamp to 2^53-1 BEFORE the advance.
-                let this_index = host_index_saturating(
-                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1),
-                );
-                let next = advance_string_index(&u16s, this_index, full_unicode);
+                let this_index = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+                let next = advance_string_index_u64(&u16s, this_index, full_unicode);
                 self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
         }
@@ -2858,7 +2898,7 @@ impl<'p> Vm<'p> {
         let old = self.arr_props.remove(&idx);
         let has_indices = p.values[3] != Value::UNDEFINED;
         let mut m = ObjMap::side_table_with_capacity(
-            3 + has_indices as usize + old.as_ref().map_or(0, ObjMap::len),
+            3 + has_indices as usize + old.as_ref().map_or(0, ObjMap::live_len),
         );
         m.push_data("index".to_string(), p.values[0]);
         m.push_data("input".to_string(), p.values[1]);
@@ -3074,10 +3114,11 @@ impl<'p> Vm<'p> {
         let found = if start > subj_units {
             None
         } else if is_ascii {
-            self.ensure_regexp_ascii_twin(re_idx);
+            self.ensure_regexp_ascii_twin_deferred(re_idx, subj_units);
             // Both the subject string and the regex/twin are shared borrows of
             // `self.heap` — they coexist. Prefer the byte-optimized twin; fall
-            // back to the base program when the twin compile failed.
+            // back to the base program while it is deferred or when its
+            // compile failed.
             let subj: &str = match self.heap.get(s_idx) {
                 HeapObj::Str(js) => js.as_str_wf(),
                 _ => "",
@@ -4205,6 +4246,36 @@ impl<'p> Vm<'p> {
         Ok(Some(result))
     }
 
+    /// [`Self::ensure_regexp_ascii_twin`] for one exec over a `subject_len`
+    /// byte ASCII subject. The twin is a second compile with its own
+    /// optimizer passes, which a regex made and run once or twice never earns
+    /// back: for a short subject and a plainly ASCII pattern
+    /// (`twin_deferrable`), the first [`TWIN_DEFER_EXECS`] execs search with
+    /// the base program and the twin is built on the next. A long subject
+    /// builds it at once, as its search may need the byte-optimized start
+    /// predicates; so does any other pattern, since the base program's byte
+    /// search is not exact for every one that can name a non-ASCII code point
+    /// (a case-folded non-ASCII literal under `i`, a lone-surrogate escape, a
+    /// `v`-mode class).
+    pub(crate) fn ensure_regexp_ascii_twin_deferred(&mut self, re_idx: u32, subject_len: usize) {
+        if subject_len < TWIN_DEFER_MAX_SUBJECT
+            && matches!(self.heap.get(re_idx), HeapObj::RegExp { ascii_twin: None, source, flags, .. }
+                if twin_deferrable(source.as_bytes(), flags.as_bytes()))
+            && (self.regexp_exact_source.is_empty() || !self.regexp_exact_source.contains_key(&re_idx))
+        {
+            if self.regex_twin_defer.len() >= TWIN_DEFER_TABLE_CAP {
+                self.regex_twin_defer.clear();
+            }
+            let seen = self.regex_twin_defer.entry(re_idx).or_insert(0);
+            if *seen < TWIN_DEFER_EXECS {
+                *seen += 1;
+                return;
+            }
+            self.regex_twin_defer.remove(&re_idx);
+        }
+        self.ensure_regexp_ascii_twin(re_idx);
+    }
+
     /// Ensure the BYTE-OPTIMIZED twin compile (`HeapObj::RegExp::ascii_twin`)
     /// for the RegExp at `re_idx` exists — built once, lazily, from the SAME
     /// pattern characters and flags as the heap regex (mirrors
@@ -4697,7 +4768,7 @@ impl<'p> Vm<'p> {
                     rxstats::count_scalar_elided();
                 }
                 if p.mstart == p.mend {
-                    self.set_regexp_last_index(regexp, p.mend as usize + 1);
+                    self.set_regexp_last_index(regexp, p.mend as u64 + 1);
                 }
                 rxstats::count_step_fused();
                 rxstats::count_scalar_success();
@@ -5163,8 +5234,13 @@ impl<'p> Vm<'p> {
             ),
             _ => return RegexpScalarExecStep::Decline,
         };
-        if !flags_ok || !last_index_ok || !matcher_ok || !twin_ready {
+        if !flags_ok || !last_index_ok || !matcher_ok {
             return RegexpScalarExecStep::Decline;
+        }
+        // Compiled code runs this, so the regex is hot: build its twin now
+        // rather than defer it as a first ordinary exec would.
+        if !twin_ready {
+            self.ensure_regexp_ascii_twin(re_idx);
         }
         let s_idx = input.heap_index();
         let subj_units = match self.heap.get(s_idx) {
@@ -5434,7 +5510,7 @@ impl<'p> Vm<'p> {
             if let Some(end) = empty_end {
                 // `lastIndex` was just written by the exec (== the match
                 // end); ASCII subject ⇒ the advance is exactly +1.
-                self.set_regexp_last_index(regexp, end + 1);
+                self.set_regexp_last_index(regexp, end as u64 + 1);
             }
             return Some(Ok((r, false)));
         }
@@ -5464,7 +5540,7 @@ impl<'p> Vm<'p> {
             // `lastIndex` was just written by the exec above (a number, ==
             // the match end); ASCII subject ⇒ the advance is exactly +1.
             let cur = match self.heap.get(regexp) {
-                HeapObj::RegExp { last_index, .. } => last_index.as_f64().max(0.0) as usize,
+                HeapObj::RegExp { last_index, .. } => last_index.as_f64().max(0.0) as u64,
                 _ => 0,
             };
             self.set_regexp_last_index(regexp, cur + 1);
@@ -5550,7 +5626,7 @@ impl<'p> Vm<'p> {
                             // `lastIndex` was just written by the publish (==
                             // the match end); ASCII subject ⇒ the advance is
                             // exactly +1.
-                            self.set_regexp_last_index(regexp, mend + 1);
+                            self.set_regexp_last_index(regexp, mend as u64 + 1);
                         }
                         return Some(Ok((r, false)));
                     }
@@ -5735,10 +5811,9 @@ impl<'p> Vm<'p> {
                     let cur_v = self.get_prop(Value::heap(regexp), "lastIndex")?;
                     // ToLength(Get(R,"lastIndex")) — a throwing
                     // lastIndex.valueOf must propagate, not be swallowed; the
-                    // 2^53-1 clamp applies BEFORE the advance.
-                    let cur = host_index_saturating(
-                        self.to_integer_or_zero(cur_v)?.clamp(0, (1i64 << 53) - 1),
-                    );
+                    // 2^53-1 clamp applies BEFORE the advance, which stays in
+                    // u64 (a `usize` stops at 2^32-1 on a 32-bit host).
+                    let cur = self.to_integer_or_zero(cur_v)?.clamp(0, (1i64 << 53) - 1) as u64;
                     #[cfg(feature = "safe-sandbox")]
                     let next = self.advance_index_on_value(string, cur, full_unicode)?;
                     #[cfg(not(feature = "safe-sandbox"))]
@@ -5758,26 +5833,25 @@ impl<'p> Vm<'p> {
 
     /// AdvanceStringIndex reading the units from heap string `s` (for the lazy
     /// matchAll driver, which doesn't keep an encoded unit buffer around).
+    /// `index` is a ToLength, so it is u64 (see `advance_string_index_u64`).
     #[cfg(not(feature = "safe-sandbox"))]
     pub(crate) fn advance_index_on_value(
         &mut self,
         s: Value,
-        index: usize,
+        index: u64,
         unicode: bool,
-    ) -> usize {
-        if unicode && s.is_heap() {
+    ) -> u64 {
+        if let (true, Ok(i)) = (unicode && s.is_heap(), usize::try_from(index)) {
             self.heap.flatten(s.heap_index());
             if let HeapObj::Str(js) = self.heap.get(s.heap_index()) {
-                if let (Some(hi), Some(lo)) =
-                    (js.unit_at(index), js.unit_at(index.saturating_add(1)))
-                {
+                if let (Some(hi), Some(lo)) = (js.unit_at(i), js.unit_at(i.saturating_add(1))) {
                     if (0xD800..=0xDBFF).contains(&hi) && (0xDC00..=0xDFFF).contains(&lo) {
-                        return index.saturating_add(2);
+                        return index + 2;
                     }
                 }
             }
         }
-        index.saturating_add(1)
+        index + 1
     }
 
     /// Safe-profile AdvanceStringIndex without flattening a rope or rebuilding
@@ -5786,20 +5860,20 @@ impl<'p> Vm<'p> {
     pub(crate) fn advance_index_on_value(
         &mut self,
         s: Value,
-        index: usize,
+        index: u64,
         unicode: bool,
-    ) -> Result<usize, Thrown> {
-        if unicode && s.is_heap() {
-            if let Some(hi) = regex_value_unit_at(self, s, index)? {
+    ) -> Result<u64, Thrown> {
+        if let (true, Ok(i)) = (unicode && s.is_heap(), usize::try_from(index)) {
+            if let Some(hi) = regex_value_unit_at(self, s, i)? {
                 if (0xD800..=0xDBFF).contains(&hi)
-                    && regex_value_unit_at(self, s, index.saturating_add(1))?
+                    && regex_value_unit_at(self, s, i.saturating_add(1))?
                         .is_some_and(|lo| (0xDC00..=0xDFFF).contains(&lo))
                 {
-                    return Ok(index.saturating_add(2));
+                    return Ok(index + 2);
                 }
             }
         }
-        Ok(index.saturating_add(1))
+        Ok(index + 1)
     }
 
     /// Regex-backed `String.prototype.replace`/`replaceAll`. `repl` is a function
@@ -6875,6 +6949,17 @@ pub(crate) fn advance_string_index(units: &[u16], index: usize, unicode: bool) -
     }
 }
 
+/// AdvanceStringIndex for a ToLength'd `lastIndex` (up to 2^53-1), whose
+/// result is written back: computed in u64, because a `usize` saturates at
+/// 2^32-1 on a 32-bit host and `lastIndex` 2^53-1 advanced to 2^32-1 there
+/// instead of 2^53. An index at or past the end advances by one.
+pub(crate) fn advance_string_index_u64(units: &[u16], index: u64, unicode: bool) -> u64 {
+    match usize::try_from(index) {
+        Ok(i) if i < units.len() => advance_string_index(units, i, unicode) as u64,
+        _ => index + 1,
+    }
+}
+
 /// `ZIPP_NO_MATCH_VARIANT=1` restores the eager `arr_props` `ObjMap` for every
 /// match result: the compact record is built and then immediately materialised,
 /// so the old representation (and its cost) is reproduced exactly. Exists so
@@ -7405,6 +7490,42 @@ mod subject_unit_tests {
                 assert!(!push_wtf8_units(&bytes, &mut short, limit), "limit {limit}");
                 assert!(short.len() <= limit && expected.starts_with(&short));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod twin_deferral_tests {
+    use super::twin_deferrable;
+
+    /// Only a pattern that can name nothing but ASCII code points defers its
+    /// twin; everything that might spell a non-ASCII one builds it at once.
+    #[test]
+    fn deferral_takes_only_plainly_ascii_patterns() {
+        for (src, flags) in [
+            ("(\\w+)=(\\d+)", ""),
+            ("[a-z]+\\s*(?:get|put)", "gi"),
+            ("(\\w)\\1x", "g"),
+            ("^line\\d$", "m"),
+            ("a.b", "sy"),
+            ("(?<k>[a-z]{3})\\k<k>", "d"),
+        ] {
+            assert!(twin_deferrable(src.as_bytes(), flags.as_bytes()), "{src} /{flags}");
+        }
+        for (src, flags) in [
+            ("abc", "u"),
+            ("abc", "v"),
+            ("c\\uDE00*", ""),
+            ("\\x41\\xff", ""),
+            ("\\p{L}", ""),
+            ("\\cJ", ""),
+            ("\\377", ""),
+            ("\\12", ""),
+            ("caf\u{e9}", ""),
+            ("\u{1d400}", "i"),
+            ("trailing\\", ""),
+        ] {
+            assert!(!twin_deferrable(src.as_bytes(), flags.as_bytes()), "{src} /{flags}");
         }
     }
 }

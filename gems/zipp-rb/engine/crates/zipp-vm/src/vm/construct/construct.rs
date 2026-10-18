@@ -17,7 +17,7 @@ impl<'p> Vm<'p> {
     /// regrowth is what we are paying to avoid.
     pub(crate) fn learn_ctor_field_hint(&mut self, fid: u32, obj: Value) {
         let n = match self.heap.get(obj.heap_index()) {
-            HeapObj::Object(m) => m.keys.len().min(u16::MAX as usize) as u16,
+            HeapObj::Object(m) => m.live_len().min(u16::MAX as usize) as u16,
             _ => 0,
         };
         // CAPPED. A high-water mark is unbounded by construction: one
@@ -401,6 +401,12 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         if !cv.is_heap() {
             return Err(Thrown::from_static("TypeError: value is not a constructor"));
+        }
+        // A class: none of the built-in constructor routes below can take
+        // one (each is an identity test against a built-in, a realm facade,
+        // a Proxy or a function), so it skips their tests.
+        if matches!(self.heap.get(cv.heap_index()), HeapObj::Class(_)) {
+            return self.construct_class(cv, args, new_target);
         }
         // A constructor from a `$262.createRealm()` realm. Only the realm's
         // FACADE constructors (plain Objects) take this route — a realm-TAGGED
@@ -1248,6 +1254,14 @@ impl<'p> Vm<'p> {
                 vm.construct_with_newtarget(target, &combined, nt)
             });
         }
+        self.construct_class(cv, args, new_target)
+    }
+
+    /// [[Construct]] of the class `cv` (`construct_with_newtarget_rooted`'s
+    /// class arm), in that function's host-root scope. Every built-in
+    /// constructor route it tests first is for another kind of object, so a
+    /// class comes straight here.
+    fn construct_class(&mut self, cv: Value, args: &[Value], new_target: Value) -> Result<Value, Thrown> {
         let (ctor, has_explicit, parent, extends_null) =
             match self.heap.get(cv.heap_index()) {
                 HeapObj::Class(c) => (

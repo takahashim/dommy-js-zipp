@@ -370,6 +370,7 @@ fn builtin_object_method(key: &str) -> bool {
 
 /// `ZIPP_NO_DYNAMIC_IC=1` keeps runtime `eval` / `new Function` code out of
 /// the interpreter inline caches (the pre-B274 behaviour) for A/B runs.
+#[inline]
 fn dynamic_ic_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
@@ -407,9 +408,19 @@ impl<'p> Vm<'p> {
     /// case, must stay one compare in the caller: the module and dynamic
     /// checks (two lazily read switches, a range scan, a subtraction) live
     /// out of line so their size can never cost the hot path its inlining.
+    ///
+    /// Installed code is hot too: every function of the Python runtime (and
+    /// of torch) and every script an embedder runs through `eval_in_context`
+    /// is installed, and the out-of-line half binary-searched the module
+    /// ranges on each probe (2% of an interpreted torch loop). With dynamic
+    /// caching on, the default, an installed function is eligible whichever
+    /// kind it is, so that answer is one more compare here.
     #[inline(always)]
     fn ic_func_eligible(&self, func_id: u32) -> bool {
-        (func_id as usize) < self.main_func_count || self.ic_func_eligible_installed(func_id)
+        let f = func_id as usize;
+        f < self.main_func_count
+            || (f.wrapping_sub(self.main_func_count) < self.eval_funcs.len() && dynamic_ic_enabled())
+            || self.ic_func_eligible_installed(func_id)
     }
 
     /// The runtime-installed half of `ic_func_eligible`: loader-recorded
@@ -802,6 +813,31 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The way-0 own-data hit of [`Self::ic_get_prop`], for the general
+    /// profile's dispatch loop to take inline. `ic_get_prop` is large and stays
+    /// a call there; on an interpreted property-read loop the call and its
+    /// prologue were a sixth of the run (property-ic-shapes) for a hit that is
+    /// three loads and a compare. This is exactly `ic_get_prop`'s first check:
+    /// the same answer, or `None` and the full call. The safe profile inlines
+    /// `ic_get_prop` whole and does not use it.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_own_hit(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
+        if !self.ic_func_eligible(func_id) {
+            return None;
+        }
+        let site = self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)?.as_deref()?;
+        if site.n == 0 {
+            return None;
+        }
+        let IcEntry::OwnData { shape, slot } = site.entries[0] else {
+            return None;
+        };
+        let (_, m) = self.ic_recv_map(recv)?;
+        let sh = m.shape();
+        (sh != crate::shape::DICT && sh == shape).then(|| m.val_at(slot as usize))
+    }
+
     /// IC lookup + fill for a `GetProp` site. `GetAct::None` ⇒ slow path.
     ///
     /// The safe profile's dispatch loop takes it inline. Left to the
@@ -887,8 +923,7 @@ impl<'p> Vm<'p> {
                             {
                                 if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
                                     let s = slot as usize;
-                                    if s < hm.keys.len()
-                                        && hm.keys[s] == key
+                                    if hm.key_get(s) == Some(key)
                                         && !hm.attr_at(s).accessor
                                     {
                                         return GetAct::Value(hm.val_at(s));
@@ -1155,7 +1190,7 @@ impl<'p> Vm<'p> {
                     return GetAct::Value(Value::UNDEFINED); // guarded chain miss
                 }
                 let s = slot as usize;
-                if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
+                if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
                     GetAct::Value(hm.val_at(s))
                 } else {
                     GetAct::None
@@ -1201,7 +1236,7 @@ impl<'p> Vm<'p> {
             return GetAct::None;
         };
         let s = slot as usize;
-        if s >= m.keys.len() || m.keys[s] != key || !m.attr_at(s).accessor {
+        if m.key_get(s) != Some(key) || !m.attr_at(s).accessor {
             return GetAct::None;
         }
         self.ic_acc_get_from(m, s)
@@ -1216,7 +1251,7 @@ impl<'p> Vm<'p> {
             _ => return GetAct::None,
         };
         let s = slot as usize;
-        if s >= hm.vals_len() || !hm.attr_at(s).accessor {
+        if hm.key_get(s).is_none() || !hm.attr_at(s).accessor {
             return GetAct::None;
         }
         let g = hm.val_at(s);
@@ -1234,6 +1269,53 @@ impl<'p> Vm<'p> {
     }
 
     // ── SetProp sites ──
+
+    /// The way-0 own-data hit of [`Self::ic_set_prop`], inline in the general
+    /// profile's dispatch loop (see [`Self::ic_get_prop_own_hit`]): the same
+    /// shape guard and the same store `ic_apply_set`'s `WriteOwn` makes.
+    /// `false` leaves the write to the full call.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    pub(crate) fn ic_set_prop_own_hit(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        val: Value,
+    ) -> bool {
+        if !self.ic_func_eligible(func_id) {
+            return false;
+        }
+        let Some(site) = self
+            .site_ics
+            .get(func_id as usize)
+            .and_then(|f| f.as_ref())
+            .and_then(|f| f.get(ip))
+            .and_then(|s| s.as_deref())
+        else {
+            return false;
+        };
+        if site.n == 0 {
+            return false;
+        }
+        let IcEntry::OwnData { shape: cached, slot } = site.entries[0] else {
+            return false;
+        };
+        let Some((idx, m)) = self.ic_recv_map(recv) else {
+            return false;
+        };
+        let sh = m.shape();
+        if sh == crate::shape::DICT || sh != cached {
+            return false;
+        }
+        if val.is_heap() {
+            self.heap.write_barrier_val(idx, val);
+        }
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            m.set_val_at(slot as usize, val);
+        }
+        true
+    }
 
     /// IC lookup + fill for a `SetProp` site. `SetAct::Done` means the own
     /// data slot was written; `Setter` hands a plain setter to frame-call.
@@ -1405,7 +1487,7 @@ impl<'p> Vm<'p> {
             }
             Walked::ChainData { first, hops, slot }
                 if matches!(self.heap.get(hops.0[hops.1 as usize - 1].0), HeapObj::Object(hm)
-                    if (slot as usize) < hm.vals_len()
+                    if hm.key_get(slot as usize).is_some()
                         && !hm.attr_at(slot as usize).accessor
                         && hm.attr_at(slot as usize).writable) =>
             {
@@ -1788,8 +1870,7 @@ impl<'p> Vm<'p> {
     fn ic_own_set_plan(&self, recv: Value, key: &str, slot: u32) -> Option<SetPlan> {
         let (idx, m) = self.ic_recv_map(recv)?;
         let s = slot as usize;
-        if s < m.keys.len()
-            && m.keys[s] == key
+        if m.key_get(s) == Some(key)
             && !m.attr_at(s).accessor
             && m.attr_at(s).writable
             && !m.class_proto
@@ -1821,7 +1902,7 @@ impl<'p> Vm<'p> {
             return SetAct::None;
         };
         let s = slot as usize;
-        if s >= m.keys.len() || m.keys[s] != key || !m.attr_at(s).accessor {
+        if m.key_get(s) != Some(key) || !m.attr_at(s).accessor {
             return SetAct::None;
         }
         let setter = m.attr_at(s).setter;
@@ -1844,7 +1925,7 @@ impl<'p> Vm<'p> {
             _ => return SetAct::None,
         };
         let s = slot as usize;
-        if s >= hm.vals_len() || !hm.attr_at(s).accessor {
+        if hm.key_get(s).is_none() || !hm.attr_at(s).accessor {
             return SetAct::None;
         }
         let setter = hm.attr_at(s).setter;
@@ -2029,10 +2110,10 @@ impl<'p> Vm<'p> {
                 continue;
             }
             let slot = slot as usize;
-            if slot >= m.keys.len()
+            if m.key_get(slot).is_none()
                 || slot >= m.vals_len()
                 || slot >= m.attrs_len()
-                || &*m.keys[slot] != key
+                || m.key_at(slot) != key
                 || m.attr_at(slot).accessor
             {
                 return None;
@@ -2089,7 +2170,7 @@ impl<'p> Vm<'p> {
                 }
                 let hm = self.ic_chain_ok(idx, first, &hops)?;
                 let s = slot as usize;
-                if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
+                if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
                     let v = hm.val_at(s);
                     let (fid, closure) = self.ic_plain_fn(v)?;
                     Some((fid, closure, v))
@@ -2331,7 +2412,7 @@ impl<'p> Vm<'p> {
                 if h == home && self.ic_super_chain_ok(&hops) {
                     if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
                         let s = slot as usize;
-                        if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
+                        if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
                             let v = hm.val_at(s);
                             if let Some((fid, _closure)) = self.ic_plain_fn(v) {
                                 return Some(MiSuperResolved {
@@ -2392,7 +2473,7 @@ impl<'p> Vm<'p> {
                         // The key must still name THIS slot and still be an
                         // accessor: a `delete` + re-add shifts slots, and a
                         // redefine to a data property changes what `vals[s]` means.
-                        if s < hm.keys.len() && hm.keys[s] == key && hm.attr_at(s).accessor {
+                        if hm.key_get(s) == Some(key) && hm.attr_at(s).accessor {
                             let g = hm.val_at(s);
                             // A getter-less accessor (`set` only) reads as
                             // `undefined` rather than calling anything — not
@@ -2454,7 +2535,7 @@ impl<'p> Vm<'p> {
                 if h == home && self.ic_super_chain_ok(&hops) {
                     if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
                         let s = slot as usize;
-                        if s < hm.keys.len() && hm.keys[s] == key && hm.attr_at(s).accessor {
+                        if hm.key_get(s) == Some(key) && hm.attr_at(s).accessor {
                             let setter = hm.attr_at(s).setter;
                             // A setter-less accessor (`get` only) is a strict
                             // TypeError / sloppy no-op — helper only.
@@ -2660,7 +2741,7 @@ impl<'p> Vm<'p> {
                             _ => continue,
                         };
                         let s = slot as usize;
-                        if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
+                        if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
                             let v = hm.val_at(s);
                             if let Some((fid, closure)) = self.ic_plain_fn(v) {
                                 return Some((fid, closure, v));
@@ -2729,7 +2810,7 @@ impl<'p> Vm<'p> {
                                 self.heap.get(hops.0[hops.1 as usize - 1].0)
                             {
                                 let s = slot as usize;
-                                if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor
+                                if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor
                                 {
                                     return GetAct::Value(hm.val_at(s));
                                 }
