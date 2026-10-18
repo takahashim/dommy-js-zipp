@@ -1542,6 +1542,14 @@ pub struct HeapHelperAddrs {
     /// captured callee IS that native runs the dedicated helper.
     pub push_intrinsic_bits: u64,
     pub char_code_at_intrinsic_bits: u64,
+    /// Boot bits of %Map.prototype% `get` / `has`, %Set.prototype% `has`,
+    /// %Map.prototype% `set` and %Set.prototype% `add` (0 = unavailable),
+    /// and the helpers a captured callee of one of them calls directly
+    /// (`jit_coll_lookup_direct`, `jit_coll_mutate_direct`; see
+    /// `emit_captured_method_lane`).
+    pub coll_boot_bits: [u64; 5],
+    pub coll_lookup_direct: usize,
+    pub coll_mutate_direct: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
     /// class-instance receiver): interpreter-IC resolution + getter frame
     /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
@@ -1740,6 +1748,9 @@ impl HeapHelperAddrs {
             cross3_finish: self.cross3_finish,
             push_intrinsic_bits: self.push_intrinsic_bits,
             char_code_at_intrinsic_bits: self.char_code_at_intrinsic_bits,
+            coll_boot_bits: self.coll_boot_bits,
+            coll_lookup_direct: self.coll_lookup_direct,
+            coll_mutate_direct: self.coll_mutate_direct,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,
             get_prop_acc: self.get_prop_acc,
@@ -2265,7 +2276,8 @@ pub(crate) fn multi_split_enabled() -> bool {
 /// MEASURED ON THE DEFAULT BUILD (W18, 21 paired reps, one binary, the switch
 /// as the only difference): `parse-large-js` 420ms -> 370ms, **-11.6%
 /// [-12.6, -11.1]** — W17's -11.8% [-12.2, -11.3] reproduced now that the row
-/// is the default. `bench/w18_gprwtshare_default_2026-08-22.json`.
+/// is the default. `w18_gprwtshare_default_2026-08-22.json` in
+/// `bench/history/results.csv`.
 ///
 /// `ZIPP_NO_GPR_WT_SHARE=1` restores the pre-W17 plans byte-for-byte, matching
 /// every other perf mechanism in this file: a memoized latch, read at plan time,
@@ -5667,11 +5679,13 @@ pub(crate) mod meter;
 mod plan;
 mod plan_region;
 mod proto_mem;
+// Python's compiled tier (`lang/python/jit/`).
 #[cfg(feature = "python")]
+#[path = "../lang/python/jit/py.rs"]
 mod py;
 // No Python program in this build: the tier's questions answer "none".
 #[cfg(not(feature = "python"))]
-#[path = "py_off.rs"]
+#[path = "../lang/python/jit/py_off.rs"]
 mod py;
 mod regalloc;
 mod region_admit;

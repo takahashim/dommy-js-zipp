@@ -58,7 +58,7 @@ impl<'p> Vm<'p> {
             let copy = match (self.heap.get(src.heap_index()), self.heap.get(ti)) {
                 (HeapObj::Object(sm), HeapObj::Object(tm))
                     if !sm.is_ctor
-                        && tm.keys.is_empty()
+                        && tm.is_empty()
                         && tm.extensible
                         && tm.class.is_none()
                         && !tm.class_proto =>
@@ -83,14 +83,14 @@ impl<'p> Vm<'p> {
         // Everything else: the general CopyDataProperties (getters, proxies,
         // strings, arrays, symbols, index order), then each property defined.
         let m = self.with_host_roots(&[target], |vm| vm.copy_data_properties_rest(src, &[]))?;
-        let n = m.keys.len();
-        for i in 0..n {
+        let n = m.live_len();
+        for i in m.slots() {
             let v = m.val_at(i);
             if v.is_heap() {
                 self.heap.write_barrier_val(ti, v);
             }
             if let HeapObj::Object(tm) = self.heap.get_mut(ti) {
-                tm.define(&m.keys[i], v, crate::heap::PropAttr::data());
+                tm.define(m.key_at(i), v, crate::heap::PropAttr::data());
             }
         }
         if n > 0 {
@@ -194,13 +194,16 @@ impl<'p> Vm<'p> {
     }
 
     /// One source of `Object.assign` that is a plain object holding only
-    /// ordinary data properties (no index key, no symbol key, no accessor),
-    /// into a plain extensible target: its own keys are its insertion order
-    /// and each Get is its slot, so the copy is each key's Set made where it
-    /// is — a store into the target's own writable data property, or the
-    /// append of a key no level of the target's chain intercepts
-    /// (`plain_add_chain_clear`); an empty target takes the source's whole
-    /// store, as an object spread does. `false`, with nothing written, for
+    /// ordinary data properties (no symbol key, no accessor), into a plain
+    /// extensible target: each Get is its slot and no Set can run code, so
+    /// the copy is each key's Set made where it is — a store into the
+    /// target's own writable data property, or the append of a key no level
+    /// of the target's chain intercepts (`plain_add_chain_clear`). The order
+    /// of those Sets is unobservable, and the target's index keys enumerate
+    /// in index order whatever order they arrive in, so the source's slot
+    /// order serves for its [[OwnPropertyKeys]] order; an empty target takes
+    /// the source's whole store, as an object spread does. `false`, with
+    /// nothing written, for
     /// anything else (a Proxy, a getter, a setter or a read-only property in
     /// the way, a class instance or prototype as the target, the global, a
     /// namespace, Object.prototype or Array.prototype): the general loop
@@ -221,40 +224,35 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        let keys: Vec<String> = match self.heap.get(sidx) {
-            HeapObj::Object(sm)
-                if !sm.is_ctor
-                    && !sm.has_element_key()
-                    && sm.attrs_all_data()
-                    && !sm.keys.iter().any(|k| k.starts_with("@@") || k == "__proto__") =>
-            {
-                sm.keys.iter().cloned().collect()
-            }
-            _ => return false,
+        let (HeapObj::Object(sm), HeapObj::Object(tm)) = (self.heap.get(sidx), self.heap.get(tidx)) else {
+            return false;
         };
-        let target_ok = matches!(
-            self.heap.get(tidx),
-            HeapObj::Object(tm)
-                if tm.extensible && tm.class.is_none() && !tm.class_proto && !tm.is_ctor
-        );
-        if !target_ok || keys.iter().any(|k| !self.plain_add_chain_clear(tidx, k)) {
+        if sm.is_ctor
+            || !sm.attrs_all_data()
+            || !tm.extensible
+            || tm.class.is_some()
+            || tm.class_proto
+            || tm.is_ctor
+            || sm.keys_iter().any(|k| k.starts_with("@@") || k == "__proto__")
+        {
             return false;
         }
-        // Every key's Set is now an own store or an ordinary append.
-        let own_ok = match self.heap.get(tidx) {
-            HeapObj::Object(tm) => keys.iter().all(|k| match tm.pos(k) {
-                Some(i) => {
-                    let a = tm.attr_at(i);
-                    !a.accessor && a.writable && !tm.val_at(i).is_uninitialized()
-                }
-                None => true,
-            }),
-            _ => false,
-        };
-        if !own_ok {
+        // Every key's Set must be an own store or an ordinary append.
+        let target_empty = tm.is_empty();
+        let sets_plain = sm.keys_iter().all(|k| {
+            self.plain_add_chain_clear(tidx, k)
+                && (target_empty
+                    || match tm.pos(k) {
+                        Some(i) => {
+                            let a = tm.attr_at(i);
+                            !a.accessor && a.writable && !tm.val_at(i).is_uninitialized()
+                        }
+                        None => true,
+                    })
+        });
+        if !sets_plain {
             return false;
         }
-        let target_empty = matches!(self.heap.get(tidx), HeapObj::Object(tm) if tm.keys.is_empty());
         if target_empty {
             let copy = match self.heap.get(sidx) {
                 HeapObj::Object(sm) => sm.spread_copy(),
@@ -272,8 +270,8 @@ impl<'p> Vm<'p> {
                 return true;
             }
         }
-        let vals: Vec<Value> = match self.heap.get(sidx) {
-            HeapObj::Object(sm) => sm.vals_slice().to_vec(),
+        let (keys, vals): (Vec<String>, Vec<Value>) = match self.heap.get(sidx) {
+            HeapObj::Object(sm) => sm.iter().map(|(k, v, _)| (k.to_owned(), v)).unzip(),
             _ => return false,
         };
         for (k, v) in keys.into_iter().zip(vals) {
@@ -712,8 +710,14 @@ impl<'p> Vm<'p> {
             return None;
         }
         let idx = obj.heap_index();
-        let HeapObj::Array(items) = self.heap.get(idx) else {
-            return None;
+        let items = match self.heap.get(idx) {
+            HeapObj::Array(items) => items,
+            // A plain object's own index key, found by number.
+            HeapObj::Object(_) => {
+                let i = crate::vm::array_index(key)?;
+                return self.plain_index_key_has(idx, i, true);
+            }
+            _ => return None,
         };
         // A non-integral or negative key spells something `has_own_property`'s
         // `parse::<usize>()` would reject; leave those to the general path
@@ -753,15 +757,16 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(idx) else {
             return None;
         };
-        let Some(std::borrow::Cow::Borrowed(bytes)) = self.heap.str_wtf8_cow(key.heap_index())
-        else {
+        // A flat string's own record says whether it is well-formed, which
+        // is what viewing it as `&str` needs; validating its bytes again was
+        // a tenth of the call.
+        let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
             return None;
         };
-        if bytes.starts_with(b"@@") {
+        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
             return None;
         }
-        let key = std::str::from_utf8(bytes).ok()?;
-        Some(m.pos(key).is_some())
+        Some(m.pos(js.as_str_wf()).is_some())
     }
 
     pub(crate) fn has_own_property(&self, obj: Value, key: &str) -> bool {
@@ -1055,8 +1060,7 @@ impl<'p> Vm<'p> {
         let hit = e.proto_ver != 0
             && e.proto_ver == self.heap.version_of(e.proto).wrapping_add(1)
             && matches!(self.heap.get(e.proto), HeapObj::Object(p)
-                if (e.next_slot as usize) < p.keys.len()
-                    && p.val_at(e.next_slot as usize).bits() == e.next_bits)
+                if p.val_get(e.next_slot as usize).is_some_and(|v| v.bits() == e.next_bits))
             && (!closes
                 || (e.chain_len > 0
                     && e.chain[..e.chain_len as usize]
@@ -1199,7 +1203,7 @@ impl<'p> Vm<'p> {
             && self.heap.version_of(first).wrapping_add(1) == memo.first_ver
             && self.heap.version_of(memo.holder) == memo.holder_ver
             && matches!(self.heap.get(memo.holder), HeapObj::Object(m)
-                if (memo.slot as usize) < m.vals_len() && m.val_at(memo.slot as usize).bits() == memo.bits)
+                if m.val_get(memo.slot as usize).is_some_and(|v| v.bits() == memo.bits))
         {
             return true;
         }
@@ -1281,7 +1285,7 @@ impl<'p> Vm<'p> {
         let hit = ver != 0
             && ver == self.heap.version_of(holder).wrapping_add(1)
             && matches!(self.heap.get(holder), HeapObj::Object(p)
-                if (at as usize) < p.keys.len() && p.val_at(at as usize).bits() == default.bits());
+                if p.val_get(at as usize).is_some_and(|v| v.bits() == default.bits()));
         if !hit {
             // Prove the holder's own `@@iterator` is the default DATA method;
             // its slot then stays valid for as long as its version does.
@@ -1879,9 +1883,11 @@ impl<'p> Vm<'p> {
         }
         // A generator's `return` resumes the suspended body with a RETURN completion
         // so any `finally` spanning the yield runs (GeneratorResume semantics) — not
-        // a no-op. The {value,done} result is discarded.
+        // a no-op. The {value,done} result is discarded. Only while a Get of
+        // `return` finds the intrinsic: an own or prototype override is the
+        // GetMethod below's, as for any iterator.
         match self.heap.get(iter.heap_index()) {
-            HeapObj::Generator { .. } => {
+            HeapObj::Generator { .. } if self.gen_method_pristine(iter.heap_index(), "return") => {
                 self.generator_method(iter.heap_index(), "return", &[])?;
                 return Ok(());
             }
@@ -2332,7 +2338,7 @@ impl<'p> Vm<'p> {
                 } else {
                     v
                 };
-                self.create_data_property_or_throw(a, i, mapped)?;
+                self.create_data_property_or_throw(a, i as u64, mapped)?;
             }
             self.set_prop(a, "length", Value::num(n as f64), true)?;
             return Ok(a);
@@ -2611,7 +2617,7 @@ impl<'p> Vm<'p> {
                     {
                         close_and_throw!(e);
                     }
-                    if let Err(e) = self.create_data_property_or_throw(a, k, mapped) {
+                    if let Err(e) = self.create_data_property_or_throw(a, k as u64, mapped) {
                         close_and_throw!(e);
                     }
                 }

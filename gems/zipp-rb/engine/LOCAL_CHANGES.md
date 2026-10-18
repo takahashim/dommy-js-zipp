@@ -40,7 +40,7 @@ candidate to propose upstream.
 - **Module resolver and `import.meta.url`** — `ModuleResolver`,
   `join_module_specifier` (vm/mod.rs), `ScriptState::set_module_resolver` /
   `set_module_meta_url`; every `dir.join(spec)` in vm/engine/modules.rs,
-  vm/dispatch.rs (dynamic import) and vm/construct/modules_dispose.rs goes
+  vm/dispatch_cold.rs (dynamic import) and vm/construct/modules_dispose.rs goes
   through `join_module_specifier`, and `Vm::fill_module_meta_url` gives a
   module's `import.meta` a `url` (it had none). Lets zipp-rb's
   `VM#module_loader=` load modules named by URL or bare name.
@@ -69,7 +69,7 @@ candidate to propose upstream.
   `error` share a stream. zipp-rb's `on_log` severities come from it. The
   `Print` lowering of `console.*(…)` prints at its method's level too
   (vm/helpers_misc.rs `console_print_level`, in place of upstream's
-  stream-only `console_print_stream`; vm/dispatch.rs `Instr::Print`).
+  stream-only `console_print_stream`; vm/dispatch_cold.rs `Instr::Print`).
 - **In-memory modules** — `HostModuleProvider`,
   `ScriptState::set_module_provider` (vm/engine/modules.rs): modules under a
   virtual root served from host memory, sharing the confined loader's budgets.
@@ -80,13 +80,13 @@ candidate to propose upstream.
 (`Name: message` then `    at f (script:line:col)`):
 
 - **Positions** — `Stmt::Expr` / `Return` / `Throw` carry their start offset
-  and `VarDecl` a `pos` (parse/ast.rs, parse/stmt.rs, parse/funcs.rs); the
+  and `VarDecl` a `pos` (lang/js/parse/ast.rs, stmt.rs, funcs.rs); the
   compiler records `FuncProto::positions` (`SourcePos { ip, line, col }`) in
-  `FnCompiler::note_stmt_pos` (compile/decls.rs), with the function's own
-  start at ip 0 (`Compiler::default_position`, compile/funcs.rs) and
-  `Compiler::line_col` (compile/compiler.rs). Matches on those variants in
-  capture.rs, parse/limits.rs, compile/decls.rs and vm/engine/run.rs gained
-  the extra field. bytecode_codec.rs encodes both new FuncProto fields.
+  `FnCompiler::note_stmt_pos` (lang/js/compile/decls.rs), with the function's own
+  start at ip 0 (`Compiler::default_position`, lang/js/compile/funcs.rs) and
+  `Compiler::line_col` (lang/js/compile/compiler.rs). Matches on those
+  variants in capture.rs, lang/js/parse/limits.rs, lang/js/compile/decls.rs
+  and vm/engine/run.rs gained the extra field. bytecode_codec.rs encodes both new FuncProto fields.
 - **Script names** — `FuncProto::script`, stamped in `prepare_eval_program`
   (vm/engine/eval_prog.rs) from `Vm::script_name`
   (`ScriptState::set_script_name`, `HostCtx::set_script_name`) or, for a
@@ -100,7 +100,8 @@ candidate to propose upstream.
 - **Host** — a JsError's `stack` is the formatted stack (vm/host_api.rs;
   `read_data_prop` had returned the inherited accessor's getter), and
   `ScriptState::load_in_context` reports a throw structured. The
-  `FuncProto` size pin is 312 (bytecode.rs).
+  `FuncProto` size pin is 336 (bytecode.rs; upstream's 296 plus the two
+  fields).
 
 ## Resource limits (crates/zipp-vm/src/vm/instrument.rs, embed.rs)
 
@@ -146,18 +147,18 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   `slot_table_growth_reserve`), which is how the regex came to see no
   headroom at all. Test: `test/limits_test.rb`.
 
-## Global object (crates/zipp-vm/src/vm/dispatch.rs)
+## Global object (crates/zipp-vm/src/vm/dispatch.rs, vm/dispatch_cold.rs)
 
 - **A builtin read finds the global's own property first** — a global slot
   an eval-installed program reads (vm/dispatch.rs: `LoadGlobalOrUndefined`,
-  `LoadGlobalOrUndefinedDyn`, `LoadGlobalDyn`, `load_global_slow`) consulted
-  the global's prototype chain before `global_by_name`, so every read of
+  `load_global_slow`; vm/dispatch_cold.rs: `LoadGlobalOrUndefinedDyn`,
+  `LoadGlobalDyn`) consulted the global's prototype chain before `global_by_name`, so every read of
   `Array` or `Object` in dommy's `host_runtime.js` asked the window proxy's
   `has` trap once the window sat on that chain (and walked
   `Object.prototype` before). The builtin is an own property of the global
   object, so it now answers first. Test: `test/engine_fixes_test.rb`.
 
-## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, compile/*, vm/dispatch.rs)
+## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, lang/js/compile/*, vm/dispatch.rs)
 
 - **Unwritten captured bindings are captured by value** — a captured
   binding took a heap cell (a whole slot) even when nothing ever wrote it,
@@ -179,7 +180,7 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   548MB → 326MB. Tests: vm/gc.rs `value_capture_tests`, heap.rs,
   `test/engine_fixes_test.rb`.
 
-## Performance (crates/zipp-vm/src/parse/parser.rs, src/compile/*)
+## Performance (crates/zipp-vm/src/lang/js/parse/parser.rs, lang/js/compile/*)
 
 - **Scope lookups indexed** — parser `Scope` gains `lex_all` / `lex_nonfn` /
   `var_all` sets; the compiler keeps `scope_index` (name → register per scope)
@@ -191,12 +192,12 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
 ## Correctness (crates/zipp-vm/src)
 
 - **A top-level `const` destructuring initializes its globals** —
-  `var_decl` (compile/decls.rs) pre-initialized a script's destructured
+  `var_decl` (lang/js/compile/decls.rs) pre-initialized a script's destructured
   leaves to undefined (strict stores need the TDZ over), which made the
   extraction a const's second write under script GDI (`const {a} = o` threw
   "Assignment to constant variable"). A global const's leaves are now
   extracted into locals and each slot written once. A const reassignment's
-  TypeError also carries V8's message (compile/bindings.rs). Test:
+  TypeError also carries V8's message (lang/js/compile/bindings.rs). Test:
   `test/engine_fixes_test.rb`.
 - **A Proxy is constructible only when its target is** — the Proxy
   `[[Construct]]` path (vm/construct/construct.rs) ran the trap for any
@@ -204,7 +205,7 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   `test/engine_fixes_test.rb`.
 - **A host runs classic scripts, not evals** — `Vm::host_run_script`
   (vm/engine/eval_prog.rs, with `compile_script_with_completion` /
-  `Compiler::script_completion` in compile/) runs a script with script
+  `Compiler::script_completion` in lang/js/compile/) runs a script with script
   GlobalDeclarationInstantiation (the `$262.evalScript` path) and its
   completion value. `ScriptState::load_in_context`,
   `eval_in_context_structured` (`host_eval_structured`) and
@@ -212,18 +213,12 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   evals, a strict script's `var`s and functions stayed inside it, and no
   script's `let`/`const`/`class` reached later ones (WPT's `common.js`
   files are strict). Test: `test/engine_fixes_test.rb`.
-- **A builtin replaced on the global object is the binding later scripts
-  see** — `eval_global_slot` seeded a later script's fresh slot for a builtin
-  name (`setTimeout`, `Map`, …) from the boot intrinsic, ignoring an own data
-  property an earlier script had set (`globalThis.setTimeout = f` before any
-  code named it bare). It now seeds from that property. dommy installs its
-  timer globals this way. Test: `test/engine_fixes_test.rb`.
-- **`typeof` of a global agrees with a read** — `LoadGlobalOrUndefined` /
-  `LoadGlobalOrUndefinedDyn` (vm/dispatch.rs) returned a live slot even when
-  the global object shadowed it with a real own property, which `LoadGlobal`
-  reads instead; and `eval_global_slot` (vm/engine/run.rs) re-seeded a builtin
-  deleted from the global object before any code named it. Test:
-  `test/engine_fixes_test.rb`.
+- **`typeof` of a global agrees with a read** — `LoadGlobalOrUndefined`
+  (vm/dispatch.rs) / `LoadGlobalOrUndefinedDyn` (vm/dispatch_cold.rs)
+  returned a live slot even when the global object shadowed it with a real
+  own property, which `LoadGlobal` reads instead. (A builtin replaced on or
+  deleted from the global object before later code names it is upstream's
+  now, in `eval_global_slot`.) Test: `test/engine_fixes_test.rb`.
 - **Re-entry does not drain microtasks** — `HostCtx::eval_script`,
   `call_global_value` and `call_handle_value` drained the job queue on return,
   running promise jobs while the guest's stack (the host call) was still

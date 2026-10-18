@@ -1151,6 +1151,7 @@ impl ScriptState {
     #[cfg(feature = "instrument")]
     pub fn set_heap_limit(&mut self, bytes: usize) {
         self.with_vm(|vm| {
+            vm.meter_fold();
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.heap_limit = bytes;
                 rec.ceiling_gc_pending = false;
@@ -1174,6 +1175,7 @@ impl ScriptState {
     #[cfg(feature = "instrument")]
     pub fn set_output_limit(&mut self, bytes: usize) {
         self.with_vm(|vm| {
+            vm.meter_fold();
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.output_limit = bytes;
                 rec.output_used = 0;
@@ -1300,6 +1302,7 @@ impl ScriptState {
     #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
     pub fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
         self.with_vm(|vm| {
+            vm.meter_fold();
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.deadline = deadline;
                 // Reschedule: a deadline shortens the countdown's stride.
@@ -1368,6 +1371,7 @@ impl ScriptState {
             // A trace must be a complete record, and native code produces no
             // rows.
             vm.enter_trace_mode();
+            vm.meter_fold();
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.start_trace(max_steps);
             }
@@ -1384,8 +1388,11 @@ impl ScriptState {
     /// to an execution that did not happen.
     #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
     pub fn finish_trace(&mut self, result: u64) -> Option<Vec<TraceStep>> {
-        self.with_vm(|vm| vm.instr_rec.as_mut().and_then(|rec| rec.finish(result)))
-            .flatten()
+        self.with_vm(|vm| {
+            vm.meter_fold();
+            vm.instr_rec.as_mut().and_then(|rec| rec.finish(result))
+        })
+        .flatten()
     }
 
     /// Whether the last recording stopped early at the row cap.
@@ -1409,7 +1416,7 @@ impl ScriptState {
         let Some(rec) = vm.instr_rec.as_ref() else {
             return u64::MAX;
         };
-        let Some(left) = rec.finite_remaining() else {
+        let Some(left) = rec.finite_remaining(vm.meter_hot()) else {
             return u64::MAX;
         };
         (left as i64 + vm.jit_steps.max(0)).max(0) as u64
@@ -1433,7 +1440,7 @@ impl ScriptState {
         let Some(rec) = vm.instr_rec.as_ref() else {
             return 0;
         };
-        rec.steps_used()
+        rec.steps_used(vm.meter_hot())
     }
 
     /// Return the recorder's typed resource-exhaustion state, if any.

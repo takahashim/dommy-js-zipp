@@ -340,9 +340,9 @@ fn json_repeat_bounded(text: &str, count: usize) -> Result<String, JsonOutputErr
 /// Fallible `spec_key_order` used by stringify snapshots. A first pass gives
 /// exact integer/rest counts, avoiding geometric infallible growth on hostile
 /// objects with many keys.
-fn json_spec_key_order_bounded(keys: &[String]) -> Result<(Vec<usize>, usize), JsonOutputError> {
-    let integer_count = keys
-        .iter()
+fn json_spec_key_order_bounded(map: &ObjMap) -> Result<(Vec<usize>, usize), JsonOutputError> {
+    let integer_count = map
+        .keys_iter()
         .filter(|key| canonical_u32_key(key).is_some())
         .count();
     let mut integers = Vec::new();
@@ -350,9 +350,9 @@ fn json_spec_key_order_bounded(keys: &[String]) -> Result<(Vec<usize>, usize), J
         .try_reserve_exact(integer_count)
         .map_err(|_| JsonOutputError)?;
     let mut rest = Vec::new();
-    rest.try_reserve_exact(keys.len().saturating_sub(integer_count))
+    rest.try_reserve_exact(map.live_len().saturating_sub(integer_count))
         .map_err(|_| JsonOutputError)?;
-    for (index, key) in keys.iter().enumerate() {
+    for (index, key) in map.slot_keys() {
         match canonical_u32_key(key) {
             Some(number) => integers.push((number, index)),
             None => rest.push(index),
@@ -368,7 +368,7 @@ fn json_spec_key_order_bounded(keys: &[String]) -> Result<(Vec<usize>, usize), J
     integers.sort_unstable_by_key(|&(number, _)| number);
     let mut ordered = Vec::new();
     ordered
-        .try_reserve_exact(keys.len())
+        .try_reserve_exact(map.live_len())
         .map_err(|_| JsonOutputError)?;
     let allocated = integers
         .capacity()
@@ -595,7 +595,7 @@ impl<'p> Vm<'p> {
                         json_push_char_bounded(out, '\n')?;
                         json_push_str_bounded(out, pad)?;
                     }
-                    json_quote_bounded(out, guest_key_text(&map.keys[slot]))?;
+                    json_quote_bounded(out, guest_key_text(map.key_at(slot)))?;
                     json_push_str_bounded(out, separator)
                 })();
                 (map.val_at(slot), appended)
@@ -764,8 +764,8 @@ impl<'p> Vm<'p> {
                     return false;
                 }
                 let mut any = false;
-                for i in 0..map.keys.len() {
-                    let key = &map.keys[i];
+                for i in map.slots() {
+                    let key = map.key_at(i);
                     if is_hidden_key(key) || !map.attr_at(i).enumerable {
                         continue;
                     }
@@ -857,7 +857,7 @@ impl<'p> Vm<'p> {
         let object_proto_barren = self.obj_proto != 0
             && !self.proto_of.contains_key(&self.obj_proto)
             && matches!(self.heap.get(self.obj_proto), HeapObj::Object(m)
-                if m.keys.iter().enumerate().all(|(i, k)|
+                if m.slot_keys().all(|(i, k)|
                     is_hidden_key(k) || !m.attr_at(i).enumerable));
 
         // `(value, exit, depth)` implements DFS without Rust recursion. Exit markers
@@ -944,8 +944,8 @@ impl<'p> Vm<'p> {
                     // With no integer-index key, insertion order is exactly
                     // for-in's own-key order. Rejecting that rare shape avoids a
                     // per-object sort/allocation and preserves floating-add order.
-                    for i in (0..map.keys.len()).rev() {
-                        let key = &map.keys[i];
+                    for i in map.slots().rev() {
+                        let key = map.key_at(i);
                         if is_hidden_key(key) || !map.attr_at(i).enumerable {
                             continue;
                         }
@@ -988,11 +988,34 @@ impl<'p> Vm<'p> {
         //
         // Those calls are nearly always two int32s, whose ToUint32 is their
         // own bits: the product needs no snapshot and no coercion.
-        if matches!(op, crate::bytecode::MathFn::Imul) && argc >= 2 {
-            let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
-            if a.is_int() && b.is_int() {
-                return Ok(a.as_int().wrapping_mul(b.as_int()) as f64);
+        use crate::bytecode::MathFn as M;
+        match op {
+            M::Imul if argc >= 2 => {
+                let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
+                if a.is_int() && b.is_int() {
+                    return Ok(a.as_int().wrapping_mul(b.as_int()) as f64);
+                }
+                if a.is_number() && b.is_number() {
+                    return Ok(math_binary(op, a.as_f64(), b.as_f64()));
+                }
             }
+            // Numbers coerce without running anything, so they need no
+            // snapshot either: the one operand of a unary op (any further
+            // argument is never read), the two of a binary one.
+            M::Pow | M::Atan2 if argc >= 2 => {
+                let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
+                if a.is_number() && b.is_number() {
+                    return Ok(math_binary(op, a.as_f64(), b.as_f64()));
+                }
+            }
+            M::Min | M::Max | M::Hypot | M::Pow | M::Atan2 | M::Imul => {}
+            _ if argc >= 1 => {
+                let x = self.get(base, arg_base);
+                if x.is_number() {
+                    return Ok(math_unary(op, x.as_f64()));
+                }
+            }
+            _ => {}
         }
         self.with_argv(base, arg_base, argc, |vm, args| vm.eval_math_args(op, args))
     }
@@ -1072,26 +1095,10 @@ impl<'p> Vm<'p> {
                 acc
             }
             // The two-arg ops coerce arg0 then arg1 (ToNumber, left-to-right).
-            M::Pow => {
+            M::Pow | M::Atan2 | M::Imul => {
                 let a = self.to_number_strict(at(args, 0))?;
                 let b = self.to_number_strict(at(args, 1))?;
-                // Spec: base of magnitude 1 with a NaN/±Infinity exponent is NaN
-                // (C/Rust powf returns 1 for these — a deliberate deviation).
-                if (a == 1.0 || a == -1.0) && (b.is_nan() || b.is_infinite()) {
-                    f64::NAN
-                } else {
-                    a.powf(b)
-                }
-            }
-            M::Atan2 => {
-                let a = self.to_number_strict(at(args, 0))?;
-                let b = self.to_number_strict(at(args, 1))?;
-                a.atan2(b)
-            }
-            M::Imul => {
-                let a = self.to_number_strict(at(args, 0))?;
-                let b = self.to_number_strict(at(args, 1))?;
-                (to_uint32(a).wrapping_mul(to_uint32(b)) as i32) as f64
+                math_binary(op, a, b)
             }
             _ => {
                 let x = self.to_number_strict(at(args, 0))?;
@@ -1468,7 +1475,7 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let key_count = match self.heap.get(idx) {
-            HeapObj::Object(map) => map.keys.len(),
+            HeapObj::Object(map) => map.live_len(),
             _ => return Ok(None),
         };
         // Peak working storage is the integer/rest partition plus the returned
@@ -1478,7 +1485,7 @@ impl<'p> Vm<'p> {
             .ok_or_else(|| self.json_key_snapshot_limit_error())?;
         self.json_preflight_key_snapshot(snapshot_budget, order_working_bytes, output_capacity)?;
         let ordered = match self.heap.get(idx) {
-            HeapObj::Object(map) => json_spec_key_order_bounded(&map.keys),
+            HeapObj::Object(map) => json_spec_key_order_bounded(map),
             _ => return Ok(None),
         };
         let (mut slots, allocated_bytes) =
@@ -1486,7 +1493,7 @@ impl<'p> Vm<'p> {
         self.json_charge_key_snapshot(snapshot_budget, allocated_bytes, output_capacity)?;
         let all_prim = match self.heap.get(idx) {
             HeapObj::Object(map) => {
-                slots.retain(|&i| map.attr_at(i).enumerable && !is_hidden_key(&map.keys[i]));
+                slots.retain(|&i| map.attr_at(i).enumerable && !is_hidden_key(map.key_at(i)));
                 slots
                     .iter()
                     .all(|&i| !map.attr_at(i).accessor && !map.val_at(i).is_heap())
@@ -1519,7 +1526,7 @@ impl<'p> Vm<'p> {
 
         for &slot in slots {
             let key_len = match self.heap.get(idx) {
-                HeapObj::Object(map) => map.keys[slot].len(),
+                HeapObj::Object(map) => map.key_at(slot).len(),
                 _ => 0,
             };
             self.json_preflight_key_snapshot(snapshot_budget, key_len, output_capacity)?;
@@ -1528,7 +1535,7 @@ impl<'p> Vm<'p> {
                 .map_err(|_| self.json_key_snapshot_allocation_error())?;
             self.json_charge_key_snapshot(snapshot_budget, key.capacity(), output_capacity)?;
             if let HeapObj::Object(map) = self.heap.get(idx) {
-                key.push_str(&map.keys[slot]);
+                key.push_str(map.key_at(slot));
             }
             keys.push(key);
         }
@@ -1558,7 +1565,7 @@ impl<'p> Vm<'p> {
 
         for &slot in slots {
             let key_len = match self.heap.get(idx) {
-                HeapObj::Object(map) => map.keys[slot].len(),
+                HeapObj::Object(map) => map.key_at(slot).len(),
                 _ => 0,
             };
             self.json_preflight_key_snapshot(snapshot_budget, key_len, output_capacity)?;
@@ -1567,7 +1574,7 @@ impl<'p> Vm<'p> {
                 .map_err(|_| self.json_key_snapshot_allocation_error())?;
             self.json_charge_key_snapshot(snapshot_budget, key.capacity(), output_capacity)?;
             if let HeapObj::Object(map) = self.heap.get(idx) {
-                key.push_str(&map.keys[slot]);
+                key.push_str(map.key_at(slot));
             }
             keys.push((slot, key));
         }
@@ -2179,7 +2186,7 @@ impl<'p> Vm<'p> {
     /// flushed as UTF-8 slices). Allocates heap objects/arrays/strings.
     pub(crate) fn json_parse(&mut self, src: &[u8]) -> Result<Value, Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
-        // W9 static pretenure (NURSERY_DESIGN.md §4): the parsed tree is the
+        // W9 static pretenure (docs/archive/NURSERY_DESIGN.md §4): the parsed tree is the
         // measured pretenure case (B119's oracle: json-large's 48% old-trace
         // share with ~zero old→young stores), so the whole builder allocates
         // OLD. No user code runs inside this scope (the reviver path,

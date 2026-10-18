@@ -731,6 +731,7 @@ mod tests {
             source: String::new(),
             positions: Vec::new(),
             script: None,
+            fused: Default::default(),
         }
     }
 

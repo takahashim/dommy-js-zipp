@@ -335,8 +335,9 @@ impl<'p> Vm<'p> {
     }
 
     /// The CANONICAL live slot of `key`'s ModuleSource binding (`import
-    /// source`), creating the %AbstractModuleSource%-prototype-linked source
-    /// object on first request. `key` is the canonical target path, or the
+    /// source`), creating the source object on first request (its prototype
+    /// is `module_source_proto`, whose own is %AbstractModuleSource%.prototype).
+    /// `key` is the canonical target path, or the
     /// synthetic `<module source>` host-module key (test262: every
     /// `<module source>` request resolves to ONE shared module record).
     pub(crate) fn module_source_slot(&mut self, key: &std::path::Path) -> Result<u32, Thrown> {
@@ -347,9 +348,9 @@ impl<'p> Vm<'p> {
         let idx = self
             .heap
             .alloc(HeapObj::Object(Box::new(crate::heap::ObjMap::new())));
-        if self.abstractmodulesource_proto != 0 {
+        if self.module_source_proto != 0 {
             self.proto_of
-                .insert(idx, Value::heap(self.abstractmodulesource_proto));
+                .insert(idx, Value::heap(self.module_source_proto));
         }
         self.globals[s as usize] = Value::heap(idx);
         self.bump_global_gen(s);
@@ -369,7 +370,7 @@ impl<'p> Vm<'p> {
         gmap: &[u32],
     ) -> Vec<(String, u32)> {
         let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
-        let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut own_map = super::super::ExportSlots::default();
         for (exported, local) in exports {
             if let Some(i) = names.iter().position(|n| n == local) {
                 full.push((exported.clone(), gmap[i]));
@@ -715,7 +716,7 @@ impl<'p> Vm<'p> {
         let decl_set: std::collections::HashSet<u32> =
             prog.module_decl_globals.iter().copied().collect();
         let mut prealloc: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-        let mut own_pre: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut own_pre = super::super::ExportSlots::default();
         if !early_prepare {
             for (exported, local) in &exports {
                 if let Some(i) = names.iter().position(|n| n == local) {
@@ -2161,7 +2162,7 @@ impl<'p> Vm<'p> {
         raw_path: &std::path::Path,
     ) -> Result<Vec<(String, u32)>, Thrown> {
         let dep = self.resolve_module_path(raw_path)?;
-        let collect = |m: &std::collections::HashMap<String, u32>| -> Vec<(String, u32)> {
+        let collect = |m: &super::super::ExportSlots| -> Vec<(String, u32)> {
             m.iter()
                 .filter(|(n, _)| n.as_str() != "default")
                 .map(|(n, s)| (n.clone(), *s))

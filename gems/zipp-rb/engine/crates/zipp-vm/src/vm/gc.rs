@@ -20,7 +20,7 @@
 //!      `with_host_roots` stack (`push_host_root`), or take `gc_lock_guard`
 //!      when the re-entry is bounded.
 //!
-//! Two collection kinds since the nursery (NURSERY_DESIGN.md §§1-2;
+//! Two collection kinds since the nursery (docs/archive/NURSERY_DESIGN.md §§1-2;
 //! `ZIPP_NO_NURSERY=1` restores majors-only exactly):
 //!   * MAJOR — the historical collection, unchanged: full mark, sweep
 //!     `floor..len`, whole-table side-table retains.
@@ -358,7 +358,7 @@ impl Vm<'_> {
     }
 
     /// Stage-3 write barrier + B6 oracle, one latched call per store
-    /// chokepoint (NURSERY_DESIGN.md §1). With the nursery on, an old-holder/
+    /// chokepoint (docs/archive/NURSERY_DESIGN.md §1). With the nursery on, an old-holder/
     /// young-value store enters `holder` into the remembered set (holder-
     /// grain, deduped by the generation byte); with `ZIPP_GCSTATS=1` the
     /// same condition is counted per site. Both latches off — the default —
@@ -1079,8 +1079,14 @@ impl Vm<'_> {
             self.regex_subject_units = None;
         }
         self.method_brand.retain_marked(&marks);
+        // A kept constructor's class (see `Vm::ctor_owner`): gone with either.
+        self.ctor_owner.retain(|&k, &mut c| marks[k as usize] && marks[c as usize]);
         self.instance_brand.retain_marked(&marks);
+        let owners = self.brand_owner.len();
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
+        if self.brand_owner.len() != owners {
+            self.clear_private_memo();
+        }
         self.closure_eval_scope.retain(|&k, _| marks[k as usize]);
         self.eval_scope_parent.retain_marked(&marks);
         self.shadow_fn_realm.retain_marked(&marks);
@@ -1088,7 +1094,7 @@ impl Vm<'_> {
         // Keep declared-name records only for brands still referenced by a live
         // lexical chain or instance brand (these maps were just pruned by marks).
         if !self.brand_private_names.is_empty() {
-            let mut live_brands: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut live_brands: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
             for bs in self.method_brand.values() {
                 live_brands.extend(bs.iter().copied());
             }
@@ -1165,7 +1171,7 @@ impl Vm<'_> {
         }
     }
 
-    /// Stage-3 MINOR collection (NURSERY_DESIGN.md §§1-2): minor liveness =
+    /// Stage-3 MINOR collection (docs/archive/NURSERY_DESIGN.md §§1-2): minor liveness =
     /// reachable-from(roots ∪ dirty old holders) ∩ young. Old objects are
     /// BOUNDARY nodes — pre-marked from the generation bytes, presumed live,
     /// never traced; the remembered set (this epoch's write-barrier hits) and
@@ -1291,7 +1297,7 @@ impl Vm<'_> {
     /// trace and panic on the first live young object the minor missed — a
     /// write-barrier hole caught AT the collection where it opened, with the
     /// slot named, instead of surfacing as silent corruption arbitrarily
-    /// later (the failure mode NURSERY_DESIGN.md names as this design's
+    /// later (the failure mode docs/archive/NURSERY_DESIGN.md names as this design's
     /// biggest risk). Test/stress use only: it doubles the mark.
     fn verify_minor_marks(&mut self, minor_marks: &[bool], n: usize) {
         let mut marks = vec![false; n];
@@ -1400,10 +1406,19 @@ impl Vm<'_> {
         prune_map!(self.matchall_batches);
         let brand_entries = self.method_brand.len() + self.instance_brand.len();
         prune_map!(self.method_brand);
+        if !self.ctor_owner.is_empty() {
+            self.ctor_owner.retain(|&k, &mut c| live_bits[k as usize] && live_bits[c as usize]);
+        }
         prune_map!(self.instance_brand);
         // Keyed by brand id, pruned on its VALUE (the owning class slot).
         if !self.brand_owner.is_empty() {
+            let owners = self.brand_owner.len();
             self.brand_owner.retain(|_, &mut c| live_bits[c as usize]);
+            // A remembered private resolution may name a class just freed
+            // (see `Vm::resolve_private_site`).
+            if self.brand_owner.len() != owners {
+                self.private_memo.fill(super::values::PrivateMemo::EMPTY);
+            }
         }
         // A guarded wrapper with its own `retain` and `remove`, not a std
         // map: pruned here as the macro used to prune every table.
@@ -1428,7 +1443,7 @@ impl Vm<'_> {
         if !self.brand_private_names.is_empty()
             && self.method_brand.len() + self.instance_brand.len() != brand_entries
         {
-            let mut live_brands: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut live_brands: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
             for bs in self.method_brand.values() {
                 live_brands.extend(bs.iter().copied());
             }
@@ -2378,7 +2393,7 @@ mod gcstats {
     static SLOTS: AtomicU64 = AtomicU64::new(0);
     static LIVE: AtomicU64 = AtomicU64::new(0);
     static SWEPT: AtomicU64 = AtomicU64::new(0);
-    // B6 generational-oracle splits (NURSERY_DESIGN.md §6): young = allocated
+    // B6 generational-oracle splits (docs/archive/NURSERY_DESIGN.md §6): young = allocated
     // since the previous collection. Summed over all collections.
     static MARKED_YOUNG: AtomicU64 = AtomicU64::new(0);
     static MARKED_OLD: AtomicU64 = AtomicU64::new(0);

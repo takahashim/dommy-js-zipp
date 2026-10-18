@@ -422,7 +422,9 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-            let freed = m.remove_at(slot);
+            // A big dictionary keeps the slot as a hole rather than shifting
+            // every later one down (see `ObjMap::delete_at`).
+            let freed = m.delete_at(slot);
             // B220: the delete path is the key pool's best feed (see
             // `Heap::recycle_key_buf`).
             #[cfg(not(feature = "safe-sandbox"))]
@@ -703,7 +705,19 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // Likewise a class's non-configurable static (sealed, frozen, or
+        // defineProperty'd so).
+        if matches!(self.heap.get(idx), HeapObj::Class(c)
+            if c.statics.pos(key).is_some_and(|i| !c.statics.attr_at(i).configurable))
+        {
+            return Value::bool(false);
+        }
+        // The objects the fast path above leaves to the waterfall for their
+        // own sake keep shifting deletes; every other one may keep a hole
+        // (see `ObjMap::delete_at`), whatever its key.
+        let holes_ok = idx != self.global_this && idx != self.obj_proto && idx != self.arr_proto;
         let removed = match self.heap.get_mut(idx) {
+            HeapObj::Object(map) if holes_ok => map.delete_key(key),
             HeapObj::Object(map) => map.remove(key),
             HeapObj::Array(items) => {
                 // A CANONICAL index key never reaches here (the index path above
@@ -1149,7 +1163,7 @@ impl<'p> Vm<'p> {
         strict: bool,
     ) -> Result<bool, Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::PropSlow);
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1 (interp
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 1 (interp
         // SetProp, incl. the fn_props/arr_props sidecar routes below — same
         // holder, same value; the sidecars are additionally root-rescanned
         // at every minor).
@@ -1288,8 +1302,7 @@ impl<'p> Vm<'p> {
             let n = u as u32;
             if let HeapObj::Object(m) = self.heap.get_mut(self.arr_proto) {
                 let doomed: Vec<String> = m
-                    .keys
-                    .iter()
+                    .keys_iter()
                     .filter(|k| canonical_index_str(k).is_some_and(|i| i >= n as usize))
                     .cloned()
                     .collect();
@@ -1842,12 +1855,21 @@ impl<'p> Vm<'p> {
                 }
             } else {
                 // An existing NON-WRITABLE own data property (e.g. a function `name`
-                // set by NamedEvaluation/SetFunctionName) rejects assignment.
-                if let Some(m) = self.fn_props.get(&idx) {
-                    if let Some(i) = m.pos(key) {
-                        if !m.attr_at(i).accessor && !m.attr_at(i).writable {
-                            return self.reject_write(key, strict);
+                // set by NamedEvaluation/SetFunctionName) rejects assignment, and
+                // an own ACCESSOR governs it: its setter runs, and one without a
+                // setter rejects. (Storing the value instead overwrote the
+                // getter, so the next read called the assigned value.)
+                let own = self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attr_at(i)));
+                if let Some(a) = own {
+                    if a.accessor {
+                        if a.setter != Value::UNDEFINED {
+                            self.call_value(a.setter, obj, &[val])?;
+                            return Ok(true);
                         }
+                        return self.reject_write(key, strict);
+                    }
+                    if !a.writable {
+                        return self.reject_write(key, strict);
                     }
                 }
                 // A NEW own property on a non-extensible function is rejected (the
@@ -1934,11 +1956,22 @@ impl<'p> Vm<'p> {
                     if self.array_index_write_rejected(idx, n) {
                         return self.reject_write(key, strict);
                     }
-                    // Past the eager-materialization cap AND the dense prefix:
-                    // a sparse-overlay element + a virtual-length bump (never a
-                    // billions-of-holes resize). Mirrors set_index's numeric path.
-                    if n >= crate::vm::MAX_DENSE_ARRAY_LEN && !present {
-                        if !self.arguments_objs.contains_key(&idx) {
+                    // Past the dense prefix and either the eager-materialization
+                    // cap or the widest gap the Vec opens: a sparse-overlay
+                    // element + a virtual-length bump (never a long resize over
+                    // holes). Mirrors set_index's numeric path.
+                    let args = self.arguments_objs.contains_key(&idx);
+                    let dense_len = match self.heap.get(idx) {
+                        HeapObj::Array(items) => items.len(),
+                        _ => usize::MAX,
+                    };
+                    let sparse = if args {
+                        n >= crate::vm::MAX_DENSE_ARRAY_LEN
+                    } else {
+                        n >= dense_len && self.array_new_index_sparse(idx, n, dense_len)
+                    };
+                    if sparse && !present {
+                        if !args {
                             self.arr_props
                                 .entry(idx)
                                 .or_insert_with(ObjMap::new_side_table)
@@ -1956,12 +1989,17 @@ impl<'p> Vm<'p> {
                         self.heap.bump_version(idx);
                         return Ok(true);
                     }
+                    let mut grew = false;
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         if n >= items.len() {
                             // Intervening slots are HOLES (absent), per spec.
                             items.resize(n + 1, Value::HOLE);
+                            grew = true;
                         }
                         items[n] = val;
+                    }
+                    if grew && !args {
+                        self.array_dense_grew(idx, dense_len);
                     }
                     self.heap.bump_version(idx);
                     return Ok(true);
@@ -2073,8 +2111,38 @@ impl<'p> Vm<'p> {
             }
             return Ok(true);
         }
+        // The global object's builtin bindings (`print`, `parseInt`, ...) are
+        // own data properties {w, !e, c} its map does not hold until something
+        // writes one. OrdinarySet updates that existing property, so the first
+        // write keeps those attributes (it used to add an enumerable property,
+        // which `Object.keys(globalThis)` and for-in then listed). A deleted
+        // one is gone: writing it creates an ordinary {w, e, c} property and
+        // lifts the deletion record, as `StoreGlobal` does for `delete x; x = 1`.
+        // A non-extensible class value (preventExtensions/seal/freeze record
+        // it in arr_props) takes no new static property: a sloppy no-op, a
+        // strict TypeError, as for an ordinary object below.
+        if matches!(self.heap.get(idx), HeapObj::Class(c) if c.statics.pos(key).is_none())
+            && self.arr_props.get(&idx).is_some_and(|m| !m.extensible)
+        {
+            return self.reject_write(key, strict);
+        }
+        let global_builtin = idx == self.global_this
+            && self.global_this != 0
+            && self.builtin_globals.contains_key(key)
+            && !self.global_name_is_lexical(key);
+        let revived = global_builtin && self.deleted_globals.contains(key);
         let mut added = false;
         match self.heap.get_mut(idx) {
+            HeapObj::Object(map) if global_builtin && !revived && map.pos(key).is_none() => {
+                let attr = crate::heap::PropAttr {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                added = map.define(key, val, attr);
+            }
             HeapObj::Object(map) => {
                 // A non-extensible object rejects NEW own properties (sloppy no-op);
                 // existing writable data properties still accept writes.
@@ -2082,6 +2150,9 @@ impl<'p> Vm<'p> {
                     return self.reject_write(key, strict);
                 }
                 added = map.set(key, val);
+                if revived {
+                    self.deleted_globals.remove(key);
+                }
             }
             // Static-member assignment on a class value (`C.x = …`).
             HeapObj::Class(c) => {

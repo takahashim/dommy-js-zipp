@@ -16,6 +16,60 @@ const ERROR_MESSAGE_ATTR: PropAttr = PropAttr {
     setter: Value::UNDEFINED,
 };
 
+/// What `Vm::plain_chain_get` found for a key on a chain of ordinary objects.
+pub(crate) enum PlainGet {
+    /// A data property's value.
+    Data(Value),
+    /// An accessor's getter, UNDEFINED for a setter-only one.
+    Getter(Value),
+    /// No level holds the key.
+    Absent,
+}
+
+/// `Vm::private_memo`'s size, a power of two.
+pub(crate) const PRIVATE_MEMO_SLOTS: usize = 256;
+
+/// One answer of `Vm::resolve_private_in`: at the access site `site` (see
+/// `private_site`), code whose chain's innermost brand is `head` resolves
+/// its private name to `(brand, kind, owner)`, and the name's id in
+/// `private_name_ids` is `id`. A site never has every bit set, so `EMPTY`
+/// matches nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct PrivateMemo {
+    head: u64,
+    site: u64,
+    brand: u64,
+    owner: u32,
+    id: u32,
+    kind: u8,
+}
+
+impl PrivateMemo {
+    pub(crate) const EMPTY: PrivateMemo = PrivateMemo {
+        head: 0,
+        site: u64::MAX,
+        brand: 0,
+        owner: 0,
+        id: 0,
+        kind: 0,
+    };
+}
+
+/// The access site of a private name: the function and the index of the
+/// name among its string constants.
+#[inline]
+pub(crate) fn private_site(func_id: u32, name: u32) -> u64 {
+    (u64::from(func_id) << 32) | u64::from(name)
+}
+
+#[inline]
+fn private_memo_index(head: u64, site: u64) -> usize {
+    let h = (head as u32).wrapping_mul(0x9E37_79B1)
+        ^ ((site >> 32) as u32).wrapping_mul(0x85EB_CA77)
+        ^ (site as u32).wrapping_mul(0xC2B2_AE3D);
+    (h >> 24) as usize & (PRIVATE_MEMO_SLOTS - 1)
+}
+
 /// Everything the RegExp constructor reads out of `pattern` BEFORE RegExpAlloc.
 /// See [`Vm::regexp_pattern_snapshot`].
 pub(crate) struct RegExpPre {
@@ -543,7 +597,7 @@ impl<'p> Vm<'p> {
     /// scope: `method(){ const self = this; function inner(){ self.#m = 1; } }`
     /// is legal, and so is an arrow doing the same, because a private name is
     /// lexically scoped rather than tied to being a method. Copy the defining
-    /// code's chain onto the new function value, so `resolve_private` finds
+    /// code's chain onto the new function value, so `resolve_private_in` finds
     /// the declaring class from inside it (the textual fall-back it used
     /// instead could not see a private ACCESSOR at all, and would have
     /// accepted another class's same-named private).
@@ -816,11 +870,16 @@ impl<'p> Vm<'p> {
     /// PrivateFieldFind: the field's value for the EXACT (instance, brand,
     /// name), or None (spec: empty -> TypeError at the access site).
     pub(crate) fn private_field_get(&self, inst: Value, brand: u64, key: &str) -> Option<Value> {
+        self.private_field_get_id(inst, brand, *self.private_name_ids.get(key)?)
+    }
+
+    /// `private_field_get` with the name's id in `private_name_ids` known.
+    #[inline]
+    pub(crate) fn private_field_get_id(&self, inst: Value, brand: u64, id: u32) -> Option<Value> {
         if !inst.is_heap() {
             return None;
         }
         let fields = self.private_fields.get(&inst.heap_index())?;
-        let id = *self.private_name_ids.get(key)?;
         fields
             .iter()
             .find(|&&(b, n, _)| b == brand && n == id)
@@ -864,6 +923,21 @@ impl<'p> Vm<'p> {
                 None => return false,
             }
         };
+        self.private_field_set_id(inst, brand, id, v, add)
+    }
+
+    /// `private_field_set` with the name's id in `private_name_ids` known.
+    pub(crate) fn private_field_set_id(
+        &mut self,
+        inst: Value,
+        brand: u64,
+        id: u32,
+        v: Value,
+        add: bool,
+    ) -> bool {
+        if !inst.is_heap() {
+            return false;
+        }
         let m = if add {
             self.private_fields.entry(inst.heap_index()).or_default()
         } else {
@@ -918,18 +992,69 @@ impl<'p> Vm<'p> {
         true
     }
 
-    /// Declaring-class private resolution (kind-aware): walk the ACCESSING
-    /// code's lexical brand chain innermost-first; for the first brand that
-    /// DECLARES `key`, return (brand, kind, declaring-class heap idx). `None`
-    /// when the chain is unresolvable, the name is foreign to the chain, or
-    /// the declaring class value is unknown — the caller keeps its textual
-    /// path. kind bits: 1 = method, 2 = getter, 4 = setter; 0 = field.
-    pub(crate) fn resolve_private(&self, key: &str) -> Option<(u64, u8, u32)> {
-        self.resolve_private_in(self.frames.last()?.callee, key)
+    /// `resolve_private_in(ctx, key)` for the private name `key` that the
+    /// access site `site` names (`private_site`), remembered in
+    /// `Vm::private_memo` with the name's id in `private_name_ids`:
+    /// `(brand, kind, owner, id)`.
+    ///
+    /// The search compares `key` with the private names of each class on the
+    /// accessing chain, on every `this.#x`, and its answer depends only on
+    /// the chain and the name. The chain's innermost brand names the chain:
+    /// each class evaluation mints a fresh brand from a counter that never
+    /// repeats, and every function of its body carries the same chain. A
+    /// brand's declared names are fixed when its class is made, and kept
+    /// while a live chain holds the brand, as the running one does. What can
+    /// change is `brand_owner`: the declaring class can die while one of its
+    /// methods lives on, which makes the search answer `None`; the collector
+    /// clears the memo whenever it drops an entry there.
+    pub(crate) fn resolve_private_site(
+        &mut self,
+        ctx: Value,
+        site: u64,
+        key: &str,
+    ) -> Option<(u64, u8, u32, u32)> {
+        let head = *self.private_brands_of(ctx)?.first()?;
+        let slot = private_memo_index(head, site);
+        let e = self.private_memo[slot];
+        if e.head == head && e.site == site {
+            return Some((e.brand, e.kind, e.owner, e.id));
+        }
+        let (brand, kind, owner) = self.resolve_private_in(ctx, key)?;
+        let id = self.private_name_id(key);
+        self.private_memo[slot] = PrivateMemo {
+            head,
+            site,
+            brand,
+            owner,
+            id,
+            kind,
+        };
+        Some((brand, kind, owner, id))
     }
 
-    /// `resolve_private` against the brand chain of `ctx` (see
-    /// `private_brands_of`) rather than the running frame's.
+    /// What `resolve_private_site` remembers for `site` under `ctx`'s chain,
+    /// if anything; never resolves. For a caller that can then skip spelling
+    /// the name, which only a miss needs.
+    #[inline]
+    pub(crate) fn private_memo_hit(&self, ctx: Value, site: u64) -> Option<(u64, u8, u32, u32)> {
+        let head = *self.private_brands_of(ctx)?.first()?;
+        let e = self.private_memo[private_memo_index(head, site)];
+        (e.head == head && e.site == site).then_some((e.brand, e.kind, e.owner, e.id))
+    }
+
+    /// Forget every remembered private resolution (see
+    /// `resolve_private_site`): a class's `brand_owner` entry was dropped.
+    pub(crate) fn clear_private_memo(&mut self) {
+        self.private_memo.fill(PrivateMemo::EMPTY);
+    }
+
+    /// Declaring-class private resolution (kind-aware): walk the brand chain
+    /// of `ctx`, the ACCESSING code (see `private_brands_of`), innermost
+    /// first; for the first brand that DECLARES `key`, return (brand, kind,
+    /// declaring-class heap idx). `None` when the chain is unresolvable, the
+    /// name is foreign to the chain, or the declaring class value is unknown
+    /// — the caller keeps its textual path. kind bits: 1 = method, 2 =
+    /// getter, 4 = setter; 0 = field.
     pub(crate) fn resolve_private_in(&self, ctx: Value, key: &str) -> Option<(u64, u8, u32)> {
         let chain = self.private_brands_of(ctx)?;
         for &b in chain.iter() {
@@ -1062,17 +1187,25 @@ impl<'p> Vm<'p> {
     /// the receiver passes the textual presence check without a private field
     /// value; the caller then takes its ordinary property lookup.
     ///
-    /// The interpreter's `CallMethod` passes the running frame's callee. The JIT
-    /// region-call fallback passes the callee of the code that is actually
-    /// running: it used to look `#m` up as a plain property, so one class could
-    /// call another class's same-named `#m`.
+    /// The interpreter's `CallMethod` passes the running frame's callee, and
+    /// its access site (`private_site`) so the resolution is remembered. The
+    /// JIT region-call fallback passes the callee of the code that is
+    /// actually running: it used to look `#m` up as a plain property, so one
+    /// class could call another class's same-named `#m`.
     pub(crate) fn private_method_callee(
         &mut self,
         ctx: Value,
         recv: Value,
         key: &str,
+        site: Option<u64>,
     ) -> Result<Option<Value>, Thrown> {
-        if let Some((b, kind, owner)) = self.resolve_private_in(ctx, key) {
+        let resolved = match site {
+            Some(site) => self
+                .resolve_private_site(ctx, site, key)
+                .map(|(b, kind, owner, _)| (b, kind, owner)),
+            None => self.resolve_private_in(ctx, key),
+        };
+        if let Some((b, kind, owner)) = resolved {
             // Declaring-class-resolved, KIND-aware (FIX-3).
             if !self.private_receiver_ok(recv, b, kind, owner) {
                 return Err(Thrown(format!(
@@ -1116,10 +1249,172 @@ impl<'p> Vm<'p> {
         Ok(self.private_field_scan(recv, key))
     }
 
+    /// `key in obj` for a flat string `key` and a plain object `idx`, read off
+    /// the key string where it lies: the answer `has_property_dyn`'s
+    /// plain-object arm gives, level for level, when every level of the chain
+    /// takes that arm. That arm spelled the key afresh with `key_of` at the
+    /// receiver and again at each prototype it recursed into, so a miss on a
+    /// dictionary paid two allocations and two copies of the key.
+    ///
+    /// `None` leaves it to that arm: a Symbol or `@@`-escaped key, a string
+    /// with a lone surrogate (`key_of` spells it lossily), a deferred
+    /// namespace anywhere, and any level that is not an ordinary object, is a
+    /// class instance (its member tables answer), the global object (its
+    /// slot-backed properties) or `%Array.prototype%` (its exotic `length`).
+    fn plain_string_key_has(&self, idx: u32, key: Value) -> Option<bool> {
+        if !key.is_heap() || !self.deferred_ns_state.is_empty() {
+            return None;
+        }
+        let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
+            return None;
+        };
+        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+            return None;
+        }
+        let key = js.as_str_wf();
+        let mut cur = idx;
+        for _ in 0..64 {
+            if (cur == self.global_this && self.global_this != 0)
+                || (cur == self.arr_proto && self.arr_proto != 0)
+            {
+                return None;
+            }
+            let HeapObj::Object(m) = self.heap.get(cur) else {
+                return None;
+            };
+            if m.pos(key).is_some() {
+                return Some(true);
+            }
+            if m.class.is_some() {
+                return None;
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => return Some(false),
+                None if self.obj_proto != 0 && cur != self.obj_proto => self.obj_proto,
+                None => return Some(false),
+            };
+        }
+        None
+    }
+
+    /// `Reflect.get(target, key, receiver)` for a flat string `key` where
+    /// `target` and its chain are ordinary objects: what [[Get]] finds, read
+    /// through the key where it lies. A data property's value, which no
+    /// receiver changes; an accessor's getter, which the caller calls with
+    /// the receiver; or nothing, at an explicit null prototype or the end of
+    /// the default chain. A trap forwarding with `Reflect.get(t, k, recv)`
+    /// spelled the key afresh as a String for every read, and an inherited
+    /// getter read that way (`Reflect.get(proto, "x", obj)`) did the same.
+    ///
+    /// `None` leaves it to the general path. The levels are those of
+    /// [`Vm::plain_string_key_miss`]: an exotic or live-slot object
+    /// (`ic_obj_ok`), a class instance and a constructor's map decline. So do
+    /// a Symbol, an `@@`-spelled key, a lone surrogate, `__proto__`, and an
+    /// uninitialized slot. The target alone may be an array with nothing in a
+    /// side table, for a present element or its `length`.
+    pub(crate) fn plain_chain_get(&self, target: Value, key: Value) -> Option<PlainGet> {
+        if !target.is_heap() || !key.is_heap() || !self.deferred_ns_state.is_empty() {
+            return None;
+        }
+        let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
+            return None;
+        };
+        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+            return None;
+        }
+        let key = js.as_str_wf();
+        if key == "__proto__" {
+            return None;
+        }
+        let mut cur = target.heap_index();
+        for depth in 0..64 {
+            if !self.ic_obj_ok(cur) {
+                return None;
+            }
+            let m = match self.heap.get(cur) {
+                HeapObj::Object(m) if !m.is_ctor && m.class.is_none() => m,
+                _ if depth == 0 => return self.plain_array_own_data_get(cur, key).map(PlainGet::Data),
+                _ => return None,
+            };
+            if let Some(slot) = m.pos(key) {
+                let v = m.val_at(slot);
+                if m.attr_at(slot).accessor {
+                    return Some(PlainGet::Getter(v));
+                }
+                return (!v.is_uninitialized()).then_some(PlainGet::Data(v));
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                // An explicit null prototype: a true miss.
+                Some(_) => return Some(PlainGet::Absent),
+                None if self.obj_proto != 0 && cur != self.obj_proto => self.obj_proto,
+                None => return Some(PlainGet::Absent),
+            };
+        }
+        None
+    }
+
+    /// [`Vm::plain_chain_get`] for an array with nothing in a side table: a
+    /// present element or its `length`. `None` for anything else: an
+    /// arguments object (its elements are mapped to its frame, its `length`
+    /// is its own), a hole (the read goes on to the chain), any other kind of
+    /// object, any other key. Out of line, so the ordinary-object path
+    /// compiles as it did.
+    #[inline(never)]
+    fn plain_array_own_data_get(&self, idx: u32, key: &str) -> Option<Value> {
+        let HeapObj::Array(items) = self.heap.get(idx) else {
+            return None;
+        };
+        if self.arguments_objs.contains_key(&idx) || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx)) {
+            return None;
+        }
+        if key == "length" {
+            return Some(len_value(self.js_array_len(idx)));
+        }
+        let v = *items.get(crate::heap::canonical_array_index_key(key)? as usize)?;
+        (!v.is_hole()).then_some(v)
+    }
+
     /// Proxy-aware [[HasProperty]] (`in` / Reflect.has). Mirrors `has_property`
     /// but is `&mut` so it can dispatch a `has` trap — both when `obj` itself is a
     /// Proxy AND when a Proxy sits in the prototype chain (e.g.
     /// `Object.create(proxy)`), which the immutable `has_property` cannot do.
+    /// Whether a `has` trap may answer `false` for the flat string `key`
+    /// without its invariant applying, read from a plain `target`'s map: the
+    /// target has no own `key`, or has a configurable one and is extensible.
+    /// `false` (check the descriptor) for anything else. The check spelled
+    /// the key as a String and built a descriptor object to read back.
+    fn proxy_has_false_unconstrained(&self, target: Value, key: Value) -> bool {
+        if !target.is_heap() || !key.is_heap() {
+            return false;
+        }
+        let ti = target.heap_index();
+        if (ti == self.global_this && self.global_this != 0)
+            || (ti == self.arr_proto && self.arr_proto != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&ti))
+            || !self.deferred_ns_state.is_empty()
+        {
+            return false;
+        }
+        let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
+            return false;
+        };
+        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+            return false;
+        }
+        let HeapObj::Object(m) = self.heap.get(ti) else {
+            return false;
+        };
+        if m.is_ctor {
+            return false;
+        }
+        match m.pos(js.as_str_wf()) {
+            None => true,
+            Some(i) => m.attr_at(i).configurable && m.extensible,
+        }
+    }
+
     pub(crate) fn has_property_dyn(&mut self, obj: Value, key: Value) -> Result<bool, Thrown> {
         if !obj.is_heap() {
             return Ok(false);
@@ -1145,13 +1440,24 @@ impl<'p> Vm<'p> {
             }
             return match self.proxy_trap(handler, "has")? {
                 Some(trap) => {
-                    let ks = self.key_of(key);
-                    let kv = self.key_to_value(&ks);
+                    // A string key is the trap's argument as it stands (it
+                    // is what `key_to_value(key_of(key))` spells back).
+                    let kv = if key.is_heap()
+                        && matches!(
+                            self.heap.get(key.heap_index()),
+                            HeapObj::Str(_) | HeapObj::Cons { .. }
+                        ) {
+                        key
+                    } else {
+                        let ks = self.key_of(key);
+                        self.key_to_value(&ks)
+                    };
                     let res = self.call_value(trap, handler, &[target, kv])?;
                     let present = self.truthy(res);
                     // A `false` result is illegal when the target has the own
                     // property non-configurable, or the target is non-extensible.
-                    if !present {
+                    if !present && !self.proxy_has_false_unconstrained(target, key) {
+                        let ks = self.key_of(key);
                         let desc = self.object_get_own_property_descriptor(target, &ks);
                         if desc != Value::UNDEFINED {
                             let cfg = self.get_prop(desc, "configurable")?;
@@ -1172,6 +1478,18 @@ impl<'p> Vm<'p> {
         // via has_property_dyn, using has_property's proto resolution. Each
         // `self.heap.get` borrow is scoped so the recursive &mut call is free.
         if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+            if key.is_heap() {
+                self.heap.flatten(key.heap_index());
+            }
+            if let Some(found) = self.plain_string_key_has(idx, key) {
+                return Ok(found);
+            }
+            // An array-index number (`n in counts`), found by number.
+            if let Some(i) = crate::vm::array_index(key) {
+                if let Some(found) = self.plain_index_key_has(idx, i, false) {
+                    return Ok(found);
+                }
+            }
             let k = self.key_of(key);
             if matches!(self.heap.get(idx), HeapObj::Object(m) if m.get(&k).is_some()) {
                 return Ok(true);

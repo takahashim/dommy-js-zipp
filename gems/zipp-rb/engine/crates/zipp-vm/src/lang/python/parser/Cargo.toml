@@ -1,0 +1,18 @@
+[package]
+name = "zipp-pyparse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIPP's Python front end: a byte-oriented lexer, an arena AST and a recursive-descent parser for Python 3.13 syntax."
+
+[dependencies]
+rustc-hash = { workspace = true }
+# XID_Start / XID_Continue, the same tables the RustPython-compatible lexer used.
+unicode-ident = "=1.0.26"
+# Emoji_Presentation: a lone emoji is an identifier (RustPython's extension, kept).
+unicode-properties = { version = "=0.1.4", default-features = false, features = ["emoji"] }
+# The arena the emitter's tree (`tree`) is laid out in.
+bumpalo = "3.20"
+# Float literal values: the engine's decimal parser, so that a module with the
+# Python front end does not link core's (and its 10 KB power-of-five table).
+zipp-numparse = { path = "../../../../../zipp-numparse" }

@@ -162,6 +162,23 @@ console.log("module-rec:" + sum);
 const FN_CTOR_CACHE_MAX_SOURCE: usize = 64 * 1024;
 const FN_CTOR_CACHE_MAX_ENTRIES: usize = 4096;
 
+/// Whether an eval program creates no binding when it is installed: no
+/// `var`, function, `let`/`const` or class declaration, at its top level or
+/// into the caller's EvalScope. Everything such a program does on a run
+/// happens in `execute_eval_program`.
+fn eval_program_declares_nothing(p: &crate::bytecode::Program) -> bool {
+    p.eval_dynamic_names.is_empty()
+        && p.hoisted_globals.is_empty()
+        && p.decl_globals.is_empty()
+        && p.lexical_globals.is_empty()
+        && p.const_globals.is_empty()
+        && p.classes.is_empty()
+        && p.module_decl_globals.is_empty()
+        && p.module_imports.is_empty()
+        && p.module_exports.is_empty()
+        && p.functions.iter().all(|f| f.name_global.is_none())
+}
+
 impl<'p> Vm<'p> {
     /// Run the top-level function (id 0) to completion.
     pub fn run(&mut self) -> Result<Value, Thrown> {
@@ -1456,9 +1473,10 @@ impl<'p> Vm<'p> {
     }
 
     /// Hand out the next slot of the run-time global pool (see `EVAL_POOL`),
-    /// seeded with `seed`. The pool's capacity was reserved at boot, so the
-    /// pushes below never reallocate `globals` / `global_gens` (the JIT pins
-    /// both). `what` names the consumer in the exhaustion error.
+    /// seeded with `seed`. A JIT build reserved the pool's capacity at boot,
+    /// so there the pushes below never reallocate `globals` / `global_gens`
+    /// (the JIT pins both); the profiles without a JIT may grow them (see
+    /// `EVAL_POOL_RESERVE`). `what` names the consumer in the exhaustion error.
     pub(crate) fn alloc_global_pool_slot(
         &mut self,
         seed: Value,
@@ -1473,6 +1491,7 @@ impl<'p> Vm<'p> {
             )));
         }
         debug_assert_eq!(self.globals.len(), s);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         debug_assert!(s < self.globals.capacity() && s < self.global_gens.capacity());
         self.globals.push(seed);
         self.global_gens.push(0);
@@ -1551,27 +1570,25 @@ impl<'p> Vm<'p> {
         // fresh slot with the builtin value rather than the never-declared
         // sentinel. A genuinely-undeclared name stays UNINITIALIZED → ReferenceError.
         //
-        // An earlier script may already have replaced the builtin through the
-        // global object (`globalThis.setTimeout = f`, before any code named it
-        // bare): that own data property IS the binding's value, so the slot
-        // starts from it rather than from the boot intrinsic.
-        let replaced = if self.builtin_globals.contains_key(name) && self.global_this != 0 {
-            match self.heap.get(self.global_this) {
-                HeapObj::Object(m) => m
-                    .pos(name)
-                    .filter(|&i| !m.attr_at(i).accessor)
-                    .map(|i| m.val_at(i)),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        // A builtin deleted from the global object before any code named it
-        // stays deleted.
-        let deleted = self.deleted_globals.contains(name);
-        let seed = match (replaced, self.builtin_globals.get(name)) {
-            (Some(v), _) => v,
-            (None, Some(&v)) if !deleted => Value::heap(v),
+        // Only while the global object's binding IS still that builtin. A
+        // program that replaced it (`globalThis.print = f`, a getter defined
+        // over it) holds the replacement as an own property, and one that
+        // deleted it holds nothing: either way the slot starts UNINITIALIZED,
+        // and a read falls back to the global object exactly as for any other
+        // name (`get_prop` of the own property; the builtin table, which
+        // respects the deletion; else a ReferenceError). Seeding the builtin
+        // there made eval and `new Function` code call the original `print`
+        // after the program had silenced it, and see a deleted builtin.
+        let builtin = self.builtin_globals.get(name).copied();
+        let replaced = builtin.is_some()
+            && (self.deleted_globals.contains(name)
+                || (self.global_this != 0
+                    && matches!(
+                        self.heap.get(self.global_this),
+                        HeapObj::Object(m) if m.pos(name).is_some()
+                    )));
+        let seed = match builtin {
+            Some(v) if !replaced => Value::heap(v),
             _ => Value::UNINITIALIZED,
         };
         // A plain {w, e, c} data property the global object already holds
@@ -1579,8 +1596,10 @@ impl<'p> Vm<'p> {
         // slot, which presents exactly that descriptor: every read and write
         // of `d` from the code being compiled is then a slot access, in every
         // tier, instead of the global-object fallback. Anything else (an
-        // accessor, other attributes, a ShadowRealm's binding) stays put.
+        // accessor, other attributes, a ShadowRealm's binding, a replaced
+        // builtin, whose slot presents the builtin's descriptor) stays put.
         let migrate = seed.is_uninitialized()
+            && builtin.is_none()
             && self.active_realm.is_none()
             && self.global_this != 0
             && matches!(
@@ -1875,7 +1894,7 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn global_obj_has_own_keys(&self) -> bool {
         self.global_this != 0
-            && matches!(self.heap.get(self.global_this), HeapObj::Object(m) if !m.keys.is_empty())
+            && matches!(self.heap.get(self.global_this), HeapObj::Object(m) if !m.is_empty())
     }
 
     /// True when the global OBJECT carries a REAL own property (an ObjMap entry,
@@ -1891,7 +1910,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(self.global_this) else {
             return false;
         };
-        if m.keys.is_empty() {
+        if m.is_empty() {
             return false;
         }
         match self.global_slot_name_ref(idx) {
@@ -2083,6 +2102,9 @@ impl<'p> Vm<'p> {
         // assembled source before standalone parameter parsing/allocation, so
         // the marker also suppresses exactly this matching second charge.
         let fn_ctor = std::mem::take(&mut self.pending_fn_ctor_eval);
+        // Likewise one-shot: the DirectEval arm asking which program this
+        // compile installs (see `direct_eval_cache`).
+        let report_install = std::mem::take(&mut self.direct_eval_want);
         self.require_external_code_enabled()?;
         // This is the common gate for every runtime compiler entry: direct and
         // indirect eval, Function constructors, ShadowRealm.evaluate, and the
@@ -2290,6 +2312,13 @@ impl<'p> Vm<'p> {
                 None,
                 None,
             );
+        }
+        // A program that declares nothing does all its per-run work in
+        // `execute_eval_program`; installing it again would install the same
+        // code. Report where it lands (the base `prepare_eval_program`
+        // assigns) so the caller can re-run it.
+        if report_install && eval_program_declares_nothing(&eval_prog) {
+            self.direct_eval_installed = Some((self.main_func_count + self.eval_funcs.len()) as u32);
         }
         self.run_eval_program(
             eval_prog,
