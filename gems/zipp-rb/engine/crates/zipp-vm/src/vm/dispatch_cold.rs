@@ -112,13 +112,6 @@ impl<'p> Vm<'p> {
                             HeapObj::Object(m) if m.pos(&name).is_some()
                         );
                     if !has_own {
-                        // A slot-backed builtin is an own property of
-                        // the global object, found before its chain.
-                        if let Some(val) = self.global_by_name(&name) {
-                            self.set(base, dst, val);
-                            ip += 1;
-                            return Ok(ColdFlow::Next(ip));
-                        }
                         // Chain fallback, as in LoadGlobal: a Proxy
                         // prototype's `has` trap / an inherited property
                         // resolves the name (HasBinding = HasProperty).
@@ -2621,16 +2614,11 @@ impl<'p> Vm<'p> {
                                 HeapObj::Object(m) if m.pos(&name).is_some()
                             );
                             let gobj = Value::heap(self.global_this);
-                            // A slot-backed builtin is an own property of
-                            // the global object, found before its chain.
-                            if let Some(own) =
-                                (!has_own).then(|| self.global_by_name(&name)).flatten()
+                            let proto = self.object_get_prototype_of(gobj);
+                            if has_own
+                                || (proto.is_heap()
+                                    && self.has_property_str_dyn(proto, &name)?)
                             {
-                                own
-                            } else if has_own || {
-                                let proto = self.object_get_prototype_of(gobj);
-                                proto.is_heap() && self.has_property_str_dyn(proto, &name)?
-                            } {
                                 self.get_prop(gobj, &name)?
                             } else {
                                 Value::UNDEFINED
@@ -2638,11 +2626,6 @@ impl<'p> Vm<'p> {
                         }
                         _ => Value::UNDEFINED,
                     }
-                } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
-                    // A live slot the global object shadows with a real
-                    // own property: the property is the binding, as
-                    // for `LoadGlobal` (`typeof x` agrees with `x`).
-                    self.load_global_slow(idx, func_id)?
                 } else {
                     v
                 };

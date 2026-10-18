@@ -151,17 +151,6 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   `slot_table_growth_reserve`), which is how the regex came to see no
   headroom at all. Test: `test/limits_test.rb`.
 
-## Global object (crates/zipp-vm/src/vm/dispatch.rs, vm/dispatch_cold.rs)
-
-- **A builtin read finds the global's own property first** — a global slot
-  an eval-installed program reads (vm/dispatch.rs: `LoadGlobalOrUndefined`,
-  `load_global_slow`; vm/dispatch_cold.rs: `LoadGlobalOrUndefinedDyn`,
-  `LoadGlobalDyn`) consulted the global's prototype chain before `global_by_name`, so every read of
-  `Array` or `Object` in dommy's `host_runtime.js` asked the window proxy's
-  `has` trap once the window sat on that chain (and walked
-  `Object.prototype` before). The builtin is an own property of the global
-  object, so it now answers first. Test: `test/engine_fixes_test.rb`.
-
 ## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, lang/js/compile/*, vm/dispatch.rs)
 
 - **Unwritten captured bindings are captured by value** — a captured
@@ -217,12 +206,6 @@ zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
   evals, a strict script's `var`s and functions stayed inside it, and no
   script's `let`/`const`/`class` reached later ones (WPT's `common.js`
   files are strict). Test: `test/engine_fixes_test.rb`.
-- **`typeof` of a global agrees with a read** — `LoadGlobalOrUndefined`
-  (vm/dispatch.rs) / `LoadGlobalOrUndefinedDyn` (vm/dispatch_cold.rs)
-  returned a live slot even when the global object shadowed it with a real
-  own property, which `LoadGlobal` reads instead. (A builtin replaced on or
-  deleted from the global object before later code names it is upstream's
-  now, in `eval_global_slot`.) Test: `test/engine_fixes_test.rb`.
 - **Re-entry does not drain microtasks** — `HostCtx::eval_script`,
   `call_global_value` and `call_handle_value` drained the job queue on return,
   running promise jobs while the guest's stack (the host call) was still
