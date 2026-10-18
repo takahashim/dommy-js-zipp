@@ -8,11 +8,15 @@ description = "ZIPP dynamic JavaScript engine v2 — explicit-frame register VM 
 [dependencies]
 # ZIPP's own Python front end (lexer, parser, and the tree the emitter walks).
 # Optional and off by default: it backs the `frontend::python` compiler.
-zipp-pyparse = { path = "../zipp-pyparse", optional = true }
+zipp-pyparse = { path = "src/lang/python/parser", optional = true }
 # Decimal text to f64 without core's 10 KB power-of-five table (`num_parse`).
 # A crate of its own because zipp-pyparse uses it too.
 zipp-numparse = { path = "../zipp-numparse" }
 rustc-hash = { workspace = true }
+# Substring search over a string's own WTF-8 bytes (`indexOf` and friends on a
+# string holding a lone surrogate). Already in the graph through the regex and
+# allocator crates; the version Cargo.lock pins.
+memchr = "2.8"
 # The regex engine. A DIRECT path dependency on our fork rather than a
 # crates.io version rewritten by `[patch.crates-io]`: zipp-vm calls
 # `Regex::from_unicode_byteopt`, which exists only in the fork, so the upstream
@@ -42,7 +46,7 @@ wasm-lite = ["safe-sandbox", "wasm-no-fs-loader", "wasm-single-agent", "regress/
 # The full WebAssembly artifacts share the UTF-16 and UCS-2 matcher bodies
 # too. The ASCII matcher, which serves every ASCII subject, stays its own.
 wasm-compact-regex = ["regress/compact-utf16"]
-# Experimental Python-subset frontend (see docs/PYTHON_FRONTEND_EXPERIMENT.md).
+# Experimental Python-subset frontend (see docs/python/FRONTEND.md).
 # Pulls in the Python parser and `instrument` (a Python state starts with the
 # VM JIT off; a host without an instruction budget, such as the CLI's
 # `zipp py`/`zipp run`, turns on its Python loop tier with

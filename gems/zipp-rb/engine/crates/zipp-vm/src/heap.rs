@@ -11,7 +11,7 @@
 //! enumeration order and is correct (if not yet fast — shapes/inline-caches are
 //! a later tier).
 
-use crate::bytecode::{static_key_plans_enabled, StaticKeyPlan};
+use crate::bytecode::{static_key_plans_enabled, PlanHandle, StaticKeyPlan};
 use crate::value::Value;
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -93,6 +93,12 @@ fn named_value_vec_payload(v: &Vec<(String, Value)>) -> usize {
 /// the hysteresis keeping a map oscillating at the boundary from
 /// rebuilding every time it crosses.
 pub const PROP_INDEX_THRESHOLD: usize = 12;
+
+/// Most keys a map's shape is rebuilt for after `seal`/`freeze`
+/// (`ObjMap::reshape_after_integrity`): each rebuild walks a fresh path of
+/// the shape tree, so a large frozen dictionary goes DICT rather than spend
+/// the tree's node budget on a layout no cache will share.
+const SHAPE_REBUILD_MAX: usize = 64;
 
 /// What a heap audit charges a `PropIndex::HashTree` entry: its 12 bytes in
 /// a B-tree node and the node overhead around it, overcounted.
@@ -232,6 +238,181 @@ fn prop_tag(key: &str) -> u32 {
     ((h ^ (h >> 31)) >> 32) as u32
 }
 
+/// Decrement every occupied entry of `slots` above `slot`: the renumbering a
+/// removal owes the entries the owning map's `Vec::remove` shifted down.
+///
+/// Live slots are positions in a property list, far below 2^31, and
+/// `PROP_EMPTY` is `u32::MAX`, which is -1 as an `i32`; so one SIGNED compare
+/// against `slot` selects exactly the occupied entries above it, and its
+/// all-ones lanes are -1, so adding the mask decrements them. On x86_64 that
+/// is written with SSE2 (part of the baseline; not in the safe-sandbox
+/// profile, which has no unsafe code) rather than left to the loop vectorizer: a profile-guided build whose training only removed from small
+/// maps compiled the plain loop one entry at a time, which made a removal
+/// from a 2,000-key dictionary four times slower than without the profile.
+#[inline]
+fn renumber_above(slots: &mut [u32], slot: u32) {
+    debug_assert!(slot < 1 << 31, "renumber_above: slot {slot} is not a position");
+    #[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_add_epi32, _mm_cmpgt_epi32, _mm_loadu_si128, _mm_set1_epi32,
+            _mm_storeu_si128,
+        };
+        let mut chunks = slots.chunks_exact_mut(8);
+        // SAFETY: SSE2 is in every x86_64 target's baseline. Each unaligned
+        // load and store covers four u32s inside one 8-element chunk.
+        unsafe {
+            let pivot = _mm_set1_epi32(slot as i32);
+            for chunk in &mut chunks {
+                let lo = chunk.as_mut_ptr().cast::<__m128i>();
+                let hi = chunk.as_mut_ptr().add(4).cast::<__m128i>();
+                let a = _mm_loadu_si128(lo);
+                let b = _mm_loadu_si128(hi);
+                _mm_storeu_si128(lo, _mm_add_epi32(a, _mm_cmpgt_epi32(a, pivot)));
+                _mm_storeu_si128(hi, _mm_add_epi32(b, _mm_cmpgt_epi32(b, pivot)));
+            }
+        }
+        for s in chunks.into_remainder() {
+            *s -= ((*s as i32) > slot as i32) as u32;
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "safe-sandbox"))))]
+    for s in slots.iter_mut() {
+        *s -= ((*s as i32) > slot as i32) as u32;
+    }
+}
+
+/// [`ObjMap`]'s side index for canonical Array-index keys: index -> slot, in
+/// [`PropIndex::Split`]'s layout (parallel arrays, linear probing,
+/// backward-shift removal) so that a removal renumbers it with the same
+/// contiguous [`renumber_above`] sweep. It was a hash map, whose values sit
+/// between its keys: renumbering them walked every bucket one at a time, and
+/// cost a dictionary with a few hundred integer-like keys half a microsecond
+/// per `delete` of any key. Buckets come from Fibonacci hashing (the high bits
+/// of the product), so indices that share their low bits, such as multiples
+/// of 1024, still spread.
+#[derive(Clone, Debug)]
+struct NumIndex {
+    idx: Vec<u32>,
+    /// `PROP_EMPTY` marks a free bucket; `idx[i]` is meaningful only otherwise.
+    slots: Vec<u32>,
+    /// `32 - log2(capacity)`.
+    shift: u32,
+    len: usize,
+}
+
+impl NumIndex {
+    fn with_capacity(cap: usize) -> NumIndex {
+        debug_assert!(cap.is_power_of_two() && cap >= 16);
+        NumIndex {
+            idx: vec![0; cap],
+            slots: vec![PROP_EMPTY; cap],
+            shift: 32 - cap.trailing_zeros(),
+            len: 0,
+        }
+    }
+
+    fn new() -> NumIndex {
+        NumIndex::with_capacity(16)
+    }
+
+    #[inline]
+    fn bucket(&self, n: u32) -> usize {
+        (n.wrapping_mul(0x9E37_79B9) >> self.shift) as usize
+    }
+
+    #[inline]
+    fn get(&self, n: u32) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut i = self.bucket(n);
+        loop {
+            let s = self.slots[i];
+            if s == PROP_EMPTY {
+                return None;
+            }
+            if self.idx[i] == n {
+                return Some(s);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Record `n` at `slot`, replacing any entry `n` already has.
+    fn insert(&mut self, n: u32, slot: u32) {
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
+            let mut grown = NumIndex::with_capacity(self.slots.len() * 2);
+            for (&k, &s) in self.idx.iter().zip(&self.slots) {
+                if s != PROP_EMPTY {
+                    grown.insert(k, s);
+                }
+            }
+            *self = grown;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = self.bucket(n);
+        loop {
+            if self.slots[i] == PROP_EMPTY {
+                self.idx[i] = n;
+                self.slots[i] = slot;
+                self.len += 1;
+                return;
+            }
+            if self.idx[i] == n {
+                self.slots[i] = slot;
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Forget `n` (absent is fine), backward-shift-deleting its bucket as
+    /// [`PropIndex::remove_slot`] does.
+    fn remove(&mut self, n: u32) {
+        let mask = self.slots.len() - 1;
+        let mut j = self.bucket(n);
+        loop {
+            if self.slots[j] == PROP_EMPTY {
+                return;
+            }
+            if self.idx[j] == n {
+                break;
+            }
+            j = (j + 1) & mask;
+        }
+        self.slots[j] = PROP_EMPTY;
+        self.len -= 1;
+        let mut k = (j + 1) & mask;
+        loop {
+            let ks = self.slots[k];
+            if ks == PROP_EMPTY {
+                break;
+            }
+            let ideal = self.bucket(self.idx[k]);
+            if (j.wrapping_sub(ideal) & mask) < (k.wrapping_sub(ideal) & mask) {
+                self.idx[j] = self.idx[k];
+                self.slots[j] = ks;
+                self.slots[k] = PROP_EMPTY;
+                j = k;
+            }
+            k = (k + 1) & mask;
+        }
+    }
+
+    /// The owning map moved each slot `s` to `to[s]` (see `PropIndex::remap`).
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    fn remap(&mut self, to: &[u32]) {
+        for s in self.slots.iter_mut() {
+            if *s != PROP_EMPTY {
+                *s = to[*s as usize];
+            }
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        vec_capacity_bytes(&self.idx).saturating_add(vec_capacity_bytes(&self.slots))
+    }
+}
+
 /// Hash index over an [`ObjMap`]'s `keys`: a flat open-addressing table of
 /// `(tag, slot)` pairs with linear probing (the CollIndex shape — 8-byte
 /// entries pack eight to a cache line, so a lookup is typically one random
@@ -320,6 +501,9 @@ pub enum PropIndex {
         table: Vec<(u32, u32)>,
         mask: usize,
         len: usize,
+        /// Deleted slots of the owning map that no entry names (see
+        /// [`ObjMap::delete_at`]).
+        holes: usize,
     },
     /// W19 M1: parallel `tags` / `slots`, same length, same bucket index.
     /// INVARIANT: `tags.len() == slots.len() == mask + 1`, a bucket is occupied
@@ -329,6 +513,8 @@ pub enum PropIndex {
         slots: Vec<u32>,
         mask: usize,
         len: usize,
+        /// As for `Inter`.
+        holes: usize,
     },
 }
 
@@ -360,12 +546,14 @@ impl PropIndex {
                 slots: vec![PROP_EMPTY; cap],
                 mask: cap - 1,
                 len: 0,
+                holes: 0,
             }
         } else {
             PropIndex::Inter {
                 table: vec![(0, PROP_EMPTY); cap],
                 mask: cap - 1,
                 len: 0,
+                holes: 0,
             }
         }
     }
@@ -617,8 +805,10 @@ impl PropIndex {
     /// key through this very index.
     ///
     /// Both arms run the SAME two passes over the SAME buckets in the same
-    /// order; only the physical layout differs.
-    fn remove_slot(&mut self, tag: u32, slot: u32) {
+    /// order; only the physical layout differs. Without `renumber` the second
+    /// pass is skipped: the owning map left `slot` in place as a hole, so no
+    /// other key moved.
+    fn remove_slot(&mut self, tag: u32, slot: u32, renumber: bool) {
         match self {
             #[cfg(feature = "safe-sandbox")]
             PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
@@ -653,9 +843,11 @@ impl PropIndex {
                     k = (k + 1) & mask;
                 }
                 *len -= 1;
-                for e in table.iter_mut() {
-                    if e.1 != PROP_EMPTY && e.1 > slot {
-                        e.1 -= 1;
+                if renumber {
+                    for e in table.iter_mut() {
+                        if e.1 != PROP_EMPTY && e.1 > slot {
+                            e.1 -= 1;
+                        }
                     }
                 }
             }
@@ -693,14 +885,9 @@ impl PropIndex {
                 }
                 *len -= 1;
                 // The renumber sweep, and the whole point of the split: one
-                // contiguous u32 store per entry, written UNCONDITIONALLY so the
-                // loop vectorizes. `PROP_EMPTY` is `u32::MAX`, so it satisfies
-                // `v > slot` and must be excluded explicitly — the second
-                // conjunct is not redundant.
-                for s in slots.iter_mut() {
-                    let v = *s;
-                    let dec = ((v > slot) as u32) & ((v != PROP_EMPTY) as u32);
-                    *s = v - dec;
+                // contiguous u32 store per entry.
+                if renumber {
+                    renumber_above(slots, slot);
                 }
             }
         }
@@ -737,7 +924,59 @@ impl PropIndex {
             }
             return;
         }
-        self.remove_slot(prop_tag(key), slot);
+        self.remove_slot(prop_tag(key), slot, true);
+    }
+
+    /// Holes left by [`ObjMap::delete_at`] in the owning map: slots that no
+    /// entry names. Always 0 for the safe profile's trees, which never hold
+    /// one.
+    #[inline]
+    fn holes(&self) -> usize {
+        match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => 0,
+            PropIndex::Inter { holes, .. } | PropIndex::Split { holes, .. } => *holes,
+        }
+    }
+
+    /// Unrecord `slot` (`key`'s), which the owning map keeps as a hole: no
+    /// other slot moves, so nothing is renumbered. The flat layouts only.
+    fn forget(&mut self, key: &str, slot: u32) {
+        self.remove_slot(prop_tag(key), slot, false);
+        match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => {
+                unreachable!("the safe profile's maps never hold holes")
+            }
+            PropIndex::Inter { holes, .. } | PropIndex::Split { holes, .. } => *holes += 1,
+        }
+    }
+
+    /// The owning map dropped its holes, moving each slot `s` to `to[s]`:
+    /// rewrite every entry to match.
+    fn remap(&mut self, to: &[u32]) {
+        match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => {
+                unreachable!("the safe profile's maps never hold holes")
+            }
+            PropIndex::Inter { table, holes, .. } => {
+                for e in table.iter_mut() {
+                    if e.1 != PROP_EMPTY {
+                        e.1 = to[e.1 as usize];
+                    }
+                }
+                *holes = 0;
+            }
+            PropIndex::Split { slots, holes, .. } => {
+                for s in slots.iter_mut() {
+                    if *s != PROP_EMPTY {
+                        *s = to[*s as usize];
+                    }
+                }
+                *holes = 0;
+            }
+        }
     }
 
     /// Double and rehash from the stored tags (bucket = `tag & mask`).
@@ -857,7 +1096,7 @@ pub(crate) fn key_names_element(key: &str) -> bool {
 /// allocating.  `2^32 - 1` is deliberately excluded: it is a named property,
 /// not an Array index, even though it is all decimal digits.
 #[inline]
-fn canonical_array_index_key(key: &str) -> Option<u32> {
+pub(crate) fn canonical_array_index_key(key: &str) -> Option<u32> {
     let b = key.as_bytes();
     if b.is_empty() || (b.len() > 1 && b[0] == b'0') || b.len() > 10 {
         return None;
@@ -1074,6 +1313,11 @@ where
 #[cfg(not(feature = "safe-sandbox"))]
 const ARR_POOL_MAX_CAP: usize = 32;
 
+/// Largest string byte-buffer CAPACITY the byte pool retains (see
+/// `Heap::byte_pool`).
+#[cfg(not(feature = "safe-sandbox"))]
+const BYTE_POOL_MAX_CAP: usize = 64;
+
 /// Retained-shell FLOOR for the recycle pool (~450 KiB of shells): the trim
 /// at each collection-done note keeps `max(2 * served, floor)` shells, so a
 /// steady literal-churn loop ramps the pool to its whole inter-sweep window
@@ -1217,7 +1461,7 @@ pub(crate) fn note_static_key_jit_object() {
 pub enum PropKeys {
     Owned(Vec<String>),
     Planned {
-        all: StaticKeyPlan,
+        all: PlanHandle,
         visible_len: usize,
     },
 }
@@ -1292,7 +1536,7 @@ impl PropKeys {
 
     fn planned(plan: StaticKeyPlan) -> Self {
         Self::Planned {
-            all: plan,
+            all: PlanHandle::owned(plan),
             visible_len: 0,
         }
     }
@@ -1362,10 +1606,98 @@ fn key_bytes_sub(count: &mut u32, n: usize) {
     }
 }
 
+/// Slots a map must have before [`ObjMap::delete_at`] leaves a hole rather
+/// than shifting every later slot down: below this the shift is cheaper than
+/// skipping holes afterwards.
+const HOLE_MIN_SLOTS: usize = 32;
+
+/// `ZIPP_PROP_HOLES`: `0` turns holes off (every delete shifts, as before
+/// they existed), `all` makes every delete from any map with owned keys
+/// leave one, building the index holes need on demand — the setting the test
+/// suites run under to reach every positional reader with one. Anything else,
+/// or unset, is the shipped policy. Latched once. The safe profile never
+/// holds a hole: its indexes are trees.
+fn prop_holes_mode() -> u8 {
+    if cfg!(feature = "safe-sandbox") {
+        return 0;
+    }
+    if crate::WASM_STATIC_SWITCHES {
+        return 1;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let s = STATE.load(Ordering::Relaxed);
+    if s != u8::MAX {
+        return s;
+    }
+    let mode = match std::env::var("ZIPP_PROP_HOLES").as_deref() {
+        Ok("0") => 0,
+        Ok("all") => 2,
+        _ => 1,
+    };
+    STATE.store(mode, Ordering::Relaxed);
+    mode
+}
+
+/// The slot index of every property of an [`ObjMap`], in order: its slots
+/// without the holes [`ObjMap::delete_at`] left. Exact-sized, so collecting
+/// through it allocates once, as collecting a slice iterator did.
+#[derive(Clone)]
+pub struct Slots<'a> {
+    /// The value column when the map holds holes (each a
+    /// [`Value::PROP_HOLE`]); `None` when every slot is a property.
+    vals: Option<&'a [Value]>,
+    front: usize,
+    back: usize,
+    left: usize,
+}
+
+impl Iterator for Slots<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        while self.front < self.back {
+            let i = self.front;
+            self.front += 1;
+            if self.vals.is_none_or(|v| v[i].bits() != Value::PROP_HOLE.bits()) {
+                self.left -= 1;
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl DoubleEndedIterator for Slots<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<usize> {
+        while self.front < self.back {
+            self.back -= 1;
+            let i = self.back;
+            if self.vals.is_none_or(|v| v[i].bits() != Value::PROP_HOLE.bits()) {
+                self.left -= 1;
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+impl ExactSizeIterator for Slots<'_> {}
+
 /// A JS object: insertion-ordered string-keyed properties.
 #[derive(Default)]
 pub struct ObjMap {
-    pub keys: PropKeys,
+    /// PRIVATE since dictionary holes (see [`ObjMap::delete_at`]): a slot of
+    /// the list can hold no property, so every read of it goes through the
+    /// accessors that know which slots do.
+    keys: PropKeys,
     /// PRIVATE since the B187 stage-1 migration (like `attrs`/`index`): all
     /// access goes through the `val_*`/`vals_*` methods so the storage can
     /// change underneath — the planned literal-born representation keeps the
@@ -1416,7 +1748,7 @@ pub struct ObjMap {
     /// created lazily only for maps that actually acquire an Array index, so an
     /// ordinary named-property object pays one nullable pointer and no heap
     /// allocation. Slots point into the authoritative parallel vectors.
-    numeric_index: Option<Box<rustc_hash::FxHashMap<u32, u32>>>,
+    numeric_index: Option<Box<NumIndex>>,
     /// Does any key in this map name an ELEMENT of the exotic object it hangs
     /// off — a canonical decimal index, or `"length"`? Maintained by the same
     /// three appends and one removal that maintain `shape`, and read only
@@ -2069,13 +2401,7 @@ impl ObjMap {
             n = n.saturating_add(index.resident_bytes());
         }
         if let Some(index) = &self.numeric_index {
-            // Hash table control bytes are implementation-private. Two buckets'
-            // worth per reported entry is a conservative stable approximation.
-            n = n.saturating_add(
-                index
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(u32, u32)>() * 2),
-            );
+            n = n.saturating_add(index.resident_bytes());
         }
         n
     }
@@ -2134,14 +2460,95 @@ impl ObjMap {
 
     /// Number of own properties.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub fn live_len(&self) -> usize {
+        self.keys.len() - self.hole_count()
+    }
+
+    /// Whether the map holds no property.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.live_len() == 0
+    }
+
+    /// Number of slots, holes included (see [`ObjMap::delete_at`]): the bound
+    /// of a slot index, not a property count.
+    #[inline]
+    pub fn slot_len(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Slots that hold no property (see [`ObjMap::delete_at`]). Only a map
+    /// with a flat index holds one.
+    #[inline]
+    fn hole_count(&self) -> usize {
+        match &self.index {
+            Some(ix) => ix.holes(),
+            None => 0,
+        }
+    }
+
+    /// Whether any slot holds no property (see [`ObjMap::delete_at`]).
+    #[inline]
+    pub fn has_holes(&self) -> bool {
+        self.hole_count() != 0
+    }
+
+    /// Whether slot `i` holds no property. Meaningful for any `i` below
+    /// `slot_len()`; only a map that `has_holes` answers `true`.
+    #[inline]
+    pub fn is_hole(&self, i: usize) -> bool {
+        self.vals.as_slice()[i].bits() == Value::PROP_HOLE.bits()
+    }
+
+    /// The slot of every property, in order (see [`Slots`]).
+    #[inline]
+    pub fn slots(&self) -> Slots<'_> {
+        let n = self.keys.len();
+        let holes = self.hole_count();
+        Slots {
+            vals: (holes != 0).then(|| self.vals.as_slice()),
+            front: 0,
+            back: n,
+            left: n - holes,
+        }
+    }
+
+    /// The name of every property, in order.
+    #[inline]
+    pub fn keys_iter(&self) -> impl DoubleEndedIterator<Item = &String> + ExactSizeIterator + Clone + '_ {
+        let keys: &[String] = &self.keys;
+        self.slots().map(move |i| &keys[i])
+    }
+
+    /// The key list itself, for a caller asking which REPRESENTATION it is
+    /// (a planned list is shared with the literal that made it). Its slots
+    /// include holes; a planned list never holds one.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    #[inline]
+    pub(crate) fn prop_keys(&self) -> &PropKeys {
+        &self.keys
+    }
+
+    /// `(slot, name)` of every property, in order: what
+    /// `keys.iter().enumerate()` was before holes.
+    #[inline]
+    pub fn slot_keys(&self) -> impl DoubleEndedIterator<Item = (usize, &String)> + ExactSizeIterator + Clone + '_ {
+        let keys: &[String] = &self.keys;
+        self.slots().map(move |i| (i, &keys[i]))
+    }
+
+    /// The property name at slot `i`, or `None` past the end or at a hole.
+    #[inline]
+    pub fn key_get(&self, i: usize) -> Option<&str> {
+        let k = self.keys.get(i)?;
+        (!self.has_holes() || !self.is_hole(i)).then_some(k.as_str())
     }
 
     /// The property name at `i`. Panics out of range, exactly like the indexing
     /// it replaces — every caller has already established `i` from `pos()`.
     #[inline]
     pub fn key_at(&self, i: usize) -> &str {
+        debug_assert!(!self.has_holes() || !self.is_hole(i), "key_at({i}) read a hole");
         &self.keys[i]
     }
 
@@ -2149,11 +2556,13 @@ impl ObjMap {
     #[cfg_attr(feature = "wasm-lite", inline(always))]
     #[cfg_attr(not(feature = "wasm-lite"), inline)]
     pub fn val_at(&self, i: usize) -> Value {
+        debug_assert!(self.vals[i].bits() != Value::PROP_HOLE.bits(), "val_at({i}) read a hole");
         self.vals[i]
     }
 
     #[inline]
     pub fn attr_at(&self, i: usize) -> PropAttr {
+        debug_assert!(!self.has_holes() || !self.is_hole(i), "attr_at({i}) read a hole");
         self.attrs.at(i)
     }
 
@@ -2239,10 +2648,16 @@ impl ObjMap {
         self.attrs.push(a);
     }
 
-    /// Every slot's attributes in order, by value (`PropAttr` is `Copy`).
+    /// Every property's attributes in order, by value (`PropAttr` is
+    /// `Copy`): one per [`ObjMap::slots`] entry.
     #[inline]
     pub fn attrs_iter(&self) -> impl Iterator<Item = PropAttr> + '_ {
-        self.attrs.iter()
+        let holes = self.has_holes();
+        self.attrs
+            .iter()
+            .enumerate()
+            .filter(move |&(i, _)| !holes || !self.is_hole(i))
+            .map(|(_, a)| a)
     }
 
     /// Number of attribute slots. Equals `len()` for a consistent map; the
@@ -2302,8 +2717,9 @@ impl ObjMap {
 
     /// `(name, value, attrs)` per own property, insertion order.
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = (&str, Value, PropAttr)> {
-        (0..self.keys.len()).map(move |i| (&*self.keys[i], self.vals[i], self.attrs.at(i)))
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&str, Value, PropAttr)> + ExactSizeIterator {
+        self.slots()
+            .map(move |i| (&*self.keys[i], self.vals[i], self.attrs.at(i)))
     }
 
     /// This object's hidden class, or [`shape::DICT`] if it has none.
@@ -2435,16 +2851,15 @@ impl ObjMap {
 
     /// The map `{ ...self }` makes when `self`'s properties can be copied as
     /// they stand: every one a default data property (writable, enumerable,
-    /// configurable) and none naming an element or a symbol, so the keys'
-    /// insertion order is their [[OwnPropertyKeys]] order. The same keys in
-    /// the same order (a planned list is shared, not copied), the same values,
-    /// the same shape and index. `None` otherwise: the caller copies property
-    /// by property.
+    /// configurable) and none a symbol. Creating them on an empty object in
+    /// [[OwnPropertyKeys]] order (the element keys ascending, then the rest
+    /// in insertion order) leaves the rest in this map's order, and every
+    /// enumeration orders the element keys itself, so the same keys in the
+    /// same order (a planned list is shared, not copied), the same values,
+    /// the same shape and indexes are that object. `None` otherwise: the
+    /// caller copies property by property.
     pub(crate) fn spread_copy(&self) -> Option<ObjMap> {
-        if !matches!(self.attrs, PropAttrs::AllData { .. })
-            || self.has_element_key
-            || self.keys.iter().any(|k| k.starts_with("@@"))
-        {
+        if !matches!(self.attrs, PropAttrs::AllData { .. }) || self.keys.iter().any(|k| k.starts_with("@@")) {
             return None;
         }
         let mut m = ObjMap::new();
@@ -2455,7 +2870,12 @@ impl ObjMap {
         };
         m.shape = self.shape;
         m.index = self.index.clone();
+        m.numeric_index = self.numeric_index.clone();
+        m.has_element_key = self.has_element_key;
         m.planned_append_failed = self.planned_append_failed;
+        // The copy is a consistent map, holes and all; a fresh literal has
+        // no reason to carry them.
+        m.compact();
         Some(m)
     }
 
@@ -2559,7 +2979,8 @@ impl ObjMap {
     /// `finalized_from_store` overwrites applied on top.
     #[cfg(not(feature = "safe-sandbox"))]
     fn refit_finalized(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
-        self.refit_finalized_inner(plan, vals, shape);
+        // SAFETY: no borrowed handle is minted.
+        unsafe { self.refit_finalized_inner(plan, vals, shape, false) };
         static_key_stats::object();
         static_key_stats::bulk_appends(plan.len());
     }
@@ -2567,14 +2988,34 @@ impl ObjMap {
     /// `refit_finalized` for the construction-latched thin path. That path is
     /// reachable only while static-key telemetry is disabled, so avoid the
     /// two otherwise-redundant atomic latch loads per literal.
+    ///
+    /// # Safety
+    ///
+    /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s contract.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
-    fn refit_finalized_no_stats(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
-        self.refit_finalized_inner(plan, vals, shape);
+    unsafe fn refit_finalized_no_stats(
+        &mut self,
+        plan: &StaticKeyPlan,
+        vals: ValStore,
+        shape: u32,
+        borrow: bool,
+    ) {
+        // SAFETY: this function's contract.
+        unsafe { self.refit_finalized_inner(plan, vals, shape, borrow) };
     }
 
+    /// # Safety
+    ///
+    /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s contract.
     #[cfg(not(feature = "safe-sandbox"))]
-    fn refit_finalized_inner(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
+    unsafe fn refit_finalized_inner(
+        &mut self,
+        plan: &StaticKeyPlan,
+        vals: ValStore,
+        shape: u32,
+        borrow: bool,
+    ) {
         debug_assert!(plan.runtime_valid());
         debug_assert_eq!(vals.len(), plan.len());
         let n = plan.len();
@@ -2599,12 +3040,17 @@ impl ObjMap {
         // Whatever the list was, it is the plan's below, which owns no strings.
         *key_bytes = 0;
         match keys {
-            PropKeys::Planned { all, visible_len } if StaticKeyPlan::ptr_eq(all, plan) => {
+            PropKeys::Planned { all, visible_len } if all.is(plan) => {
                 *visible_len = n;
             }
             _ => {
                 *keys = PropKeys::Planned {
-                    all: plan.clone(),
+                    all: if borrow {
+                        // SAFETY: this function's contract.
+                        unsafe { PlanHandle::borrowed(plan) }
+                    } else {
+                        PlanHandle::owned(plan.clone())
+                    },
                     visible_len: n,
                 }
             }
@@ -2626,7 +3072,7 @@ impl ObjMap {
         // The same cold tails `finalized_from_store` builds, on the same
         // conditions.
         if self.has_element_key && sparse_num_index_enabled() {
-            let mut numeric = Box::new(rustc_hash::FxHashMap::default());
+            let mut numeric = Box::new(NumIndex::new());
             for (slot, key) in self.keys.as_ref().iter().enumerate() {
                 if let Some(idx) = canonical_array_index_key(key) {
                     numeric.insert(idx, slot as u32);
@@ -2644,7 +3090,7 @@ impl ObjMap {
     /// representation. Only [`Heap::alloc_finalized`] passes a `Slab` store.
     fn finalized_from_store(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
         let n = plan.len();
-        let m = Self::finalized_from_store_inner(plan, vals, shape);
+        let m = Self::finalized_from_store_inner(PlanHandle::owned(plan), vals, shape);
         static_key_stats::object();
         static_key_stats::bulk_appends(n);
         m
@@ -2654,11 +3100,11 @@ impl ObjMap {
     /// `refit_finalized_no_stats`.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
-    fn finalized_from_store_no_stats(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
+    fn finalized_from_store_no_stats(plan: PlanHandle, vals: ValStore, shape: u32) -> ObjMap {
         Self::finalized_from_store_inner(plan, vals, shape)
     }
 
-    fn finalized_from_store_inner(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
+    fn finalized_from_store_inner(plan: PlanHandle, vals: ValStore, shape: u32) -> ObjMap {
         debug_assert!(plan.runtime_valid());
         debug_assert_eq!(vals.len(), plan.len());
         let n = plan.len();
@@ -2676,7 +3122,7 @@ impl ObjMap {
         // numeric side index for element-naming keys, and the key index past
         // the probe threshold. Both are rare for finalize-eligible literals.
         if has_element_key && sparse_num_index_enabled() {
-            let mut numeric = Box::new(rustc_hash::FxHashMap::default());
+            let mut numeric = Box::new(NumIndex::new());
             for (slot, key) in m.keys.as_ref().iter().enumerate() {
                 if let Some(idx) = canonical_array_index_key(key) {
                     numeric.insert(idx, slot as u32);
@@ -2736,7 +3182,7 @@ impl ObjMap {
         };
         let mut m = ObjMap::new_side_table();
         m.set_keys(PropKeys::Planned {
-            all: plan.clone(),
+            all: PlanHandle::of_static(plan),
             visible_len: 3,
         });
         m.vals = ValStore::Vec(vec![length, iterator, callee]);
@@ -2849,17 +3295,19 @@ impl ObjMap {
 
     /// `Object.seal`: clear extensibility and make every own property non-configurable.
     pub fn seal(&mut self) {
-        self.shape_to_dict(); // every property's `configurable` changes
+        // A sealed map takes no more deletes: drop its holes once.
+        self.compact();
         self.extensible = false;
         self.sealed = true;
         for a in self.attrs.materialize() {
             a.configurable = false;
         }
+        self.reshape_after_integrity(); // every property's `configurable` changed
     }
 
     /// `Object.freeze`: seal, and make every own data property non-writable too.
     pub fn freeze(&mut self) {
-        self.shape_to_dict(); // every property's `configurable`/`writable` changes
+        self.compact();
         self.extensible = false;
         self.sealed = true;
         self.frozen = true;
@@ -2869,6 +3317,34 @@ impl ObjMap {
                 a.writable = false;
             }
         }
+        self.reshape_after_integrity(); // every property's `configurable`/`writable` changed
+    }
+
+    /// After `seal`/`freeze` changed every property's descriptor bits at
+    /// once: the shape an object built with these keys and bits from the
+    /// start has, rebuilt by appending them from the root. Shapes carry the
+    /// bits, so the rebuilt shape is no writable layout's; and they do not
+    /// carry extensibility, which every append path checks for itself (as it
+    /// must for `Object.preventExtensions`, which keeps the shape). A frozen
+    /// configuration object therefore keeps the shape-keyed property caches
+    /// instead of a key lookup per read. A map that was already DICT (a side
+    /// table, a deleted key), a class prototype (pinned DICT) and one past
+    /// [`SHAPE_REBUILD_MAX`] keys go DICT.
+    fn reshape_after_integrity(&mut self) {
+        if !self.shape_guardable() || self.class_proto || self.keys.len() > SHAPE_REBUILD_MAX {
+            self.shape_to_dict();
+            return;
+        }
+        let mut shape = crate::shape::EMPTY;
+        for i in 0..self.keys.len() {
+            let a = self.attrs.at(i);
+            shape = crate::shape::add(
+                shape,
+                &self.keys[i],
+                crate::shape::attr_bits(a.writable, a.enumerable, a.configurable, a.accessor),
+            );
+        }
+        self.shape = shape;
     }
 
     #[inline]
@@ -2877,6 +3353,13 @@ impl ObjMap {
             Some(ix) => ix.find(&self.keys, key),
             None => self.keys.iter().position(|k| key_eq(k, key)),
         }
+    }
+
+    /// Whether a lookup here hashes the key (the map has its index): a
+    /// caller that may append can then hash once for both.
+    #[inline]
+    pub(crate) fn is_indexed(&self) -> bool {
+        self.index.is_some()
     }
 
     /// B219: `pos` with the key's tag supplied by the caller, for the append
@@ -2926,8 +3409,7 @@ impl ObjMap {
             return self
                 .numeric_index
                 .as_ref()?
-                .get(&index)
-                .copied()
+                .get(index)
                 .map(|slot| slot as usize);
         }
         let mut buf = [0u8; 20];
@@ -2954,7 +3436,7 @@ impl ObjMap {
         if sparse_num_index_enabled() {
             if let Some(n) = canonical_array_index_key(&self.keys[slot]) {
                 self.numeric_index
-                    .get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()))
+                    .get_or_insert_with(|| Box::new(NumIndex::new()))
                     .insert(n, slot as u32);
             }
         }
@@ -3027,7 +3509,7 @@ impl ObjMap {
             Some(all) if all.len() == n + 1 => {
                 debug_assert!(all.keys()[..n] == *self.keys.as_ref() && all.keys()[n] == key);
                 self.set_keys(PropKeys::Planned {
-                    all,
+                    all: PlanHandle::owned(all),
                     visible_len: n + 1,
                 });
             }
@@ -3174,11 +3656,16 @@ impl ObjMap {
     /// not pay a second hash lookup to remove the same key. Pure refactor: the
     /// body below is `remove`'s former body verbatim, in the same order.
     ///
-    /// `i` MUST be a live slot index (`i < self.keys.len()`).
+    /// `i` MUST be a property's slot. Every later property moves down one
+    /// slot; a map holding holes drops them first, so it holds none after.
     /// B220: returns the removed key's String so a caller with the Heap in
     /// hand can recycle the buffer (`Heap::recycle_key_buf`). Callers that do
     /// not want it simply drop the value, exactly as before.
-    pub fn remove_at(&mut self, i: usize) -> String {
+    pub fn remove_at(&mut self, mut i: usize) -> String {
+        if self.has_holes() {
+            i -= (0..i).filter(|&j| self.is_hole(j)).count();
+            self.compact();
+        }
         // A hole in the middle of the sequence: every later property's slot
         // shifts down, so no shape in the tree describes the result.
         self.shape_to_dict();
@@ -3186,25 +3673,12 @@ impl ObjMap {
         let key = self.remove_key(i);
         self.vals.remove(i);
         self.attrs.remove(i);
-        // Removing the last element-naming key must clear the bit, or a
-        // `delete arr[0]` would leave every dense fast path shut off for the
-        // life of the object. Recompute rather than count: deletion is rare
-        // and a stale count is a silent wrong answer.
-        if self.has_element_key && key_names_element(&key) {
-            self.has_element_key = self.keys.iter().any(|k| key_names_element(k));
-        }
         if let Some(numeric) = &mut self.numeric_index {
             if let Some(n) = canonical_array_index_key(&key) {
-                numeric.remove(&n);
+                numeric.remove(n);
             }
-            // `Vec::remove` shifted every later property down by one. Deletes
-            // are cold; updating the compact u32 slots in place avoids hashing
-            // every surviving decimal key again.
-            for slot in numeric.values_mut() {
-                if (*slot as usize) > i {
-                    *slot -= 1;
-                }
-            }
+            // `Vec::remove` shifted every later property down by one.
+            renumber_above(&mut numeric.slots, i as u32);
         }
         if let Some(ix) = &mut self.index {
             if self.keys.len() < PROP_INDEX_THRESHOLD / 2 {
@@ -3213,7 +3687,194 @@ impl ObjMap {
                 ix.remove(&key, i as u32);
             }
         }
+        self.element_key_removed(&key);
         key
+    }
+
+    /// The delete operator's `remove_at`: the same removal, except that a map
+    /// big enough for the shift to dominate the delete keeps the slot as a
+    /// HOLE — its key emptied, its value [`Value::PROP_HOLE`], its index
+    /// entries gone — so no other property moves and nothing is renumbered.
+    /// Holes are dropped in one pass once they are half the slots (or by any
+    /// `remove_at`), which keeps a delete amortized O(1) where shifting every
+    /// later slot made a dictionary emptied key by key quadratic.
+    ///
+    /// A hole is a slot without a property, so every reader that walks slots
+    /// skips them ([`ObjMap::slots`], [`ObjMap::iter`], [`ObjMap::keys_iter`]);
+    /// a slot from `pos()` or a cache is never one. Only maps that cannot
+    /// carry a shape another object shares hold them: owned keys, a value
+    /// vector, a flat index (which counts them).
+    pub fn delete_at(&mut self, i: usize) -> String {
+        if !self.hole_ok() {
+            return self.remove_at(i);
+        }
+        self.shape_to_dict();
+        let PropKeys::Owned(keys) = &mut self.keys else {
+            unreachable!("hole_ok requires owned keys")
+        };
+        let key = std::mem::take(&mut keys[i]);
+        key_bytes_sub(&mut self.key_bytes, key.capacity());
+        self.vals[i] = Value::PROP_HOLE;
+        if let PropAttrs::Mixed(attrs) = &mut self.attrs {
+            attrs[i] = PropAttrs::DEFAULT;
+        }
+        if let Some(numeric) = &mut self.numeric_index {
+            if let Some(n) = canonical_array_index_key(&key) {
+                numeric.remove(n);
+            }
+        }
+        self.index
+            .as_mut()
+            .expect("hole_ok requires an index")
+            .forget(&key, i as u32);
+        self.element_key_removed(&key);
+        if self.hole_count() * 2 > self.keys.len() {
+            self.compact();
+        }
+        key
+    }
+
+    /// [`ObjMap::remove`] for the delete operator: [`ObjMap::delete_at`]
+    /// at `key`'s slot.
+    pub fn delete_key(&mut self, key: &str) -> bool {
+        match self.pos(key) {
+            Some(i) => {
+                self.delete_at(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether [`ObjMap::delete_at`] may leave a hole here, building the
+    /// index a hole needs first when `ZIPP_PROP_HOLES=all`.
+    fn hole_ok(&mut self) -> bool {
+        let mode = prop_holes_mode();
+        if mode == 0
+            || self.class_proto
+            || !matches!(self.keys, PropKeys::Owned(_))
+            || !matches!(self.vals, ValStore::Vec(_))
+        {
+            return false;
+        }
+        if mode == 2 && self.index.is_none() && self.keys.len() > 1 {
+            self.index = Some(PropIndex::build(&self.keys));
+        }
+        matches!(
+            self.index.as_deref(),
+            Some(PropIndex::Inter { .. } | PropIndex::Split { .. })
+        ) && (mode == 2 || self.keys.len() >= HOLE_MIN_SLOTS)
+    }
+
+    /// Drop every hole in one pass: each property moves down past the holes
+    /// before it, in order, and both indexes are rewritten to match.
+    pub(crate) fn compact(&mut self) {
+        if !self.has_holes() {
+            return;
+        }
+        let ObjMap {
+            keys,
+            vals,
+            attrs,
+            index,
+            numeric_index,
+            ..
+        } = self;
+        let PropKeys::Owned(keys) = keys else {
+            unreachable!("holes are owned-key maps only")
+        };
+        #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
+        let ValStore::Vec(vals) = vals
+        else {
+            unreachable!("holes are value-vector maps only")
+        };
+        let n = keys.len();
+        let mut to = vec![PROP_EMPTY; n];
+        let mut w = 0usize;
+        for r in 0..n {
+            if vals[r].bits() == Value::PROP_HOLE.bits() {
+                continue;
+            }
+            to[r] = w as u32;
+            if r != w {
+                // Every slot in `w..r` is a hole's or one already moved out,
+                // so the key swapped back is an empty hole key.
+                keys.swap(r, w);
+                vals[w] = vals[r];
+                if let PropAttrs::Mixed(a) = attrs {
+                    a[w] = a[r];
+                }
+            }
+            w += 1;
+        }
+        keys.truncate(w);
+        vals.truncate(w);
+        match attrs {
+            PropAttrs::Mixed(a) => a.truncate(w),
+            PropAttrs::AllData { len } => *len = w as u32,
+        }
+        if let Some(ix) = index {
+            ix.remap(&to);
+        }
+        if let Some(numeric) = numeric_index {
+            numeric.remap(&to);
+        }
+    }
+
+    /// Clear `has_element_key` when `key`, just removed, was the last key
+    /// naming an element.
+    ///
+    /// Removing the last element-naming key must clear the bit, or a
+    /// `delete arr[0]` would leave every dense fast path shut off for the
+    /// life of the object. Recompute rather than count: deletion is rare
+    /// and a stale count is a silent wrong answer. With the numeric side
+    /// index on, the index holds every canonical index key (`element_pos`
+    /// answers from it alone), so the question is whether it still holds
+    /// one or `"length"` remains, not a scan of every key.
+    fn element_key_removed(&mut self, key: &str) {
+        if self.has_element_key && key_names_element(key) {
+            self.has_element_key = if sparse_num_index_enabled() {
+                self.numeric_index.as_ref().is_some_and(|n| n.len > 0) || self.pos("length").is_some()
+            } else {
+                self.keys_iter().any(|k| key_names_element(k))
+            };
+        }
+    }
+
+    /// Remove every Array-index key `drop(index, attrs)` selects, in ONE pass:
+    /// the survivors are re-appended in order, with their attributes, to a
+    /// fresh side table that keeps this map's flags. `remove` shifts every
+    /// later slot and rescans the keys, so shedding `k` of `n` keys through it
+    /// is `O(k·n)`; a sparse array going back to its dense store sheds tens of
+    /// thousands at once. Returns the removed `(index, value, attrs)` in table
+    /// order. For side tables only (the result's shape is DICT); the caller
+    /// bumps the object's version when anything was removed.
+    pub(crate) fn remove_elements_where(
+        &mut self,
+        mut drop: impl FnMut(usize, PropAttr) -> bool,
+    ) -> Vec<(usize, Value, PropAttr)> {
+        let mut gone = Vec::new();
+        let mut kept = ObjMap::new_side_table();
+        for (k, v, a) in self.iter() {
+            if let Some(n) = canonical_array_index_key(k) {
+                if drop(n as usize, a) {
+                    gone.push((n as usize, v, a));
+                    continue;
+                }
+            }
+            kept.define(k, v, a);
+        }
+        if !gone.is_empty() {
+            kept.class = self.class;
+            kept.extensible = self.extensible;
+            kept.is_ctor = self.is_ctor;
+            kept.is_raw_json = self.is_raw_json;
+            kept.sealed = self.sealed;
+            kept.frozen = self.frozen;
+            kept.class_proto = self.class_proto;
+            *self = kept;
+        }
+        gone
     }
 }
 
@@ -3259,6 +3920,47 @@ pub struct JsStr {
     /// keeps the one-byte constructor initialization.
     memo_state: u8,
     cursor: Cell<u64>,
+    /// Code-point boundaries every [`SEEK_MARK_STRIDE`] units, packed like
+    /// `cursor`, made by `seek` the first time it has to walk farther than
+    /// [`SEEK_MARKS_DISTANCE`] from every anchor: the boundary at or before
+    /// unit `k * SEEK_MARK_STRIDE` is entry `k`. Like `cursor` an
+    /// accelerator, and kept to the same rule: appends leave every recorded
+    /// boundary in place (entries past the end at the time are simply
+    /// absent), and the seam merge that rewrites a tail drops them.
+    marks: std::cell::OnceCell<Box<Vec<u64>>>,
+}
+
+/// Unit distance between the boundaries [`JsStr`]'s `marks` record.
+const SEEK_MARK_STRIDE: usize = 128;
+
+/// How far `JsStr::seek` walks from its nearest anchor before it records
+/// the string's boundaries instead: a scan that moves by small steps never
+/// pays for them, and a random search in a long non-ASCII string walks at
+/// most a stride.
+const SEEK_MARKS_DISTANCE: usize = 1024;
+
+/// The boundaries of WTF-8 `bytes` that `JsStr::marks` holds.
+fn seek_marks(bytes: &[u8]) -> Vec<u64> {
+    let mut marks = Vec::new();
+    let (mut pos, mut bi) = (0usize, 0usize);
+    let mut prev = 0u64;
+    loop {
+        let cur = ((pos as u64) << 32) | bi as u64;
+        while marks.len() * SEEK_MARK_STRIDE <= pos {
+            // Short of `pos` only when an astral scalar stepped over the
+            // target; the boundary before it is then the one at or before.
+            let target = marks.len() * SEEK_MARK_STRIDE;
+            marks.push(if target == pos { cur } else { prev });
+        }
+        if bi >= bytes.len() {
+            break;
+        }
+        let (cp, blen) = wtf8_decode(bytes, bi);
+        prev = cur;
+        pos += cp_units(cp);
+        bi += blen;
+    }
+    marks
 }
 
 /// The bytes of a [`JsStr`].
@@ -3609,10 +4311,61 @@ pub fn wtf8_decode(b: &[u8], i: usize) -> (u32, usize) {
 
 /// UTF-16 unit count of a WTF-8 buffer: one per lead byte, plus one extra per
 /// 4-byte (astral) sequence. A 3-byte lone-surrogate encoding counts 1.
+///
+/// On x86_64 (outside the safe-sandbox profile, which has no unsafe code)
+/// the count runs sixteen bytes at a time with SSE2, in byte
+/// lanes summed every 127 blocks: left to the vectorizer, the `usize` sum
+/// widened each byte to a 64-bit lane, two bytes per instruction, and
+/// converting a search's byte offset back to a unit index over a long
+/// non-ASCII string was most of its cost.
 pub fn wtf8_units(b: &[u8]) -> usize {
-    b.iter()
-        .map(|&x| ((x & 0xC0) != 0x80) as usize + (x >= 0xF0) as usize)
-        .sum()
+    fn scalar(b: &[u8]) -> usize {
+        b.iter()
+            .map(|&x| ((x & 0xC0) != 0x80) as usize + (x >= 0xF0) as usize)
+            .sum()
+    }
+    #[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_add_epi64, _mm_cmpeq_epi8, _mm_cmpgt_epi8, _mm_cvtsi128_si64,
+            _mm_loadu_si128, _mm_max_epu8, _mm_sad_epu8, _mm_set1_epi8, _mm_setzero_si128,
+            _mm_srli_si128, _mm_sub_epi8,
+        };
+        let mut blocks = b.chunks_exact(16);
+        let mut total = 0usize;
+        // SAFETY: SSE2 is in every x86_64 target's baseline; each unaligned
+        // load reads one 16-byte block inside `b`.
+        unsafe {
+            // As i8, continuation bytes 0x80..=0xBF are -128..=-65 and every
+            // other byte is above -65; a 4-byte lead is 0xF0 or more unsigned.
+            let continuation_max = _mm_set1_epi8(-65);
+            let astral_lead = _mm_set1_epi8(0xF0u8 as i8);
+            let zero = _mm_setzero_si128();
+            loop {
+                // Each block adds at most 2 to a lane: 127 blocks fit a byte.
+                let mut acc = _mm_setzero_si128();
+                let mut n = 0;
+                while n < 127 {
+                    let Some(block) = blocks.next() else { break };
+                    let v = _mm_loadu_si128(block.as_ptr().cast::<__m128i>());
+                    let lead = _mm_cmpgt_epi8(v, continuation_max);
+                    let astral = _mm_cmpeq_epi8(_mm_max_epu8(v, astral_lead), v);
+                    // A set lane is -1, so subtracting it counts one.
+                    acc = _mm_sub_epi8(_mm_sub_epi8(acc, lead), astral);
+                    n += 1;
+                }
+                if n == 0 {
+                    break;
+                }
+                let sums = _mm_sad_epu8(acc, zero);
+                let both = _mm_add_epi64(sums, _mm_srli_si128::<8>(sums));
+                total += _mm_cvtsi128_si64(both) as usize;
+            }
+        }
+        total + scalar(blocks.remainder())
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "safe-sandbox"))))]
+    scalar(b)
 }
 
 /// Whether WTF-8 buffer `b` contains NO surrogate encodings — for engine-built
@@ -3824,6 +4577,7 @@ impl JsStr {
             wellformed: true,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -3847,6 +4601,7 @@ impl JsStr {
             ascii: true,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -3863,6 +4618,7 @@ impl JsStr {
             wellformed: true,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -3901,6 +4657,7 @@ impl JsStr {
             bytes,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -3919,6 +4676,7 @@ impl JsStr {
             bytes,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -3943,6 +4701,7 @@ impl JsStr {
             bytes,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -4083,6 +4842,21 @@ impl JsStr {
         self.bytes.capacity()
     }
 
+    /// The bytes the seek marks hold, if made: at most a sixteenth of the
+    /// string's own (one u64 per 128 units, each at least a byte).
+    pub(crate) fn marks_bytes(&self) -> usize {
+        self.marks.get().map_or(0, |m| {
+            std::mem::size_of::<Vec<u64>>().saturating_add(vec_capacity_bytes(m))
+        })
+    }
+
+    /// The byte buffer itself (the sweep's `Heap::byte_pool` keeps it).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn into_byte_buf(self) -> Vec<u8> {
+        self.bytes.0
+    }
+
     /// Prepare this proven-linear flat ASCII string for a native append
     /// cursor. The returned allocation pointer stays valid until another
     /// operation mutates this string's `Vec`; the cursor planner admits no
@@ -4191,8 +4965,9 @@ impl JsStr {
             self.wellformed = self.bytes.settle(wellformed);
             // A seam merge rewrites the tail, and the memo may name a
             // boundary at the old end that now falls inside the merged
-            // scalar: start over from byte zero.
+            // scalar: start over from byte zero. The marks may name it too.
             self.cursor.set(0);
+            self.marks = std::cell::OnceCell::new();
         }
     }
 
@@ -4208,7 +4983,10 @@ impl JsStr {
     /// non-ASCII text quadratic: on the wasm build a 64K-unit sequential
     /// scan took 4.5 s against 2.5 ms for the same loop over ASCII, and a
     /// word tokenizer over 64K mostly-ASCII units with a few accents 7.6 s.
-    /// Random access still costs the distance to the nearest anchor.
+    /// Random access far from every anchor walks from the nearest of the
+    /// string's `marks` instead, made the first time it is needed:
+    /// `indexOf` from scattered positions in a 16,000-unit document had
+    /// walked a quarter of it on every call.
     fn seek(&self, i: usize) -> (usize, usize) {
         debug_assert!(!self.ascii);
         let units = self.units as usize;
@@ -4223,6 +5001,13 @@ impl JsStr {
         } else {
             (units, self.bytes.len())
         };
+        if pos.abs_diff(i) > SEEK_MARKS_DISTANCE {
+            let marks = self.marks.get_or_init(|| Box::new(seek_marks(&self.bytes)));
+            if let Some(&m) = marks.get(i / SEEK_MARK_STRIDE) {
+                // At or before `i`, by at most a stride and a pair.
+                (pos, bi) = ((m >> 32) as usize, m as u32 as usize);
+            }
+        }
         while pos < i {
             let (cp, blen) = wtf8_decode(&self.bytes, bi);
             let n = cp_units(cp);
@@ -4298,6 +5083,7 @@ impl JsStr {
                 bytes,
                 memo_state: 0,
                 cursor: Cell::new(0),
+                marks: std::cell::OnceCell::new(),
             };
         }
         let units = self.units as usize;
@@ -5835,9 +6621,11 @@ pub enum HeapObj {
         live: Option<(u32, u8)>,
     },
     /// A lazy Iterator Helper (the result of `Iterator.prototype.{map,filter,
-    /// take,drop,flatMap}`). `source` is the underlying iterator; `kind` selects
-    /// the transform (0=map,1=filter,2=take,3=drop,4=flatMap); `arg` is the
-    /// callback (map/filter/flatMap); `n` is the remaining count (take/drop);
+    /// take,drop,flatMap,chunks,windows}`). `source` is the underlying iterator;
+    /// `kind` selects the transform (0=map,1=filter,2=take,3=drop,4=flatMap,
+    /// 8=chunks,9=windows); `arg` is the callback (map/filter/flatMap) or the
+    /// windows buffer; `n` is the remaining count (take/drop) or the chunk or
+    /// window size (negative: windows' `allow-partial`);
     /// `idx` is the 0-based counter passed to callbacks; `done` marks exhaustion;
     /// `inner` is flatMap's current inner iterator (or UNDEFINED).
     IterHelper {
@@ -5895,7 +6683,7 @@ impl HeapObj {
             | HeapObj::Boxed { .. }
             | HeapObj::BigInt(_)
             | HeapObj::WeakRef(_) => 0,
-            HeapObj::Str(s) => s.byte_capacity(),
+            HeapObj::Str(s) => s.byte_capacity().saturating_add(s.marks_bytes()),
             HeapObj::Array(items) => vec_capacity_bytes(items),
             HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),
             HeapObj::Promise { reactions, .. } => match reactions {
@@ -5914,7 +6702,7 @@ impl HeapObj {
     /// its reserved address space back to the host allocator.
     fn resident_payload_bytes(&self) -> usize {
         match self {
-            HeapObj::Str(s) => s.byte_capacity(),
+            HeapObj::Str(s) => s.byte_capacity().saturating_add(s.marks_bytes()),
             HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),
             HeapObj::EvalScope(bindings) => bindings
                 .capacity()
@@ -6234,6 +7022,23 @@ pub struct Heap {
     /// by the same notes and flag as the shell pool.
     #[cfg(not(feature = "safe-sandbox"))]
     arr_pool: Vec<Vec<Value>>,
+    /// Recycled string byte buffers (capacity 1..=`BYTE_POOL_MAX_CAP`), the
+    /// string twin of `arr_pool`: a minor's sweep keeps a dying small
+    /// string's buffer here instead of freeing it, and the producers that
+    /// build a new string's bytes (`take_byte_buf`) take one instead of
+    /// allocating. Demand-trimmed at each collection-done note like the
+    /// other pools; never traced (plain bytes).
+    #[cfg(not(feature = "safe-sandbox"))]
+    byte_pool: Vec<Vec<u8>>,
+    /// `take_byte_buf` calls of a pool-sized buffer since the last
+    /// collection-done note: the trim's demand signal.
+    #[cfg(not(feature = "safe-sandbox"))]
+    byte_pool_asks: usize,
+    /// Whether the last window asked for any: only then does the sweep keep
+    /// string buffers (a workload whose producers never ask would only move
+    /// each free from the sweep to the trim).
+    #[cfg(not(feature = "safe-sandbox"))]
+    byte_pool_want: bool,
     /// B220: recycled property-key buffers, the third member of the
     /// B194/B196b pool family. The sweep drains a dying DYNAMIC-keyed
     /// object's key Strings here and the `obj["prefix" + i] = v` append pops
@@ -6342,7 +7147,7 @@ pub struct Heap {
     /// gate on every oracle field above. `false` = the default build's behavior,
     /// bit for bit.
     oracle: bool,
-    /// Stage-1 nursery alloc log (NURSERY_DESIGN.md §6, step 2): the slots
+    /// Stage-1 nursery alloc log (docs/archive/NURSERY_DESIGN.md §6, step 2): the slots
     /// allocated since the last collection, in allocation order — what a MINOR
     /// collection sweeps INSTEAD of walking `floor..len`. One `Vec` push per
     /// allocation (~1ns amortized against B104's 23-148ns alloc/free; the
@@ -6375,7 +7180,7 @@ pub struct Heap {
     /// `gen == GEN_YOUNG ⇔ the slot is in the young log` is a real invariant.
     gen: Vec<u8>,
     /// Stage-3 remembered set: OLD holders that received a young store since
-    /// the last collection (holder-grain — NURSERY_DESIGN.md §1's dirty-object
+    /// the last collection (holder-grain — docs/archive/NURSERY_DESIGN.md §1's dirty-object
     /// form; deduped by the `GEN_DIRTY` state so each holder appears once).
     /// A minor re-traces every entry's full edge list; drained and reset to
     /// `GEN_OLD` by [`Heap::remset_reset`] at the end of each minor.
@@ -6393,6 +7198,10 @@ pub struct Heap {
     /// major schedule is measured against (a post-MINOR count includes floated
     /// old garbage, which must not compound the threshold — B120's named fix).
     live_at_major: usize,
+    /// Majors completed. The meter's heap poll measures growth from the
+    /// level its first walk after the latest major finds (see
+    /// `Vm::instrument_heap_poll_inner`), so it needs to see one complete.
+    majors_done: u64,
     /// Occupied-slot count that latches the next collection into a MAJOR:
     /// the PRE-NURSERY schedule (`GC_GROWTH * live_at_major`, floored). A
     /// minor that ends with the heap still at or above this point has proven
@@ -6444,6 +7253,9 @@ pub struct Heap {
     /// small-object path that the count-based schedule already handles well
     /// pays one size read and nothing else.
     big_bytes_since_gc: usize,
+    /// Byte-schedule collections requested since the last major (see
+    /// [`Heap::big_payload_due`]).
+    big_triggers: u32,
     /// Payload bytes allocated since the last collection, counted only while
     /// no allocator reports blocks (`ALLOCATOR_REPORTS`). Without those
     /// reports the byte schedule never fires and collections ran on slot
@@ -6464,7 +7276,7 @@ pub struct Heap {
     /// construction; values below 1024 are ignored as certainly-wrong). Only
     /// read under `self.nursery`, so the default build is bit-identical.
     young_budget: usize,
-    /// W9 static-pretenure depth (NURSERY_DESIGN.md §4): while non-zero,
+    /// W9 static-pretenure depth (docs/archive/NURSERY_DESIGN.md §4): while non-zero,
     /// `alloc` stamps new slots OLD-clean and skips the young log — used by
     /// the builtin builders whose output is measured to survive minors
     /// wholesale (JSON.parse's tree, String.prototype.split's parts). A depth,
@@ -6562,7 +7374,7 @@ pub const GC_MIN_THRESHOLD: usize = 1 << 16;
 /// already grown still collects on the same schedule it did.
 const GC_GROWTH: usize = 3;
 
-/// Stage-3 nursery scheduling (NURSERY_DESIGN.md §2): allocations between
+/// Stage-3 nursery scheduling (docs/archive/NURSERY_DESIGN.md §2): allocations between
 /// MINOR collections. A minor's cost is O(young live + roots + remset), not
 /// O(heap), so it can afford to run far more often than a major — this is the
 /// slot-recycling cadence §2 argues is the design's locality upside.
@@ -6612,6 +7424,12 @@ const BIG_PAYLOAD_BYTES: usize = 4096;
 /// exists to prevent — and large enough that a program allocating big buffers
 /// steadily is not collecting on every frame.
 const BIG_PAYLOAD_GC_AT: usize = 8 * 1024 * 1024;
+
+/// Byte-schedule collections per major while the nursery is on (see
+/// `Heap::big_payload_due`): old garbage held in large payloads is
+/// reclaimed within this many `BIG_PAYLOAD_GC_AT` steps.
+#[cfg(not(feature = "safe-sandbox"))]
+const BIG_TRIGGERS_PER_MAJOR: u32 = 4;
 
 /// Net bytes the process's allocator has outstanding, for a binary whose
 /// global allocator reports them: every block through [`note_every_block`] (the
@@ -6930,6 +7748,12 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             arr_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
+            byte_pool: Vec::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            byte_pool_asks: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
+            byte_pool_want: false,
+            #[cfg(not(feature = "safe-sandbox"))]
             key_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             key_pool_stats: [0; 3],
@@ -6988,11 +7812,13 @@ impl Heap {
             remset: Vec::new(),
             scan_roots: Vec::new(),
             live_at_major: live,
+            majors_done: 0,
             // Same offset as gc_threshold: a first minor's occupied count
             // includes these permanent slots, so preserve the old boundary in
             // terms of collectable survivors rather than total prefix size.
             major_at: GC_MIN_THRESHOLD + INTERN_PREFIX_EXTRA as usize,
             big_bytes_since_gc: 0,
+            big_triggers: 0,
             payload_since_gc: 0,
             footprint_gc_at: footprint_bytes().saturating_add(FOOTPRINT_STEP),
             footprint_at_look: footprint_bytes(),
@@ -7154,6 +7980,39 @@ impl Heap {
         Vec::with_capacity(cap)
     }
 
+    /// A byte buffer for a new string's bytes — recycled from `byte_pool`
+    /// when the pool has one and `cap` fits its class (cleared here), fresh
+    /// otherwise. Hand it to a `JsStr` constructor; a buffer that ends up
+    /// unused goes back through `return_byte_buf`.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))] // the Python str methods' producers
+    #[inline]
+    pub(crate) fn take_byte_buf(&mut self, cap: usize) -> Vec<u8> {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if cap <= BYTE_POOL_MAX_CAP {
+            self.byte_pool_asks += 1;
+            if let Some(mut v) = self.byte_pool.pop() {
+                v.clear();
+                if v.capacity() < cap {
+                    v.reserve(cap);
+                }
+                return v;
+            }
+        }
+        Vec::with_capacity(cap)
+    }
+
+    /// Give back a buffer `take_byte_buf` handed out that was not used.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    #[inline]
+    pub(crate) fn return_byte_buf(&mut self, v: Vec<u8>) {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if (1..=BYTE_POOL_MAX_CAP).contains(&v.capacity()) {
+            self.byte_pool.push(v);
+            return;
+        }
+        drop(v);
+    }
+
     /// B187 stage 2: allocate a FINALIZE-BORN literal with its values in the
     /// slab — one call fusing cell allocation, map construction and the
     /// ordinary slot allocation (whose bookkeeping, mirrors included, stays
@@ -7166,7 +8025,8 @@ impl Heap {
     ) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc {
-            return self.alloc_finalized_thin(plan, vals, shape);
+            // SAFETY: no borrowed handle is minted.
+            return unsafe { self.alloc_finalized_thin(plan, vals, shape, false) };
         }
         #[cfg(not(feature = "safe-sandbox"))]
         let store = match val_slab_class(vals.len()) {
@@ -7228,6 +8088,30 @@ impl Heap {
         self.alloc_object_settled(boxed, shape)
     }
 
+    /// [`Heap::alloc_finalized`] for a literal site's own plan: the object's
+    /// keys BORROW the plan (see [`PlanHandle`]), so neither this allocation
+    /// nor a later refit of its shell to another site changes a plan's count.
+    ///
+    /// # Safety
+    ///
+    /// `plan` must outlive this heap: an entry of an installed `FuncProto`'s
+    /// `static_key_plans` (the program, eval arena and leaked programs all
+    /// outlive the VM that owns the heap).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) unsafe fn alloc_finalized_borrowed(
+        &mut self,
+        plan: &crate::bytecode::StaticKeyPlan,
+        vals: &[Value],
+        shape: u32,
+    ) -> u32 {
+        if self.thin_alloc && crate::bytecode::plan_borrow_enabled() {
+            // SAFETY: this function's contract.
+            return unsafe { self.alloc_finalized_thin(plan, vals, shape, true) };
+        }
+        self.alloc_finalized(plan, vals, shape)
+    }
+
     /// B257: the thin twin of [`Heap::alloc_finalized`] — the same slab
     /// cell, pool pop and in-place refit, with the allocation-mode latches
     /// already folded into `thin_alloc` and the occupant installed by
@@ -7236,13 +8120,18 @@ impl Heap {
     /// the shell refit and the settled mirror are all on and the static-key
     /// statistics are off — exactly the configuration whose general-path
     /// behaviour this reproduces.
+    ///
+    /// # Safety
+    ///
+    /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s contract.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
-    fn alloc_finalized_thin(
+    unsafe fn alloc_finalized_thin(
         &mut self,
         plan: &crate::bytecode::StaticKeyPlan,
         vals: &[Value],
         shape: u32,
+        borrow: bool,
     ) -> u32 {
         debug_assert!(self.thin_alloc);
         let class = val_slab_class(vals.len());
@@ -7331,11 +8220,17 @@ impl Heap {
                 if self.oracle {
                     self.obj_pool_stats[1] += 1;
                 }
-                b.refit_finalized_no_stats(plan, store, shape);
+                // SAFETY: this function's contract.
+                unsafe { b.refit_finalized_no_stats(plan, store, shape, borrow) };
                 b
             }
             None => Box::new(ObjMap::finalized_from_store_no_stats(
-                plan.clone(),
+                if borrow {
+                    // SAFETY: this function's contract.
+                    unsafe { PlanHandle::borrowed(plan) }
+                } else {
+                    PlanHandle::owned(plan.clone())
+                },
                 store,
                 shape,
             )),
@@ -7582,6 +8477,37 @@ impl Heap {
     ///
     /// `ZIPP_NO_SETTLED_ALLOC=1` routes back through `refresh_mirror`, so the
     /// two spellings can be A/B'd on one binary.
+    /// Python layout-mode attribute storage (`vm::py_table::layout`), with
+    /// its mirror (`LAYOUT_BASE | layout`, the buffer, as `refresh_mirror`
+    /// writes it) settled from the values in hand instead of re-read from
+    /// the slot just written; a recycled slot is written as B257's thin
+    /// paths write one (no drop glue on the tombstone).
+    #[cfg(feature = "python")]
+    pub(crate) fn alloc_py_attrs(&mut self, layout: u32, vals: Vec<Value>) -> u32 {
+        #[cfg(feature = "jit")]
+        let hot = Some(HotMirror {
+            shape: crate::vm::py_table::layout::LAYOUT_BASE | layout,
+            fid: FID_MIRROR_NONE,
+            vals: vals.as_ptr() as u64,
+        });
+        #[cfg(not(feature = "jit"))]
+        let hot = no_hot_mirror();
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc && !self.payload_accounting.get() {
+            if let Some(idx) = self.free.pop() {
+                self.reuse_slot_begin();
+                self.reuse_slot_write(idx, HeapObj::PyAttrs { layout, vals });
+                #[cfg(feature = "jit")]
+                if let Some(hot) = hot {
+                    self.hot_mirror[idx as usize] = hot;
+                }
+                self.reuse_slot_stamp(idx);
+                return idx;
+            }
+        }
+        self.alloc_settled(HeapObj::PyAttrs { layout, vals }, hot)
+    }
+
     pub fn alloc_object_settled(&mut self, boxed: Box<ObjMap>, shape: u32) -> u32 {
         if !settled_alloc_enabled() {
             return self.alloc(HeapObj::Object(boxed));
@@ -7660,7 +8586,8 @@ impl Heap {
     #[inline(always)]
     pub fn refresh_mirror(&mut self, _idx: u32) {}
 
-    /// W9: enter a static-pretenure scope (NURSERY_DESIGN.md §4) — until the
+
+    /// W9: enter a static-pretenure scope (docs/archive/NURSERY_DESIGN.md §4) — until the
     /// matching [`Heap::pretenure_end`], every allocation is stamped OLD-clean
     /// and skipped from the young log. Callers must pair begin/end on every
     /// path OUT of the scope including errors: a leaked depth silently turns
@@ -7724,9 +8651,32 @@ impl Heap {
             self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(bytes);
             if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
                 self.big_bytes_since_gc = 0;
-                self.gc_requested = true;
-                self.major_due = true;
+                self.big_payload_due();
             }
+        }
+    }
+
+    /// A collection on the byte schedule: `BIG_PAYLOAD_GC_AT` of large
+    /// payloads allocated since the last one. With the nursery on it is a
+    /// minor, and every `BIG_TRIGGERS_PER_MAJOR`-th since the last major is a
+    /// major. A large buffer is born young (only a static-pretenure scope
+    /// stamps an allocation old), so the minor reclaims every one that died
+    /// young, which is what a loop of temporary buffers makes: a torch
+    /// training step's tensors (young survival 4%) forced a major, a walk of
+    /// the whole old heap, every 8 MiB of them. Buffers that were promoted
+    /// and then dropped wait for the major at most four steps away, or for
+    /// the footprint and ceiling schedules' own majors. The checked profile,
+    /// whose heap ceilings the WebAssembly modules enforce, still takes a
+    /// major every time.
+    fn big_payload_due(&mut self) {
+        self.gc_requested = true;
+        self.big_triggers = self.big_triggers.saturating_add(1);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let major = !self.nursery || self.big_triggers >= BIG_TRIGGERS_PER_MAJOR;
+        #[cfg(feature = "safe-sandbox")]
+        let major = true;
+        if major {
+            self.major_due = true;
         }
     }
 
@@ -7931,11 +8881,10 @@ impl Heap {
         // everything else before the counter is touched, so the small-object
         // path the count-based schedule already serves well is unaffected.
         //
-        // A major is requested, not a minor. Large buffers are what the
-        // nursery pretenures and what survives a minor, so a young-only sweep
-        // is precisely the collection that cannot reclaim them — that is why
-        // the existing schedule, which reaches a major only after 64 minors,
-        // never arrived in time.
+        // Which collection it is, and when a major follows, is
+        // `big_payload_due`'s: the count schedule alone reaches a major only
+        // after 64 minors, which never arrived in time for buffers that were
+        // promoted and then dropped.
         let big = obj.birth_payload_bytes();
         debug_assert_eq!(big, obj.resident_payload_bytes());
         // With no allocator reporting, weigh every payload: a minor once a
@@ -7955,8 +8904,7 @@ impl Heap {
             self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(big);
             if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
                 self.big_bytes_since_gc = 0;
-                self.gc_requested = true;
-                self.major_due = true;
+                self.big_payload_due();
             }
         }
         // Memory that grew in place since the last look (see
@@ -8350,7 +9298,7 @@ impl Heap {
     /// `free_slot` exactly as the major does (tombstone + version bump + free
     /// list), so every stale inline cache misses identically. Survivors are
     /// PROMOTED (`GEN_OLD`, keeping a sticky scan bit) — promotion is a
-    /// bookkeeping byte, never a copy (NURSERY_DESIGN.md §0). `free_slot`
+    /// bookkeeping byte, never a copy (docs/archive/NURSERY_DESIGN.md §0). `free_slot`
     /// appends each reclaimed slot to the persistent free list; the caller
     /// records that list's pre-sweep length and uses the appended suffix as its
     /// exact side-table prune set. The young log is then cleared (capacity
@@ -8663,6 +9611,12 @@ impl Heap {
         self.gc_requested = true;
     }
 
+    /// Majors completed so far (see the field).
+    #[cfg(feature = "instrument")]
+    pub(crate) fn majors_done(&self) -> u64 {
+        self.majors_done
+    }
+
     /// The slot tables and pools at their capacity: every resident byte but
     /// the objects' payloads.
     fn resident_table_bytes(&self) -> usize {
@@ -8938,10 +9892,13 @@ impl Heap {
                         self.obj_pool_stats[0] += 1;
                     }
                     self.obj_pool.push(m);
-                    HeapObj::Date(f64::NAN)
-                } else {
-                    HeapObj::Object(m)
+                    // Nothing is left to ship or drop: finish here rather
+                    // than carry a tombstone through the courier test and
+                    // the enum's out-of-line drop glue at the end.
+                    self.free_slot_tail(idx);
+                    return;
                 }
+                HeapObj::Object(m)
             }
             other => other,
         };
@@ -8953,7 +9910,36 @@ impl Heap {
                     && (1..=ARR_POOL_MAX_CAP).contains(&v.capacity()) =>
             {
                 self.arr_pool.push(v);
-                HeapObj::Date(f64::NAN)
+                self.free_slot_tail(idx);
+                return;
+            }
+            // A Python instance's layout-mode attribute values are the same
+            // small `Value` buffer (`take_arr_buf` hands one back to
+            // `py_attrs_new`): every instance of a class with attributes
+            // allocated one and the sweep freed it. Compiled code reads the
+            // buffer through the slot's hot mirror, cleared above and
+            // rewritten for the next owner at its allocation.
+            #[cfg(feature = "python")]
+            HeapObj::PyAttrs { vals, .. }
+                if self.obj_pool_refill
+                    && obj_pool_enabled()
+                    && (1..=ARR_POOL_MAX_CAP).contains(&vals.capacity()) =>
+            {
+                self.arr_pool.push(vals);
+                self.free_slot_tail(idx);
+                return;
+            }
+            // A small string's bytes, for the next string a producer builds
+            // (`take_byte_buf`). Nothing else in a `JsStr` owns memory.
+            HeapObj::Str(js)
+                if self.byte_pool_want
+                    && self.obj_pool_refill
+                    && obj_pool_enabled()
+                    && (1..=BYTE_POOL_MAX_CAP).contains(&js.byte_capacity()) =>
+            {
+                self.byte_pool.push(js.into_byte_buf());
+                self.free_slot_tail(idx);
+                return;
             }
             other => other,
         };
@@ -9080,6 +10066,14 @@ impl Heap {
                 other => drop(other),
             }
         }
+        self.free_slot_tail(idx);
+    }
+
+    /// The bookkeeping that ends every `free_slot` whose occupant has been
+    /// pooled, shipped or dropped: a new version for the slot and its return
+    /// to the free list.
+    #[inline(always)]
+    fn free_slot_tail(&mut self, idx: u32) {
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
         if self.nursery {
             // Tombstones read OLD: `gen == GEN_YOUNG ⇔ in the young log`
@@ -9148,6 +10142,16 @@ impl Heap {
                     self.obj_pool_sort_stats[(!run) as usize] += 1;
                 }
             }
+            // The byte pool, trimmed the same way by the window's asks; its
+            // buffers are a few dozen bytes and drop inline.
+            let keep = self
+                .byte_pool_asks
+                .saturating_mul(2)
+                .max(self.byte_pool.len() / 2)
+                .max(OBJ_POOL_FLOOR);
+            self.byte_pool_want = self.byte_pool_asks != 0;
+            self.byte_pool_asks = 0;
+            self.byte_pool.truncate(keep);
             let keep = self
                 .arr_pool_pops
                 .saturating_mul(2)
@@ -9243,9 +10247,11 @@ impl Heap {
         };
         self.gc_requested = false;
         self.live_at_major = live;
+        self.majors_done = self.majors_done.wrapping_add(1);
         self.minors_since_major = 0;
         self.major_due = false;
         self.big_bytes_since_gc = 0;
+        self.big_triggers = 0;
         self.payload_since_gc = 0;
         if self.nursery {
             // Every survivor of a major is OLD (and the remembered set is
@@ -9330,7 +10336,7 @@ impl Heap {
             self.resident_payload_high_water
                 .set(self.resident_payload_high_water.get().max(current));
         }
-        // Nursery barrier (NURSERY_DESIGN.md §1 case 8): the incoming object
+        // Nursery barrier (docs/archive/NURSERY_DESIGN.md §1 case 8): the incoming object
         // may hold young references; if the SLOT is old, its whole edge list
         // is re-traced at the next minor (holder-grain — the value set is a
         // full HeapObj, not a single Value).
@@ -9497,7 +10503,38 @@ impl Heap {
             }
             _ => {}
         }
-        self.alloc(HeapObj::Str(JsStr::new(s)))
+        self.alloc_str_settled(JsStr::new(s))
+    }
+
+    /// [`Heap::alloc`] of a string. A small one takes B257's slot-reuse path
+    /// (`alloc_array_settled`'s): a `Str` owns no mirror line, so the cleared
+    /// mirror `free_slot` left stands, and the slot is written without the
+    /// occupant drop glue `alloc`'s assignment runs on the tombstone. A
+    /// string past `BIG_PAYLOAD_BYTES`, a heap without allocator reporting
+    /// (whose `alloc` weighs every payload) and every non-default
+    /// configuration go through `alloc` unchanged.
+    #[inline]
+    fn alloc_str_settled(&mut self, js: JsStr) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc
+            && !self.payload_accounting.get()
+            && js.byte_capacity() < BIG_PAYLOAD_BYTES
+            && ALLOCATOR_REPORTS.load(Ordering::Relaxed)
+        {
+            if let Some(idx) = self.free.pop() {
+                #[cfg(feature = "jit")]
+                debug_assert_eq!(
+                    self.hot_mirror[idx as usize],
+                    HotMirror::CLEAR,
+                    "free_slot leaves a recycled slot's mirror cleared"
+                );
+                self.reuse_slot_begin();
+                self.reuse_slot_write(idx, HeapObj::Str(js));
+                self.reuse_slot_stamp(idx);
+                return idx;
+            }
+        }
+        self.alloc(HeapObj::Str(js))
     }
 
     /// `alloc_str` for an already-built `JsStr` (the WTF-8 creation sites):
@@ -9509,7 +10546,7 @@ impl Heap {
             1 if b[0] < 128 => return b[0] as u32,
             _ => {}
         }
-        self.alloc(HeapObj::Str(js))
+        self.alloc_str_settled(js)
     }
 
     /// Allocate a rope node over two string-like children (O(1) concatenation).
@@ -9940,7 +10977,7 @@ impl Heap {
     #[inline]
     pub fn cell_set(&mut self, idx: u32, v: Value) {
         // Nursery barrier + B6 oracle: a captured-variable write is edge
-        // source 3 of NURSERY_DESIGN.md §1 (CellSet/CellSetChecked/UpvalSet
+        // source 3 of docs/archive/NURSERY_DESIGN.md §1 (CellSet/CellSetChecked/UpvalSet
         // all land here — the JIT's `jit_cell_set`/`jit_upval_set` too).
         self.write_barrier_val(idx, v);
         if self.oracle
@@ -9976,7 +11013,7 @@ impl Heap {
 }
 
 /// B6 generational-ORACLE store counters (`ZIPP_GCSTATS=1` only): how many
-/// stores at each helper chokepoint of NURSERY_DESIGN.md §1 would have been an
+/// stores at each helper chokepoint of docs/archive/NURSERY_DESIGN.md §1 would have been an
 /// old→young edge — i.e. would have entered a remembered set had the nursery
 /// existed. The tax NUMERATOR of the design study's kill rule; zero behavior.
 pub(crate) mod gcoracle {
@@ -10398,11 +11435,12 @@ mod tests {
         // `safe-sandbox` keeps a string's bytes behind a tag (see `StrBytes`).
         // On a 64-bit host that is one word more; on wasm32, the target that
         // profile ships for, the tag fits the padding and the size is 32
-        // either way.
+        // either way. The seek marks are one pointer more, which HeapObj's
+        // largest variants already cover.
         #[cfg(not(feature = "safe-sandbox"))]
-        assert_eq!(std::mem::size_of::<JsStr>(), 40);
-        #[cfg(feature = "safe-sandbox")]
         assert_eq!(std::mem::size_of::<JsStr>(), 48);
+        #[cfg(feature = "safe-sandbox")]
+        assert_eq!(std::mem::size_of::<JsStr>(), 56);
         assert_eq!(std::mem::size_of::<PropKeys>(), 24);
         assert_eq!(std::mem::size_of::<ValStore>(), 24);
         assert_eq!(std::mem::size_of::<ObjMap>(), 112);
@@ -10725,6 +11763,86 @@ mod tests {
         }
     }
 
+    /// `delete_at` leaves holes every reader skips and `compact` drops them:
+    /// a dictionary churned by sets, hole-leaving deletes, shifting removes
+    /// and compactions, checked after every step against an ordered model.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn dictionary_holes_track_an_ordered_model() {
+        let mut m = ObjMap::new();
+        let mut model: Vec<(String, i32)> = Vec::new();
+        let mut seed = 0x9E37_79B9u32;
+        let mut rnd = move |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % n
+        };
+        let mut saw_holes = false;
+        for step in 0..6000i32 {
+            let k = rnd(160);
+            let key = match k % 11 {
+                0 => (k * 7).to_string(),
+                1 if k == 1 => "length".to_string(),
+                _ => format!("k{k}"),
+            };
+            match rnd(20) {
+                0..=8 => {
+                    m.set(&key, Value::int(step));
+                    match model.iter_mut().find(|(mk, _)| *mk == key) {
+                        Some(e) => e.1 = step,
+                        None => model.push((key.clone(), step)),
+                    }
+                }
+                9..=16 => {
+                    assert_eq!(m.delete_key(&key), model.iter().any(|(mk, _)| *mk == key));
+                    model.retain(|(mk, _)| *mk != key);
+                }
+                17 | 18 => {
+                    assert_eq!(m.remove(&key), model.iter().any(|(mk, _)| *mk == key));
+                    model.retain(|(mk, _)| *mk != key);
+                }
+                _ => m.compact(),
+            }
+            saw_holes |= m.has_holes();
+            assert_eq!(m.live_len(), model.len(), "step {step}");
+            assert_eq!(m.slots().len(), model.len());
+            let seen: Vec<(String, i32)> = m.iter().map(|(k, v, _)| (k.to_owned(), v.as_int())).collect();
+            assert_eq!(seen, model, "step {step}");
+            assert!(m.keys_iter().eq(model.iter().map(|(k, _)| k)));
+            assert_eq!(m.attrs_iter().count(), model.len());
+            for (i, (mk, mv)) in model.iter().enumerate() {
+                let slot = m.pos(mk).expect("a model key is present");
+                assert!(!m.is_hole(slot));
+                assert_eq!(m.key_get(slot), Some(mk.as_str()));
+                assert_eq!(m.val_at(slot), Value::int(*mv));
+                if let Some(n) = canonical_array_index_key(mk) {
+                    assert_eq!(m.element_pos(n as usize), Some(slot), "step {step} key {i}");
+                }
+            }
+            for probe in [format!("k{}", rnd(160)), (rnd(160) * 7).to_string()] {
+                let present = model.iter().any(|(mk, _)| *mk == probe);
+                assert_eq!(m.pos(&probe).is_some(), present);
+                if let Some(n) = canonical_array_index_key(&probe) {
+                    assert_eq!(m.element_pos(n as usize).is_some(), present);
+                }
+            }
+            for s in 0..m.slot_len() {
+                assert_eq!(m.key_get(s).is_none(), m.is_hole(s));
+            }
+            assert_eq!(
+                m.has_element_key(),
+                model.iter().any(|(mk, _)| key_names_element(mk)),
+                "step {step}"
+            );
+            if step % 997 == 0 {
+                let c = m.clone();
+                assert!(c.iter().map(|(k, v, _)| (k.to_owned(), v.as_int())).eq(model.iter().cloned()));
+            }
+        }
+        assert!(saw_holes, "the churn never left a hole");
+    }
+
     #[cfg(not(feature = "safe-sandbox"))]
     #[test]
     fn structural_churn_reuses_one_chunk_and_resident_bytes_plateau() {
@@ -10939,8 +12057,8 @@ mod tests {
                     let i = rng.below(keys.len());
                     let k = keys.remove(i);
                     let tag = prop_tag(&k);
-                    inter.remove_slot(tag, i as u32);
-                    split.remove_slot(tag, i as u32);
+                    inter.remove_slot(tag, i as u32, true);
+                    split.remove_slot(tag, i as u32, true);
                 }
 
                 assert_eq!(
@@ -11095,6 +12213,169 @@ mod tests {
         assert!(m.remove("7"));
         assert_eq!(m.element_pos(7), None);
         assert_eq!(m.element_pos(123456), m.pos("123456"));
+    }
+
+    /// The SSE2 unit count against the per-byte formula, on buffers mixing
+    /// ASCII, two- and three-byte scalars, astral pairs and lone surrogates,
+    /// at lengths on and off its 16-byte blocks and 127-block batches.
+    #[test]
+    fn wtf8_units_counts_like_the_per_byte_formula() {
+        let mut bytes = Vec::new();
+        let mut x = 7u32;
+        while bytes.len() < 40_000 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let cp = match (x >> 24) % 6 {
+                0 | 1 => (x >> 8) % 0x80,
+                2 => 0x80 + (x >> 8) % 0x780,
+                3 => 0x800 + (x >> 8) % 0xD000,
+                4 => 0x10000 + (x >> 8) % 0xF_0000,
+                _ => 0xD800 + (x >> 8) % 0x800,
+            };
+            push_cp_raw(&mut bytes, cp);
+        }
+        let want = |b: &[u8]| -> usize {
+            b.iter()
+                .map(|&x| ((x & 0xC0) != 0x80) as usize + (x >= 0xF0) as usize)
+                .sum()
+        };
+        for len in (0..64).chain([127 * 16 - 1, 127 * 16, 127 * 16 + 1, 254 * 16 + 7, 40_000]) {
+            let b = &bytes[..len.min(bytes.len())];
+            assert_eq!(wtf8_units(b), want(b), "len {len}");
+            assert_eq!(wtf8_units(&b[b.len().min(3)..]), want(&b[b.len().min(3)..]), "offset len {len}");
+        }
+        assert_eq!(wtf8_units(&[0xFF; 5000]), 10_000);
+    }
+
+    /// Random positions in a long non-ASCII string with astral pairs, which
+    /// make the seek marks, against a plain walk of its code points: the
+    /// unit there and the byte bounds of its scalar. Again after an append
+    /// (the marks stay and cover the old part only) and after a surrogate
+    /// seam merge (which drops them).
+    #[test]
+    fn seek_marks_answer_random_positions_like_a_walk() {
+        fn check(js: &JsStr, salt: u32) {
+            let bytes = js.as_bytes();
+            let mut want: Vec<(u16, (usize, usize))> = Vec::new();
+            let mut bi = 0;
+            while bi < bytes.len() {
+                let (cp, blen) = wtf8_decode(bytes, bi);
+                if cp > 0xFFFF {
+                    let v = cp - 0x10000;
+                    want.push(((0xD800 + (v >> 10)) as u16, (bi, bi)));
+                    want.push(((0xDC00 + (v & 0x3FF)) as u16, (bi, bi + blen)));
+                } else {
+                    want.push((cp as u16, (bi, bi)));
+                }
+                bi += blen;
+            }
+            assert_eq!(want.len(), js.units());
+            let mut x = 12345u32 ^ salt;
+            for _ in 0..4000 {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let i = (x >> 8) as usize % want.len();
+                assert_eq!(js.unit_at(i), Some(want[i].0), "unit {i}");
+                assert_eq!(js.unit_byte_bounds(i), want[i].1, "bounds {i}");
+            }
+            assert_eq!(js.unit_byte_bounds(want.len()), (bytes.len(), bytes.len()));
+        }
+        let mut s = String::new();
+        for i in 0..12_000u32 {
+            s.push(match i % 7 {
+                0 => '\u{1F600}',
+                1 | 2 => '\u{E9}',
+                3 => '\u{65E5}',
+                _ => char::from(b'a' + (i % 26) as u8),
+            });
+        }
+        let mut js = JsStr::new(s);
+        check(&js, 1);
+        assert!(js.marks.get().is_some(), "random access far from every anchor made the marks");
+        js.push_str("tail \u{FC} \u{1F600} and more text past the marks");
+        assert!(js.marks.get().is_some(), "a well-formed append keeps them");
+        check(&js, 2);
+        js.push_wtf8(&[0xED, 0xA0, 0xBD]);
+        assert!(js.marks.get().is_none(), "a lone-surrogate append drops them");
+        js.push_wtf8(&[0xED, 0xB8, 0x80]);
+        assert!(js.as_bytes().ends_with("\u{1F600}".as_bytes()), "the halves merged");
+        check(&js, 3);
+    }
+
+    /// The SSE2 sweep and its scalar tail against the plain predicate, over
+    /// lengths that are and are not multiples of its 8-entry chunk, with free
+    /// buckets (`PROP_EMPTY`) mixed in.
+    #[test]
+    fn renumber_above_decrements_exactly_the_occupied_slots_above() {
+        for len in [0usize, 1, 7, 8, 9, 31, 32, 33, 4096] {
+            let mut slots: Vec<u32> = (0..len as u32)
+                .map(|i| if i % 5 == 3 { PROP_EMPTY } else { (i * 7919) % 5000 })
+                .collect();
+            for pivot in [0u32, 1, 2500, 4999, 5000] {
+                let want: Vec<u32> = slots
+                    .iter()
+                    .map(|&v| if v != PROP_EMPTY && v > pivot { v - 1 } else { v })
+                    .collect();
+                renumber_above(&mut slots, pivot);
+                assert_eq!(slots, want, "len {len} pivot {pivot}");
+            }
+        }
+    }
+
+    /// NumIndex against a reference map through growth, replacement and
+    /// backward-shift removal, on keys that share their low bits.
+    #[test]
+    fn num_index_matches_a_reference_map() {
+        let mut ix = NumIndex::new();
+        let mut want = std::collections::HashMap::new();
+        let keys: Vec<u32> = (0..3000u32)
+            .map(|i| if i % 3 == 0 { i * 1024 } else { i.wrapping_mul(2_654_435_761) >> 1 })
+            .collect();
+        for (slot, &k) in keys.iter().enumerate() {
+            ix.insert(k, slot as u32);
+            want.insert(k, slot as u32);
+        }
+        ix.insert(keys[10], 99_999);
+        want.insert(keys[10], 99_999);
+        for &k in keys.iter().step_by(4) {
+            ix.remove(k);
+            want.remove(&k);
+        }
+        ix.remove(7); // absent
+        assert_eq!(ix.len, want.len());
+        for &k in &keys {
+            assert_eq!(ix.get(k), want.get(&k).copied(), "key {k}");
+        }
+        assert_eq!(ix.get(u32::MAX - 1), None);
+    }
+
+    /// A dictionary with integer-like keys stays consistent through deletes
+    /// of both kinds of key in a scattered order: every survivor is found at
+    /// its position by name and by index.
+    #[test]
+    fn deletes_from_a_mixed_dictionary_keep_both_indexes() {
+        let mut m = ObjMap::new();
+        let keys: Vec<String> = (0..2100u32)
+            .map(|i| if i % 7 < 2 { (100_000 + i * 13).to_string() } else { format!("key_{i}") })
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            m.set(k, Value::int(i as i32));
+        }
+        let mut live = vec![true; keys.len()];
+        for step in (0..keys.len()).step_by(2) {
+            let i = (step * 1031) % keys.len();
+            assert!(m.remove(&keys[i]));
+            live[i] = false;
+        }
+        for (i, k) in keys.iter().enumerate() {
+            let pos = m.pos(k);
+            assert_eq!(pos.is_some(), live[i], "{k}");
+            if let Some(p) = pos {
+                assert_eq!(m.vals[p], Value::int(i as i32), "{k}");
+                assert_eq!(&m.keys[p], k);
+            }
+            if let Some(n) = canonical_array_index_key(k) {
+                assert_eq!(m.element_pos(n as usize), pos, "{k}");
+            }
+        }
     }
 
     /// The renumber sweep after a delete must leave EVERY surviving key
@@ -11268,20 +12549,52 @@ mod tests {
     }
 
     /// `seal` and `freeze` change every property's descriptor at once, so they
-    /// must leave DICT rather than a shape that claims the old bits.
+    /// must leave a shape that claims the NEW bits, never the old ones: the
+    /// shape of an object defined with those bits from the start. A map that
+    /// was DICT, or is past the rebuild bound, stays DICT.
     #[test]
     fn seal_and_freeze_leave_a_shape_that_cannot_lie() {
         for op in [0u8, 1] {
             let mut m = ObjMap::new();
             m.set("a", Value::num(1.0));
             m.set("b", Value::num(2.0));
+            let open = m.shape();
             if op == 0 {
                 m.seal();
             } else {
                 m.freeze();
             }
-            assert!(!m.shape_guardable());
+            assert!(m.shape_guardable());
+            assert_ne!(m.shape(), open);
             assert!(m.verify_shape().is_ok());
+            let attr = PropAttr {
+                writable: op == 0,
+                enumerable: true,
+                configurable: false,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            let mut direct = ObjMap::new();
+            direct.define("a", Value::num(1.0), attr);
+            direct.define("b", Value::num(2.0), attr);
+            assert_eq!(m.shape(), direct.shape());
+
+            let mut churned = ObjMap::new();
+            churned.set("a", Value::num(1.0));
+            churned.set("b", Value::num(2.0));
+            churned.remove("a");
+            let mut big = ObjMap::new();
+            for i in 0..SHAPE_REBUILD_MAX + 1 {
+                big.set(&format!("k{i}"), Value::num(i as f64));
+            }
+            for map in [&mut churned, &mut big] {
+                if op == 0 {
+                    map.seal();
+                } else {
+                    map.freeze();
+                }
+                assert!(!map.shape_guardable());
+            }
         }
     }
 
@@ -11323,13 +12636,18 @@ mod tests {
         deleted.remove("a");
         assert!(!deleted.shape_guardable(), "delete shifts later slots");
 
+        // Seal and freeze rewrite every attr: they leave the shape of the new
+        // bits (see `seal_and_freeze_leave_a_shape_that_cannot_lie`), never
+        // the old one.
         let mut resealed = base();
         resealed.seal();
-        assert!(!resealed.shape_guardable(), "seal rewrites every attr");
+        assert_ne!(resealed.shape(), base().shape(), "seal rewrites every attr");
+        assert!(resealed.verify_shape().is_ok());
 
         let mut frozen = base();
         frozen.freeze();
-        assert!(!frozen.shape_guardable(), "freeze rewrites every attr");
+        assert_ne!(frozen.shape(), base().shape(), "freeze rewrites every attr");
+        assert!(frozen.verify_shape().is_ok());
 
         let mut redefined = base();
         redefined.define(
@@ -12053,7 +13371,7 @@ pub fn bench_floor_decompose(
             owner_and_len,
         };
         let m = Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape));
-        keep = keep.wrapping_add(m.len());
+        keep = keep.wrapping_add(m.live_len());
         if let ValStore::Slab { base, .. } = &m.vals {
             slab.free_cell(*base);
         }
@@ -12074,7 +13392,7 @@ pub fn bench_floor_decompose(
             v.push(Value::num((bits ^ (i as u64 ^ j as u64)) as f64));
         }
         *b = ObjMap::finalized_from_store(plan.clone(), ValStore::Vec(v), shape);
-        keep = keep.wrapping_add(b.len());
+        keep = keep.wrapping_add(b.live_len());
     }
     lines.push(format!(
         "pooled-box+vec: {:.1}ns/obj (k{})",
@@ -12111,7 +13429,7 @@ pub fn bench_floor_decompose(
         if let Some(pb) = prev {
             slab.free_cell(pb);
         }
-        keep = keep.wrapping_add(b.len());
+        keep = keep.wrapping_add(b.live_len());
     }
     lines.push(format!(
         "pooled-box+slab: {:.1}ns/obj (k{})",

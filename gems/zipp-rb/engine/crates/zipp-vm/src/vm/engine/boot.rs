@@ -116,6 +116,17 @@ impl<'p> Vm<'p> {
         if (func_id as usize).wrapping_sub(self.main_func_count) >= self.eval_funcs.len() {
             return false;
         }
+        // The default: no meter and both kinds' switches on, so a module
+        // function and an eval function answer alike and the range search
+        // below is not needed (it was 2% of an interpreted torch loop, which
+        // asks at every frame entry and back-edge of the Python runtime).
+        #[cfg(feature = "instrument")]
+        let metered = self.instr_rec.is_some();
+        #[cfg(not(feature = "instrument"))]
+        let metered = false;
+        if !metered && jit_module_functions_enabled() && jit_eval_functions_enabled() {
+            return true;
+        }
         // Ranges are appended as the monotonically-growing runtime function
         // table is installed. Failed eval/module preparations can leave gaps,
         // but cannot reorder later ids, so binary search is valid and avoids a
@@ -177,10 +188,11 @@ impl<'p> Vm<'p> {
         // as scratch "field globals" for object scalar-replacement (SROA): a
         // field-promoted region's GetProp/SetProp are rewritten to Load/StoreGlobal
         // on pool slots, and the interpreter syncs object.field ↔ pool slot around
-        // the native run. The whole pool is RESERVED here so the globals Vec never
-        // reallocates at runtime (the JIT pins its base pointer); the eval pool's
-        // slots join the live length only as they are handed out.
-        let pool_reserve = program.global_count as usize + FIELD_POOL + EVAL_POOL;
+        // the native run. A JIT build RESERVES the whole pool here so the globals
+        // Vec never reallocates at runtime (the JIT pins its base pointer); see
+        // `EVAL_POOL_RESERVE`. The eval pool's slots join the live length only
+        // as they are handed out.
+        let pool_reserve = program.global_count as usize + FIELD_POOL + EVAL_POOL_RESERVE;
         let mut globals = Vec::with_capacity(pool_reserve);
         globals.resize(program.global_count as usize + FIELD_POOL, Value::UNDEFINED);
         // Real global slots start as the never-declared sentinel: a LoadGlobal of
@@ -270,6 +282,8 @@ impl<'p> Vm<'p> {
             frames: Vec::new(),
             #[cfg(feature = "instrument")]
             instr_rec: None,
+            #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+            step_hot: i64::MAX,
             heap_audit_extra: std::cell::Cell::new(0),
             #[cfg(feature = "instrument")]
             jit_steps: 0,
@@ -285,6 +299,10 @@ impl<'p> Vm<'p> {
             pending_eval_frame: false,
             pending_fn_ctor_eval: false,
             fn_ctor_cache: rustc_hash::FxHashMap::default(),
+            direct_eval_cache: rustc_hash::FxHashMap::default(),
+            direct_eval_cache_len: 0,
+            direct_eval_want: false,
+            direct_eval_installed: None,
             external_code_disabled: false,
             pending_yield: None,
             pending_yield_handlers: Vec::new(),
@@ -342,17 +360,27 @@ impl<'p> Vm<'p> {
             array_stringify_active: Vec::new(),
             regexp_exact_source: std::collections::HashMap::new(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),
+            regex_twin_defer: rustc_hash::FxHashMap::default(),
+            handler_pool: Vec::new(),
             regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),
             collection_index: rustc_hash::FxHashMap::default(),
             next_private_brand: 1,
             method_brand: crate::slot_table::SlotTable::default(),
+            ctor_owner: crate::slot_table::SlotTable::default(),
             instance_brand: crate::slot_table::SlotTable::default(),
             brand_private_names: rustc_hash::FxHashMap::default(),
             brand_owner: rustc_hash::FxHashMap::default(),
+            private_memo: vec![
+                crate::vm::values::PrivateMemo::EMPTY;
+                crate::vm::values::PRIVATE_MEMO_SLOTS
+            ]
+            .into_boxed_slice(),
             prototypes: crate::slot_table::SlotTable::default(),
             class_proto_owner: rustc_hash::FxHashMap::default(),
             ctor_initial_name: rustc_hash::FxHashMap::default(),
             proto_of: crate::slot_table::SlotTable::default(),
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            lite: Default::default(),
             ctor_field_hint: Vec::new(),
             fn_props: crate::slot_table::SlotTable::default(),
             arr_props: crate::slot_table::SlotTable::default(),
@@ -424,6 +452,7 @@ impl<'p> Vm<'p> {
             deferred_mods: std::collections::HashMap::new(),
             module_pending_reexports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
+            in_probe_sites: Vec::new(),
             obj_proto: 0,
             fn_proto: 0,
             function_ctor: 0,
@@ -443,6 +472,7 @@ impl<'p> Vm<'p> {
             str_proto: 0,
             map_proto: 0,
             coll_intrinsic_memo: [[None; crate::vm::COLL_MEMO_NAMES]; 2],
+            weakmap_intrinsic_memo: [None; 4],
             str_proto_baseline: rustc_hash::FxHashMap::default(),
             arr_proto_baseline: rustc_hash::FxHashMap::default(),
             str_intrinsic_memo: [None; crate::vm::STR_MEMO_NAMES],
@@ -475,6 +505,8 @@ impl<'p> Vm<'p> {
             dataview_proto: 0,
             dataview_proto_shape: crate::shape::DICT,
             dataview_numeric_getter_bits: [Value::UNDEFINED.bits(); 8],
+            dataview_numeric_setter_bits: [Value::UNDEFINED.bits(); 8],
+            dataview_bigint_bits: [Value::UNDEFINED.bits(); 4],
             sab_ctor: 0,
             sab_proto: 0,
             shared_buffers: std::collections::HashSet::new(),
@@ -502,7 +534,7 @@ impl<'p> Vm<'p> {
             module_total_bytes: 0,
             module_load_depth: 0,
             module_cache: std::collections::HashMap::new(),
-            module_namespaces: std::collections::HashMap::new(),
+            module_namespaces: Default::default(),
             module_own: std::collections::HashMap::new(),
             closure_home: ClosureHomeTable::default(),
             closure_new_target: crate::slot_table::SlotTable::default(),
@@ -530,6 +562,7 @@ impl<'p> Vm<'p> {
             shadow_fn_realm: std::collections::HashMap::new(),
             abstractmodulesource_ctor: 0,
             abstractmodulesource_proto: 0,
+            module_source_proto: 0,
             resolver_pair_next: 1,
             resolved_pairs: Vec::new(),
             promise_ctor_intrinsic: 0,
@@ -769,6 +802,13 @@ impl<'p> Vm<'p> {
                     .saturating_mul(std::mem::size_of::<(usize, usize)>()),
             )
             .saturating_add(self.sloppy_eval_memo.capacity())
+            .saturating_add(
+                self.in_probe_sites
+                    .iter()
+                    .map(|s| s.as_deref().map_or(0, |s| s.len() * 4))
+                    .sum::<usize>()
+                    .saturating_add(self.in_probe_sites.capacity() * std::mem::size_of::<Option<Box<[u32]>>>()),
+            )
     }
 
     /// Conservative bytes reserved by a hash table's bucket allocation.
@@ -799,6 +839,7 @@ impl<'p> Vm<'p> {
             .resident_bytes()
             .saturating_add(Self::hash_map_resident_bytes(&self.private_name_ids))
             .saturating_add(self.method_brand.resident_bytes())
+            .saturating_add(self.ctor_owner.resident_bytes())
             .saturating_add(self.instance_brand.resident_bytes())
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_private_names))
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_owner));
@@ -948,6 +989,15 @@ impl<'p> Vm<'p> {
             n.saturating_add(Self::hash_map_resident_bytes(&self.fn_ctor_cache)),
             |n, key| n.saturating_add(key.len()),
         );
+        n = self.direct_eval_cache.values().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.direct_eval_cache)),
+            |n, sources| {
+                sources.iter().fold(
+                    n.saturating_add(sources.capacity() * std::mem::size_of::<(Box<str>, u32)>()),
+                    |n, (src, _)| n.saturating_add(src.len()),
+                )
+            },
+        );
         n = self.pool_slot_names.values().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.pool_slot_names)),
             |n, name| match name {
@@ -1048,6 +1098,12 @@ impl<'p> Vm<'p> {
         // whether the dispatch hook may take its short path.
         rec.refresh_slow();
         self.instr_rec = Some(Box::new(rec));
+        // The new recorder's own countdown is the whole of it: the next step
+        // takes the hook's slow path, which schedules the first countdown.
+        #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+        {
+            self.step_hot = 0;
+        }
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             // Safe to read now that `instr_rec` is set: the offset is relative to

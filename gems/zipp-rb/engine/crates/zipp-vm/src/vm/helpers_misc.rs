@@ -702,6 +702,93 @@ pub(crate) extern "win64" fn jit_coll_lookup(
     if !vm.collection_method_is_intrinsic(idx, name, kind) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    coll_lookup_proven(vm, idx, key_bits, op)
+}
+
+/// The Map/Set lookups compiled code calls once a captured callee's bits ARE
+/// the boot intrinsic's (`Vm::coll_boot_bits`, compared inline by
+/// `emit_captured_method_lane`): `callee.[[Call]](recv, [key])` for
+/// %Map.prototype.get% (`op` 0), %Map.prototype.has% (1) or
+/// %Set.prototype.has% (2). The bits are the whole proof of WHICH function
+/// runs (the natives sit in pinned slots below the GC floor, as for the
+/// `push`/`charCodeAt` lane), and running it needs only a receiver of its
+/// brand: any other declines (`SELF_CALL_DEOPT`), so the generic call raises
+/// the TypeError. What `recv.get` would resolve to now does not matter: the
+/// call invokes the value captured before the arguments. Runs no user code.
+///
+/// # Safety
+/// `vm` is the live `Vm`; operands are raw Value bits from the reg file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_coll_lookup_direct(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    key_bits: u64,
+    op: u64,
+) -> u64 {
+    let recv = Value::from_bits(recv_bits);
+    if vm.is_null() || !recv.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: generated code passes its exclusive live VM pointer.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = recv.heap_index();
+    if idx as usize >= vm.heap.len() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let branded = matches!(
+        (vm.heap.get(idx), op),
+        (HeapObj::Map { .. }, 0 | 1) | (HeapObj::Set(_), 2)
+    );
+    if !branded {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    coll_lookup_proven(vm, idx, key_bits, op)
+}
+
+/// [`jit_coll_lookup_direct`]'s twin for the two mutations compiled code
+/// calls directly: %Map.prototype.set% (`op` 0, `key`, `val`) and
+/// %Set.prototype.add% (`op` 2, `key` the value). The same proof (the
+/// captured callee's bits, compared inline) and the same brand check;
+/// neither intrinsic can run user code.
+///
+/// # Safety
+/// `vm` is the live `Vm`; operands are raw Value bits from the reg file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_coll_mutate_direct(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    key_bits: u64,
+    val_bits: u64,
+    op: u64,
+) -> u64 {
+    let recv = Value::from_bits(recv_bits);
+    if vm.is_null() || !recv.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: generated code passes its exclusive live VM pointer.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = recv.heap_index();
+    if idx as usize >= vm.heap.len() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let branded = matches!(
+        (vm.heap.get(idx), op),
+        (HeapObj::Map { .. }, 0) | (HeapObj::Set(_), 2)
+    );
+    if !branded {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    coll_mutate_proven(vm, idx, key_bits, val_bits, op)
+}
+
+/// [`jit_coll_lookup`]'s lookup itself, for a caller that has already proved
+/// the method is the intrinsic and the receiver `idx` the collection its `op`
+/// names (a Map for 0 and 1, a Set for 2): `jit_coll_lookup` after its own
+/// proof, and [`jit_captured_method`], whose captured callee IS the intrinsic,
+/// which is all the call it stands for invokes. Runs no user code.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn coll_lookup_proven(vm: &mut Vm, idx: u32, key_bits: u64, op: u64) -> u64 {
     let found = vm.coll_find(idx, Value::from_bits(key_bits));
     match op {
         0 => match found {
@@ -766,16 +853,32 @@ pub(crate) extern "win64" fn jit_coll_mutate(
         }
         return jit_weak_coll(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, key_bits, val_bits, id);
     }
-    let (name, kind) = match op {
+    let (name, kind) = coll_mutate_name(op);
+    if !vm.collection_method_is_intrinsic(idx, name, kind) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    coll_mutate_proven(vm, idx, key_bits, val_bits, op)
+}
+
+/// [`jit_coll_mutate`]'s method name and receiver kind for `op`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn coll_mutate_name(op: u64) -> (&'static str, u8) {
+    match op {
         0 => ("set", 4u8),
         1 => ("clear", 4),
         2 => ("add", 3),
         3 => ("delete", 4),
         _ => ("delete", 3),
-    };
-    if !vm.collection_method_is_intrinsic(idx, name, kind) {
-        return crate::codegen::SELF_CALL_DEOPT;
     }
+}
+
+/// [`jit_coll_mutate`]'s mutation itself, for a caller that has already
+/// proved the method is the intrinsic and the receiver `idx` the collection
+/// `op` names (see [`coll_lookup_proven`]). Runs no user code.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn coll_mutate_proven(vm: &mut Vm, idx: u32, key_bits: u64, val_bits: u64, op: u64) -> u64 {
+    let (name, kind) = coll_mutate_name(op);
     let key = Value::from_bits(key_bits);
     let val = Value::from_bits(val_bits);
     if (key.is_heap() && key.heap_index() as usize >= vm.heap.len())
@@ -991,9 +1094,20 @@ pub(crate) extern "win64" fn jit_captured_method(
         }
     };
     match lane {
-        Lane::Lookup(o) => jit_coll_lookup(vm, recv_bits, arg(0), o),
+        // The lane above proved the captured callee is the intrinsic for this
+        // receiver's kind: the call runs it, so the dedicated helpers' own
+        // re-proof of the same method (a second `collection_method_is_intrinsic`
+        // with nothing run in between) is skipped.
+        Lane::Lookup(o) => {
+            // SAFETY: generated code passes its exclusive live VM pointer; the
+            // proof's borrow has ended.
+            let vm = unsafe { &mut *(vm as *mut Vm) };
+            coll_lookup_proven(vm, idx, arg(0), o)
+        }
         Lane::Mutate(o) => {
-            jit_coll_mutate(vm, recv_bits, arg(0), if argc >= 2 { arg(1) } else { 0 }, o)
+            // SAFETY: as above.
+            let vm = unsafe { &mut *(vm as *mut Vm) };
+            coll_mutate_proven(vm, idx, arg(0), if argc >= 2 { arg(1) } else { 0 }, o)
         }
         Lane::Weak(id) => jit_weak_coll(vm, recv_bits, arg(0), if argc >= 2 { arg(1) } else { 0 }, id),
         Lane::IndexOf => jit_str_index_of(vm, recv_bits, arg(0)),
@@ -1931,7 +2045,7 @@ pub(crate) extern "win64" fn jit_set_index(
     // SAFETY: exclusive view; the running region holds no conflicting borrow and
     // pins only the register file (not the array's Vec, which may reallocate).
     let vm = unsafe { &mut *(vm as *mut Vm) };
-    // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 2, the JIT
+    // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 2, the JIT
     // element-store route. There is NO inline region element store for a
     // dense Array (`region_mem.rs` deliberately routes every Array SetIndex
     // through this helper — growth/holes/length exotica), and pinned
@@ -2067,10 +2181,14 @@ pub(crate) extern "win64" fn jit_set_index(
         HeapObj::Array(items) => i >= items.len() || items[i].is_hole(),
         _ => false,
     };
+    // A VIRTUAL array's length is its side-table entry, which an append at
+    // the dense end would leave behind once the Vec reaches it; the
+    // interpreter's growth path settles it (`Vm::array_dense_grew`).
     if creates_new_index
         && (vm.array_length_nonwritable.contains(&arr.heap_index())
             || vm.array_proto_has_index
-            || vm.proto_of.contains_key(&arr.heap_index()))
+            || vm.proto_of.contains_key(&arr.heap_index())
+            || vm.array_js_len.contains_key(&arr.heap_index()))
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
@@ -2718,6 +2836,19 @@ pub(crate) extern "win64" fn jit_array_push(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     if vm.array_js_len.contains_key(&arr.heap_index()) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // An OWN `push` (`arr.push = fn; arr.push(x)`) is what a real Get finds
+    // before the prototype's intrinsic, so `fn` must run: the interpreter's
+    // lane (`interp_array_push_fast`, B289) declines it, and this one
+    // appended instead. It lives in the side table as a named key, which
+    // `array_elements_overlaid` below does not see.
+    if !vm.arr_props.is_empty()
+        && vm
+            .arr_props
+            .get(&arr.heap_index())
+            .is_some_and(|m| m.pos("push").is_some())
+    {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     // `push` is `Set(O, len, v, true)` then `Set(O, "length", …, true)`, and BOTH
@@ -4732,7 +4863,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 let s = slot as usize;
                 // Revalidate bounds, the exact live key and descriptor before
                 // carrying any Value/pointer out of the shared heap view.
-                (map.keys.get(s).is_some_and(|k| k == key)
+                (map.key_get(s).is_some_and(|k| k == key)
                     && map.attr_get(s).is_some_and(|a| !a.accessor))
                 .then(|| (map.val_at(s), map.vals_ptr() as u64, slot, sh))
             })
@@ -5442,7 +5573,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // living in `vm.eval_funcs` past `main_func_count`, and indexing the program's
     // table directly is an out-of-bounds panic the moment such a function gets hot
     // and takes a `SetProp` miss. The get side was fixed; this one was missed.
-    // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1, the JIT miss
+    // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 1, the JIT miss
     // route. IC-HIT stores make no call — that is what `register_scan_root`
     // at the fill below is for.
     vm.store_barrier(
@@ -5485,7 +5616,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                 .copied()
                 .filter(|&slot| {
                     let s = slot as usize;
-                    map.keys.get(s).is_some_and(|k| k == key)
+                    map.key_get(s).is_some_and(|k| k == key)
                         && map.attr_get(s).is_some_and(|a| !a.accessor && a.writable)
                 })
                 .map(|slot| (sh, slot))
@@ -5504,7 +5635,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         let vals_ptr = match vm.heap.get_mut(idx) {
             HeapObj::Object(map)
                 if map.shape() == shape
-                    && map.keys.get(s).is_some_and(|k| k == key)
+                    && map.key_get(s).is_some_and(|k| k == key)
                     && map.attr_get(s).is_some_and(|a| !a.accessor && a.writable) =>
             {
                 map.set_val_at(s, Value::from_bits(val_bits));
@@ -5740,7 +5871,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     if let HeapObj::Object(map) = vm.heap.get(idx) {
         let sh = map.shape();
         if sh != crate::shape::DICT
-            && map.keys.get(slot as usize).is_some_and(|k| k == key)
+            && map.key_get(slot as usize).is_some_and(|k| k == key)
             && map
                 .attr_get(slot as usize)
                 .is_some_and(|a| !a.accessor && a.writable)
@@ -7691,6 +7822,9 @@ impl<'p> Vm<'p> {
         }
     }
 
+    // Inlined so that a constant namespace (every caller's `"Math"`) folds
+    // to its slot.
+    #[inline]
     pub(crate) fn static_builtin_is_intrinsic(
         &self,
         namespace: &str,

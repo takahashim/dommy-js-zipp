@@ -156,7 +156,7 @@ impl<'p> Vm<'p> {
         if kb.starts_with(b"@@") {
             return None;
         }
-        if s >= m.len() || !crate::heap::key_bytes_eq(m.keys[s].as_bytes(), kb) {
+        if !m.key_get(s).is_some_and(|k| crate::heap::key_bytes_eq(k.as_bytes(), kb)) {
             return None;
         }
         let a = m.attr_at(s);
@@ -292,6 +292,61 @@ impl<'p> Vm<'p> {
                         }
                         let v = m2.val_at(s);
                         return (!v.is_uninitialized()).then_some(v);
+                    }
+                }
+                _ => return None, // exotic link
+            }
+            cur = next;
+        }
+        None
+    }
+
+    /// `i in o` for an array index `i` and the plain object `idx`, from the
+    /// same levels [`Vm::plain_index_key_get`] reads (a data property or an
+    /// accessor is present either way). `own` asks `hasOwnProperty` instead:
+    /// `idx`'s own properties only. `None` leaves it to the general path,
+    /// which spelled `i` as a fresh `String` to look it up.
+    #[inline]
+    pub(crate) fn plain_index_key_has(&self, idx: u32, i: usize, own: bool) -> Option<bool> {
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return None;
+        };
+        if !index_key_fast_enabled()
+            || (idx == self.global_this && self.global_this != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            || !self.deferred_ns_state.is_empty()
+            || !self.realm_global_objs.is_empty()
+        {
+            return None;
+        }
+        if m.element_pos(i).is_some() {
+            return Some(true);
+        }
+        if own {
+            return Some(false);
+        }
+        if !self.ic_obj_ok(idx) || m.class.is_some() || m.is_ctor {
+            return None;
+        }
+        let mut cur = idx;
+        for _ in 0..64 {
+            let next = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => return Some(false),
+                None => {
+                    if self.obj_proto == 0 || cur == self.obj_proto {
+                        return Some(false);
+                    }
+                    self.obj_proto
+                }
+            };
+            if !self.ic_obj_ok(next) {
+                return None;
+            }
+            match self.heap.get(next) {
+                HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
+                    if m2.element_pos(i).is_some() {
+                        return Some(true);
                     }
                 }
                 _ => return None, // exotic link
@@ -834,7 +889,7 @@ impl<'p> Vm<'p> {
         val: Value,
         strict: bool,
     ) -> Result<(), Thrown> {
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 2 (interp
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 2 (interp
         // SetIndex — every downstream route stores `val` under this holder).
         self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, obj, val);
         if !obj.is_heap() {
@@ -857,6 +912,24 @@ impl<'p> Vm<'p> {
         }
         let key = self.coerce_index_key(key)?;
         let idx = obj.heap_index();
+        // FAST PATH: a present element of an ordinary array with nothing in a
+        // side table (`counts[0]++`). Every check the general path makes
+        // before its own `items[i] = val` passes for it: no defineProperty'd
+        // index, frozen or sealed state, or extensibility record (all in
+        // `arr_props`), no arguments object's mapped formal, and an own
+        // element, so no prototype step.
+        if let Some(i) = array_index(key) {
+            if (self.arr_props.is_empty() || !self.arr_props.contains_key(&idx))
+                && (self.arguments_objs.is_empty() || !self.arguments_objs.contains_key(&idx))
+            {
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    if i < items.len() && !items[i].is_hole() {
+                        items[i] = val;
+                        return Ok(());
+                    }
+                }
+            }
+        }
         // A rope key is flattened in place first, as `get_index` does: the
         // fast path below views the key's bytes.
         if key.is_heap() && matches!(self.heap.get(idx), HeapObj::Object(_)) {
@@ -886,7 +959,11 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
             }
-            // hit: own writable data slot; add: proven-clean new key.
+            // hit: own writable data slot; add: proven-clean new key, owned,
+            // with its tag. B219 as in `try_set_index_concat_prebuilt`: an
+            // indexed map's key is hashed once for its probe, the chain's
+            // probes and the insert, and an unindexed map's only to append.
+            let once = crate::heap::hash_once_enabled();
             let (hit, add) = match self.heap.str_wtf8_cow(key.heap_index()) {
                 // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
                 Some(std::borrow::Cow::Borrowed(b)) if !b.starts_with(b"@@") => {
@@ -894,24 +971,26 @@ impl<'p> Vm<'p> {
                         // (A class prototype's writes must reach `set_prop`,
                         // which records when they retire its member tables.)
                         (Ok(k), HeapObj::Object(m)) if k != "__proto__" && !m.class_proto => {
-                            match m.pos(k) {
+                            let tag = (once && m.is_indexed()).then(|| crate::heap::prop_tag_of(k));
+                            match tag.map_or_else(|| m.pos(k), |t| m.pos_tagged(k, t)) {
                                 Some(i) if !m.attr_at(i).accessor && m.attr_at(i).writable => {
-                                    (Some(i), false)
+                                    (Some(i), None)
                                 }
-                                Some(_) => (None, false),
-                                None => (
-                                    None,
-                                    m.extensible
+                                Some(_) => (None, None),
+                                None => {
+                                    let tag = once.then(|| tag.unwrap_or_else(|| crate::heap::prop_tag_of(k)));
+                                    let clear = m.extensible
                                         && m.class.is_none()
                                         && !m.is_ctor
-                                        && self.plain_add_chain_clear(idx, k),
-                                ),
+                                        && self.plain_add_chain_clear_tagged(idx, k, tag);
+                                    (None, clear.then(|| (k.to_owned(), tag)))
+                                }
                             }
                         }
-                        _ => (None, false),
+                        _ => (None, None),
                     }
                 }
-                _ => (None, false),
+                _ => (None, None),
             };
             if let Some(i) = hit {
                 self.keyed_memo_put(idx, key.heap_index(), i);
@@ -920,19 +999,14 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
             }
-            if add {
-                let ks: Option<String> = match self.heap.str_wtf8_cow(key.heap_index()) {
-                    Some(std::borrow::Cow::Borrowed(b)) => {
-                        std::str::from_utf8(b).ok().map(|s| s.to_string())
+            if let Some((ks, tag)) = add {
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    match tag {
+                        Some(tag) => m.push_data_tagged(ks, val, tag),
+                        None => m.push_data(ks, val),
                     }
-                    _ => None,
-                };
-                if let Some(ks) = ks {
-                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                        m.push_data(ks, val);
-                        self.heap.bump_version(idx); // key add reallocs vals (IC)
-                        return Ok(());
-                    }
+                    self.heap.bump_version(idx); // key add reallocs vals (IC)
+                    return Ok(());
                 }
             }
         }
@@ -1076,36 +1150,21 @@ impl<'p> Vm<'p> {
                 self.args_mapped_set(idx, i, val);
             }
         }
-        // A write past the eager-materialization cap goes to the SPARSE overlay:
-        // the element lives in arr_props under its canonical index key (default
-        // data attributes) and the JS length in the virtual-length side table —
-        // the dense Vec is never resized to billions of holes. (An overridden /
-        // defineProperty'd index was routed to set_prop above, and an arguments
-        // object's past-the-end write returned above, so this index is NEW.)
-        if let Some(i) = array_index(key) {
-            if i >= crate::vm::MAX_DENSE_ARRAY_LEN
-                && matches!(self.heap.get(idx), HeapObj::Array(items) if i >= items.len())
-            {
-                self.arr_props
-                    .entry(idx)
-                    .or_insert_with(ObjMap::new_side_table)
-                    .set(&i.to_string(), val);
-                self.array_grow_js_len(idx, i);
-                self.heap.bump_version(idx);
-                return Ok(());
-            }
-        }
+        // A write at or past the dense end goes through `array_index_grow`,
+        // which keeps one past the eager-materialization cap, or too far past
+        // the dense end, out of the Vec. (An overridden / defineProperty'd
+        // index was routed to set_prop above, and an arguments object's
+        // past-the-end write returned above, so such an index is NEW.)
         match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
                 // Numeric key (incl. an integral double — the JIT region produces
-                // f64 indices): store, growing with `undefined` holes past the end.
+                // f64 indices): an in-range store stays here.
                 if let Some(i) = array_index(key) {
-                    if i >= items.len() {
-                        // Slots between the old length and the new index are
-                        // HOLES (absent), not present undefineds.
-                        items.resize(i + 1, Value::HOLE);
+                    if i < items.len() {
+                        items[i] = val;
+                        return Ok(());
                     }
-                    items[i] = val;
+                    return self.array_index_grow(idx, i, val);
                 }
                 Ok(())
             }

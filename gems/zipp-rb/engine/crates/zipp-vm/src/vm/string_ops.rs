@@ -44,7 +44,7 @@ impl<'p> Vm<'p> {
         if !recv.is_heap()
             || !arg.is_int()
             || !matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_))
-            || !self.string_method_is_intrinsic("charCodeAt")
+            || !self.char_code_at_is_intrinsic()
         {
             return None;
         }
@@ -585,13 +585,15 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // The position is an i64 ToIntegerOrInfinity: `usize::try_from` (not
+        // `as usize`, which wraps 2^32 to 0 on a 32-bit host) makes a negative
+        // or unaddressable one simply out of range.
         match name {
             "charCodeAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let u = if i >= 0 {
-                    self.heap_unit_at(idx, i as usize)
-                } else {
-                    None
+                let u = match usize::try_from(i) {
+                    Ok(i) => self.heap_unit_at(idx, i),
+                    Err(_) => None,
                 };
                 return Ok(Some(match u {
                     Some(u) => Value::int(u as i32),
@@ -600,10 +602,9 @@ impl<'p> Vm<'p> {
             }
             "codePointAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let c = if i >= 0 {
-                    self.heap_code_point_at(idx, i as usize)
-                } else {
-                    None
+                let c = match usize::try_from(i) {
+                    Ok(i) => self.heap_code_point_at(idx, i),
+                    Err(_) => None,
                 };
                 return Ok(Some(match c {
                     Some(cp) => Value::int(cp as i32),
@@ -612,10 +613,9 @@ impl<'p> Vm<'p> {
             }
             "charAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let u = if i >= 0 {
-                    self.heap_unit_at(idx, i as usize)
-                } else {
-                    None
+                let u = match usize::try_from(i) {
+                    Ok(i) => self.heap_unit_at(idx, i),
+                    Err(_) => None,
                 };
                 return Ok(Some(match u {
                     Some(u) => self.str_from_unit(u),
@@ -635,6 +635,134 @@ impl<'p> Vm<'p> {
                     Some(u) => self.str_from_unit(u),
                     None => Value::UNDEFINED,
                 }));
+            }
+            // No-clone trims of a well-formed receiver: the result is a part of
+            // it, read in place, and the receiver itself when nothing is
+            // trimmed (strings have no identity). The general path below
+            // copied the receiver first, and copied the result again.
+            "trim" | "trimStart" | "trimEnd" => {
+                let trimmed = match self.heap.get(idx) {
+                    HeapObj::Str(js) if js.is_wellformed() => {
+                        let s = js.as_str_wf();
+                        let ws = crate::vm::helpers_numeric::str_white_space;
+                        let t = match name {
+                            "trim" => s.trim_matches(ws),
+                            "trimStart" => s.trim_start_matches(ws),
+                            _ => s.trim_end_matches(ws),
+                        };
+                        Some((t.len() != s.len()).then(|| t.to_string()))
+                    }
+                    _ => None,
+                };
+                match trimmed {
+                    Some(None) => return Ok(Some(Value::heap(idx))),
+                    Some(Some(t)) => return Ok(Some(self.alloc_str(t))),
+                    None => {}
+                }
+            }
+            // No-clone case mapping: ASCII maps byte for byte (the receiver
+            // itself when no letter changes), and short well-formed text in
+            // one pass (`case_map_one_pass`). Arguments are ignored, as the
+            // general path does.
+            "toUpperCase" | "toLowerCase" => {
+                let upper = name == "toUpperCase";
+                let mapped = match self.heap.get(idx) {
+                    HeapObj::Str(js) if js.is_ascii() => {
+                        let b = js.as_bytes();
+                        let changes = if upper {
+                            b.iter().any(u8::is_ascii_lowercase)
+                        } else {
+                            b.iter().any(u8::is_ascii_uppercase)
+                        };
+                        if !changes {
+                            return Ok(Some(Value::heap(idx)));
+                        }
+                        let out = if upper { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() };
+                        // ASCII is UTF-8.
+                        Some(String::from_utf8(out).unwrap_or_default())
+                    }
+                    HeapObj::Str(js) if case_map_one_pass(js) => {
+                        let s = js.as_str_wf();
+                        Some(if upper {
+                            crate::vm::special_casing::str_to_uppercase(s)
+                        } else {
+                            crate::vm::special_casing::str_to_lowercase(s)
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(m) = mapped {
+                    self.preflight_guest_string_size(m.len())?;
+                    return Ok(Some(Value::heap(self.heap.alloc_js(crate::heap::JsStr::new(m)))));
+                }
+            }
+            // No-clone padding of an ASCII receiver to an integer length with
+            // an ASCII string filler (or the default space): no coercion can
+            // run, so StringPad is built straight from the two strings. A long
+            // target (its RangeError included) takes the general path.
+            "padStart" | "padEnd" if arg0.is_int() => {
+                let fill = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let target = arg0.as_int().max(0) as usize;
+                let built = match self.heap.get(idx) {
+                    HeapObj::Str(js) if js.is_ascii() && target <= SHORT_STRING_BUILD_BYTES => {
+                        let cur = js.as_bytes();
+                        let filler: Option<&[u8]> = if fill == Value::UNDEFINED {
+                            Some(b" ")
+                        } else if fill.is_heap() {
+                            match self.heap.get(fill.heap_index()) {
+                                HeapObj::Str(f) if f.is_ascii() => Some(f.as_bytes()),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        match filler {
+                            _ if target <= cur.len() => Some(None),
+                            Some(f) if f.is_empty() => Some(None),
+                            Some(f) => {
+                                let mut out = Vec::with_capacity(target);
+                                let pad = f.iter().cycle().take(target - cur.len());
+                                if name == "padStart" {
+                                    out.extend(pad);
+                                    out.extend_from_slice(cur);
+                                } else {
+                                    out.extend_from_slice(cur);
+                                    out.extend(pad);
+                                }
+                                Some(Some(out))
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match built {
+                    Some(None) => return Ok(Some(Value::heap(idx))),
+                    Some(Some(out)) => {
+                        // ASCII is UTF-8.
+                        let s = String::from_utf8(out).unwrap_or_default();
+                        return Ok(Some(self.alloc_str(s)));
+                    }
+                    None => {}
+                }
+            }
+            // No-clone `repeat` of a well-formed receiver by a small integer
+            // count; a negative count's RangeError and long results take the
+            // general path.
+            "repeat" if arg0.is_int() && arg0.as_int() >= 0 => {
+                let n = arg0.as_int() as usize;
+                let out = match self.heap.get(idx) {
+                    HeapObj::Str(js)
+                        if js.is_wellformed()
+                            && js.as_bytes().len().saturating_mul(n) <= SHORT_STRING_BUILD_BYTES =>
+                    {
+                        Some(js.as_str_wf().repeat(n))
+                    }
+                    _ => None,
+                };
+                if let Some(s) = out {
+                    return Ok(Some(self.alloc_str(s)));
+                }
             }
             // No-clone `replace`/`replaceAll` of a plain string by a plain
             // string with no `$` pattern: no user code can run (neither
@@ -1015,7 +1143,7 @@ impl<'p> Vm<'p> {
                 parts
                     .try_reserve_exact(count)
                     .map_err(|_| Thrown::from_static("RangeError: Invalid array length"))?;
-                // W9 static pretenure (NURSERY_DESIGN.md §4): split's parts and
+                // W9 static pretenure (docs/archive/NURSERY_DESIGN.md §4): split's parts and
                 // result array are the markdown/regex rows' retained "builder"
                 // output — measured to survive minors wholesale, so they
                 // allocate OLD. Purely internal from here down: nothing throws
@@ -1152,7 +1280,9 @@ impl<'p> Vm<'p> {
                     if c < 0 {
                         0
                     } else {
-                        (c as usize).min(avail)
+                        // Clamped in i64: `c as usize` wraps 2^32 to 0 on a
+                        // 32-bit host.
+                        c.min(avail as i64) as usize
                     }
                 };
                 let sub = subu(start, start + count);
@@ -1275,10 +1405,9 @@ impl<'p> Vm<'p> {
             "padStart" | "padEnd" => {
                 let cur = unit_len(&s);
                 let t = self.to_integer_strict(arg0)?;
-                let target = if t > 0 { t as usize } else { 0 };
-                if target > MAX_STRING_UNITS {
-                    return Err(Thrown::from_static("RangeError: Invalid string length"));
-                }
+                // Saturating: `t as usize` wraps 2^32 to 0 on a 32-bit host,
+                // which returned the string unpadded instead of throwing.
+                let target = if t > 0 { usize::try_from(t).unwrap_or(usize::MAX) } else { 0 };
                 if cur >= target {
                     return Ok(Some(Value::heap(idx)));
                 }
@@ -1294,6 +1423,12 @@ impl<'p> Vm<'p> {
                 };
                 if pad.units() == 0 {
                     return Ok(Some(Value::heap(idx)));
+                }
+                // The length cap is the first step that builds anything, so it
+                // follows the fill's ToString and the empty-fill return, as in
+                // StringPad: `"abc".padStart(2 ** 32, "")` is "abc".
+                if target > MAX_STRING_UNITS {
+                    return Err(Thrown::from_static("RangeError: Invalid string length"));
                 }
                 // StringPad truncates the repeated filler to (target - cur)
                 // UNITS; a truncation that splits an astral filler char keeps
@@ -1476,6 +1611,43 @@ impl<'p> Vm<'p> {
     /// * Otherwise both sides are mapped to one `char` per UTF-16 code unit
     ///   ([`unit_chars_into`]) and searched there, which is the spec's
     ///   code-unit comparison: a lone-surrogate needle can match half of a pair.
+    /// `memchr::memmem::find` for `string_search`: memmem builds a searcher
+    /// (its SIMD prefilter) on every call, which costs more than the scan
+    /// itself when the match is near, as in a find-the-next-delimiter loop.
+    /// A needle of up to [`SHORT_NEEDLE`] bytes is found by `memchr` on its
+    /// first byte and a compare (at most that many compares per byte); a
+    /// longer one keeps memmem's linear bound.
+    fn find_bytes(h: &[u8], n: &[u8]) -> Option<usize> {
+        let Some((first, rest)) = n.split_first().filter(|_| n.len() <= SHORT_NEEDLE) else {
+            return memchr::memmem::find(h, n);
+        };
+        let mut from = 0;
+        while let Some(off) = memchr::memchr(*first, &h[from..]) {
+            let at = from + off;
+            if h[at + 1..].starts_with(rest) {
+                return Some(at);
+            }
+            from = at + 1;
+        }
+        None
+    }
+
+    /// [`Self::find_bytes`]'s `memmem::rfind` twin: the last start of `n` in
+    /// `h` (the whole needle within `h`).
+    fn rfind_bytes(h: &[u8], n: &[u8]) -> Option<usize> {
+        let Some((first, rest)) = n.split_first().filter(|_| n.len() <= SHORT_NEEDLE) else {
+            return memchr::memmem::rfind(h, n);
+        };
+        let mut end = h.len();
+        while let Some(at) = memchr::memrchr(*first, &h[..end]) {
+            if h[at + 1..].starts_with(rest) {
+                return Some(at);
+            }
+            end = at;
+        }
+        None
+    }
+
     fn string_search(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Value, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         if name != "indexOf" && name != "lastIndexOf" && self.is_regexp(arg0)? {
@@ -1506,14 +1678,21 @@ impl<'p> Vm<'p> {
                 _ => Value::bool(true),
             });
         }
-        let lossy_exact = ned.is_wellformed()
-            && (hay.is_wellformed() || !bytes_contain_replacement_char(ned.as_bytes()));
-        if lossy_exact {
-            let s = hay.as_str_lossy();
-            let n = ned.as_str_wf();
+        // A well-formed needle is searched for in the receiver's own bytes. A
+        // lone surrogate in the receiver is `ED A0..BF xx` in WTF-8, bytes
+        // well-formed UTF-8 never holds, and the needle starts on a lead byte,
+        // so a match can neither start inside one nor cross it: the byte
+        // search is the code-unit search, a U+FFFD in the needle included.
+        // Searching a lossy copy instead cost a copy of the whole receiver on
+        // every call, which made a find-all loop over a string with one lone
+        // surrogate quadratic.
+        if ned.is_wellformed() {
+            let s = hay.as_bytes();
+            let n = ned.as_bytes();
+            let is_char_boundary = |i: usize| i >= s.len() || (s[i] & 0xC0) != 0x80;
             let (lo, hi) = hay.unit_byte_bounds(pos);
             return Ok(match name {
-                "indexOf" => match s[hi..].find(n) {
+                "indexOf" => match Self::find_bytes(&s[hi..], n) {
                     Some(b) if hay.is_ascii() => Value::int((hi + b) as i32),
                     Some(b) => {
                         // `hi` is unit `pos`, or `pos + 1` when `pos` split a pair.
@@ -1523,7 +1702,7 @@ impl<'p> Vm<'p> {
                     }
                     None => Value::int(-1),
                 },
-                "includes" => Value::bool(s[hi..].contains(n)),
+                "includes" => Value::bool(Self::find_bytes(&s[hi..], n).is_some()),
                 // Anchored positions: a start or end between the halves of a
                 // pair leaves a lone surrogate at the edge of the spec's
                 // substring, which a well-formed needle cannot match.
@@ -1532,15 +1711,15 @@ impl<'p> Vm<'p> {
                 _ => {
                     // lastIndexOf: the last match starting at or before `lo`.
                     let mut end = (lo + n.len()).min(s.len());
-                    while !s.is_char_boundary(end) {
+                    while !is_char_boundary(end) {
                         end += 1;
                     }
                     let found = loop {
-                        match s[..end].rfind(n) {
+                        match Self::rfind_bytes(&s[..end], n) {
                             Some(b) if b <= lo => break Some(b),
                             Some(b) => {
                                 end = b + n.len() - 1;
-                                while !s.is_char_boundary(end) {
+                                while !is_char_boundary(end) {
                                     end -= 1;
                                 }
                             }
@@ -2216,6 +2395,10 @@ fn invalid_string_length() -> Thrown {
 /// result is bounded by its length and admitted after the ranges are found.
 const SPLIT_ADMIT_BYTES: usize = 4096;
 
+/// The longest needle `find_bytes` / `rfind_bytes` search by first byte and
+/// compare rather than through `memmem`'s per-call searcher.
+const SHORT_NEEDLE: usize = 8;
+
 /// Whether WTF-8 `bytes` hold a U+FFFD. A needle without one can be searched
 /// for in a receiver's LOSSY view exactly: the view differs from the content
 /// only where a lone surrogate reads as U+FFFD.
@@ -2277,6 +2460,23 @@ fn extend_chars(out: &mut String, iter: impl Iterator<Item = char>) {
     for c in iter {
         out.push(c);
     }
+}
+
+/// Receivers whose case mapping is built in one pass and admitted after:
+/// well-formed (no lone surrogate to copy through) and short enough that
+/// the result, at most three times the bytes (U+0390 uppercases to three
+/// code points), is a small allocation to make before the size check. The
+/// rest are measured exactly first ([`case_map_exact_len`]), which mapped
+/// every character twice.
+const CASE_MAP_ONE_PASS_BYTES: usize = 64 * 1024;
+
+/// The largest result the no-clone `padStart`/`padEnd`/`repeat` arms of
+/// `string_method` build; longer ones, and their size checks, take the
+/// general path.
+const SHORT_STRING_BUILD_BYTES: usize = 4096;
+
+fn case_map_one_pass(s: &crate::heap::JsStr) -> bool {
+    s.is_wellformed() && !s.is_ascii() && s.as_bytes().len() <= CASE_MAP_ONE_PASS_BYTES
 }
 
 /// `toUpperCase`/`toLowerCase` over the receiver's EXACT WTF-8 bytes. The

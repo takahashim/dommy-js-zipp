@@ -387,6 +387,11 @@ const HEAP_WALK_STRIDE: u32 = 64;
 /// that followed it; the slack is what a poll may leave unreconciled.
 const HEAP_WALK_FOOTPRINT_SLACK: usize = 64 * 1024;
 
+/// Heap growth since the level a walk found after the last major (or a
+/// quarter of that level, if more) at which the walk asks for a major of its
+/// own. See `Recorder::growth_level`.
+const HEAP_GROWTH_MAJOR_STEP: usize = 8 * 1024 * 1024;
+
 fn heap_walk_stride_for(slots: usize) -> u32 {
     if slots < 4_096 {
         1
@@ -444,6 +449,15 @@ pub(crate) struct Recorder {
     /// collection instead of convicting: the poll that follows that
     /// collection decides. See `instrument_heap_poll_inner`.
     pub(crate) ceiling_gc_pending: bool,
+    /// What the first heap walk after the latest major found (`growth_major`
+    /// names that major): the level in-place growth is measured from. The
+    /// collector schedules on what it allocates, and an Array filled by
+    /// `push` allocates nothing, so a program that refills such arrays never
+    /// collected the old ones at all. See `instrument_heap_poll_inner`.
+    growth_level: usize,
+    growth_major: u64,
+    /// A walk asked for a major on growth; cleared when one completes.
+    growth_gc_pending: bool,
     /// Combined UTF-8 bytes retained for stdout/stderr lines, including the
     /// newline written for each line; `usize::MAX` means unlimited.
     pub(crate) output_limit: usize,
@@ -555,6 +569,9 @@ impl Recorder {
             abort: None,
             heap_limit: usize::MAX,
             ceiling_gc_pending: false,
+            growth_level: 0,
+            growth_major: u64::MAX,
+            growth_gc_pending: false,
             output_limit: usize::MAX,
             output_used: 0,
             output_exhausted: false,
@@ -610,15 +627,18 @@ impl Recorder {
         }
     }
 
-    /// Steps taken on the countdown since the last [`Self::settle`].
+    /// Steps taken on the countdown since the last [`Self::settle`]. `hot` is
+    /// the VM's unfolded `step_hot` (the countdown is `countdown + hot`); a
+    /// caller that folded first, or that holds no VM, passes 0.
     #[inline]
-    fn elapsed(&self) -> i64 {
+    fn elapsed(&self, hot: i64) -> i64 {
         #[cfg(not(feature = "meter-only"))]
         {
-            self.window - self.countdown
+            self.window - (self.countdown + hot)
         }
         #[cfg(feature = "meter-only")]
         {
+            let _ = hot;
             0
         }
     }
@@ -643,13 +663,13 @@ impl Recorder {
     }
 
     /// `remaining` with the countdown's steps taken off: exact at any point,
-    /// `i64::MAX` when unlimited.
+    /// `i64::MAX` when unlimited. `hot` as for [`Self::elapsed`].
     #[inline]
-    pub(crate) fn remaining_now(&self) -> i64 {
+    pub(crate) fn remaining_now(&self, hot: i64) -> i64 {
         if self.remaining == i64::MAX {
             i64::MAX
         } else {
-            self.remaining - self.elapsed()
+            self.remaining - self.elapsed(hot)
         }
     }
 
@@ -723,9 +743,10 @@ impl Recorder {
         (self.dynamic_calls, self.dynamic_source_bytes)
     }
 
-    pub(crate) fn steps_used(&self) -> u64 {
+    pub(crate) fn steps_used(&self, hot: i64) -> u64 {
         #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
         {
+            let _ = hot;
             if self.finite {
                 return finite_meter_total_used(self.ticks, self.remaining);
             }
@@ -735,7 +756,7 @@ impl Recorder {
         #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
         self.used
             .wrapping_add(self.ticks)
-            .wrapping_add(self.elapsed() as u64)
+            .wrapping_add(self.elapsed(hot) as u64)
             .saturating_sub(self.steps_base)
     }
 
@@ -753,7 +774,7 @@ impl Recorder {
 
     /// Steps left when the meter is finite, `None` when it is unlimited.
     #[inline]
-    pub(crate) fn finite_remaining(&self) -> Option<u64> {
+    pub(crate) fn finite_remaining(&self, hot: i64) -> Option<u64> {
         #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
         if !self.finite {
             return None;
@@ -761,7 +782,7 @@ impl Recorder {
         if self.remaining == i64::MAX {
             return None;
         }
-        Some(self.remaining_now().max(0) as u64)
+        Some(self.remaining_now(hot).max(0) as u64)
     }
 
     #[inline]
@@ -1012,10 +1033,11 @@ impl super::Vm<'_> {
             .max_memory_bytes
             .saturating_sub(transient.saturating_sub(self.regex_kept_subject_bytes()));
         limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
+        let hot = self.meter_hot();
         let Some(rec) = self.instr_rec.as_ref() else {
             return limits;
         };
-        if let Some(left) = rec.finite_remaining() {
+        if let Some(left) = rec.finite_remaining(hot) {
             limits.max_steps = limits.max_steps.min(left);
         }
         if rec.heap_limit != usize::MAX {
@@ -1177,7 +1199,7 @@ impl super::Vm<'_> {
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn instrument_regex_memory_exhausted(&mut self) -> &'static str {
         let cause = ResourceExhaustion::RegexMemory;
-        match self.instr_rec.as_mut() {
+        match rec_mut!(self) {
             Some(rec) => rec.exhaust(cause),
             None => cause.message(),
         }
@@ -1197,7 +1219,7 @@ impl super::Vm<'_> {
         if cause == ResourceExhaustion::RegexMemory {
             Err(self.instrument_regex_memory_exhausted())
         } else {
-            match self.instr_rec.as_mut() {
+            match rec_mut!(self) {
                 Some(rec) => Err(rec.exhaust(cause)),
                 None => Err(cause.message()),
             }
@@ -1273,32 +1295,24 @@ impl super::Vm<'_> {
         //     workload.
         let estimate = self.instrument_heap_estimate();
         if bytes > heap_limit.saturating_sub(estimate) {
-            let rec = self
-                .instr_rec
-                .as_mut()
+            let rec = rec_mut!(self)
                 .expect("recorder checked present above");
             return Err(rec.exhaust(ResourceExhaustion::Heap));
         }
 
-        let rec = self
-            .instr_rec
-            .as_mut()
+        let rec = rec_mut!(self)
             .expect("recorder checked present above");
         rec.preflight_bytes_since_audit = rec.preflight_bytes_since_audit.saturating_add(fresh);
         if rec.preflight_bytes_since_audit < preflight_audit_bytes_for(self.heap.len()) {
             return Ok(());
         }
-        let rec = self
-            .instr_rec
-            .as_mut()
+        let rec = rec_mut!(self)
             .expect("recorder checked present above");
         rec.preflight_bytes_since_audit = 0;
 
         // The live audit, not the reported peak (`heap_bytes`).
         let resident = self.audit_heap_bytes();
-        let rec = self
-            .instr_rec
-            .as_mut()
+        let rec = rec_mut!(self)
             .expect("recorder checked present above");
         if bytes > heap_limit.saturating_sub(resident) {
             return Err(rec.exhaust(ResourceExhaustion::Heap));
@@ -1312,7 +1326,7 @@ impl super::Vm<'_> {
     /// Repeated mutations coalesce into one walk.
     #[inline]
     pub(crate) fn instrument_mark_external_heap_growth(&mut self) {
-        if let Some(rec) = self.instr_rec.as_mut() {
+        if let Some(rec) = rec_mut!(self) {
             rec.external_heap_dirty = true;
         }
     }
@@ -1356,9 +1370,7 @@ impl super::Vm<'_> {
         } else {
             Some(self.audit_heap_bytes())
         };
-        let rec = self
-            .instr_rec
-            .as_mut()
+        let rec = rec_mut!(self)
             .expect("recorder checked present above");
         if let Some(resident) = resident {
             rec.preflight_bytes_since_audit = 0;
@@ -1385,7 +1397,7 @@ impl super::Vm<'_> {
         functions: usize,
         classes: usize,
     ) {
-        if let Some(rec) = self.instr_rec.as_mut() {
+        if let Some(rec) = rec_mut!(self) {
             rec.set_dynamic_code_limits(
                 per_source_bytes,
                 lifetime_source_bytes,
@@ -1398,7 +1410,7 @@ impl super::Vm<'_> {
 
     /// Charge one dynamic-code attempt before parsing begins.
     pub(crate) fn instrument_dynamic_code_attempt(&mut self, source_bytes: usize) -> Tick {
-        match self.instr_rec.as_mut() {
+        match rec_mut!(self) {
             Some(rec) => rec.charge_dynamic_code_attempt(source_bytes),
             None => Ok(()),
         }
@@ -1413,7 +1425,7 @@ impl super::Vm<'_> {
     ) -> Tick {
         let installed_functions = self.eval_funcs.len();
         let installed_classes = self.eval_classes.len();
-        match self.instr_rec.as_mut() {
+        match rec_mut!(self) {
             Some(rec) => rec.admit_dynamic_code_install(
                 installed_functions,
                 new_functions,
@@ -1465,7 +1477,7 @@ impl super::Vm<'_> {
         let heap_bytes = if ceiling == usize::MAX {
             None
         } else {
-            let reconcile = match self.instr_rec.as_mut() {
+            let reconcile = match rec_mut!(self) {
                 Some(rec) => {
                     rec.postflight_since_audit = rec.postflight_since_audit.saturating_add(1);
                     let stride = rec.postflight_since_audit >= POSTFLIGHT_AUDIT_STRIDE;
@@ -1488,7 +1500,7 @@ impl super::Vm<'_> {
             }
         };
 
-        let rec = self.instr_rec.as_mut()?;
+        let rec = rec_mut!(self)?;
         if rec.exhaustion.is_none() && rec.output_exhausted {
             rec.exhaust(ResourceExhaustion::Output);
         }
@@ -1515,7 +1527,7 @@ impl super::Vm<'_> {
     #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
     #[must_use]
     pub(crate) fn meter_lend(&mut self) -> i64 {
-        let Some(rec) = self.instr_rec.as_mut() else {
+        let Some(rec) = rec_mut!(self) else {
             return 0;
         };
         rec.settle();
@@ -1568,7 +1580,7 @@ impl super::Vm<'_> {
                 return 0;
             }
             // `heap_bytes` took `&self`, so the recorder has to be re-borrowed.
-            let Some(rec) = self.instr_rec.as_mut() else {
+            let Some(rec) = rec_mut!(self) else {
                 return 0;
             };
             if rec.remaining != i64::MAX && rec.remaining <= 0 {
@@ -1626,7 +1638,7 @@ impl super::Vm<'_> {
         if k <= 0 {
             return false;
         }
-        let Some(rec) = self.instr_rec.as_mut() else {
+        let Some(rec) = rec_mut!(self) else {
             return false;
         };
         rec.settle();
@@ -1661,7 +1673,7 @@ impl super::Vm<'_> {
             self.jit_steps = outer;
             return;
         }
-        let Some(rec) = self.instr_rec.as_mut() else {
+        let Some(rec) = rec_mut!(self) else {
             self.jit_steps = outer;
             return;
         };
@@ -1680,7 +1692,7 @@ impl super::Vm<'_> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn meter_return(&mut self) {
         let unspent = self.jit_steps.max(0);
-        if let Some(rec) = self.instr_rec.as_mut() {
+        if let Some(rec) = rec_mut!(self) {
             rec.settle();
             if rec.remaining != i64::MAX {
                 rec.remaining += unspent;
@@ -1741,7 +1753,7 @@ impl super::Vm<'_> {
                 return false;
             }
         }
-        rec.finite_remaining()
+        rec.finite_remaining(self.meter_hot())
             .is_none_or(|left| left.saturating_add(self.meter_loan()) >= cost)
     }
 
@@ -1777,7 +1789,8 @@ impl super::Vm<'_> {
         } else {
             rec.heap_limit.saturating_sub(self.instrument_heap_estimate())
         };
-        Some((open, room, rec.finite_remaining().map(|left| left.saturating_add(self.meter_loan()))))
+        let hot = self.meter_hot();
+        Some((open, room, rec.finite_remaining(hot).map(|left| left.saturating_add(self.meter_loan()))))
     }
 
     /// Polled between blocks of a long native kernel: a host abort request
@@ -1806,7 +1819,7 @@ impl super::Vm<'_> {
     /// declines half way falls back to a real call, which the interpreter
     /// charges itself, and charging both would be double-counting.
     pub(crate) fn charge_steps(&mut self, n: i64) {
-        if let Some(rec) = self.instr_rec.as_mut() {
+        if let Some(rec) = rec_mut!(self) {
             rec.settle();
             let n = n.max(0);
             #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
@@ -1826,12 +1839,12 @@ impl super::Vm<'_> {
                 // Off-loop work nested inside a native run may spend that
                 // run's unspent loan (see `meter_reclaim`).
                 let rec = if rec.remaining != i64::MAX && n > rec.remaining && self.meter_reclaim() {
-                    match self.instr_rec.as_mut() {
+                    match rec_mut!(self) {
                         Some(rec) => rec,
                         None => return,
                     }
                 } else {
-                    match self.instr_rec.as_mut() {
+                    match rec_mut!(self) {
                         Some(rec) => rec,
                         None => return,
                     }
@@ -1874,7 +1887,7 @@ impl super::Vm<'_> {
     /// Charge one buffered console line before retaining it. Once exhausted,
     /// the next instruction also fails so a script cannot catch and continue.
     pub(crate) fn instrument_output_line(&mut self, line: &str) -> Tick {
-        let Some(rec) = self.instr_rec.as_mut() else {
+        let Some(rec) = rec_mut!(self) else {
             return Ok(());
         };
         let bytes = line.len().saturating_add(OUTPUT_LINE_OVERHEAD_BYTES);
@@ -1969,24 +1982,77 @@ impl super::Vm<'_> {
         Ok(())
     }
 
+    /// The general profile's dispatch hook, past its common edge. That edge
+    /// is the dispatch loop's own decrement of `step_hot` and one test
+    /// (written out there: through an inlined helper the loop compiled
+    /// measurably worse): nothing is due for that many more steps, and there
+    /// is no load through the recorder's box. Without a recorder `step_hot`
+    /// is `i64::MAX` and never runs out.
+    ///
+    /// Here `step_hot` ran out, or a fold (`rec_mut!`) handed the count to the
+    /// recorder. Fold what is left into the recorder's countdown, take this
+    /// step exactly as the countdown always has (when the countdown is
+    /// spent, the full path settles the count, runs the step and schedules
+    /// the next countdown), and hand the countdown back to `step_hot`.
     #[cfg(not(feature = "meter-only"))]
-    #[inline]
-    pub(crate) fn instrument_step(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
-        let rec = match self.instr_rec.as_mut() {
-            Some(rec) => rec,
-            None => return Ok(()),
-        };
-
-        // The common edge is one decrement and one test: nothing is due for
-        // `countdown` more steps (see the field). When it runs out, the full
-        // path settles the count, runs the step exactly as before and
-        // schedules the next countdown.
-        rec.countdown -= 1;
-        if rec.countdown >= 0 {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn instrument_step_hot_out(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
+        let Some(rec) = self.instr_rec.as_mut() else {
+            self.step_hot = i64::MAX;
             return Ok(());
+        };
+        // The caller's decrement already took this step off `step_hot`.
+        rec.countdown += self.step_hot;
+        self.step_hot = 0;
+        let result = if rec.countdown >= 0 {
+            Ok(())
+        } else {
+            rec.countdown += 1;
+            self.instrument_step_due(base, ip, instr)
+        };
+        if let Some(rec) = self.instr_rec.as_mut() {
+            self.step_hot = rec.countdown;
+            rec.countdown = 0;
         }
-        rec.countdown += 1;
-        self.instrument_step_due(base, ip, instr)
+        result
+    }
+
+    /// Fold the dispatch hook's `step_hot` into the recorder's countdown so
+    /// every figure the recorder holds is exact; the next step then takes
+    /// the hook's slow path, which hands the countdown back. Every mutable
+    /// use of the recorder outside the hook goes through this (`rec_mut!`).
+    /// Out of line: it sits at every such use, several of them inside code
+    /// the dispatch loop inlines, and inlined there it cost the loop's code
+    /// generation far more than the call does.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline(never)]
+    pub(crate) fn meter_fold(&mut self) {
+        if let Some(rec) = self.instr_rec.as_mut() {
+            rec.countdown += self.step_hot;
+            self.step_hot = 0;
+        }
+    }
+
+    /// The meter-only profile keeps no `step_hot`: nothing to fold. Inlined
+    /// away, so its own per-instruction hook (which reaches the recorder
+    /// through `rec_mut!` like everything else) pays nothing for it.
+    #[cfg(feature = "meter-only")]
+    #[inline(always)]
+    pub(crate) fn meter_fold(&mut self) {}
+
+    /// The VM's unfolded `step_hot`, for a read-only use of the recorder's
+    /// countdown figures (`remaining_now`, `steps_used`, ...); 0 where the
+    /// profile keeps no such count.
+    #[inline]
+    pub(crate) fn meter_hot(&self) -> i64 {
+        #[cfg(not(feature = "meter-only"))]
+        {
+            if self.instr_rec.is_some() {
+                return self.step_hot;
+            }
+        }
+        0
     }
 
     /// The general hook's full path: a heap poll, the budget's last step, or
@@ -1996,7 +2062,7 @@ impl super::Vm<'_> {
     #[inline(never)]
     fn instrument_step_due(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
         let result = self.instrument_step_full(base, ip, instr);
-        if let Some(rec) = self.instr_rec.as_mut() {
+        if let Some(rec) = rec_mut!(self) {
             rec.schedule();
         }
         result
@@ -2006,7 +2072,7 @@ impl super::Vm<'_> {
     #[cfg(not(feature = "meter-only"))]
     #[inline]
     fn instrument_step_full(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
-        let rec = match self.instr_rec.as_mut() {
+        let rec = match rec_mut!(self) {
             Some(rec) => rec,
             None => return Ok(()),
         };
@@ -2023,12 +2089,12 @@ impl super::Vm<'_> {
                     return Err(self.instrument_steps_out());
                 }
             }
-            let Some(rec) = self.instr_rec.as_mut() else {
+            let Some(rec) = rec_mut!(self) else {
                 return Ok(());
             };
             rec.remaining -= 1;
         }
-        let Some(rec) = self.instr_rec.as_mut() else {
+        let Some(rec) = rec_mut!(self) else {
             return Ok(());
         };
         rec.ticks = rec.ticks.wrapping_add(1);
@@ -2046,7 +2112,7 @@ impl super::Vm<'_> {
     #[inline(never)]
     #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     fn instrument_steps_out(&mut self) -> &'static str {
-        match self.instr_rec.as_mut() {
+        match rec_mut!(self) {
             Some(rec) => rec.exhaust(ResourceExhaustion::Steps),
             None => "",
         }
@@ -2063,7 +2129,7 @@ impl super::Vm<'_> {
         // inside the `&mut self.instr_rec` borrow below.
         self.instrument_complete();
 
-        let rec = match self.instr_rec.as_mut() {
+        let rec = match rec_mut!(self) {
             Some(r) => r,
             None => return Ok(()),
         };
@@ -2080,12 +2146,12 @@ impl super::Vm<'_> {
                     return Err(self.instrument_steps_out());
                 }
             }
-            let Some(rec) = self.instr_rec.as_mut() else {
+            let Some(rec) = rec_mut!(self) else {
                 return Ok(());
             };
             rec.remaining -= 1;
         }
-        let Some(rec) = self.instr_rec.as_mut() else {
+        let Some(rec) = rec_mut!(self) else {
             return Ok(());
         };
         // `ticks` is both the polling clock and the interpreter-work counter.
@@ -2106,7 +2172,7 @@ impl super::Vm<'_> {
             self.instrument_heap_poll()?;
         }
 
-        let Some(rec) = self.instr_rec.as_mut() else {
+        let Some(rec) = rec_mut!(self) else {
             return Ok(());
         };
         if !tracing {
@@ -2164,7 +2230,7 @@ impl super::Vm<'_> {
             self.instrument_mark_external_heap_growth();
         }
         // A conviction that waited for this collection is decided now.
-        if let Some(rec) = self.instr_rec.as_mut() {
+        if let Some(rec) = rec_mut!(self) {
             rec.ceiling_gc_pending = false;
         }
         let force = !self.heap.payload_accounting_enabled();
@@ -2230,7 +2296,7 @@ impl super::Vm<'_> {
         } else {
             None
         };
-        let reconcile = match self.instr_rec.as_mut() {
+        let reconcile = match rec_mut!(self) {
             Some(rec) => {
                 let grew = match footprint {
                     Some(now) => {
@@ -2261,7 +2327,8 @@ impl super::Vm<'_> {
         if convicted || reconcile {
             let total = self.audit_heap_bytes();
             let collectable = may_defer && self.gc_can_run_now();
-            let rec = self.instr_rec.as_mut().expect("recorder checked above");
+            let majors = self.heap.majors_done();
+            let rec = rec_mut!(self).expect("recorder checked above");
             if let Some(now) = crate::heap::every_block_footprint() {
                 rec.walk_footprint_floor = now;
             }
@@ -2273,6 +2340,32 @@ impl super::Vm<'_> {
                 }
                 rec.ceiling_gc_pending = false;
                 return Err(rec.exhaust(ResourceExhaustion::Heap));
+            }
+            // Growth the collector's own schedule cannot see. It counts what
+            // it allocates; an Array filled by `push` grows in place, so a
+            // tokenizer refilling three arrays per pass never collected the
+            // old ones (eight passes held 106 MB where QuickJS held 38). The
+            // walk sees that growth: once the heap stands a step over the
+            // level the first walk after the last major found, ask for a
+            // major. The step is a quarter of that level when that is more,
+            // so a heap that is really growing pays for O(log) majors, not
+            // O(n). (Weighing every poll with the O(1) estimate as well was
+            // tried: json-large's peak fell 89 MB to 57, but extra majors cost
+            // json-large 15% and markdown-render 20% of their time, and a
+            // gentler step raised markdown-render's peak instead.)
+            if rec.growth_major != majors {
+                rec.growth_major = majors;
+                rec.growth_level = total;
+                rec.growth_gc_pending = false;
+            } else if collectable
+                && !rec.growth_gc_pending
+                && total
+                    >= rec
+                        .growth_level
+                        .saturating_add(HEAP_GROWTH_MAJOR_STEP.max(rec.growth_level / 4))
+            {
+                rec.growth_gc_pending = true;
+                self.heap.request_major();
             }
         }
         Ok(())
@@ -2313,7 +2406,7 @@ impl super::Vm<'_> {
         let dst_val = dst.and_then(|i| self.regs.get(i).copied());
         let frames_now = self.frames.len();
 
-        let rec = self.instr_rec.as_mut().expect("checked above");
+        let rec = rec_mut!(self).expect("checked above");
         rec.pending = None;
         rec.refresh_slow();
         let depth_before = rec.depth;
@@ -2437,7 +2530,7 @@ impl super::Vm<'_> {
         let val_a = a.map(|r| enc(self.reg_at(base, r))).unwrap_or(0);
         let val_b = b.map(|r| enc(self.reg_at(base, r))).unwrap_or(0);
         let frames = self.frames.len();
-        let rec = self.instr_rec.as_mut().expect("caller checked");
+        let rec = rec_mut!(self).expect("caller checked");
         let row = rec.steps.len();
         // A jump claims that THIS row's pc is its `aux`.
         if row > 0 && rec.steps[row - 1].opcode == op::JUMP {
@@ -2923,7 +3016,7 @@ mod tests {
             .instr_rec
             .as_ref()
             .expect("recorder attached")
-            .steps_used();
+            .steps_used(measured.meter_hot());
         assert!(used > 0);
 
         let mut exact = crate::vm::Vm::new(program(src));
@@ -2933,7 +3026,7 @@ mod tests {
         exact
             .run()
             .expect("the final permitted instruction may halt");
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(exact.meter_hot()), 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
         let mut short = crate::vm::Vm::new(program(src));
@@ -3015,7 +3108,7 @@ mod tests {
             crate::value::Value::int(7)
         );
         assert_eq!(
-            exact.instr_rec.as_ref().unwrap().steps_used(),
+            exact.instr_rec.as_ref().unwrap().steps_used(exact.meter_hot()),
             executed_len as u64,
             "forwarding must charge every logical bytecode"
         );
@@ -3083,7 +3176,7 @@ mod tests {
             crate::value::Value::int(832_040)
         );
         assert_eq!(
-            measured.instr_rec.as_ref().unwrap().steps_used(),
+            measured.instr_rec.as_ref().unwrap().steps_used(measured.meter_hot()),
             expected_steps,
             "off-dispatch recursion must retain the historical bytecode bill"
         );
@@ -3100,7 +3193,7 @@ mod tests {
                 .expect("the exact final allowance succeeds"),
             crate::value::Value::int(832_040)
         );
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(exact.meter_hot()), 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
         let mut short = ready(SRC, expected_steps as i64 - 1);
@@ -3141,7 +3234,7 @@ mod tests {
             crate::value::Value::int(21)
         );
         assert!(
-            near.instr_rec.as_ref().unwrap().steps_used() > fib_steps(NEAR_N),
+            near.instr_rec.as_ref().unwrap().steps_used(near.meter_hot()) > fib_steps(NEAR_N),
             "a FuncProto with extra observable control flow must fail the exact cached classifier"
         );
 
@@ -3212,7 +3305,7 @@ mod tests {
         // ninth call is the first one to enter the whole-function native body.
         let (measured, result) = exercise(i64::MAX, false);
         assert_eq!(result.expect("measurement call succeeds"), Value::int(9));
-        let exact_steps = measured.instr_rec.as_ref().unwrap().steps_used();
+        let exact_steps = measured.instr_rec.as_ref().unwrap().steps_used(measured.meter_hot());
         assert!(exact_steps > 0);
         assert!(
             exact_steps < NATIVE_CHUNK as u64,
@@ -3223,13 +3316,13 @@ mod tests {
         assert_eq!(result.expect("interpreter oracle succeeds"), Value::int(9));
         assert_eq!(
             exact_steps,
-            interpreted.instr_rec.as_ref().unwrap().steps_used(),
+            interpreted.instr_rec.as_ref().unwrap().steps_used(interpreted.meter_hot()),
             "native and interpreter execution must charge the same bytecodes"
         );
 
         let (mut exact, result) = exercise(exact_steps as i64, false);
         assert_eq!(result.expect("exact native call succeeds"), Value::int(9));
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(exact.meter_hot()), 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
         let slot = exact.func(1).name_global.unwrap();
@@ -3262,15 +3355,16 @@ mod tests {
         )));
         aborted.set_instrumentation(abort_rec);
         aborted.run().expect_err("host abort stops execution");
+        let hot = aborted.meter_hot();
         let abort_rec = aborted.instr_rec.as_ref().unwrap();
         assert_eq!(abort_rec.exhaustion, Some(ResourceExhaustion::Abort));
-        let used = abort_rec.steps_used();
+        let used = abort_rec.steps_used(hot);
         assert!(
             (1..=ABORT_POLL).contains(&used),
             "the interpreter poll or an earlier native-entry poll must stop execution; used {used}"
         );
-        assert_eq!(abort_rec.remaining_now(), ABORT_BUDGET - used as i64);
-        assert_eq!(used + abort_rec.remaining_now() as u64, ABORT_BUDGET as u64);
+        assert_eq!(abort_rec.remaining_now(hot), ABORT_BUDGET - used as i64);
+        assert_eq!(used + abort_rec.remaining_now(hot) as u64, ABORT_BUDGET as u64);
         assert_eq!(aborted.instrument_resource_limit_error(), Some(ABORT_MSG));
     }
 

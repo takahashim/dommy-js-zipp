@@ -81,14 +81,22 @@ mod codegen {
         true
     }
 }
+/// JavaScript: AST to register bytecode. Each language's source lives under
+/// `lang/<name>/` (see `lang/mod.rs`); its modules keep their crate-level
+/// names.
+#[path = "lang/js/compile/mod.rs"]
 mod compile;
 /// Persistent-VM embedding API, for hosts that keep a script alive across many
 /// re-entries rather than running it once (see the module docs).
 pub mod embed;
-pub mod frontend;
+/// The languages, and which one's frontend compiles a source.
+pub mod lang;
+/// The earlier name of [`lang`], kept for embedders.
+pub use lang as frontend;
 /// Python packages a host adds at run time (the torch package of the
 /// WebAssembly `python` artifact).
 #[cfg(feature = "python")]
+#[path = "lang/python/packages.rs"]
 pub mod python_packages;
 
 /// B187 scouting support: expose the exact object-construction floor to the
@@ -118,7 +126,7 @@ pub mod bench_support {
             v.push(Value::num((bits ^ (salt as u64 ^ i as u64)) as f64));
         }
         let m = Box::new(ObjMap::finalized_from_plan(plan.clone(), v, shape));
-        (m.len() as usize).wrapping_add(m.shape() as usize & 1)
+        (m.live_len() as usize).wrapping_add(m.shape() as usize & 1)
     }
 
     /// B187 stage-3: the allocator/init/store decomposition ladder (lives in
@@ -135,6 +143,8 @@ pub mod bench_support {
         crate::heap::bench_append_decompose(objs, keys_per)
     }
 }
+/// JavaScript: source text to an AST, one entry point per grammar.
+#[path = "lang/js/front.rs"]
 mod front;
 pub use front::set_pure_script_goal;
 /// A diagnostic switch that is set or not for the life of the process, read
@@ -181,8 +191,8 @@ pub use heap::{note_every_block, note_large_block, LARGE_BLOCK_BYTES};
 /// Decimal text to `f64` without core's 10 KB power-of-five table (see the
 /// module docs). Every string-to-number path in the engine goes through it.
 mod num_parse;
-/// Hand-written front end (lexer/AST/parser) being built to replace
-/// `oxc_parser` — see the module docs for why. Not yet wired in.
+/// JavaScript: the hand-written lexer, AST and parser.
+#[path = "lang/js/parse/mod.rs"]
 mod parse;
 
 /// The hardened profile's three parse-shape limits, so a test can build a
@@ -272,7 +282,7 @@ pub fn gc_gen_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
 }
 
 /// `ZIPP_GCSTATS=1` B6 oracle would-be old→young store counts per helper
-/// chokepoint (NURSERY_DESIGN.md §1): `(site, count)`. Zeroed unless set.
+/// chokepoint (docs/archive/NURSERY_DESIGN.md §1): `(site, count)`. Zeroed unless set.
 pub fn gc_oracle_stats() -> Vec<(&'static str, u64)> {
     heap::gcoracle::dump()
 }

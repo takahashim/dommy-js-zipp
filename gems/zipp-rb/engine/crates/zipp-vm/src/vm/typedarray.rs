@@ -87,6 +87,47 @@ fn dataview_get_kind(name: &str) -> Option<(usize, u8)> {
     }
 }
 
+/// The prototype entry and `TA_KINDS` index of each non-BigInt numeric
+/// DataView setter (entries 10..18 of `DV_PROTO_METHODS`).
+#[inline]
+fn dataview_set_kind(name: &str) -> Option<(usize, u8)> {
+    match name {
+        "setInt8" => Some((10, 0)),
+        "setUint8" => Some((11, 1)),
+        "setInt16" => Some((12, 3)),
+        "setUint16" => Some((13, 4)),
+        "setInt32" => Some((14, 5)),
+        "setUint32" => Some((15, 6)),
+        "setFloat32" => Some((16, 7)),
+        "setFloat64" => Some((17, 8)),
+        _ => None,
+    }
+}
+
+/// The prototype entry of each BigInt DataView accessor (entries 8, 9, 18 and
+/// 19 of `DV_PROTO_METHODS`), and whether it is a setter.
+#[inline]
+fn dataview_big_kind(name: &str) -> Option<(usize, bool)> {
+    match name {
+        "getBigInt64" => Some((8, false)),
+        "getBigUint64" => Some((9, false)),
+        "setBigInt64" => Some((18, true)),
+        "setBigUint64" => Some((19, true)),
+        _ => None,
+    }
+}
+
+/// `Vm::dataview_bigint_bits`' index for a BigInt accessor's entry.
+#[inline]
+fn dataview_big_bits_index(slot: usize) -> usize {
+    match slot {
+        8 => 0,
+        9 => 1,
+        18 => 2,
+        _ => 3,
+    }
+}
+
 impl<'p> Vm<'p> {
     pub(crate) fn as_array_buffer(&self, v: Value) -> Option<u32> {
         (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::ArrayBuffer { .. }))
@@ -461,7 +502,7 @@ impl<'p> Vm<'p> {
                 // exact pinned function bits as the independent live proof.
                 HeapObj::Object(map) => {
                     map.shape() == self.dataview_proto_shape
-                        && method < map.len()
+                        && method < map.slot_len()
                         && map.val_at(method).bits() == self.dataview_numeric_getter_bits[method]
                 }
                 _ => false,
@@ -473,6 +514,298 @@ impl<'p> Vm<'p> {
         self.dataview_get_leaf(view_idx, method, position, little_endian)
     }
 
+    /// `dataview_interp_get_fast`'s twin for the pristine numeric setters:
+    /// `view.setUint32(pos, v, le)` with a non-negative integral `pos` and a
+    /// Number `v`, so that neither ToIndex nor ToNumber can run code, on a
+    /// buffer that is not immutable. The callee is proved the same way (the
+    /// view's own properties and prototype untouched since construction, the
+    /// prototype's boot shape, the setter's exact bits). `Ok(None)`: nothing
+    /// observable happened; the caller makes the generic call. From the
+    /// proof on it is SetViewValue: the detached or out-of-bounds TypeError,
+    /// the bounds RangeError, the write.
+    pub(crate) fn dataview_interp_set_fast(
+        &mut self,
+        view_idx: u32,
+        name: &str,
+        position: Value,
+        value: Value,
+        little_endian: Value,
+    ) -> Result<Option<()>, Thrown> {
+        let Some((slot, kind)) = dataview_set_kind(name) else {
+            return Ok(None);
+        };
+        let pristine_version = match self.heap.get(view_idx) {
+            HeapObj::DataView {
+                pristine_version, ..
+            } => *pristine_version,
+            _ => return Ok(None),
+        };
+        if !self.realm_global_objs.is_empty()
+            || self.dataview_proto == 0
+            || self.heap.version_of(view_idx) != pristine_version
+            || self.dataview_proto_shape == crate::shape::DICT
+        {
+            return Ok(None);
+        }
+        let intrinsic_live = match self.heap.get(self.dataview_proto) {
+            HeapObj::Object(map) => {
+                map.shape() == self.dataview_proto_shape
+                    && slot < map.slot_len()
+                    && map.val_at(slot).bits() == self.dataview_numeric_setter_bits[slot - 10]
+            }
+            _ => false,
+        };
+        if !intrinsic_live {
+            return Ok(None);
+        }
+        self.dataview_set_leaf(view_idx, kind, name, position, value, little_endian)
+    }
+
+    /// The BigInt accessors' twin of [`Self::dataview_interp_get_fast`] and
+    /// [`Self::dataview_interp_set_fast`]: `view.getBigInt64(pos, le)`,
+    /// `view.setBigUint64(pos, v, le)` and the other two, on the same proof
+    /// (the view's own properties and prototype untouched since
+    /// construction, the prototype's boot shape, the accessor's exact bits).
+    /// `a1`/`a2` are the second and third arguments. `Ok(None)`: nothing
+    /// observable happened; the caller makes the generic call.
+    pub(crate) fn dataview_interp_big_fast(
+        &mut self,
+        view_idx: u32,
+        name: &str,
+        position: Value,
+        a1: Value,
+        a2: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        let Some((slot, setter)) = dataview_big_kind(name) else {
+            return Ok(None);
+        };
+        let pristine_version = match self.heap.get(view_idx) {
+            HeapObj::DataView {
+                pristine_version, ..
+            } => *pristine_version,
+            _ => return Ok(None),
+        };
+        if !self.realm_global_objs.is_empty()
+            || self.dataview_proto == 0
+            || self.heap.version_of(view_idx) != pristine_version
+            || self.dataview_proto_shape == crate::shape::DICT
+        {
+            return Ok(None);
+        }
+        let intrinsic_live = match self.heap.get(self.dataview_proto) {
+            HeapObj::Object(map) => {
+                map.shape() == self.dataview_proto_shape
+                    && slot < map.slot_len()
+                    && map.val_at(slot).bits() == self.dataview_bigint_bits[dataview_big_bits_index(slot)]
+            }
+            _ => false,
+        };
+        if !intrinsic_live {
+            return Ok(None);
+        }
+        self.dataview_big_leaf(view_idx, slot, setter, position, a1, a2)
+    }
+
+    /// The split member-call form's BigInt accessor lane (see
+    /// `dataview_captured_get`): `native_id` is the main realm's intrinsic
+    /// BigInt getter or setter, so the call is that accessor's.
+    pub(crate) fn dataview_captured_big(
+        &mut self,
+        view_idx: u32,
+        native_id: u16,
+        position: Value,
+        a1: Value,
+        a2: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        if !self.realm_global_objs.is_empty() {
+            return Ok(None);
+        }
+        let slot = native_id.wrapping_sub(native::DV_METHOD_BASE) as usize;
+        let Some((slot, setter)) = native::DV_PROTO_METHODS.get(slot).and_then(|n| dataview_big_kind(n)) else {
+            return Ok(None);
+        };
+        self.dataview_big_leaf(view_idx, slot, setter, position, a1, a2)
+    }
+
+    /// The BigInt accessor at prototype entry `slot` on `view_idx`, for a
+    /// caller that has proved it is the function being called. GetViewValue
+    /// or SetViewValue for a non-negative integral `position` and, to set, a
+    /// BigInt in the i128 range (so neither ToIndex nor ToBigInt runs code) on
+    /// a buffer that is not immutable; else `Ok(None)` with nothing done.
+    /// Past that it is the general path's order and messages: the detached
+    /// or out-of-bounds TypeError, the bounds RangeError, the access. Both
+    /// sizes are the value's low 64 bits, so one encoding serves the signed
+    /// and the unsigned setter.
+    fn dataview_big_leaf(
+        &mut self,
+        view_idx: u32,
+        slot: usize,
+        setter: bool,
+        position: Value,
+        a1: Value,
+        a2: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        let name = native::DV_PROTO_METHODS[slot];
+        let (written, little_endian) = if setter {
+            let Some(v) = self.bigint_i128(a1) else {
+                return Ok(None);
+            };
+            (Some(v as u64), a2)
+        } else {
+            (None, a1)
+        };
+        let (buffer, byte_offset, byte_length) = match self.heap.get(view_idx) {
+            HeapObj::DataView {
+                buffer,
+                byte_offset,
+                byte_length,
+                ..
+            } => (*buffer, *byte_offset, *byte_length),
+            _ => return Ok(None),
+        };
+        if setter && !self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&buffer) {
+            return Ok(None);
+        }
+        let Some(pos) = array_index(position) else {
+            return Ok(None);
+        };
+        let view_len = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                self.dv_effective_len_at(view_idx, byte_offset, byte_length, data.len())
+            }
+            HeapObj::ArrayBuffer { .. } => None,
+            _ => return Ok(None),
+        };
+        super::builtins::builtin_stats_count(self, Value::heap(view_idx), name);
+        let Some(view_len) = view_len else {
+            return Err(Thrown::from_static(if setter {
+                "TypeError: Cannot perform DataView write on a detached or out-of-bounds ArrayBuffer"
+            } else {
+                "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer"
+            }));
+        };
+        if view_len < 8 || pos > view_len - 8 {
+            return Err(Thrown::from_static(
+                "RangeError: Offset is outside the bounds of the DataView",
+            ));
+        }
+        let little = self.truthy(little_endian);
+        let abs = byte_offset + pos;
+        if let Some(bits) = written {
+            let bytes = if little { bits.to_le_bytes() } else { bits.to_be_bytes() };
+            if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
+                if abs + 8 <= data.len() {
+                    data[abs..abs + 8].copy_from_slice(&bytes);
+                }
+            }
+            return Ok(Some(Value::UNDEFINED));
+        }
+        let raw = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, .. } if abs + 8 <= data.len() => {
+                let b: [u8; 8] = data[abs..abs + 8].try_into().expect("eight-byte DataView read");
+                if little {
+                    u64::from_le_bytes(b)
+                } else {
+                    u64::from_be_bytes(b)
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(if slot == 8 {
+            self.make_bigint(raw as i64 as i128)
+        } else {
+            self.make_bigint(raw as i128)
+        }))
+    }
+
+    /// The split member-call form's setter lane (see `dataview_captured_get`):
+    /// `native_id` is the main realm's intrinsic numeric setter, so the call
+    /// is that setter's. `Ok(None)`: nothing observable happened.
+    pub(crate) fn dataview_captured_set(
+        &mut self,
+        view_idx: u32,
+        native_id: u16,
+        position: Value,
+        value: Value,
+        little_endian: Value,
+    ) -> Result<Option<()>, Thrown> {
+        if !self.realm_global_objs.is_empty() {
+            return Ok(None);
+        }
+        let slot = native_id.wrapping_sub(native::DV_METHOD_BASE) as usize;
+        if !(10..18).contains(&slot) {
+            return Ok(None);
+        }
+        let name = native::DV_PROTO_METHODS[slot];
+        let Some((_, kind)) = dataview_set_kind(name) else {
+            return Ok(None);
+        };
+        self.dataview_set_leaf(view_idx, kind, name, position, value, little_endian)
+    }
+
+    /// The numeric setter `name` (`TA_KINDS` index `kind`) on `view_idx`, for
+    /// a caller that has proved it is the function being called: SetViewValue
+    /// for a non-negative integral `position` and a Number `value` on a buffer
+    /// that is not immutable, else `Ok(None)` with nothing done.
+    fn dataview_set_leaf(
+        &mut self,
+        view_idx: u32,
+        kind: u8,
+        name: &str,
+        position: Value,
+        value: Value,
+        little_endian: Value,
+    ) -> Result<Option<()>, Thrown> {
+        if !value.is_number() {
+            return Ok(None);
+        }
+        let (buffer, byte_offset, byte_length) = match self.heap.get(view_idx) {
+            HeapObj::DataView {
+                buffer,
+                byte_offset,
+                byte_length,
+                ..
+            } => (*buffer, *byte_offset, *byte_length),
+            _ => return Ok(None),
+        };
+        if !self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&buffer) {
+            return Ok(None);
+        }
+        let Some(pos) = array_index(position) else {
+            return Ok(None);
+        };
+        let size = native::TA_KINDS[kind as usize].1;
+        let view_len = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                self.dv_effective_len_at(view_idx, byte_offset, byte_length, data.len())
+            }
+            HeapObj::ArrayBuffer { .. } => None,
+            _ => return Ok(None),
+        };
+        super::builtins::builtin_stats_count(self, Value::heap(view_idx), name);
+        let Some(view_len) = view_len else {
+            return Err(Thrown::from_static(
+                "TypeError: Cannot perform DataView write on a detached or out-of-bounds ArrayBuffer",
+            ));
+        };
+        if size > view_len || pos > view_len - size {
+            return Err(Thrown::from_static(
+                "RangeError: Offset is outside the bounds of the DataView",
+            ));
+        }
+        let mut bytes = crate::vm::helpers_numeric::ta_encode(kind, value.as_f64());
+        if !self.truthy(little_endian) {
+            bytes[..size].reverse();
+        }
+        let abs = byte_offset + pos;
+        if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
+            if abs + size <= data.len() {
+                data[abs..abs + size].copy_from_slice(&bytes[..size]);
+            }
+        }
+        Ok(Some(()))
+    }
+
     /// What `Get(view, name)` finds when `name` is one of the numeric getters
     /// and `view` is still default-constructed (no own property, the default
     /// prototype): that prototype's slot, read in place. `None` sends the
@@ -480,7 +813,11 @@ impl<'p> Vm<'p> {
     /// property cache to key on, so `dv.getUint32` otherwise walked to the
     /// prototype and searched it by name on every read.
     pub(crate) fn dataview_proto_read(&self, view_idx: u32, name: &str) -> Option<u64> {
-        let (method, _) = dataview_get_kind(name)?;
+        // The setters and the BigInt accessors sit at their own boot entries;
+        // the proof is the same.
+        let (method, _) = dataview_get_kind(name)
+            .or_else(|| dataview_set_kind(name))
+            .or_else(|| dataview_big_kind(name).map(|(slot, _)| (slot, 0)))?;
         let HeapObj::DataView {
             pristine_version, ..
         } = self.heap.get(view_idx)
@@ -496,34 +833,31 @@ impl<'p> Vm<'p> {
             return None;
         }
         match self.heap.get(self.dataview_proto) {
-            HeapObj::Object(map) if map.shape() == self.dataview_proto_shape && method < map.len() => {
+            HeapObj::Object(map) if map.shape() == self.dataview_proto_shape && method < map.slot_len() => {
                 Some(map.val_at(method).bits())
             }
             _ => None,
         }
     }
 
-    /// The split member-call form's DataView lane. `callee` is the Value the
-    /// call's `[[Get]]` already returned, so when it is the main realm's
-    /// intrinsic numeric getter the call is that getter's, whatever the
-    /// receiver or its prototype holds by now. `None`: nothing observable
-    /// happened and the caller makes the generic call.
+    /// The split member-call form's DataView lane. `native_id` is the id of
+    /// the Native the call's `[[Get]]` already returned, so when it is the
+    /// main realm's intrinsic numeric getter the call is that getter's,
+    /// whatever the receiver or its prototype holds by now. `None`: nothing
+    /// observable happened and the caller makes the generic call.
     pub(crate) fn dataview_captured_get(
         &self,
         view_idx: u32,
-        callee: Value,
+        native_id: u16,
         position: Value,
         little_endian: Value,
     ) -> Result<Option<Value>, Thrown> {
         // Main realm only, as for the fused form's leaf: with no child realm
         // the one Native of a getter's id is the main realm's.
-        if !self.realm_global_objs.is_empty() || !callee.is_heap() {
+        if !self.realm_global_objs.is_empty() {
             return Ok(None);
         }
-        let HeapObj::Native(id) = self.heap.get(callee.heap_index()) else {
-            return Ok(None);
-        };
-        let method = id.wrapping_sub(native::DV_METHOD_BASE) as usize;
+        let method = native_id.wrapping_sub(native::DV_METHOD_BASE) as usize;
         if method >= DV_GET_KINDS.len() {
             return Ok(None);
         }
@@ -1317,6 +1651,89 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// [`Vm::ta_snapshot`] of a non-BigInt view as the Numbers its Values
+    /// hold (`Value::num(x).as_f64()`, so a NaN is the canonical one and -0
+    /// stays -0), each element decoded as [`Vm::ta_element_get`] decodes it,
+    /// with the view resolved once; an element past the end reads as that
+    /// call's `undefined` does, NaN.
+    pub(crate) fn ta_read_numbers(&mut self, ta_idx: u32) -> Vec<f64> {
+        let len = self.ta_len_kind(ta_idx).0;
+        let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
+            _ => return vec![f64::NAN; len],
+        };
+        debug_assert!(!native::TA_KINDS[kind as usize].2, "a BigInt view holds BigInts");
+        let size = native::TA_KINDS[kind as usize].1;
+        let eff = self.ta_effective_len(ta_idx).unwrap_or(0);
+        let data: &[u8] = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+            _ => &[],
+        };
+        (0..len)
+            .map(|i| {
+                let off = byte_offset + i * size;
+                if i >= eff || off + size > data.len() {
+                    return f64::NAN;
+                }
+                let b = &data[off..off + size];
+                let x = match kind {
+                    0 => b[0] as i8 as f64,
+                    1 | 2 => b[0] as f64,
+                    3 => i16::from_le_bytes([b[0], b[1]]) as f64,
+                    4 => u16::from_le_bytes([b[0], b[1]]) as f64,
+                    5 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+                    6 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+                    7 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+                    8 => f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+                    11 => crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes([b[0], b[1]])),
+                    _ => f64::NAN,
+                };
+                Value::num(x).as_f64()
+            })
+            .collect()
+    }
+
+    /// [`Vm::ta_element_set`] of a run of Numbers into elements `start..` of a
+    /// non-BigInt view, for a caller whose values are already coerced: no
+    /// user code runs between the stores, so the view, its effective length
+    /// and the buffer's state are read once, and each value is encoded and
+    /// stored exactly as the per-element call stores it (an element past the
+    /// end is skipped, as there). `fill` and a cross-kind `set` stored every
+    /// element through that call, resolving the view each time.
+    pub(crate) fn ta_store_numbers(&mut self, ta_idx: u32, start: usize, values: impl Iterator<Item = f64>) {
+        let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
+            _ => return,
+        };
+        debug_assert!(!native::TA_KINDS[kind as usize].2, "a BigInt view stores BigInts");
+        let size = native::TA_KINDS[kind as usize].1;
+        let len = self.ta_effective_len(ta_idx).unwrap_or(0);
+        let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buffer) else {
+            return;
+        };
+        if *detached {
+            return;
+        }
+        for (k, f) in values.enumerate() {
+            let i = start + k;
+            let off = byte_offset + i * size;
+            if i >= len || off + size > data.len() {
+                break;
+            }
+            data[off..off + size].copy_from_slice(&ta_encode(kind, f)[..size]);
+        }
+    }
+
     /// The ArrayBuffer/SharedArrayBuffer constructor's observable argument
     /// coercions, split from allocation so the ctor can run them BEFORE
     /// OrdinaryCreateFromConstructor reads newTarget.prototype: ToIndex(length)
@@ -1895,7 +2312,7 @@ impl<'p> Vm<'p> {
             // byteOffset/length are ToIndex: a negative or out-of-range value is a
             // RangeError (a bare `as usize` would silently saturate -1 to 0).
             let byte_offset = match args.get(1) {
-                Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
+                Some(&v) if v != Value::UNDEFINED => self.to_index_u64(v)?,
                 _ => 0,
             };
             // InitializeTypedArrayFromArrayBuffer order: the offset-alignment
@@ -1903,11 +2320,15 @@ impl<'p> Vm<'p> {
             // TypeError (the buffer may have been detached at entry, or by a
             // ToIndex valueOf above) precedes the byte-length RangeErrors --
             // detaching clears the data, which would otherwise mask it.
-            if byte_offset % size != 0 {
+            // The alignment is of the EXACT offset: a 32-bit `usize` saturates
+            // 2^32 to 2^32-1, which is misaligned for every element size > 1.
+            if byte_offset % size as u64 != 0 {
                 return Err(Thrown::from_static(
                     "RangeError: invalid TypedArray length/offset",
                 ));
             }
+            // Past `usize` it can only fail the bounds checks below.
+            let byte_offset = usize::try_from(byte_offset).unwrap_or(usize::MAX);
             let explicit: Option<usize> = match args.get(2) {
                 Some(&v) if v != Value::UNDEFINED => Some(self.to_index(v)?),
                 _ => None,
@@ -2098,7 +2519,10 @@ impl<'p> Vm<'p> {
         } else {
             self.to_index(args[2])?
         };
-        if byte_offset + byte_length > buf_len {
+        // Against the room left (`byte_offset <= buf_len` above), not as a
+        // sum: on a 32-bit host `1 + (2^32 - 1)` wrapped to 0 and built a
+        // 4 GB view of an 8-byte buffer.
+        if byte_length > buf_len - byte_offset {
             return Err(Thrown::from_static("RangeError: invalid DataView offset/length"));
         }
         let idx = self.heap.alloc(HeapObj::DataView {

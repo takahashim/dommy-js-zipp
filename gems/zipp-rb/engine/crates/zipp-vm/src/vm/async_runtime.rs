@@ -679,6 +679,39 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// One `next(sent)` step of a `yield*` whose inner iterator is the sync
+    /// generator `iter` with the intrinsic `next` (`gen_method_pristine`):
+    /// the generator run as that call would run it, but as a [`GenStep`]. A
+    /// plain yield stays a value: the result object `next` would have made
+    /// for it is seen only by the delegating generator, which forwards it
+    /// unread but for `done`, so whichever consumer finally takes the value
+    /// makes it (a `for-of` makes none). A raw step (the inner itself
+    /// forwarding a user iterator's result) stays raw. `None` for anything
+    /// else, which `IterDelegate` steps through the protocol.
+    pub(crate) fn generator_delegate_step(&mut self, iter: Value, sent: Value) -> Result<Option<GenStep>, Thrown> {
+        if !iter.is_heap() {
+            return Ok(None);
+        }
+        let idx = iter.heap_index();
+        let (state, fid, closure) = match self.heap.get(idx) {
+            HeapObj::Generator {
+                state,
+                func,
+                closure,
+                ..
+            } => (*state, *func, *closure),
+            _ => return Ok(None),
+        };
+        if !self.gen_method_pristine(idx, "next") {
+            return Ok(None);
+        }
+        match state {
+            GenState::Completed => Ok(Some(GenStep::Done(Value::UNDEFINED))),
+            GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
+            GenState::Suspended(ip) => self.gen_resume_step(idx, fid, closure, ip, GenResumeMode::Next(sent)),
+        }
+    }
+
     /// [`Self::gen_resume_step`] with its step as the iterator result
     /// `generator_method` returns.
     fn gen_resume(
@@ -958,7 +991,8 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(res.heap_index()) else {
             return None;
         };
-        if m.len() != 2
+        if m.slot_len() != 2
+            || m.has_holes()
             || m.key_at(0) != "value"
             || m.key_at(1) != "done"
             || m.attr_at(0).accessor
@@ -1036,7 +1070,7 @@ impl<'p> Vm<'p> {
     /// covers double-resolve / resolve-then-reject / race losers), scheduling its
     /// matching reactions as microtasks.
     pub(crate) fn settle(&mut self, p: u32, state: PromiseState, val: Value) {
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 —
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 5 —
         // resolving an old promise with a young value.
         self.store_barrier(crate::heap::gcoracle::PROMISE_SETTLE, p, val);
         let (reactions, unhandled) = match self.heap.get_mut(p) {
@@ -1179,9 +1213,7 @@ impl<'p> Vm<'p> {
         let (then_ok, ctor_ok) = match self.heap.get(self.promise_proto) {
             HeapObj::Object(m) => {
                 let check = |key: &str, pred: &dyn Fn(Value) -> bool| {
-                    m.keys
-                        .iter()
-                        .position(|k| k == key)
+                    m.pos(key)
                         .is_some_and(|i| !m.attr_at(i).accessor && pred(m.val_at(i)))
                 };
                 (
@@ -1321,8 +1353,8 @@ impl<'p> Vm<'p> {
         // Belt-and-braces: the versions say the layout is unchanged; verify
         // the slots still name their keys anyway, so an un-bumped structural
         // change could only ever cost a re-proof, never a wrong answer.
-        if m.keys.get(ts).map_or(true, |k| k != "then")
-            || m.keys.get(cs).map_or(true, |k| k != "constructor")
+        if m.key_get(ts).map_or(true, |k| k != "then")
+            || m.key_get(cs).map_or(true, |k| k != "constructor")
         {
             return None;
         }
@@ -1350,7 +1382,7 @@ impl<'p> Vm<'p> {
             None => Some(true),
             Some((slot, getter, getter_version)) => {
                 let s = slot as usize;
-                if mc.keys.get(s).map_or(true, |k| k != "@@species") {
+                if mc.key_get(s).map_or(true, |k| k != "@@species") {
                     return None;
                 }
                 if mc.attr_at(s).accessor
@@ -1422,10 +1454,8 @@ impl<'p> Vm<'p> {
             _ => return false,
         };
         let (ts, cs) = (c.then_slot as usize, c.ctor_slot as usize);
-        if ts >= m.vals_len()
-            || cs >= m.vals_len()
-            || m.val_at(ts) != c.then_val
-            || m.val_at(cs) != c.ctor_val
+        if m.val_get(ts) != Some(c.then_val)
+            || m.val_get(cs) != Some(c.ctor_val)
             || m.is_accessor_at(ts)
             || m.is_accessor_at(cs)
         {
@@ -1441,8 +1471,7 @@ impl<'p> Vm<'p> {
                     _ => return false,
                 };
                 let s = slot as usize;
-                s < mc.vals_len()
-                    && mc.val_at(s) == c.species_val
+                mc.val_get(s) == Some(c.species_val)
                     && mc.is_accessor_at(s)
                     && self.heap.version_of(getter) == getter_version
             }
@@ -1723,7 +1752,7 @@ impl<'p> Vm<'p> {
         into: Option<u32>,
     ) -> u32 {
         let dep = into.unwrap_or_else(|| self.alloc_promise());
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 — `.then`
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 5 — `.then`
         // on an old promise with young callbacks / dependent.
         self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, on_f);
         self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, on_r);
@@ -2628,6 +2657,31 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// PromiseResolve(C, x), the body of `Promise.resolve` and of a normally
+    /// completing `Promise.try`: `x` itself when it is a promise whose
+    /// `constructor` is `C`, else a new promise of `C` resolved with `x`
+    /// (the native `Promise` takes the internal path; any other `C` runs
+    /// NewPromiseCapability and observably calls its resolve).
+    pub(crate) fn promise_resolve_with(&mut self, c: Value, x: Value) -> Result<Value, Thrown> {
+        let is_promise = x.is_heap() && matches!(self.heap.get(x.heap_index()), HeapObj::Promise { .. });
+        if c == self.promise_ctor_value() {
+            // Step 2: `x` is returned as is only when Get(x, "constructor")
+            // is C; a promise whose constructor was changed is adopted.
+            if is_promise && self.get_prop(x, "constructor")? != c {
+                let p = self.alloc_promise();
+                self.resolve_fresh_promise(p, x);
+                return Ok(Value::heap(p));
+            }
+            return Ok(Value::heap(self.to_promise(x)));
+        }
+        if is_promise && self.get_prop(x, "constructor")? == c {
+            return Ok(x);
+        }
+        let (promise, resolve, _) = self.new_promise_capability(c)?;
+        self.with_promise_operation_roots(&[promise, resolve], |vm| vm.call_value(resolve, Value::UNDEFINED, &[x]))?;
+        Ok(promise)
+    }
+
     /// `Promise.resolve` as an internal helper: a Promise passes through (identity
     /// preserved); any other value is wrapped in a fulfilled promise. The basis of
     /// awaiting a non-promise (`await 5` still yields a microtask tick).
@@ -3176,9 +3230,13 @@ impl<'p> Vm<'p> {
         // `Promise.all` of that width. The length is a hint and the entries
         // are still pushed one step at a time; it is bounded, so a huge array
         // does not reserve before the lane has looked at an element.
-        let expected = match (fast_pos, self.heap.get(iterable.heap_index())) {
-            (Some(_), HeapObj::Array(items)) => items.len().min(COMBINATOR_PRESIZE_MAX),
-            _ => 0,
+        // (The inline lane implies a heap Array; `Promise.all(0)` is neither.)
+        let expected = match fast_pos {
+            Some(_) => match self.heap.get(iterable.heap_index()) {
+                HeapObj::Array(items) => items.len().min(COMBINATOR_PRESIZE_MAX),
+                _ => 0,
+            },
+            None => 0,
         };
         let comb = self
             .heap
