@@ -97,6 +97,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("_eval", function!(eval, 2))?;
     module.define_singleton_method("_load", function!(load, 3))?;
     module.define_singleton_method("precompile", function!(precompile, 1))?;
+    module.define_singleton_method("prewarm", function!(prewarm, 0))?;
     module.define_singleton_method("compile_cache_stats", function!(compile_cache_stats, 0))?;
     module.define_singleton_method("_call", function!(call, 4))?;
     module.define_singleton_method("_set_script_name", function!(set_script_name, 2))?;

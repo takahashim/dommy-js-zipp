@@ -16,4 +16,15 @@ class Dommy::Js::TestCompileCache < Minitest::Test
   ensure
     rt&.dispose
   end
+
+  # prewarm covers both window models, whichever the process default is.
+  def test_after_prewarm_a_separate_window_runtime_compiles_nothing
+    Dommy::Js::Zipp.prewarm
+    before = ZippRb.compile_cache_stats
+    rt = Dommy::Js::Zipp::Runtime.new(unified_global: false)
+    assert_equal before[:misses], ZippRb.compile_cache_stats[:misses]
+    assert_equal 2, rt.evaluate("1 + 1")
+  ensure
+    rt&.dispose
+  end
 end

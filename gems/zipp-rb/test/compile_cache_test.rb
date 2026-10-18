@@ -36,6 +36,17 @@ class CompileCacheTest < Minitest::Test
     assert_equal 1, b.eval("bump()"), "a's calls leave b's globals alone"
   end
 
+  # ZippRb.prewarm compiles the helper define_function loads, so a VM's first
+  # definition hits the cache.
+  def test_prewarm_caches_the_host_function_helper
+    assert ZippRb.prewarm
+    before = ZippRb.compile_cache_stats
+    vm.define_function("prewarmed") { 1 }
+    after = ZippRb.compile_cache_stats
+    assert_equal 0, after[:misses] - before[:misses]
+    assert_equal 1, after[:hits] - before[:hits]
+  end
+
   def test_a_bridged_vm_loads_from_the_cache_too
     src = source("var viaHost = twice(21);")
     v = vm

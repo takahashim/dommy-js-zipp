@@ -295,6 +295,34 @@ class ZippRbTest < Minitest::Test
     vm.dispose
   end
 
+  # The helper define_function installs cannot be deleted or replaced by page
+  # script, so later definitions neither fail nor go to the page's function.
+  def test_page_script_cannot_take_over_define_function
+    vm = ZippRb::VM.new
+    vm.define_function("first") { 1 }
+    vm.eval(<<~JS)
+      globalThis.taken = [];
+      try { delete globalThis.__zippDefineHostFunction; } catch (e) {}
+      try { globalThis.__zippDefineHostFunction = function (path) { taken.push(path); }; } catch (e) {}
+    JS
+    vm.define_function("second") { 2 }
+    assert_equal [1, 2, 0], vm.eval("[first(), second(), taken.length]")
+  ensure
+    vm.dispose
+  end
+
+  # A definition that fails (a global that cannot take new properties) keeps
+  # no proc rooted for it.
+  def test_a_failed_definition_drops_its_proc
+    vm = ZippRb::VM.new
+    vm.eval("Object.preventExtensions(globalThis)")
+    before = ZippRb::CALLBACKS.size
+    assert_raises(RuntimeError) { vm.define_function("nowhere") { 1 } }
+    assert_equal before, ZippRb::CALLBACKS.size
+  ensure
+    vm.dispose
+  end
+
   def test_memory_usage
     vm = ZippRb::VM.new
     vm.load("var big = []; for (let i = 0; i < 1000; i++) big.push({ i: i });")

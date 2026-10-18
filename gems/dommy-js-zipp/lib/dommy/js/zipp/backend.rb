@@ -49,6 +49,10 @@ module Dommy
         JS
         private_constant :BOOT_JS
 
+        # Compile BOOT_JS into zipp-rb's process-wide compile cache (see
+        # Zipp.prewarm).
+        def self.prewarm = ::ZippRb.precompile(BOOT_JS)
+
         def initialize(timeout_msec: Config.timeout_msec, memory_limit: Config.memory_limit,
                        time_zone: Config.time_zone, **vm_opts)
           @vm = ::ZippRb::VM.new(timeout_msec: timeout_msec, memory_limit: memory_limit, **vm_opts)

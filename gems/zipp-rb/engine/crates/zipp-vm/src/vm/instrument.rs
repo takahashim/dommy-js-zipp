@@ -1042,13 +1042,12 @@ impl super::Vm<'_> {
             .saturating_add(rec.external_bytes_admitted[1].get())
     }
 
-    /// Derive one regex search's hard ceilings. The fixed ceilings stop
-    /// catastrophic backtracking even when the host left its VM budgets
-    /// unlimited; finite VM budgets tighten them so transient backtrack
-    /// storage cannot hide outside `heap_bytes()` and regex work cannot spend
-    /// more gas than remains.
+    /// A search's memory allowance before the heap's headroom caps it: the
+    /// fixed sandbox allowance, less what an enclosing regex operation holds.
+    /// (Split out of `instrument_regex_limits` so an exhaustion can tell
+    /// whether the headroom or this allowance was the cap it hit.)
     #[cfg(feature = "safe-sandbox")]
-    pub(crate) fn instrument_regex_limits(&self) -> regress::MatchLimits {
+    fn regex_fixed_limits(&self) -> regress::MatchLimits {
         use std::sync::atomic::Ordering;
 
         let mut limits = regress::MatchLimits::SANDBOX;
@@ -1058,11 +1057,25 @@ impl super::Vm<'_> {
         // bounded even when the embedder left its heap limit unlimited.
         let transient = self.regex_transient_bytes.load(Ordering::Relaxed);
         // A subject buffer kept between execs is not this search's storage:
-        // it counts against the heap headroom below, not the fixed allowance.
+        // it counts against the heap headroom, not the fixed allowance.
         limits.max_memory_bytes = limits
             .max_memory_bytes
             .saturating_sub(transient.saturating_sub(self.regex_kept_subject_bytes()));
         limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
+        limits
+    }
+
+    /// Derive one regex search's hard ceilings. The fixed ceilings stop
+    /// catastrophic backtracking even when the host left its VM budgets
+    /// unlimited; finite VM budgets tighten them so transient backtrack
+    /// storage cannot hide outside `heap_bytes()` and regex work cannot spend
+    /// more gas than remains.
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn instrument_regex_limits(&self) -> regress::MatchLimits {
+        use std::sync::atomic::Ordering;
+
+        let mut limits = self.regex_fixed_limits();
+        let transient = self.regex_transient_bytes.load(Ordering::Relaxed);
         let hot = self.meter_hot();
         let Some(rec) = self.instr_rec.as_ref() else {
             return limits;
@@ -1230,14 +1243,14 @@ impl super::Vm<'_> {
     pub(crate) fn instrument_regex_memory_exhausted(&mut self) -> &'static str {
         // `instrument_regex_limits` caps a search's storage at the heap's
         // headroom as well as at the regex's own fixed allowance. When the
-        // headroom was the tighter of the two, the heap is what ran out (a
-        // linear regex in a script that filled its heap is no runaway): report
-        // the heap budget, as the allocation that crossed it would have.
-        let heap_bound = self.instr_rec.as_ref().is_some_and(|rec| {
-            rec.heap_limit != usize::MAX
-                && rec.heap_limit.saturating_sub(self.heap_bytes_estimate())
-                    < regress::MatchLimits::SANDBOX.max_backtrack_bytes
-        });
+        // headroom was the tighter of the two (for either the search's memory
+        // or its backtrack stack), the heap is what ran out (a linear regex in
+        // a script that filled its heap is no runaway): report the heap
+        // budget, as the allocation that crossed it would have.
+        let fixed = self.regex_fixed_limits();
+        let applied = self.instrument_regex_limits();
+        let heap_bound = applied.max_memory_bytes < fixed.max_memory_bytes
+            || applied.max_backtrack_bytes < fixed.max_backtrack_bytes;
         let cause = if heap_bound {
             ResourceExhaustion::Heap
         } else {

@@ -44,6 +44,8 @@ module ZippRb
   #   ZippRb.precompile(src)     # compile +src+ into the cache without a VM;
   #                              # false when it does not compile. Call it
   #                              # before forking so workers share the result.
+  #   ZippRb.prewarm             # likewise for the binding's own scripts
+  #                              # (the helper define_function installs)
   #   ZippRb.compile_cache_stats # {entries:, bytes:, hits:, misses:}
   #
   # Entries are keyed by source and bounded by total source bytes.
