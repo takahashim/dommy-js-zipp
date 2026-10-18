@@ -90,3 +90,8 @@ the WPT corpus live in `test/fixtures` (`script/` rebuilds them). Capybara's
 compliance suite still fails where capybara-dommy lacks a feature (geometry,
 drag and drop), a page needs a server (puma) or loads a library from a CDN;
 Stimulus's three ApplicationStartTests need per-iframe realms.
+
+## License
+
+MIT (`LICENSE.txt`). The Zipp engine it runs on comes with zipp-rb, under
+its own licenses (see zipp-rb's `NOTICE`).

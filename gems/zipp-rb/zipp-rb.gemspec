@@ -16,13 +16,17 @@ Gem::Specification.new do |spec|
   DESC
   spec.homepage = "https://github.com/takahashim/dommy-js-zipp/tree/main/gems/zipp-rb"
   spec.metadata["source_code_uri"] = spec.homepage
-  spec.license = "MIT"
+  # All three apply, to different parts: zipp-rb's own code is MIT, the
+  # engine sources it ships are Apache-2.0 (regress-fork: MIT or Apache-2.0),
+  # and the engine's Unicode data is Unicode-3.0. See NOTICE. (RubyGems takes
+  # no SPDX `AND` expression, so they are listed.)
+  spec.licenses = ["MIT", "Apache-2.0", "Unicode-3.0"]
   spec.required_ruby_version = ">= 3.2.0"
 
   # The engine sources ship with the gem so the extension builds anywhere; its
   # Rust test suites and build output do not. A compiled extension left in
   # lib/ by `rake compile` is platform-specific and is rebuilt on install.
-  spec.files = Dir.glob(%w[lib/**/* ext/**/* engine/**/* README.md], base: __dir__)
+  spec.files = Dir.glob(%w[lib/**/* ext/**/* engine/**/* README.md LICENSE.txt NOTICE], base: __dir__)
                  .select { |f| File.file?(File.join(__dir__, f)) }
                  .reject { |f| f.match?(%r{\Aengine/crates/[^/]+/tests/|(\A|/)target/}) }
                  .reject { |f| f.match?(/\.(bundle|so|dll)\z/) }

@@ -59,3 +59,12 @@ Other API: `VM#load` (run for side effects), `#eval_async` (top-level
 named by URL) or `#set_module_provider`, and `#import`, `#on_log`
 (quickjs.rb's severities), `#on_unhandled_rejection`,
 `#promise_rejection_hook=`, `#drain_jobs!`, `#gc!`, `#memory_usage`.
+
+## License
+
+zipp-rb's own code is under the MIT License (`LICENSE.txt`). The gem also
+ships the Zipp engine's sources under `engine/`: Apache-2.0
+(`engine/LICENSE-APACHE`), with its regex engine also available under MIT,
+and Unicode data under the Unicode License v3 (`engine/LICENSE-UNICODE`).
+The engine is modified from upstream as `engine/LOCAL_CHANGES.md` describes.
+See `NOTICE`.
