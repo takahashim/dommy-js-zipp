@@ -70,6 +70,7 @@ impl Compiler {
             hoisted_set: rustc_hash::FxHashSet::default(),
             source,
             eval_mode: false,
+            script_completion: false,
             eval_inherit_super: None,
             in_field_init: false,
             module_mode: false,
@@ -322,7 +323,8 @@ impl Compiler {
         // loop body — which alone demoted such loops off the INT register
         // tier (3× on the isolated nest). Eval scripts keep it: `eval()`'s
         // RESULT is the completion value.
-        let eval_completion = is_script && self.eval_mode && !self.module_mode;
+        let eval_completion =
+            is_script && (self.eval_mode || self.script_completion) && !self.module_mode;
         // A real function body leaves any enclosing field-initializer context
         // (the eval ROOT script keeps it: PerformEval's ContainsArguments check
         // spans the eval program's top level and its arrows).
@@ -951,7 +953,7 @@ impl Compiler {
             }
             // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
             for name in &crate::compile::helpers::sorted_name_vec(&lex) {
-                if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                if !fc.scopes[0].binds(name) {
                     let r = fc.alloc_reg();
                     fc.scopes[0].push((name.clone(), r));
                     fc.emit(Instr::MakeCellTdz { reg: r });
@@ -981,9 +983,24 @@ impl Compiler {
             // (2) the with-chain's static fallback must resolve a `var`
             // textually after the `with` (unscopables-with); (3) `for (var k
             // in …)` heads resolve the hoisted binding instead of minting one.
+            // More declared names than the register file can hold: the plain
+            // locals past `SPILL_KEEP_REGS` go to a spill vector made here.
+            // (A `with` resolves names dynamically through registers; such a
+            // function keeps the old limit.)
+            if !fc.box_all_locals {
+                let (declared, has_with) = declared_binding_count(body);
+                if declared > super::scopes::SPILL_TRIGGER && !has_with {
+                    fc.start_spill();
+                }
+            }
             for name in &sorted_name_vec(&hv) {
-                if !fc.scopes[0].iter().any(|(n, _)| n == name) {
-                    fc.declare_local(name); // boxes a cell if captured (undefined)
+                if !fc.scopes[0].binds(name) {
+                    if fc.spills(name) {
+                        // The vector starts undefined, as a register does.
+                        fc.declare_spill(name);
+                    } else {
+                        fc.declare_local(name); // boxes a cell if captured (undefined)
+                    }
                 }
             }
             // FunctionDeclarationInstantiation with parameter EXPRESSIONS (a
@@ -1402,7 +1419,7 @@ impl Compiler {
         // Hoisted declarations must capture the method/constructor's own
         // bindings even when their textual declarations appear later.
         for local in hoisted_var_names(body) {
-            if !fc.scopes[0].iter().any(|(n, _)| n == &local) {
+            if !fc.scopes[0].binds(&local) {
                 fc.declare_local(&local);
             }
         }
@@ -1625,7 +1642,7 @@ impl Compiler {
                         collect_hoisted_vars(s, &mut hv);
                     }
                     for name in &sorted_name_vec(&hv) {
-                        if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                        if !fc.scopes[0].binds(name) {
                             fc.declare_local(name);
                         }
                     }
@@ -1691,7 +1708,7 @@ impl Compiler {
                             || fc.captured.contains(name)
                             || fc.box_all_locals
                             || early_cell.contains(name);
-                        if needs_cell && !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                        if needs_cell && !fc.scopes[0].binds(name) {
                             let r = fc.alloc_reg();
                             fc.scopes[0].push((name.clone(), r));
                             fc.emit(Instr::MakeCellTdz { reg: r });
@@ -1908,11 +1925,10 @@ impl<'a> FnCompiler<'a> {
             if name == "arguments" || !seen.contains(name) {
                 continue;
             }
+            // A parameter: always a register, never spilled.
             let Some(preg) = self.scopes[0]
-                .iter()
-                .rev()
-                .find(|(n, _)| n == name)
-                .map(|(_, r)| *r)
+                .slot_of(name)
+                .and_then(super::scopes::Slot::reg)
             else {
                 continue;
             };
@@ -1988,7 +2004,7 @@ impl<'a> FnCompiler<'a> {
                 || self.box_all_locals
                 || forward.contains(name)
                 || matches!(name.as_str(), "undefined" | "NaN" | "Infinity"))
-                && !self.scopes[0].iter().any(|(n, _)| n == name)
+                && !self.scopes[0].binds(name)
             {
                 // Box a TDZ cell: a read before the textual declaration runs
                 // (e.g. via a forward-materialised function) throws a

@@ -165,6 +165,10 @@ struct Compiler {
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
     eval_mode: bool,
+    /// True when compiling a SCRIPT whose top level hands back its completion
+    /// value as an eval does, with script (not eval) semantics otherwise:
+    /// `$262.evalScript`, whose result is ScriptEvaluation's.
+    script_completion: bool,
     /// Set for a DIRECT eval from a class-member context: the eval's top-level
     /// script (and its arrows) inherits the caller's home class for `super`
     /// (compiled against the u32::MAX sentinel).
@@ -455,8 +459,19 @@ struct FnCompiler<'a> {
     /// `string_constants` indices holding the lone-surrogate MARKER form
     /// (see `Function::wtf8_consts`).
     wtf8_consts: Vec<u32>,
-    /// Lexical scope chain: each entry is (name, register).
-    scopes: Vec<Vec<(String, Reg)>>,
+    /// Lexical scope chain: each entry is (name, slot).
+    scopes: Vec<scopes::ScopeBindings>,
+    /// A function with more declared names than the register file can hold
+    /// keeps the plain ones past `SPILL_KEEP_REGS` in a spill vector
+    /// (`Instr::NewSpill`), held in this register from the body's entry.
+    /// `None` in every other function, whose bytecode is unchanged.
+    spill_reg: Option<Reg>,
+    /// Spill slots handed out (the vector's length, patched into the
+    /// `NewSpill` at `spill_new_at` when the function is finalised).
+    spill_count: u32,
+    spill_new_at: Option<usize>,
+    /// Spill slots of `const` bindings: an assignment to one is a TypeError.
+    const_spills: HashSet<u32>,
     /// Parallel to `scopes` (same length, same indices): the lexically-declared
     /// names of each BLOCK-like scope, recorded at block ENTRY.
     ///
@@ -569,6 +584,15 @@ struct FnCompiler<'a> {
     /// (not globals), mirroring the simple-identifier `let`/`const` path — block
     /// `let {a} = …` must not leak to the global scope. Off everywhere else.
     pattern_block_local: bool,
+    /// The global slots of a top-level lexical destructuring declaration's
+    /// leaves, set around its extraction: each leaf's store is the binding's
+    /// initialization (`StoreGlobal`, as `const x = 1` emits), not an
+    /// assignment, and leaves the set once made. Empty everywhere else.
+    pattern_init_globals: std::collections::HashSet<u32>,
+    /// The `+` nodes (keyed by their left operand's address) that lie on a
+    /// spine `binary` already searched and found to hold no string producer,
+    /// so its concat-chain fusion test is not repeated down the spine.
+    plain_add_spines: rustc_hash::FxHashSet<usize>,
     /// True while compiling a `function*` body, so `yield` is allowed.
     in_generator: bool,
     /// True while compiling an `async` body, so `await` is allowed.
@@ -841,6 +865,9 @@ enum Binding {
     /// Local that has been boxed into a heap cell because a nested function
     /// captures it; the register holds the cell reference.
     LocalCell(Reg),
+    /// A local kept in slot `idx` of the function's spill vector: a function
+    /// with more locals than the register file addresses (`Slot::Spill`).
+    Spill(u32),
     /// A variable captured from an enclosing function: index into this
     /// function's upvalue list.
     Upvalue(u16),
@@ -869,5 +896,6 @@ mod typeof_alias;
 mod with_stmt;
 
 pub(crate) use entry::*;
+pub(crate) use scopes::Slot;
 pub(crate) use helpers::*;
 pub(crate) use string_accum::*;

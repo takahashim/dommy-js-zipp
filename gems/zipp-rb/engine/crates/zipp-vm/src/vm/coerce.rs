@@ -1307,7 +1307,14 @@ impl<'p> Vm<'p> {
                     match self.heap.as_callable(v.heap_index()) {
                         Some((fid, _)) => {
                             let fp = self.func(fid as usize);
-                            !(fp.is_generator || fp.is_async || fp.non_constructable)
+                            // Every arrow is compiled `non_constructable`;
+                            // `lexical_this` repeats the flat construct
+                            // path's own test (`flat_new_instance`), so the
+                            // two cannot drift apart.
+                            !(fp.is_generator
+                                || fp.is_async
+                                || fp.non_constructable
+                                || fp.lexical_this)
                         }
                         None => true,
                     }

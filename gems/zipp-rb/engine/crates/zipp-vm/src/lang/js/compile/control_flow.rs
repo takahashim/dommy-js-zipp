@@ -199,16 +199,14 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
-    /// Look up an in-scope local's register (innermost scope first), if any.
+    /// Look up an in-scope local's register (innermost scope first), if any:
+    /// `None` too when the innermost binding is a spill slot.
     pub(crate) fn local_reg(&self, name: &str) -> Option<Reg> {
-        for scope in self.scopes.iter().rev() {
-            for (n, r) in scope.iter().rev() {
-                if n == name {
-                    return Some(*r);
-                }
-            }
-        }
-        None
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.slot_of(name))
+            .and_then(super::scopes::Slot::reg)
     }
 
     /// The registers of a declaration's bindings that are cell-boxed (captured by
@@ -503,7 +501,7 @@ impl<'a> FnCompiler<'a> {
                 if (fc.captured.contains(name)
                     || early.contains(name)
                     || matches!(name, "undefined" | "NaN" | "Infinity"))
-                    && !fc.scopes.last().unwrap().iter().any(|(n, _)| n == name)
+                    && !fc.scopes.last().unwrap().binds(name)
                 {
                     let r = fc.alloc_reg();
                     fc.scopes.last_mut().unwrap().push((name.to_string(), r));
@@ -1002,8 +1000,8 @@ impl<'a> FnCompiler<'a> {
             .scopes
             .last()
             .unwrap()
-            .iter()
-            .map(|(_, r)| *r)
+            .regs()
+            .map(|(_, r)| r)
             .filter(|r| self.block_tdz_cells.contains(r))
             .collect();
 

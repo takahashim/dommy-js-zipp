@@ -341,6 +341,8 @@ impl<'p> Vm<'p> {
             matchall_flat_scratch: Vec::new(),
             regex_subject_units: None,
             #[cfg(feature = "safe-sandbox")]
+            sandbox_caps: crate::vm::host_api::SandboxCaps::DEFAULT,
+            #[cfg(feature = "safe-sandbox")]
             regex_transient_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             regexp_scalar_exec_pending: None,
@@ -1097,6 +1099,11 @@ impl<'p> Vm<'p> {
         // Whatever was set on the recorder before it was installed decides
         // whether the dispatch hook may take its short path.
         rec.refresh_slow();
+        // A heap the replaced budget left at its ceiling is still there:
+        // the next `set_heap_limit` collects it (f2i-com/zipp.org#73).
+        if let Some(old) = self.instr_rec.as_ref() {
+            rec.heap_ceiling_reached |= old.heap_ceiling_reached();
+        }
         self.instr_rec = Some(Box::new(rec));
         // The new recorder's own countdown is the whole of it: the next step
         // takes the hook's slow path, which schedules the first countdown.
