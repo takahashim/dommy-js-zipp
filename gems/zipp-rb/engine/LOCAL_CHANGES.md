@@ -158,7 +158,8 @@ candidate to propose upstream.
 
 ## Correctness (crates/zipp-vm/src)
 
-- **A top-level `const` destructuring initializes its globals** —
+- **A top-level `const` destructuring initializes its globals** (upstream too:
+  `$262.evalScript` throws the same, so it is not only `load_in_context`'s) —
   `var_decl` (lang/js/compile/decls.rs) pre-initialized a script's destructured
   leaves to undefined (strict stores need the TDZ over), which made the
   extraction a const's second write under script GDI (`const {a} = o` threw
