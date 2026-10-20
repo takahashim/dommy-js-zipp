@@ -344,7 +344,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "zipp-numparse"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-vm"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "memchr",
  "num-bigint",

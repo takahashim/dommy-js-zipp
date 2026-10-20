@@ -111,45 +111,19 @@ candidate to propose upstream.
 
 - **Run deadline** — `Recorder::deadline`, `ScriptState::set_deadline`. Every
   abort-flag poll goes through `Recorder::abort_requested()` (flag OR passed
-  deadline). zipp-rb's `timeout_msec` uses this instead of a timer thread.
-- **Metered fast path with an abort flag or a deadline** — upstream's
-  step countdown (`Recorder::countdown`, `schedule`) counts an abort flag as
-  a slow state (`refresh_slow`), so every instruction takes the full path
-  while one is set, and zipp-rb always sets one (`arm_limits`): a tight loop
-  cost about 1.8x its unlimited time. Here neither the flag nor a deadline
-  is a slow state; `schedule` ends the countdown on the
-  `ABORT_CHECK_MASK` stride while either is set, and the full path polls
-  them there (`Vm::instrument_poll`), then the heap on its own stride.
-  `set_deadline` settles the countdown so the stride takes effect at once.
-
-## Safe profile (crates/zipp-vm/src/vm/typedarray.rs, vm/setup.rs)
-
-zipp-rb builds the engine with `safe-sandbox` (`forbid(unsafe_code)` in
-zipp-vm, `prohibit-unsafe` in the regex engine). Upstream's profile drops
-`SharedArrayBuffer` and `Atomics` from the global, as truly-shared bytes need
-`unsafe`; pages and WPT's `common/sab.js` (through dommy-js-zipp's
-`WebAssembly.Memory({shared: true})` stub) want them.
-
-- **Agent-local SharedArrayBuffer** — under `safe-sandbox`,
-  `alloc_shared_array_buffer` gives a SharedArrayBuffer `AbData::Local` bytes
-  instead of an `Arc<SharedMem>`, and both globals stay installed. The brand
-  (`shared_buffers`), growth (`ab_max`, `AbData::grow_bytes`) and Atomics
-  already handle local bytes; with one agent (no `$262.agent` workers) the
-  difference is unobservable, except that `$262.agent.broadcast` refuses such
-  a buffer and a sync `Atomics.wait` on an equal value returns "timed-out" at
-  once instead of sleeping out its timeout (no other agent could wake it).
-  Test: `test/engine_fixes_test.rb`.
-
+  deadline), and `Recorder::schedule` ends the step countdown on the
+  `ABORT_CHECK_MASK` stride while a deadline is set, as upstream does for an
+  abort flag (f2i-com/zipp.org#62); `set_deadline` settles the countdown so
+  that stride applies at once. zipp-rb's `timeout_msec` uses this instead of
+  a timer thread. Test: `deadline_stops_execution_like_abort`.
 - **A full heap is reported as the heap budget from a regex too**
-  (vm/instrument.rs `instrument_regex_memory_exhausted`) — a search's
-  storage is capped at the heap's headroom as well as at the regex's fixed
-  allowance, so in a script that filled its heap a linear regex was the
-  first to fail, as "regular expression exceeded its backtrack memory
-  budget". When the headroom is the tighter cap, the exhaustion is recorded
-  as the heap's. A build without the JIT's slot mirrors (upstream d2886b1)
-  can cross its ceiling between audits (smaller slot tables delay
-  `slot_table_growth_reserve`), which is how the regex came to see no
-  headroom at all. Test: `test/limits_test.rb`.
+  (`instrument_regex_memory_exhausted`, `regex_fixed_limits`) — a search's
+  storage (its memory and its backtrack stack) is capped at the heap's
+  headroom as well as at the regex's fixed allowance, so in a script that
+  filled its heap a linear regex was the first to fail, as "regular
+  expression exceeded its backtrack memory budget". When the headroom was the
+  tighter cap for either figure, the exhaustion is recorded as the heap's.
+  Test: `test/limits_test.rb`.
 
 ## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, lang/js/compile/*, vm/dispatch.rs)
 
