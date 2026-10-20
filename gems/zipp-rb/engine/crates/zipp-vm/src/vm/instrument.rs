@@ -302,9 +302,6 @@ const ABORT_CHECK_MASK: u64 = 0xFFF;
 /// cheap abort poll. New objects and known large buffers are charged eagerly;
 /// this audit catches capacity growth of already-existing collections.
 const HEAP_AUDIT_MASK: u64 = 0xFFFF;
-// The metered fast path tests ABORT_CHECK_MASK alone before a heap poll.
-#[cfg(not(feature = "meter-only"))]
-const _: () = assert!(HEAP_AUDIT_MASK & ABORT_CHECK_MASK == ABORT_CHECK_MASK);
 
 /// Host re-entries between forced full heap audits in the postflight. The
 /// interpreter reconciles on a tick stride; a host that re-enters without
@@ -619,7 +616,12 @@ impl Recorder {
     }
 
     /// Recompute [`Self::slow`] from the fields it summarises. A slow state
-    /// stops the countdown, so the very next step takes the full path.
+    /// stops the countdown, so the very next step takes the full path. An
+    /// abort flag is not one: it is read only every `ABORT_CHECK_MASK + 1`
+    /// ticks, so [`Self::schedule`] ends the countdown on that stride instead
+    /// and the full path polls it there. (As a slow state it sent every
+    /// instruction down the full path, about five times slower, for any host
+    /// that installs a flag for cooperative cancellation.)
     #[inline]
     pub(crate) fn refresh_slow(&mut self) {
         #[cfg(not(feature = "meter-only"))]
@@ -685,16 +687,18 @@ impl Recorder {
 
     /// After a full-path step: how many steps may follow on the countdown.
     /// None while a slow state holds. Otherwise up to the step before the
-    /// next heap poll (`ticks & HEAP_AUDIT_MASK == 0`, which the full path
-    /// runs) and no more than a finite budget's remaining steps, so the step
-    /// that finds it empty is a full-path step too, exactly as before.
+    /// next poll the full path runs (`ticks & HEAP_AUDIT_MASK == 0`, or with
+    /// an abort flag installed `ticks & ABORT_CHECK_MASK == 0`; the abort
+    /// stride divides the heap one, so every heap poll is still reached) and
+    /// no more than a finite budget's remaining steps, so the step that finds
+    /// it empty is a full-path step too, exactly as before.
     #[cfg(not(feature = "meter-only"))]
     #[inline]
     fn schedule(&mut self) {
         let mut steps = 0;
         if !self.slow {
-            // The full path polls the abort flag and the deadline on the
-            // ABORT_CHECK_MASK stride and the heap on HEAP_AUDIT_MASK's.
+            // A deadline (local: `set_deadline`) is polled where the abort
+            // flag is, so it stops the countdown on the same stride.
             let stride = if self.abort.is_some() || self.deadline.is_some() {
                 ABORT_CHECK_MASK
             } else {
@@ -2141,28 +2145,15 @@ impl super::Vm<'_> {
             return Ok(());
         };
         rec.ticks = rec.ticks.wrapping_add(1);
-        // HEAP_AUDIT_MASK's low bits include ABORT_CHECK_MASK's, so one test
-        // guards both polls.
-        if rec.ticks & ABORT_CHECK_MASK == 0 {
-            return self.instrument_poll();
-        }
-        Ok(())
-    }
-
-    /// The periodic polls of the metered fast path: the abort flag and the
-    /// deadline, then (on its own stride) the heap reconciliation. The same
-    /// order as `instrument_step_slow`.
-    #[cfg(not(feature = "meter-only"))]
-    #[cold]
-    #[inline(never)]
-    fn instrument_poll(&mut self) -> Tick {
-        let Some(rec) = rec_mut!(self) else {
-            return Ok(());
-        };
-        if rec.abort_requested() {
+        // The abort poll, on the stride `schedule` stops the countdown at
+        // while a flag or a deadline is installed; before the heap poll, as on
+        // the slow path. `abort_requested` reads the flag and the deadline.
+        if rec.ticks & ABORT_CHECK_MASK == 0 && rec.abort_requested() {
             return Err(rec.exhaust(ResourceExhaustion::Abort));
         }
-        if rec.ticks & HEAP_AUDIT_MASK == 0 {
+        let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
+
+        if heap_poll {
             self.instrument_heap_poll()?;
         }
         Ok(())
@@ -3445,6 +3436,48 @@ mod tests {
         rec.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
         early.set_instrumentation(rec);
         early.run().expect("a run that ends before its deadline completes");
+    }
+
+    /// An installed abort flag is read every `ABORT_CHECK_MASK + 1` ticks, so
+    /// it must not make the recorder slow (that sent every instruction down the
+    /// full path, about five times slower): the countdown runs to the next
+    /// abort boundary instead of the next heap poll.
+    #[cfg(not(feature = "meter-only"))]
+    #[test]
+    fn abort_flag_keeps_the_countdown() {
+        let mut rec = Recorder::new();
+        rec.abort = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        rec.refresh_slow();
+        assert!(!rec.slow, "an abort flag alone is not a slow state");
+        rec.ticks = 100;
+        rec.schedule();
+        assert_eq!(rec.countdown, (ABORT_CHECK_MASK - 100) as i64);
+        rec.abort = None;
+        rec.refresh_slow();
+        rec.ticks = 100;
+        rec.schedule();
+        assert_eq!(rec.countdown, (HEAP_AUDIT_MASK - 100) as i64);
+    }
+
+    /// The flag still stops a running program when it is set from another
+    /// thread while the interpreter is on the countdown.
+    #[cfg(not(feature = "meter-only"))]
+    #[test]
+    fn abort_flag_set_mid_run_stops_the_countdown() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut vm = crate::vm::Vm::new(program("var s = 0; while (true) { s = (s + 1) | 0; }"));
+        let mut rec = Recorder::new();
+        rec.abort = Some(flag.clone());
+        rec.refresh_slow();
+        vm.set_instrumentation(rec);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        vm.run().expect_err("the abort flag stops an endless loop");
+        setter.join().unwrap();
+        assert_eq!(vm.instr_rec.as_ref().unwrap().exhaustion, Some(ResourceExhaustion::Abort));
+        assert_eq!(vm.instrument_resource_limit_error(), Some(ABORT_MSG));
     }
 
     #[test]

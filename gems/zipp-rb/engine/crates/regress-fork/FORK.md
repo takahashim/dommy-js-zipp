@@ -289,6 +289,65 @@ ZIPP's JavaScript lexer calls them instead of linking a crate of its own for
 the same two properties, so a module carries each property once and the
 lexer, the regex properties and group names are on one Unicode version.
 
+## Alternation is a shallow tree, with no limit on alternatives (issue #57)
+
+Upstream builds `a|b|c|…` as a right spine, `Alt(a, Alt(b, Alt(c, …)))`, and
+the optimizer's IR walks (`ir::walk_mut`, `contains_capture_groups`, the
+start predicate, `Drop`) recurse down it. A spine is as deep as the
+alternation is long: a 5,000-word list overflowed a 1 MiB stack, 10,000 words
+a 2 MiB one. The hardened profile had already switched to a balanced tree,
+but kept a limit of 64 alternatives from before it did, so keyword lists and
+tokenizers were SyntaxErrors there.
+
+- `src/parse.rs`: `make_alt` folds each run of `ALT_SPINE_LEAVES` consecutive
+  alternatives into a right spine and joins the spines in a balanced tree,
+  keeping their order (the leftmost alternative that leads to a match still
+  wins). The ordinary profile uses 64, so an alternation of up to 64 is the
+  upstream tree, instruction for instruction and step for step; the hardened
+  profile uses 1, the fully balanced tree it already had. The limit on
+  alternatives is gone in both: the depth is at most 64 + log2(n).
+- `src/optimizer.rs`: `propagate_early_fails` asked `contains_capture_groups`
+  of every node before looking for anything to replace, walking the whole
+  subtree each time, so the pass was quadratic in the depth of the tree
+  (20,000 alternatives took 682 ms). It now asks only when it has found an
+  always-failing child, with the same answers.
+- `tests/compile_limits.rs`: 65 to 50,000 alternatives, their order, capture
+  numbering across them, and a 1 MiB stack.
+
+## Unrolling is budgeted, and a program can be capped while it is emitted (issue #58)
+
+`unroll_loops` (upstream) replaces a loop with a minimum of one to five by
+that many copies of its body and the loop, and a loop unrolled inside
+another is copied again with every copy of the enclosing body. The program
+grew by `min + 1` per level of nesting: 20 levels of `(?:…|)+` took 2 s to
+compile, 31 levels never finished, and the copies took the loop count past
+the 65,535 that the emitter's 16-bit loop ids number. With overflow checks
+(the hardened build) that was a panic at `next_loop_id += 1`; without them,
+two loops shared one id's iteration state. The empty alternative played no
+part: `(?:(?:a)+)+…` doubled the same way, and `{5}` grew five times per
+level.
+
+- `src/optimizer.rs`: an `UnrollBudget` per regex. The copies may cost at
+  most 1,024 nodes plus five times the regex's own size (a bracket counts its
+  intervals too, since the copy clones its set), which every regex without
+  nested unrolled loops fits, and may add only the loops the 16-bit ids have
+  left. A loop the budget cannot pay for stays a loop: rolled and unrolled
+  match the same way. The program is now linear in the pattern.
+- `src/emit.rs`: `emit_limited` counts the bytes it emits, by length, the way
+  `CompiledRegex::resident_bytes` counts them by capacity, and stops with
+  `EmitError::ProgramTooLarge` once over its limit; a loop id that would wrap
+  is `EmitError::TooManyLoops` (reported as "Loop count limit exceeded")
+  instead of an overflow.
+- `src/api.rs`: `CompileLimits`, `CompileError`, `Regex::from_unicode_with_limits`
+  and `from_unicode_byteopt_with_limits`. ZIPP passes its compiled-program
+  cap, so an oversized program fails as soon as it outgrows the cap rather
+  than after it is finished; the count is a lower bound, so nothing the
+  VM's own check would accept is refused.
+- `tests/compile_limits.rs`: program size linear in the depth for seven
+  nested families, the 31-deep pattern from quickjs-ng#1221, loops that match
+  empty against Node, programs unrolled in full and part-way against
+  unoptimized ones, loop ids, and the limit.
+
 ## Removed: the PikeVM backend
 
 Upstream ships a second, PikeVM-style executor (`src/pikevm.rs`, feature
