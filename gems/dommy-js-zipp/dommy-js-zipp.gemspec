@@ -24,5 +24,5 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "zipp-rb", "~> 0.1"
-  spec.add_dependency "dommy", ">= 0.16.0", "< 0.17"
+  spec.add_dependency "dommy", ">= 0.16.0", "< 0.18"
 end
