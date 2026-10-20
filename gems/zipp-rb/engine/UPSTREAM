@@ -1,3 +1,3 @@
 repository: https://github.com/f2i-com/zipp.org
-commit: 9ed70441287e572c59d5229f86cf5b4e5d34848b
+commit: b9f618ae13c697dd7a563ef5c2dabe0f97385372
 crates: zipp-vm regress-fork zipp-numparse

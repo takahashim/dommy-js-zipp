@@ -116,15 +116,6 @@ candidate to propose upstream.
   abort flag (f2i-com/zipp.org#62); `set_deadline` settles the countdown so
   that stride applies at once. zipp-rb's `timeout_msec` uses this instead of
   a timer thread. Test: `deadline_stops_execution_like_abort`.
-- **A full heap is reported as the heap budget from a regex too**
-  (`instrument_regex_memory_exhausted`, `regex_fixed_limits`) — a search's
-  storage (its memory and its backtrack stack) is capped at the heap's
-  headroom as well as at the regex's fixed allowance, so in a script that
-  filled its heap a linear regex was the first to fail, as "regular
-  expression exceeded its backtrack memory budget". When the headroom was the
-  tighter cap for either figure, the exhaustion is recorded as the heap's.
-  Test: `test/limits_test.rb`.
-
 ## Memory (crates/zipp-vm/src/heap.rs, capture/value.rs, lang/js/compile/*, vm/dispatch.rs)
 
 - **Unwritten captured bindings are captured by value** — a captured
@@ -147,35 +138,12 @@ candidate to propose upstream.
   548MB → 326MB. Tests: vm/gc.rs `value_capture_tests`, heap.rs,
   `test/engine_fixes_test.rb`.
 
-## Performance (crates/zipp-vm/src/lang/js/parse/parser.rs, lang/js/compile/*)
-
-- **Scope lookups indexed** — parser `Scope` gains `lex_all` / `lex_nonfn` /
-  `var_all` sets; the compiler keeps `scope_index` (name → register per scope)
-  beside `scopes`, used by `resolve`, `resolve_existing`, declaration checks,
-  `with_obj_regs` and `bound_anywhere`. Fixes O(n²) compile time in the number
-  of locals of one function (6400 `var`s: 173 ms → 13 ms). Behaviour-neutral;
-  if upstream rewrites scope handling, re-measure before re-porting.
-
 ## Correctness (crates/zipp-vm/src)
 
-- **A top-level `const` destructuring initializes its globals** (upstream too:
-  `$262.evalScript` throws the same, so it is not only `load_in_context`'s) —
-  `var_decl` (lang/js/compile/decls.rs) pre-initialized a script's destructured
-  leaves to undefined (strict stores need the TDZ over), which made the
-  extraction a const's second write under script GDI (`const {a} = o` threw
-  "Assignment to constant variable"). A global const's leaves are now
-  extracted into locals and each slot written once. A const reassignment's
-  TypeError also carries V8's message (lang/js/compile/bindings.rs). Test:
-  `test/engine_fixes_test.rb`.
-- **A Proxy is constructible only when its target is** — the Proxy
-  `[[Construct]]` path (vm/construct/construct.rs) ran the trap for any
-  target, and `is_constructor` (vm/coerce.rs) counted an arrow as one. Test:
-  `test/engine_fixes_test.rb`.
 - **A host runs classic scripts, not evals** — `Vm::host_run_script`
-  (vm/engine/eval_prog.rs, with `compile_script_with_completion` /
-  `Compiler::script_completion` in lang/js/compile/) runs a script with script
-  GlobalDeclarationInstantiation (the `$262.evalScript` path) and its
-  completion value. `ScriptState::load_in_context`,
+  (vm/engine/eval_prog.rs, over upstream's `compile_script_with_completion`,
+  which `$262.evalScript` uses) runs a script with script
+  GlobalDeclarationInstantiation and returns its completion value. `ScriptState::load_in_context`,
   `eval_in_context_structured` (`host_eval_structured`) and
   `HostCtx::eval_script` use it (vm/host_api.rs, embed.rs): as indirect
   evals, a strict script's `var`s and functions stayed inside it, and no

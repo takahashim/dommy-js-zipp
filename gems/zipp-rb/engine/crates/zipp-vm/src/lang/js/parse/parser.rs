@@ -349,21 +349,84 @@ pub(crate) enum ScopeKind {
 #[derive(Debug)]
 pub(crate) struct Scope {
     pub kind: ScopeKind,
-    pub lex: Vec<(Box<str>, BindKind, u32)>,
-    pub var: Vec<(Box<str>, u32)>,
-    /// Membership indexes over `lex`/`var`. The declaration early-error checks
-    /// used to scan these `Vec`s, which is quadratic in the number of bindings
-    /// in one function body (a bundle's single huge IIFE). `lex_all` is every
-    /// lexical name; `lex_nonfn` those with a non-`Function` kind (the Annex B
-    /// function-duplicate carve-out); `var_all` every var/param name.
-    pub lex_all: rustc_hash::FxHashSet<Box<str>>,
-    pub lex_nonfn: rustc_hash::FxHashSet<Box<str>>,
-    pub var_all: rustc_hash::FxHashSet<Box<str>>,
+    lex: Vec<(Box<str>, BindKind, u32)>,
+    var: Vec<(Box<str>, u32)>,
+    /// `lex`'s names once it holds `NAME_INDEX_MIN` of them, each with
+    /// whether every entry of it is a plain FunctionDeclaration (the Annex B
+    /// duplicate carve-out, `declare_lexical`).
+    lex_index: Option<rustc_hash::FxHashMap<Box<str>, bool>>,
+    /// `var`'s names once it holds `NAME_INDEX_MIN` of them.
+    var_index: Option<rustc_hash::FxHashSet<Box<str>>>,
     /// `var` stops here: Script, Module, Function, ClassStaticBlock.
     pub var_boundary: bool,
     /// Annex B B.3.5: `catch (e) { var e; }` is legal for a SIMPLE catch
     /// parameter only, so the exception has to know the parameter's shape.
     pub simple_catch_param: Option<Box<str>>,
+}
+
+/// Entries a scope's name list holds before it is indexed. Each declaration
+/// checks its scope (and every one out to the var boundary) for the name, so
+/// scanning made a body of n declarations parse in O(n^2): 6,400 `var`s took
+/// a third of a second (f2i-com/zipp.org#72). Most scopes are a few names,
+/// which a scan finds faster than a hash.
+const NAME_INDEX_MIN: usize = 16;
+
+impl Scope {
+    /// A lexical entry for `name` that the carve-out does not excuse: any,
+    /// or, with `annexb_dup_ok`, one that is not a plain FunctionDeclaration.
+    fn lex_conflict(&self, name: &str, annexb_dup_ok: bool) -> bool {
+        match &self.lex_index {
+            Some(index) => index
+                .get(name)
+                .is_some_and(|all_functions| !(annexb_dup_ok && *all_functions)),
+            None => self
+                .lex
+                .iter()
+                .any(|(n, k, _)| &**n == name && !(annexb_dup_ok && *k == BindKind::Function)),
+        }
+    }
+
+    fn has_lex(&self, name: &str) -> bool {
+        match &self.lex_index {
+            Some(index) => index.contains_key(name),
+            None => self.lex.iter().any(|(n, _, _)| &**n == name),
+        }
+    }
+
+    fn has_var(&self, name: &str) -> bool {
+        match &self.var_index {
+            Some(index) => index.contains(name),
+            None => self.var.iter().any(|(n, _)| &**n == name),
+        }
+    }
+
+    fn push_lex(&mut self, name: &str, kind: BindKind, pos: u32) {
+        self.lex.push((name.into(), kind, pos));
+        if self.lex_index.is_none() && self.lex.len() >= NAME_INDEX_MIN {
+            let mut index = rustc_hash::FxHashMap::default();
+            for (n, k, _) in &self.lex {
+                let all_functions = index.entry(n.clone()).or_insert(true);
+                *all_functions &= *k == BindKind::Function;
+            }
+            self.lex_index = Some(index);
+        } else if let Some(index) = self.lex_index.as_mut() {
+            let all_functions = index.entry(name.into()).or_insert(true);
+            *all_functions &= kind == BindKind::Function;
+        }
+    }
+
+    /// Record a `var` name unless the scope has it already.
+    fn push_var(&mut self, name: &str, pos: u32) {
+        if self.has_var(name) {
+            return;
+        }
+        self.var.push((name.into(), pos));
+        if self.var_index.is_none() && self.var.len() >= NAME_INDEX_MIN {
+            self.var_index = Some(self.var.iter().map(|(n, _)| n.clone()).collect());
+        } else if let Some(index) = self.var_index.as_mut() {
+            index.insert(name.into());
+        }
+    }
 }
 
 /// The scope chain, owned by the parser and thrown away when it finishes.
@@ -389,9 +452,8 @@ impl ScopeStack {
             kind,
             lex: Vec::new(),
             var: Vec::new(),
-            lex_all: rustc_hash::FxHashSet::default(),
-            lex_nonfn: rustc_hash::FxHashSet::default(),
-            var_all: rustc_hash::FxHashSet::default(),
+            lex_index: None,
+            var_index: None,
             var_boundary,
             simple_catch_param: None,
         });
@@ -434,22 +496,13 @@ impl ScopeStack {
         let Some(scope) = self.scopes.last_mut() else {
             return Ok(());
         };
-        let dup_lex = if annexb_dup_ok {
-            scope.lex_nonfn.contains(name)
-        } else {
-            scope.lex_all.contains(name)
-        };
-        if dup_lex || scope.var_all.contains(name) {
+        if scope.lex_conflict(name, annexb_dup_ok) || scope.has_var(name) {
             return Err(SyntaxError::new(
                 format!("SyntaxError: Identifier '{name}' has already been declared"),
                 pos,
             ));
         }
-        scope.lex.push((name.into(), kind, pos));
-        scope.lex_all.insert(name.into());
-        if kind != BindKind::Function {
-            scope.lex_nonfn.insert(name.into());
-        }
+        scope.push_lex(name, kind, pos);
         Ok(())
     }
 
@@ -470,9 +523,7 @@ impl ScopeStack {
     /// Is `name` bound anywhere at the module's top level (lexically or by a
     /// `var`)? An `export { x }` must resolve to such a binding.
     pub(crate) fn module_binds(&self, name: &str) -> bool {
-        self.scopes
-            .iter()
-            .any(|s| s.lex_all.contains(name) || s.var_all.contains(name))
+        self.scopes.iter().any(|s| s.has_lex(name) || s.has_var(name))
     }
 
     /// May a `using` / `await using` declaration appear in the current scope?
@@ -502,10 +553,7 @@ impl ScopeStack {
     /// binding that does not exist yet.
     pub(crate) fn declare_param(&mut self, name: &str) {
         if let Some(scope) = self.scopes.last_mut() {
-            if !scope.var_all.contains(name) {
-                scope.var.push((name.into(), 0));
-                scope.var_all.insert(name.into());
-            }
+            scope.push_var(name, 0);
         }
     }
 
@@ -519,7 +567,7 @@ impl ScopeStack {
                     break;
                 }
             }
-            if scope.lex_all.contains(name) {
+            if scope.has_lex(name) {
                 return Err(SyntaxError::new(
                     format!("SyntaxError: Identifier '{name}' has already been declared"),
                     pos,
@@ -538,10 +586,7 @@ impl ScopeStack {
         // boundary erased exactly that association. `var f; { let f }` stays
         // legal because there the `var` is recorded in the outer scope.
         if let Some(scope) = self.scopes.last_mut() {
-            if !scope.var_all.contains(name) {
-                scope.var.push((name.into(), pos));
-                scope.var_all.insert(name.into());
-            }
+            scope.push_var(name, pos);
         }
         Ok(())
     }

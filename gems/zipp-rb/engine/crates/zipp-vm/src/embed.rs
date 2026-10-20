@@ -38,6 +38,8 @@ pub use crate::vm::host_api::{
     DEFAULT_HOST_VALUE_WORK_PER_NODE,
 };
 pub use crate::vm::host_api::{HostCallCtx, HostCtx};
+#[cfg(feature = "safe-sandbox")]
+pub use crate::vm::host_api::SandboxCaps;
 /// The execution-trace row and its opcode contract. Full `instrument` builds
 /// expose the `ScriptState::start_trace` control API; the artifact-internal
 /// `meter-only` profile deliberately does not.
@@ -1152,19 +1154,34 @@ impl ScriptState {
     pub fn set_heap_limit(&mut self, bytes: usize) {
         self.with_vm(|vm| {
             vm.meter_fold();
-            if let Some(rec) = vm.instr_rec.as_mut() {
-                rec.heap_limit = bytes;
-                rec.ceiling_gc_pending = false;
-            }
+            let reached = match vm.instr_rec.as_mut() {
+                Some(rec) => {
+                    let reached = rec.heap_ceiling_reached();
+                    rec.heap_limit = bytes;
+                    rec.ceiling_gc_pending = false;
+                    rec.heap_ceiling_reached = false;
+                    reached
+                }
+                None => false,
+            };
             // Let the slot table refuse to double past the ceiling too.
             vm.set_resident_ceiling(bytes);
-            // Re-arming between entries starts a budget on what is alive, not
-            // on what a previous entry left for the collector: a heap past half
-            // the ceiling is collected now, while no frame runs. After a script
-            // filled the heap and dropped it, the next entry would otherwise
-            // need a slot-table doubling before any collection had freed the
-            // dead objects' slots (f2i-com/zipp.org#55).
-            if bytes != usize::MAX && vm.heap_bytes_live_estimate() > bytes / 2 {
+            // Re-arming after a budget that found the heap at its ceiling
+            // starts the next one on what is alive, not on what the previous
+            // entry left for the collector: a heap past half the ceiling is
+            // collected now, while no frame runs. After a script filled the
+            // heap and dropped it, the next entry would otherwise need a
+            // slot-table doubling before any collection had freed the dead
+            // objects' slots (f2i-com/zipp.org#55).
+            //
+            // Only then. A host that re-arms before every entry paid a full
+            // collection per entry for as long as its live heap stayed past
+            // half the ceiling, with nothing exhausted: 15 ms a call at
+            // 265 MB (f2i-com/zipp.org#73). Garbage an entry leaves under
+            // the ceiling is the collector's schedule's to find, and a poll
+            // that finds the heap over the ceiling asks for a collection
+            // before it convicts.
+            if reached && bytes != usize::MAX && vm.heap_bytes_live_estimate() > bytes / 2 {
                 vm.collect_major_now();
             }
         });
@@ -1183,6 +1200,39 @@ impl ScriptState {
                 rec.refresh_slow();
             }
         });
+    }
+
+    /// Cap the backtracking steps one regular-expression search may take
+    /// (16,777,216 by default, `regress::MatchLimits::SANDBOX`'s). A search
+    /// that reaches it throws a `RangeError` the script can catch; its work
+    /// is charged to the [`Self::set_limits`] budget either way, and a search
+    /// that runs that budget out is stopped as any exhausted budget is. A
+    /// host that runs ordinary page content can raise it: a catastrophic
+    /// pattern Node finishes in tens of milliseconds can need more than the
+    /// default. Requires [`Self::set_limits`] first; without it this is a
+    /// no-op.
+    #[cfg(feature = "safe-sandbox")]
+    pub fn set_regex_step_limit(&mut self, max_steps: u64) {
+        self.with_vm(|vm| {
+            if let Some(rec) = vm.instr_rec.as_mut() {
+                rec.regex_step_limit = max_steps;
+            }
+        });
+    }
+
+    /// Set this VM's regex pattern, array join, JSON nesting and BigInt
+    /// caps — see [`SandboxCaps`]. Each is clamped to [`SandboxCaps::MAX`]
+    /// and takes effect at the next operation it bounds. Unlike the budgets,
+    /// it needs no [`Self::set_limits`]: the caps hold with or without one.
+    #[cfg(feature = "safe-sandbox")]
+    pub fn set_sandbox_caps(&mut self, caps: SandboxCaps) {
+        self.with_vm(|vm| vm.sandbox_caps = caps.clamped());
+    }
+
+    /// The caps in force — see [`Self::set_sandbox_caps`].
+    #[cfg(feature = "safe-sandbox")]
+    pub fn sandbox_caps(&self) -> SandboxCaps {
+        self.vm().map_or(SandboxCaps::DEFAULT, |vm| vm.sandbox_caps)
     }
 
     /// How many functions this state has compiled at run time (`eval`,
@@ -1231,7 +1281,9 @@ impl ScriptState {
     }
 
     /// What this VM currently retains and has spent — see [`ResourceUsage`].
-    /// Cheap (no walk), so a host may read it between every re-entry.
+    /// Cheap (no walk), so a host may read it between every re-entry: its
+    /// `heap_bytes` is the O(1) estimate, and [`Self::heap_bytes`] the exact
+    /// figure, which walks the heap.
     pub fn resource_usage(&self) -> ResourceUsage {
         self.vm()
             .map(|vm| vm.host_resource_usage())
