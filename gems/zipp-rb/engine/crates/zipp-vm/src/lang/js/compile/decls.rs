@@ -156,8 +156,8 @@ impl<'a> FnCompiler<'a> {
     fn scope_shape(&self) -> (usize, usize, usize) {
         (
             self.scopes.len(),
-            self.scopes.last().map_or(0, Vec::len),
-            self.scopes.first().map_or(0, Vec::len),
+            self.scopes.last().map_or(0, |s| s.len()),
+            self.scopes.first().map_or(0, |s| s.len()),
         )
     }
 
@@ -794,44 +794,44 @@ impl<'a> FnCompiler<'a> {
                 self.pattern_block_local = block_local;
                 self.declare_pattern(&decl.id, !d.kind.is_lexical())?;
                 let save = self.next_reg;
-                // TOP-LEVEL global-bound leaves: INITIALIZE each slot before
-                // extraction. The extraction stores are assignment-flavored —
-                // in STRICT code (a module body) StoreGlobalStrict throws on
-                // an UNINITIALIZED slot, so the leaves' TDZ must end at this
-                // statement, not at the store. Lexical leaves also register
+                // TOP-LEVEL global-bound leaves. A `var` leaf's slot is set
+                // before extraction: the extraction stores are
+                // assignment-flavored, and in STRICT code (a module body)
+                // StoreGlobalStrict throws on an UNINITIALIZED slot. A lexical
+                // leaf is instead initialized BY the extraction, one
+                // `StoreGlobal` per leaf as `const x = 1` emits
+                // (`pattern_init_globals`): set beforehand, the extraction was
+                // a `const`'s second write, which a $262.evalScript's const
+                // rejects (f2i-com/zipp.org#75), and a leaf whose extraction
+                // never ran left its TDZ anyway. Lexical leaves also register
                 // like their simple-identifier siblings (const immutability,
                 // module per-module slots, script-GDI bookkeeping).
-                // A global `const`'s leaves are extracted into locals and each
-                // slot written once at the end (see below): a script's const
-                // slot accepts exactly one write, the one that ends its TDZ, so
-                // pre-initializing it to undefined here would make the
-                // extraction's write the second.
-                // (Not in an eval whose lexicals are its own locals: there the
-                // leaves are registers, initialized by the extraction itself.)
-                let global_const = is_const
-                    && self.is_script
-                    && self.cx.script_binds_globals
-                    && !self.cx.eval_locals
-                    && !block_local;
-                if self.is_script && self.cx.script_binds_globals && !block_local && !global_const {
+                if self.is_script && self.cx.script_binds_globals && !block_local {
                     let mut leaves = std::collections::HashSet::new();
                     capture::collect_pattern_names(&decl.id, &mut leaves);
-                    let undef = self.alloc_reg();
-                    self.emit(Instr::LoadUndefined { dst: undef });
+                    let undef = if d.kind.is_lexical() {
+                        None
+                    } else {
+                        let undef = self.alloc_reg();
+                        self.emit(Instr::LoadUndefined { dst: undef });
+                        Some(undef)
+                    };
                     // Sorted: this emits one store per leaf (and may hand out
                     // new global slots), in this order.
                     for n in sorted_name_vec(&leaves) {
                         let slot = self.cx.global_slot(&n) as u32;
-                        if d.kind.is_lexical() {
-                            self.cx.lexical_globals.insert(slot);
+                        match undef {
+                            // (NOT const_globals yet: the extraction's
+                            // initializing stores must stay writable.)
+                            None => {
+                                self.cx.lexical_globals.insert(slot);
+                                self.pattern_init_globals.insert(slot);
+                            }
+                            Some(undef) => self.emit(Instr::StoreGlobal {
+                                idx: slot,
+                                src: undef,
+                            }),
                         }
-                        // (NOT const_globals: the extraction itself stores
-                        // through store_binding, which throws for a known
-                        // const — initialization must stay writable.)
-                        self.emit(Instr::StoreGlobal {
-                            idx: slot,
-                            src: undef,
-                        });
                     }
                 }
                 let src = self.alloc_reg();
@@ -856,37 +856,9 @@ impl<'a> FnCompiler<'a> {
                 if sv != src {
                     self.emit(Instr::Move { dst: src, src: sv });
                 }
-                if global_const {
-                    let mut leaves = std::collections::HashSet::new();
-                    capture::collect_pattern_names(&decl.id, &mut leaves);
-                    let leaves = sorted_name_vec(&leaves);
-                    self.push_scope();
-                    let regs: Vec<Reg> = leaves.iter().map(|n| self.declare_local(n)).collect();
-                    let extracted = self.extract_pattern(&decl.id, src);
-                    // Read each leaf out of its (possibly boxed) local before
-                    // the scope goes, then initialize the global slot once.
-                    let values: Vec<Reg> = regs
-                        .iter()
-                        .map(|&r| {
-                            if self.cell_regs.contains(&r) {
-                                let t = self.alloc_reg();
-                                self.emit(Instr::CellGet { dst: t, cell: r });
-                                t
-                            } else {
-                                r
-                            }
-                        })
-                        .collect();
-                    self.pop_scope();
-                    extracted?;
-                    for (n, v) in leaves.iter().zip(values) {
-                        let slot = self.cx.global_slot(n) as u32;
-                        self.cx.lexical_globals.insert(slot);
-                        self.emit(Instr::StoreGlobal { idx: slot, src: v });
-                    }
-                } else {
-                    self.extract_pattern(&decl.id, src)?;
-                }
+                let extracted = self.extract_pattern(&decl.id, src);
+                self.pattern_init_globals.clear();
+                extracted?;
                 // `const {a} = o` / `const [a] = xs`: the leaves are immutable
                 // too. Recorded only NOW — the extraction above stores through
                 // `store_binding`, which would reject its own initialization —
@@ -989,7 +961,7 @@ impl<'a> FnCompiler<'a> {
             if !d.kind.is_lexical()
                 && decl.init.is_some()
                 && self.scopes.len() > 1
-                && self.scopes[1..].iter().flatten().any(|(n, _)| n == name)
+                && self.scopes[1..].iter().any(|s| s.binds(name))
             {
                 let init = decl.init.as_ref().unwrap();
                 let save = self.next_reg;
@@ -1096,12 +1068,27 @@ impl<'a> FnCompiler<'a> {
             // rather than duplicating. A nested closure over it boxes the slot (the
             // var name is in the capture set). A bare `var x;` never resets `x`.
             if !d.kind.is_lexical() {
-                let existing = self.lookup_in_scope(0, name);
+                let existing = self.scopes[0].slot_of(name);
+                // A `var` the hoisting pass spilled: the initializer builds in
+                // a temporary, then goes to the slot. (A function with `with`
+                // never spills, so the with-chain cannot apply.)
+                if let Some(Slot::Spill(idx)) = existing {
+                    if let Some(init) = &decl.init {
+                        let save = self.next_reg;
+                        let tmp = self.temp();
+                        let v = self.compile_named_init(tmp, init, name)?;
+                        let vec = self.spill_vec();
+                        self.emit(Instr::StoreSpill { vec, idx, src: v });
+                        self.set_next_reg(save);
+                    }
+                    continue;
+                }
                 let reg = match existing {
-                    Some(r) => r,
+                    Some(Slot::Reg(r)) => r,
+                    Some(Slot::Spill(_)) => unreachable!("handled above"),
                     None => {
                         let r = self.alloc_reg();
-                        self.bind_in_scope(0, name, r);
+                        self.scopes[0].push((name.to_string(), r));
                         if self.captured.contains(name) {
                             self.emit(Instr::MakeCell { reg: r });
                             self.cell_regs.insert(r);
@@ -1156,6 +1143,40 @@ impl<'a> FnCompiler<'a> {
                 continue;
             }
 
+            // A plain `let`/`const` of a function with more locals than the
+            // register file holds (`spills`): a spill slot, bound before the
+            // initializer compiles, as a register is, so `let x = x` still
+            // meets the compile-time TDZ check. Never a cell: a captured or
+            // forward-referenced lexical (pre-created at entry or at block
+            // entry) keeps its register.
+            if matches!(d.kind, ast::VarKind::Let | ast::VarKind::Const)
+                && self.spills(name)
+                && !(self.scopes.len() == 1 && self.entry_lexicals.contains(name))
+                && !self.scopes.last().unwrap().binds(name)
+            {
+                let save = self.next_reg;
+                let idx = self.declare_spill(name);
+                if is_const {
+                    self.const_spills.insert(idx);
+                }
+                let tdz_added = self.param_tdz.insert(name.to_string());
+                let tmp = self.temp();
+                let v = match &decl.init {
+                    Some(init) => self.compile_named_init(tmp, init, name),
+                    None => {
+                        self.emit(Instr::LoadUndefined { dst: tmp });
+                        Ok(tmp)
+                    }
+                };
+                if tdz_added {
+                    self.param_tdz.remove(name);
+                }
+                let v = v?;
+                let vec = self.spill_vec();
+                self.emit(Instr::StoreSpill { vec, idx, src: v });
+                self.set_next_reg(save);
+                continue;
+            }
             // Allocate the local FIRST so `let x = x`-style self-reference and
             // ordinary declarations land in a stable register. declare_local
             // boxes the register into a cell if a nested function captures it.
@@ -1164,13 +1185,18 @@ impl<'a> FnCompiler<'a> {
             // rather than shadowed, so the closure and this declaration share one
             // cell; otherwise a fresh binding is allocated.
             let reg = if self.scopes.len() == 1 && self.entry_lexicals.contains(name) {
-                let r = self
-                    .lookup_in_scope(0, name)
+                let r = self.scopes[0]
+                    .first_slot_of(name)
+                    .and_then(Slot::reg)
                     .unwrap_or_else(|| self.declare_local(name));
                 self.entry_tdz_cells.remove(&r); // TDZ ends here
                 r
             } else if let Some(r) = self
-                .lookup_in_scope(self.scopes.len() - 1, name)
+                .scopes
+                .last()
+                .unwrap()
+                .first_slot_of(name)
+                .and_then(Slot::reg)
                 .filter(|r| self.block_tdz_cells.contains(r))
             {
                 // A block-entry pre-created TDZ cell (captured forward-referenced
@@ -1281,14 +1307,8 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn head_var_binding(&mut self, name: &str) -> Binding {
         // Innermost existing binding (catch param / pre-declared var / param).
         for scope in self.scopes.iter().rev() {
-            for (n, r) in scope.iter().rev() {
-                if n == name {
-                    return if self.cell_regs.contains(r) {
-                        Binding::LocalCell(*r)
-                    } else {
-                        Binding::Local(*r)
-                    };
-                }
+            if let Some(slot) = scope.slot_of(name) {
+                return self.slot_binding(slot);
             }
         }
         if self.is_script && self.cx.script_binds_globals {
@@ -1303,7 +1323,7 @@ impl<'a> FnCompiler<'a> {
         }
         // First mention: create the function-scoped var binding (scopes[0]).
         let r = self.alloc_reg();
-        self.bind_in_scope(0, name, r);
+        self.scopes[0].push((name.to_string(), r));
         if self.box_all_locals || self.captured.contains(name) {
             self.emit(Instr::MakeCell { reg: r });
             self.cell_regs.insert(r);
@@ -1345,12 +1365,15 @@ impl<'a> FnCompiler<'a> {
                     // Its TDZ ends here: the extraction that follows writes
                     // through `store_binding`, and a checked store would throw on
                     // the very cell it is initializing (`const {z} = {z:9}`).
-                    if let Some(r) = self.lookup_in_scope(0, &**id)
-                    {
+                    if let Some(r) = self.scopes[0].first_slot_of(id).and_then(Slot::reg) {
                         self.entry_tdz_cells.remove(&r);
                     }
                 } else if let Some(r) = self
-                    .lookup_in_scope(self.scopes.len() - 1, &**id)
+                    .scopes
+                    .last()
+                    .unwrap()
+                    .first_slot_of(id)
+                    .and_then(Slot::reg)
                     .filter(|r| self.block_tdz_cells.contains(r))
                 {
                     // The block-entry TDZ cell of this leaf (captured, or
@@ -1391,7 +1414,9 @@ impl<'a> FnCompiler<'a> {
 
     /// The registers a just-declared pattern's leaves occupy, innermost binding
     /// first — the same reverse walk `resolve` does, so a head leaf that shadows
-    /// an outer same-named local is found (`let a; for (const {a} of …)`).
+    /// an outer same-named local is found (`let a; for (const {a} of …)`). A
+    /// pattern's leaves are declared in registers (`declare_local`), never
+    /// spilled.
     pub(crate) fn pattern_leaf_regs(&self, pat: &ast::Pattern) -> Vec<Reg> {
         let mut names = std::collections::HashSet::new();
         capture::collect_pattern_names(pat, &mut names);
@@ -1403,8 +1428,8 @@ impl<'a> FnCompiler<'a> {
                 self.scopes
                     .iter()
                     .rev()
-                    .find_map(|s| s.iter().rev().find(|(nm, _)| nm == n))
-                    .map(|(_, r)| *r)
+                    .find_map(|s| s.slot_of(n))
+                    .and_then(Slot::reg)
             })
             .collect()
     }
@@ -1417,6 +1442,18 @@ impl<'a> FnCompiler<'a> {
         match pat {
             P::Ident(id) => {
                 let b = self.resolve(id);
+                // A top-level lexical declaration's leaf: this store is its
+                // initialization, as the simple-identifier path emits it.
+                if let Binding::Global(idx) = b {
+                    if self.pattern_init_globals.remove(&idx) {
+                        if self.box_all_locals || self.cx.dyn_global_zone {
+                            self.emit(Instr::StoreGlobalDyn { idx, src });
+                        } else {
+                            self.emit(Instr::StoreGlobal { idx, src });
+                        }
+                        return Ok(());
+                    }
+                }
                 self.store_binding(&b, src);
                 Ok(())
             }

@@ -199,16 +199,14 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
-    /// Look up an in-scope local's register (innermost scope first), if any.
+    /// Look up an in-scope local's register (innermost scope first), if any:
+    /// `None` too when the innermost binding is a spill slot.
     pub(crate) fn local_reg(&self, name: &str) -> Option<Reg> {
-        for scope in self.scopes.iter().rev() {
-            for (n, r) in scope.iter().rev() {
-                if n == name {
-                    return Some(*r);
-                }
-            }
-        }
-        None
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.slot_of(name))
+            .and_then(super::scopes::Slot::reg)
     }
 
     /// The registers of a declaration's bindings that are cell-boxed (captured by
@@ -503,10 +501,10 @@ impl<'a> FnCompiler<'a> {
                 if (fc.captured.contains(name)
                     || early.contains(name)
                     || matches!(name, "undefined" | "NaN" | "Infinity"))
-                    && fc.lookup_in_scope(fc.scopes.len() - 1, name).is_none()
+                    && !fc.scopes.last().unwrap().binds(name)
                 {
                     let r = fc.alloc_reg();
-                    fc.bind_last(name, r);
+                    fc.scopes.last_mut().unwrap().push((name.to_string(), r));
                     fc.emit(Instr::MakeCellTdz { reg: r });
                     fc.cell_regs.insert(r);
                     fc.block_tdz_cells.insert(r);
@@ -1002,8 +1000,8 @@ impl<'a> FnCompiler<'a> {
             .scopes
             .last()
             .unwrap()
-            .iter()
-            .map(|(_, r)| *r)
+            .regs()
+            .map(|(_, r)| r)
             .filter(|r| self.block_tdz_cells.contains(r))
             .collect();
 
@@ -1124,7 +1122,7 @@ impl<'a> FnCompiler<'a> {
             self.push_scope();
             for n in &tdz_added {
                 let r = self.alloc_reg();
-                self.bind_last(n, r);
+                self.scopes.last_mut().unwrap().push((n.clone(), r));
                 self.emit(Instr::MakeCellTdz { reg: r });
                 self.cell_regs.insert(r);
             }
@@ -1620,7 +1618,7 @@ impl<'a> FnCompiler<'a> {
             self.push_scope();
             for n in &tdz_added {
                 let r = self.alloc_reg();
-                self.bind_last(n, r);
+                self.scopes.last_mut().unwrap().push((n.clone(), r));
                 self.emit(Instr::MakeCellTdz { reg: r });
                 self.cell_regs.insert(r);
             }

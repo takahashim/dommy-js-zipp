@@ -449,10 +449,29 @@ pub(crate) struct Recorder {
     /// so noticing a few thousand instructions late costs a bounded overshoot
     /// and keeps the per-instruction path free of an extra memory read.
     pub(crate) heap_limit: usize,
+    /// The most backtracking steps one regular-expression search may take:
+    /// `regress::MatchLimits::SANDBOX`'s unless the host set another
+    /// (`ScriptState::set_regex_step_limit`). Reaching it is a catchable
+    /// `RangeError`; running out of the VM's own budget inside a search is
+    /// not (`Vm::instrument_regex_usage`).
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) regex_step_limit: u64,
+    /// Whether the latest search began with the heap by itself, regex
+    /// storage reserved around the search aside, already at `heap_limit`
+    /// (`Vm::instrument_regex_limits`), so that a refusal of its storage is
+    /// the heap's exhaustion and not the search's
+    /// (`Vm::instrument_regex_memory_exhausted`).
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) regex_began_on_full_heap: std::cell::Cell<bool>,
     /// A poll found the heap over `heap_limit` and asked for a major
     /// collection instead of convicting: the poll that follows that
     /// collection decides. See `instrument_heap_poll_inner`.
     pub(crate) ceiling_gc_pending: bool,
+    /// The recorder this one replaced (`Vm::set_instrumentation`) had found
+    /// the heap at its ceiling: convicted, or waiting on a collection for
+    /// it. `ScriptState::set_heap_limit` collects a heap the last budget left
+    /// at its ceiling, and only that one.
+    pub(crate) heap_ceiling_reached: bool,
     /// What the first heap walk after the latest major found (`growth_major`
     /// names that major): the level in-place growth is measured from. The
     /// collector schedules on what it allocates, and an Array filled by
@@ -573,7 +592,12 @@ impl Recorder {
             abort: None,
             deadline: None,
             heap_limit: usize::MAX,
+            #[cfg(feature = "safe-sandbox")]
+            regex_step_limit: regress::MatchLimits::SANDBOX.max_steps,
+            #[cfg(feature = "safe-sandbox")]
+            regex_began_on_full_heap: std::cell::Cell::new(false),
             ceiling_gc_pending: false,
+            heap_ceiling_reached: false,
             growth_level: 0,
             growth_major: u64::MAX,
             growth_gc_pending: false,
@@ -779,6 +803,15 @@ impl Recorder {
             .wrapping_add(self.ticks)
             .wrapping_add(self.elapsed(hot) as u64)
             .saturating_sub(self.steps_base)
+    }
+
+    /// Whether this budget found the heap at its ceiling: it convicted on
+    /// it, a poll is waiting on the collection it asked for, or the budget
+    /// it replaced did either (`heap_ceiling_reached`).
+    pub(crate) fn heap_ceiling_reached(&self) -> bool {
+        self.heap_ceiling_reached
+            || self.ceiling_gc_pending
+            || matches!(self.exhaustion, Some(ResourceExhaustion::Heap))
     }
 
     #[inline]
@@ -1046,29 +1079,6 @@ impl super::Vm<'_> {
             .saturating_add(rec.external_bytes_admitted[1].get())
     }
 
-    /// A search's memory allowance before the heap's headroom caps it: the
-    /// fixed sandbox allowance, less what an enclosing regex operation holds.
-    /// (Split out of `instrument_regex_limits` so an exhaustion can tell
-    /// whether the headroom or this allowance was the cap it hit.)
-    #[cfg(feature = "safe-sandbox")]
-    fn regex_fixed_limits(&self) -> regress::MatchLimits {
-        use std::sync::atomic::Ordering;
-
-        let mut limits = regress::MatchLimits::SANDBOX;
-        // `heap_bytes()` deliberately measures VM-owned resident storage, not
-        // Rust locals in an outer regex operation. Subtract their scoped
-        // reservation independently from the fixed regex ceiling so nesting is
-        // bounded even when the embedder left its heap limit unlimited.
-        let transient = self.regex_transient_bytes.load(Ordering::Relaxed);
-        // A subject buffer kept between execs is not this search's storage:
-        // it counts against the heap headroom, not the fixed allowance.
-        limits.max_memory_bytes = limits
-            .max_memory_bytes
-            .saturating_sub(transient.saturating_sub(self.regex_kept_subject_bytes()));
-        limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
-        limits
-    }
-
     /// Derive one regex search's hard ceilings. The fixed ceilings stop
     /// catastrophic backtracking even when the host left its VM budgets
     /// unlimited; finite VM budgets tighten them so transient backtrack
@@ -1078,12 +1088,23 @@ impl super::Vm<'_> {
     pub(crate) fn instrument_regex_limits(&self) -> regress::MatchLimits {
         use std::sync::atomic::Ordering;
 
-        let mut limits = self.regex_fixed_limits();
+        let mut limits = regress::MatchLimits::SANDBOX;
+        // `heap_bytes()` deliberately measures VM-owned resident storage, not
+        // Rust locals in an outer regex operation. Subtract their scoped
+        // reservation independently from the fixed regex ceiling so nesting is
+        // bounded even when the embedder left its heap limit unlimited.
         let transient = self.regex_transient_bytes.load(Ordering::Relaxed);
+        // A subject buffer kept between execs is not this search's storage:
+        // it counts against the heap headroom below, not the fixed allowance.
+        limits.max_memory_bytes = limits
+            .max_memory_bytes
+            .saturating_sub(transient.saturating_sub(self.regex_kept_subject_bytes()));
+        limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
         let hot = self.meter_hot();
         let Some(rec) = self.instr_rec.as_ref() else {
             return limits;
         };
+        limits.max_steps = rec.regex_step_limit;
         if let Some(left) = rec.finite_remaining(hot) {
             limits.max_steps = limits.max_steps.min(left);
         }
@@ -1103,6 +1124,12 @@ impl super::Vm<'_> {
                 .saturating_sub(transient);
             limits.max_memory_bytes = limits.max_memory_bytes.min(headroom);
             limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
+            // The heap by itself, not the regex storage reserved around this
+            // search: an outer operation's retained matches are regex storage.
+            rec.regex_began_on_full_heap
+                .set(self.heap_bytes_estimate() >= rec.heap_limit);
+        } else {
+            rec.regex_began_on_full_heap.set(false);
         }
         limits
     }
@@ -1243,19 +1270,23 @@ impl super::Vm<'_> {
         );
     }
 
+    /// Record that a regex's working storage was refused. When the search
+    /// began with the heap by itself already at its ceiling
+    /// (`instrument_regex_limits`) and the heap is still there, the heap's
+    /// budget is what ran out: a linear search that needed a few bytes was
+    /// only the first check to see a full heap, and naming the regex sent the
+    /// host after a runaway pattern that did not exist (f2i-com/zipp.org#70).
+    /// Storage that outgrew the headroom a search began with, including the
+    /// heap strings its own captures made and the matches an outer operation
+    /// retains, is still the regex's.
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn instrument_regex_memory_exhausted(&mut self) -> &'static str {
-        // `instrument_regex_limits` caps a search's storage at the heap's
-        // headroom as well as at the regex's own fixed allowance. When the
-        // headroom was the tighter of the two (for either the search's memory
-        // or its backtrack stack), the heap is what ran out (a linear regex in
-        // a script that filled its heap is no runaway): report the heap
-        // budget, as the allocation that crossed it would have.
-        let fixed = self.regex_fixed_limits();
-        let applied = self.instrument_regex_limits();
-        let heap_bound = applied.max_memory_bytes < fixed.max_memory_bytes
-            || applied.max_backtrack_bytes < fixed.max_backtrack_bytes;
-        let cause = if heap_bound {
+        let heap_full = self.instr_rec.as_ref().is_some_and(|rec| {
+            rec.heap_limit != usize::MAX
+                && rec.regex_began_on_full_heap.get()
+                && self.heap_bytes_estimate() >= rec.heap_limit
+        });
+        let cause = if heap_full {
             ResourceExhaustion::Heap
         } else {
             ResourceExhaustion::RegexMemory
@@ -1267,8 +1298,17 @@ impl super::Vm<'_> {
     }
 
     /// Reconcile completed regex work with the VM recorder before any match
-    /// result becomes observable. A regex-local ceiling is a sticky host
-    /// resource failure, not a catchable JS exception that can be ignored.
+    /// result becomes observable. The work is charged to the VM's budget
+    /// first, so what a search spent is spent whichever way it ends.
+    ///
+    /// A search stopped by its own step ceiling (`regex_step_limit`, 16M
+    /// steps by default) while the VM's budget still has room is a
+    /// `RangeError` the script can catch, as it is without a recorder: the
+    /// budget is intact, and a page's script survives one slow regex in a
+    /// library (f2i-com/zipp.org#69). One stopped because the VM's remaining
+    /// budget ran out inside it is that budget's exhaustion, sticky like
+    /// any other. The backtrack-memory ceiling, which guards the embedder's
+    /// heap limit, stays sticky too.
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn instrument_regex_usage(&mut self, usage: regress::MatchUsage) -> Tick {
         self.charge_steps(usage.steps.min(i64::MAX as u64) as i64);
@@ -1278,12 +1318,21 @@ impl super::Vm<'_> {
             Some(regress::MatchLimitError::BacktrackMemory) => ResourceExhaustion::RegexMemory,
         };
         if cause == ResourceExhaustion::RegexMemory {
-            Err(self.instrument_regex_memory_exhausted())
-        } else {
-            match rec_mut!(self) {
-                Some(rec) => Err(rec.exhaust(cause)),
-                None => Err(cause.message()),
+            return Err(self.instrument_regex_memory_exhausted());
+        }
+        let hot = self.meter_hot();
+        match rec_mut!(self) {
+            Some(rec) => {
+                if let Some(message) = rec.terminal_message() {
+                    return Err(message);
+                }
+                if rec.finite_remaining(hot) == Some(0) {
+                    Err(rec.exhaust(cause))
+                } else {
+                    Err(cause.message())
+                }
             }
+            None => Err(cause.message()),
         }
     }
 

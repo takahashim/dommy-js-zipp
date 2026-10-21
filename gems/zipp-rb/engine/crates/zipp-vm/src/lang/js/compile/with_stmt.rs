@@ -27,7 +27,7 @@ impl<'a> FnCompiler<'a> {
         // name is free here → a global/upvalue/unresolved, shadowable by all).
         let mut depth: isize = -1;
         for (i, scope) in self.scopes.iter().enumerate() {
-            if scope.iter().any(|(n, _)| n == name) {
+            if scope.binds(name) {
                 depth = i as isize;
             }
         }
@@ -48,7 +48,7 @@ impl<'a> FnCompiler<'a> {
         }
         let mut depth: isize = -1;
         for (i, scope) in self.scopes.iter().enumerate() {
-            if scope.iter().any(|(n, _)| n == name) {
+            if scope.binds(name) {
                 depth = i as isize;
             }
         }
@@ -60,7 +60,7 @@ impl<'a> FnCompiler<'a> {
                 self.scopes
                     .iter()
                     .flatten()
-                    .find(|(_, r)| *r == w.obj_reg)
+                    .find(|(_, r)| *r == Slot::Reg(w.obj_reg))
                     .map(|(n, _)| n.clone())
             })
             .collect()
@@ -85,8 +85,8 @@ impl<'a> FnCompiler<'a> {
         }
         // Enclosing-function withs apply only to names this function does not
         // bind itself (a local/param/self-name is never shadowed from outside).
-        let bound_here =
-            self.bound_anywhere(name) || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
+        let bound_here = self.scopes.iter().any(|s| s.binds(name))
+            || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
         if !bound_here {
             if let Some(chain) = self.inherited_with_shadows.get(name).cloned() {
                 for wname in chain {
@@ -342,6 +342,7 @@ impl<'a> FnCompiler<'a> {
         match self.resolve_existing(n) {
             Some(Binding::Local(_))
             | Some(Binding::LocalCell(_))
+            | Some(Binding::Spill(_))
             | Some(Binding::Upvalue(_))
             | Some(Binding::ClassName(_)) => {
                 self.emit(Instr::LoadBool { dst, val: false });
