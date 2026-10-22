@@ -99,7 +99,7 @@ pub(crate) fn set_script_name(ruby: &Ruby, id: u64, name: Option<String>) -> Res
     if with_active_ctx(id, |ctx| ctx.set_script_name(name.as_deref())).is_some() {
         return Ok(());
     }
-    with_entry(ruby, id, |entry| entry.run(ruby, |s| s.set_script_name(name.as_deref())))
+    with_entry(ruby, id, |entry| entry.run(ruby, |s| s.name_scripts(name.as_deref())))
 }
 
 /// Set VM `id`'s local time zone to the IANA zone `zone` (nil: UTC). An

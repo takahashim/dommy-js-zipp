@@ -16,6 +16,80 @@ const CONFINED_MODULE_COUNT_LIMIT: usize = 256;
 const CONFINED_MODULE_TOTAL_BYTES_LIMIT: u64 = 64 * 1024 * 1024;
 const CONFINED_MODULE_RECURSION_LIMIT: u32 = 64;
 
+/// An absolute path as a `file:` URL, as Node's `url.pathToFileURL(path).href`
+/// writes it (and so `import.meta.url`): on Windows `\` is a separator and a
+/// verbatim `\\?\` prefix is dropped, a UNC server becomes the URL's host, and
+/// what a URL path may not hold literally is percent-encoded: `%`, space, `"`,
+/// `#`, `<`, `>`, `?`, `` ` ``, `{`, `}` (and `\` off Windows), control
+/// characters and every byte of a non-ASCII character.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+pub(crate) fn file_url(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    let text = {
+        let t = path.to_string_lossy().replace('\\', "/");
+        if let Some(rest) = t.strip_prefix("//?/UNC/") {
+            format!("//{rest}")
+        } else if let Some(rest) = t.strip_prefix("//?/") {
+            rest.to_string()
+        } else {
+            t
+        }
+    };
+    #[cfg(not(windows))]
+    let text = path.to_string_lossy().into_owned();
+    let mut url = String::from("file://");
+    let path_part = if let Some(rest) = text.strip_prefix("//") {
+        let (server, rest) = rest.split_once('/').unwrap_or((rest, ""));
+        url.push_str(server);
+        format!("/{rest}")
+    } else if text.starts_with('/') {
+        text
+    } else {
+        format!("/{text}")
+    };
+    for b in path_part.bytes() {
+        match b {
+            0..=0x1F | 0x7F..=0xFF | b' ' | b'"' | b'#' | b'%' | b'<' | b'>' | b'?' | b'`' | b'{' | b'}' => {
+                url.push_str(&format!("%{b:02X}"));
+            }
+            #[cfg(not(windows))]
+            b'\\' => url.push_str("%5C"),
+            _ => url.push(b as char),
+        }
+    }
+    url
+}
+
+#[cfg(all(test, not(feature = "wasm-no-fs-loader")))]
+mod file_url_tests {
+    use super::file_url;
+    use std::path::Path;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_as_node_writes_them() {
+        assert_eq!(file_url(Path::new(r"C:\a b\x.mjs")), "file:///C:/a%20b/x.mjs");
+        assert_eq!(file_url(Path::new(r"\\?\C:\x\y.mjs")), "file:///C:/x/y.mjs");
+        assert_eq!(file_url(Path::new(r"\\server\share\f.mjs")), "file://server/share/f.mjs");
+        assert_eq!(file_url(Path::new(r"\\?\UNC\server\share\f.mjs")), "file://server/share/f.mjs");
+        assert_eq!(
+            file_url(Path::new(r"C:\d #1 %é\{q}?`<>.mjs")),
+            "file:///C:/d%20%231%20%25%C3%A9/%7Bq%7D%3F%60%3C%3E.mjs"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn posix_paths_as_node_writes_them() {
+        assert_eq!(file_url(Path::new("/tmp/a b/x.mjs")), "file:///tmp/a%20b/x.mjs");
+        assert_eq!(file_url(Path::new("/tmp/back\\slash.mjs")), "file:///tmp/back%5Cslash.mjs");
+        assert_eq!(
+            file_url(Path::new("/d #1 %é/{q}?`<>.mjs")),
+            "file:///d%20%231%20%25%C3%A9/%7Bq%7D%3F%60%3C%3E.mjs"
+        );
+    }
+}
+
 fn lexical_module_path(raw_path: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut path = std::path::PathBuf::new();
     for component in raw_path.components() {
@@ -120,51 +194,6 @@ impl<'p> Vm<'p> {
             return lexical_module_path(raw_path).ok_or_else(|| Thrown(MODULE_NOT_FOUND.into()));
         }
         canonical_module_path(self.module_root.as_deref(), raw_path)
-    }
-
-    /// Give the fresh `import.meta` object `meta` of the module whose namespace
-    /// is heap index `ns` a `url`, when the host answers one for its path.
-    pub(crate) fn fill_module_meta_url(&mut self, meta: u32, ns: u32) {
-        let Some(url_of) = self.module_meta_url.clone() else {
-            return;
-        };
-        let ns = Value::heap(ns);
-        let Some(path) = self
-            .module_cache
-            .iter()
-            .find(|(_, v)| **v == ns)
-            .map(|(p, _)| p.clone())
-        else {
-            return;
-        };
-        let Some(url) = url_of(&path) else {
-            return;
-        };
-        let url = self.alloc_str(url);
-        if let HeapObj::Object(map) = self.heap.get_mut(meta) {
-            map.define(
-                "url",
-                url,
-                crate::heap::PropAttr {
-                    writable: true,
-                    enumerable: true,
-                    configurable: true,
-                    accessor: false,
-                    setter: Value::UNDEFINED,
-                },
-            );
-        }
-    }
-
-    /// The name a module's Error stack frames report: what the host's
-    /// `import.meta.url` hook answers for its path, else the path.
-    pub(crate) fn module_name_for_stack(&self, path: &std::path::Path) -> std::sync::Arc<str> {
-        let name = self
-            .module_meta_url
-            .as_ref()
-            .and_then(|url_of| url_of(path))
-            .unwrap_or_else(|| path.display().to_string());
-        std::sync::Arc::from(name)
     }
 
     /// Install a host module provider over a virtual `root`: specifiers under
@@ -377,8 +406,7 @@ impl<'p> Vm<'p> {
                 own_map.insert(exported.clone(), gmap[i]);
             }
         }
-        self.module_namespaces.insert(ns_idx, own_map.clone());
-        self.heap.pin_mirror_dict(ns_idx);
+        self.register_module_namespace(ns_idx, own_map.clone());
         self.module_own.insert(path.to_path_buf(), own_map);
         full
     }
@@ -445,6 +473,30 @@ impl<'p> Vm<'p> {
             }
         }
         self.module_base_dir.clone()
+    }
+
+    /// `import.meta.url` of the module whose namespace is `ns`: the `file:`
+    /// URL of the path the loader cached it under. `None` for code no file
+    /// was loaded for. Under a confined loader the URL is the path below the
+    /// root (`file:///lib/util.mjs`), as its errors name no host path either:
+    /// untrusted code learns nothing of where the host keeps its files, and
+    /// a URL resolved against it still names the files beside it.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
+    pub(crate) fn module_url(&self, ns: u32) -> Option<String> {
+        let ns = Value::heap(ns);
+        let (path, _) = self.module_cache.iter().find(|(_, v)| **v == ns)?;
+        // Local: the host's name for the module (`set_module_meta_url`: a URL
+        // its loader resolved, say), when it answers one for this path.
+        if let Some(url) = self.module_meta_url.as_ref().and_then(|url_of| url_of(path)) {
+            return Some(url);
+        }
+        match &self.module_root {
+            Some(root) => {
+                let below = path.strip_prefix(root).ok()?;
+                Some(file_url(&std::path::Path::new("/").join(below)))
+            }
+            None => Some(file_url(path)),
+        }
     }
 
     /// `import_module` for a static request edge taken by the link in
@@ -755,8 +807,6 @@ impl<'p> Vm<'p> {
         let mut full: Vec<(String, u32)> = Vec::new();
         if early_prepare {
             let prog = prog_opt.take().expect("module program");
-            // Its functions' Error stacks name the module.
-            let saved_module = self.installing_module.replace(self.module_name_for_stack(&path));
             let prepared = self.prepare_eval_program(
                 prog,
                 true,
@@ -775,7 +825,6 @@ impl<'p> Vm<'p> {
                 },
                 None,
             );
-            self.installing_module = saved_module;
             match prepared {
                 Ok((gmap, base_func)) => {
                     let end = (self.main_func_count + self.eval_funcs.len()) as u32;
@@ -791,8 +840,7 @@ impl<'p> Vm<'p> {
                 }
             }
         } else {
-            self.module_namespaces.insert(ns_idx, own_pre.clone());
-            self.heap.pin_mirror_dict(ns_idx);
+            self.register_module_namespace(ns_idx, own_pre.clone());
             self.module_own.insert(path.clone(), own_pre);
         }
         // Dependencies that suspend at top-level await get collected past this
@@ -1052,8 +1100,6 @@ impl<'p> Vm<'p> {
             Some(p) => p,
             None => {
                 let prog = prog_opt.take().expect("module program");
-                // Its functions' Error stacks name the module.
-                let saved_module = self.installing_module.replace(self.module_name_for_stack(&path));
                 let prepared = self.prepare_eval_program(
                     prog,
                     true,
@@ -1076,7 +1122,6 @@ impl<'p> Vm<'p> {
                         Some(&prealloc)
                     },
                 );
-                self.installing_module = saved_module;
                 match prepared {
                     Ok((gmap, base_func)) => {
                         let end = (self.main_func_count + self.eval_funcs.len()) as u32;
@@ -1555,8 +1600,7 @@ impl<'p> Vm<'p> {
         if real.is_heap() {
             let rid = real.heap_index();
             if let Some(map) = self.module_namespaces.get(&rid).cloned() {
-                self.module_namespaces.insert(idx, map);
-                self.heap.pin_mirror_dict(idx);
+                self.register_module_namespace(idx, map);
             }
             if let Some(amb) = self.module_ambiguous.get(&rid).cloned() {
                 self.module_ambiguous.insert(idx, amb);
@@ -2385,6 +2429,21 @@ mod confined_budget_tests {
                 calls > 0 && calls < 8 * (K + G),
                 "{calls} canonicalize calls for {K} deferred imports over a {G}-module graph"
             );
+        });
+    }
+
+    #[test]
+    fn a_confined_module_url_names_no_host_path() {
+        with_confined_vm(|vm, root| {
+            vm.run().expect("initialize host realm");
+            std::fs::create_dir(root.join("lib")).expect("create lib");
+            std::fs::write(root.join("lib").join("dep.mjs"), "console.log(import.meta.url);")
+                .expect("write dependency");
+            std::fs::write(root.join("entry.mjs"), "import './lib/dep.mjs'; console.log(import.meta.url);")
+                .expect("write entry");
+            let entry = std::fs::canonicalize(root.join("entry.mjs")).expect("canonical entry");
+            vm.import_module(&entry, None).expect("the graph runs");
+            assert_eq!(vm.output, ["file:///lib/dep.mjs", "file:///entry.mjs"]);
         });
     }
 }

@@ -28,34 +28,33 @@ candidate to propose upstream.
 - **Durable handles** — `HostHandle`, `ScriptState::handle_of_global`,
   `call_handle`, `get_handle`, `release_handle`; the handle table is a GC root
   (vm/gc.rs `mark_roots`).
+- **Scripts for their side effects** — `ScriptState::load_in_context`:
+  upstream's `run_script` (`Vm::eval_script`) without marshalling the
+  completion value, reporting a throw as a structured `JsError`. zipp-rb's
+  `VM#load`; `HostCtx::eval_script` runs the same path.
 - **Structured calls and errors** — `call_global_structured`,
   `eval_in_context_structured`, `JsError { name, message, stack }`; global
   name resolution unified on `host_resolve_global_by_name` so a function
   installed as `globalThis[name]` is found.
-- **Unhandled-rejection sink** — `set_unhandled_rejection_sink`
-  (vm/async_runtime.rs: with a sink installed, every unhandled rejection is
-  reported, not only Test262's narrow case), and
-  `set_promise_rejection_hook(expression)`: HTML's
-  HostPromiseRejectionTracker, calling the JS function `expression` yields
-  with `("unhandledrejection" | "rejectionhandled", promise, reason)`.
-  zipp-rb's `VM#promise_rejection_hook=`.
 - **Lifecycle** — `ScriptState::dispose` / `disposed` (idempotent teardown),
   `gc_now` (`Vm::force_gc`, a no-op while a host conversion holds the GC lock).
-- **Module resolver and `import.meta.url`** — `ModuleResolver`,
+- **Module resolver and module names** — `ModuleResolver`,
   `join_module_specifier` (vm/mod.rs), `ScriptState::set_module_resolver` /
   `set_module_meta_url`; every `dir.join(spec)` in vm/engine/modules.rs,
   vm/dispatch_cold.rs (dynamic import) and vm/construct/modules_dispose.rs goes
-  through `join_module_specifier`, and `Vm::fill_module_meta_url` gives a
-  module's `import.meta` a `url` (it had none). Lets zipp-rb's
-  `VM#module_loader=` load modules named by URL or bare name.
+  through `join_module_specifier`, and upstream's `Vm::module_url` (what
+  `import.meta.url` and a module's stack frames report) answers the host's
+  name for a module when `set_module_meta_url` gives one, before the file URL
+  of its path. Lets zipp-rb's `VM#module_loader=` load modules named by URL
+  or bare name, and name them so. Test: `test/module_loader_test.rb`.
 - **Non-draining call** — `ScriptState::call_global_structured_opts`
   (`host_call_global_structured_opts`): a call that leaves the microtasks it
   queued for the host's next `run_microtasks`, for a host with its own
   checkpoints. zipp-rb's `VM#invoke`.
 - **Compiled scripts** — `CompiledScript::compile` (embed.rs, over
   vm/engine/eval_prog.rs `compile_host_script`) and
-  `ScriptState::load_compiled` (`Vm::host_run_compiled`, split out of
-  `host_run_script`): a classic script compiled once, needing no VM, and
+  `ScriptState::load_compiled` (`Vm::host_run_compiled`, the compiled half
+  of upstream's `Vm::eval_script`): a classic script compiled once, needing no VM, and
   loaded into any number of VMs on any thread. Each load installs its own copy
   (`prepare_eval_program` remaps slots and ids on it). zipp-rb's compile cache
   (`VM#load(cache: true)`). Test: `a_compiled_script_loads_into_many_vms_independently`.
@@ -78,34 +77,20 @@ candidate to propose upstream.
   `ScriptState::set_module_provider` (vm/engine/modules.rs): modules under a
   virtual root served from host memory, sharing the confined loader's budgets.
 
-## Error stacks (crates/zipp-vm/src)
+## Script names in stacks (crates/zipp-vm/src/vm/error_stack.rs, embed.rs, vm/engine/eval_prog.rs, bytecode.rs)
 
-`Error.prototype.stack` was always empty. Now it is V8's format
-(`Name: message` then `    at f (script:line:col)`):
+Upstream's `Error.prototype.stack` names the main program's script
+(`set_script_name`) and a module's URL, and every later script `<anonymous>`.
+A host that loads many scripts into one VM wants each named:
 
-- **Positions** — `Stmt::Expr` / `Return` / `Throw` carry their start offset
-  and `VarDecl` a `pos` (lang/js/parse/ast.rs, stmt.rs, funcs.rs); the
-  compiler records `FuncProto::positions` (`SourcePos { ip, line, col }`) in
-  `FnCompiler::note_stmt_pos` (lang/js/compile/decls.rs), with the function's own
-  start at ip 0 (`Compiler::default_position`, lang/js/compile/funcs.rs) and
-  `Compiler::line_col` (lang/js/compile/compiler.rs). Matches on those
-  variants in capture.rs, lang/js/parse/limits.rs, lang/js/compile/decls.rs
-  and vm/engine/run.rs gained the extra field. bytecode_codec.rs encodes both new FuncProto fields.
-- **Script names** — `FuncProto::script`, stamped in `prepare_eval_program`
-  (vm/engine/eval_prog.rs) from `Vm::script_name`
-  (`ScriptState::set_script_name`, `HostCtx::set_script_name`) or, for a
-  module, `module_name_for_stack` (vm/engine/modules.rs).
-- **Capture** — `Vm::interp_pc` (written per instruction in
-  vm/dispatch.rs; measured at no cost) gives the innermost frame's pc;
-  `capture_error_frames` (vm/error_stack.rs) runs wherever an object gains
-  [[ErrorData]] (vm/values.rs, async_runtime.rs, construct/inherit.rs,
-  construct/modules_dispose.rs) into `Vm::error_frames`, pruned by both GC
-  paths (vm/gc.rs). The `stack` getter (vm/natives.rs) formats it.
-- **Host** — a JsError's `stack` is the formatted stack (vm/host_api.rs;
-  `read_data_prop` had returned the inherited accessor's getter), and
-  `ScriptState::load_in_context` reports a throw structured. The
-  `FuncProto` size pin is 336 (bytecode.rs; upstream's 296 plus the two
-  fields).
+- **`ScriptState::name_scripts(Option<&str>)`** (and `HostCtx::set_script_name`)
+  sets `Vm::script_name` for the code installed from then on;
+  `prepare_eval_program` stamps it on each function as `FuncProto::script`
+  (encoded by bytecode_codec.rs; `FuncProto` is 376 bytes, upstream's 360
+  plus the field), and `stack_script_name` uses a function's stamp before
+  falling back to upstream's rule. zipp-rb sets it around each
+  `load(src, filename:)`. Proposed upstream as D46 in the notes. Test:
+  `test/error_stack_test.rb`.
 
 ## Resource limits (crates/zipp-vm/src/vm/instrument.rs, embed.rs)
 
@@ -135,20 +120,14 @@ candidate to propose upstream.
   cell-value mirror. A function making such closures is not JIT-eligible
   (`FuncProto::makes_value_captures`, vm/engine/boot.rs): the native tiers
   see a capture source only through its `MakeCell`. gethtml.html's heap:
-  548MB → 326MB. Tests: vm/gc.rs `value_capture_tests`, heap.rs,
+  548MB → 326MB. Beside upstream's late boxing (`capture::late_box_names`):
+  the by-value bindings are taken out of `captured` first, and late boxing
+  applies to the rest; `EnclosingFn` carries `value_locals` (indexed like
+  upstream's shared `cell_locals`) and both ride `snapshot`'s cache. Tests: vm/gc.rs `value_capture_tests`, heap.rs,
   `test/engine_fixes_test.rb`.
 
 ## Correctness (crates/zipp-vm/src)
 
-- **A host runs classic scripts, not evals** — `Vm::host_run_script`
-  (vm/engine/eval_prog.rs, over upstream's `compile_script_with_completion`,
-  which `$262.evalScript` uses) runs a script with script
-  GlobalDeclarationInstantiation and returns its completion value. `ScriptState::load_in_context`,
-  `eval_in_context_structured` (`host_eval_structured`) and
-  `HostCtx::eval_script` use it (vm/host_api.rs, embed.rs): as indirect
-  evals, a strict script's `var`s and functions stayed inside it, and no
-  script's `let`/`const`/`class` reached later ones (WPT's `common.js`
-  files are strict). Test: `test/engine_fixes_test.rb`.
 - **Re-entry does not drain microtasks** — `HostCtx::eval_script`,
   `call_global_value` and `call_handle_value` drained the job queue on return,
   running promise jobs while the guest's stack (the host call) was still
@@ -162,4 +141,6 @@ candidate to propose upstream.
 
 `cargo test -p zipp-vm --lib --features instrument` (`rake engine:test` in
 gems/zipp-rb). Local additions include `deadline_stops_execution_like_abort`
-and `host_ctx_reaches_handles_of_its_own_vm_only`.
+and `host_ctx_reaches_handles_of_its_own_vm_only`. codegen_aarch64.rs's test
+`proto` gains the `call_sites` field upstream's FuncProto has (the aarch64 JIT
+tests do not compile upstream, whose CI is x86_64).

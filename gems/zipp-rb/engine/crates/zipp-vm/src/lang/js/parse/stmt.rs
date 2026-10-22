@@ -80,36 +80,6 @@ pub fn parse_standalone_params(src: &str) -> PResult<()> {
     Ok(())
 }
 
-/// Parse `src` as a STANDALONE FunctionBody, requiring the whole string to be
-/// consumed. CreateDynamicFunction step 18 parses the body STRING on its own
-/// (`Let body be ParseText(bodyString, bodyParseGoal)`) BEFORE assembling
-/// `(function anonymous(<params>\n) {\n<body>\n})`. Without it a body that
-/// closes the wrapper early — `}); evil(); (function(){` — turns the assembled
-/// source into a three-statement Script: `evil()` runs while the function is
-/// still being built, and the constructor hands back whichever function the
-/// body chose. The `try { new Function(src) } catch {}` syntax-check idiom must
-/// never execute anything.
-///
-/// `generator` / `is_async` are the [Yield] / [Await] grammar parameters of the
-/// four constructors (Function, GeneratorFunction, AsyncFunction,
-/// AsyncGeneratorFunction). [`Goal::FunctionBody`] additionally makes top-level
-/// `return` legal, and `new.target` — an ordinary function's, not a method's,
-/// so `super` stays a SyntaxError.
-pub fn parse_standalone_body(src: &str, generator: bool, is_async: bool) -> PResult<()> {
-    parse_exact(
-        src,
-        None,
-        ParseOptions {
-            goal: Goal::FunctionBody,
-            allow_yield_expr: generator,
-            allow_await_expr: is_async,
-            allow_new_target: true,
-            ..ParseOptions::default()
-        },
-    )
-    .map(|_| ())
-}
-
 impl<'s> Parser<'s> {
     pub(crate) fn parse_program(&mut self, goal: Goal) -> PResult<Program> {
         let (directives, strict) = self.directive_prologue()?;
@@ -805,7 +775,6 @@ impl<'s> Parser<'s> {
     }
 
     pub(crate) fn parse_var_decl(&mut self, kind: VarKind) -> PResult<VarDecl> {
-        let decl_pos = self.cur().span.start;
         let mut decls = Vec::new();
         loop {
             let pos = self.cur().span.start;
@@ -858,7 +827,7 @@ impl<'s> Parser<'s> {
                 break;
             }
         }
-        Ok(VarDecl { kind, decls, pos: decl_pos })
+        Ok(VarDecl { kind, decls })
     }
 
     /// Declare every name a pattern binds.
@@ -951,7 +920,7 @@ impl<'s> Parser<'s> {
                         Some(self.parse_expr_full()?)
                     };
                     self.semicolon()?;
-                    Ok(Stmt::Return(arg, start))
+                    Ok(Stmt::Return(arg))
                 }
                 Keyword::Throw => {
                     self.bump_before_operand()?;
@@ -962,7 +931,7 @@ impl<'s> Parser<'s> {
                     }
                     let e = self.parse_expr_full()?;
                     self.semicolon()?;
-                    Ok(Stmt::Throw(e, start))
+                    Ok(Stmt::Throw(e))
                 }
                 Keyword::Break | Keyword::Continue => {
                     let is_break = kw == Keyword::Break;
@@ -1164,7 +1133,7 @@ impl<'s> Parser<'s> {
         }
         let e = self.parse_expr_full()?;
         self.semicolon()?;
-        Ok(Stmt::Expr(e, start))
+        Ok(Stmt::Expr(e))
     }
 
     /// Run `f` inside a Block scope, for an IfStatement clause (Annex B B.3.4).
@@ -1293,7 +1262,6 @@ impl<'s> Parser<'s> {
                 let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
                 let left = ForTarget::Var(VarDecl {
                     kind,
-                    pos: for_pos,
                     decls: vec![Declarator {
                         id: pat,
                         init: None,
@@ -1346,7 +1314,6 @@ impl<'s> Parser<'s> {
                     let left = ForTarget::Var(VarDecl {
                         kind,
                         decls: vec![Declarator { id: pat, init }],
-                        pos: for_pos,
                     });
                     Stmt::ForIn { left, right, body }
                 } else {
@@ -1381,7 +1348,7 @@ impl<'s> Parser<'s> {
                     }
                     self.ctx.in_ = saved_in;
                     self.expect(Punct::Semi, true)?;
-                    self.parse_for_classic(Some(ForInit::Var(VarDecl { kind, decls, pos: for_pos })))?
+                    self.parse_for_classic(Some(ForInit::Var(VarDecl { kind, decls })))?
                 }
             }
         } else {

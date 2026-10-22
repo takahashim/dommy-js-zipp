@@ -94,6 +94,14 @@ fn named_value_vec_payload(v: &Vec<(String, Value)>) -> usize {
 /// rebuilding every time it crosses.
 pub const PROP_INDEX_THRESHOLD: usize = 12;
 
+/// [`PROP_INDEX_THRESHOLD`] for a map whose keys are a shared plan (a
+/// literal's, or a shape's for a constructor's appends). Such a map is read
+/// through caches keyed by its shape, which never consult the index, so it
+/// stays unindexed until this wide and a lookup that does reach it scans:
+/// building an index per object was a fifth of constructing one with more
+/// than twelve fields (Babel's NodePath has seventeen).
+const PLANNED_INDEX_THRESHOLD: usize = 64;
+
 /// Most keys a map's shape is rebuilt for after `seal`/`freeze`
 /// (`ObjMap::reshape_after_integrity`): each rebuild walks a fresh path of
 /// the shape tree, so a large frozen dictionary goes DICT rather than spend
@@ -110,6 +118,14 @@ const HASH_TREE_ENTRY_BYTES: usize = 48;
 /// below it), so the emitted guard can compare against a baked id blindly.
 #[cfg(feature = "jit")]
 pub(crate) const FID_MIRROR_NONE: u32 = u32::MAX;
+
+/// The fid-mirror word of a built-in constructor's map (`ObjMap::is_ctor`):
+/// no plain callable either, so the emitted call guard never matches it,
+/// but distinct from [`FID_MIRROR_NONE`] so the interpreter's mirror-guarded
+/// property read (`Vm::ic_get_prop_own_hit`) declines the receivers its
+/// caches exclude without loading the map.
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_CTOR: u32 = u32::MAX - 1;
 
 /// Slot sentinel for an empty [`PropIndex`] bucket (a real slot is a `keys`
 /// position, far below `u32::MAX`).
@@ -2849,6 +2865,26 @@ impl ObjMap {
         m
     }
 
+    /// [`ObjMap::with_capacity`] for a constructor's instance, whose adds
+    /// take their shape's shared key list (`Vm::ic_apply_set`): the values
+    /// and attributes are reserved, the key list is not, since the first add
+    /// replaces it and a reserved one would be allocated only to be freed.
+    pub fn with_value_capacity(n: usize) -> ObjMap {
+        let mut m = ObjMap::new();
+        if n > 0 {
+            {
+                #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
+                let ValStore::Vec(v) = &mut m.vals
+                else {
+                    unreachable!("ctor stores are Vec-born")
+                };
+                v.reserve_exact(n);
+            }
+            m.attrs.reserve_exact(n);
+        }
+        m
+    }
+
     /// The map `{ ...self }` makes when `self`'s properties can be copied as
     /// they stand: every one a default data property (writable, enumerable,
     /// configurable) and none a symbol. Creating them on an empty object in
@@ -3080,7 +3116,7 @@ impl ObjMap {
             }
             self.numeric_index = Some(numeric);
         }
-        if n >= PROP_INDEX_THRESHOLD {
+        if n >= PLANNED_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
         }
     }
@@ -3130,7 +3166,7 @@ impl ObjMap {
             }
             m.numeric_index = Some(numeric);
         }
-        if n >= PROP_INDEX_THRESHOLD {
+        if n >= PLANNED_INDEX_THRESHOLD {
             m.index = Some(PropIndex::build(&m.keys));
         }
         m
@@ -3247,6 +3283,13 @@ impl ObjMap {
     /// shape-keyed cache way can ever write through it.
     pub fn mark_class_proto(&mut self) {
         self.class_proto = true;
+        self.shape_to_dict();
+    }
+
+    /// Drop this map to dictionary mode for good: an object whose
+    /// properties are not all in its map (a module namespace's live
+    /// bindings) can then never match a shape-keyed cache way.
+    pub fn pin_dict(&mut self) {
         self.shape_to_dict();
     }
 
@@ -3444,8 +3487,19 @@ impl ObjMap {
             if !ix.insert_tagged(&self.keys[slot], slot as u32, tag) {
                 self.index = Some(PropIndex::collided(&self.keys));
             }
-        } else if self.keys.len() >= PROP_INDEX_THRESHOLD {
+        } else if self.keys.len() >= self.index_threshold() {
             self.index = Some(PropIndex::build(&self.keys));
+        }
+    }
+
+    /// The key count at which this map builds its index: later for a map
+    /// whose keys are a shared plan (see [`PLANNED_INDEX_THRESHOLD`]).
+    #[inline]
+    fn index_threshold(&self) -> usize {
+        if self.keys.is_planned() {
+            PLANNED_INDEX_THRESHOLD
+        } else {
+            PROP_INDEX_THRESHOLD
         }
     }
 
@@ -3523,6 +3577,55 @@ impl ObjMap {
         self.shape = shape_after;
         self.has_element_key |= key_names_element(key);
         self.index_appended();
+    }
+
+    /// [`ObjMap::append_data_shaped`] for an append whose shape has a shared
+    /// key list: `plan` is `shape::keys_of(shape_after)` as a plan (so this
+    /// map's keys are its prefix) and names no element (`shape_key_plan`
+    /// refuses one that does). The map takes it borrowed when `borrow` is set,
+    /// and so pays no reference count, and skips the element-key parse and
+    /// numeric index an owned key needs: a constructor's adds spent a tenth
+    /// of `new F()` on the count and the parse alone.
+    ///
+    /// # Safety
+    ///
+    /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s
+    /// contract.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) unsafe fn append_data_planned(
+        &mut self,
+        key: &str,
+        val: Value,
+        shape_after: u32,
+        plan: &StaticKeyPlan,
+        borrow: bool,
+    ) {
+        let n = self.keys.len();
+        debug_assert!(self.pos(key).is_none());
+        debug_assert!(plan.len() == n + 1 && !plan.has_element_key());
+        debug_assert!(plan.keys()[..n] == *self.keys.as_ref() && plan.keys()[n] == key);
+        match &mut self.keys {
+            PropKeys::Planned { all, visible_len } if all.is(plan) => *visible_len = n + 1,
+            _ => self.set_keys(PropKeys::Planned {
+                all: if borrow {
+                    // SAFETY: this function's contract.
+                    unsafe { PlanHandle::borrowed(plan) }
+                } else {
+                    PlanHandle::owned(plan.clone())
+                },
+                visible_len: n + 1,
+            }),
+        }
+        self.vals.push(val);
+        self.attrs.push(PropAttr::data());
+        self.shape = shape_after;
+        if let Some(ix) = &mut self.index {
+            if !ix.insert_tagged(key, n as u32, prop_tag(key)) {
+                self.index = Some(PropIndex::collided(&self.keys));
+            }
+        } else if n + 1 >= PLANNED_INDEX_THRESHOLD {
+            self.index = Some(PropIndex::build(&self.keys));
+        }
     }
 
     /// [`ObjMap::set`] for a caller that already OWNS the key string: on the
@@ -5422,6 +5525,11 @@ pub struct ClassData {
     /// foreign newTarget). Lookups on this class's instances must then consult
     /// the instance's `proto_of` entry before the member tables.
     pub reproto_instances: bool,
+    /// The shape `statics` had when it was last proven to hold no
+    /// `@@hasInstance` (with no static accessors at all), or `shape::DICT`.
+    /// Shapes are never reissued, so while `statics` keeps that shape the
+    /// proof stands (`Vm::instanceof_fast`).
+    pub no_has_instance_shape: std::cell::Cell<u32>,
 }
 
 /// The per-EVALUATION decoration state of a decorated class: what the decorator
@@ -6306,9 +6414,21 @@ fn no_hot_mirror() -> HotMirrorHint {}
 fn object_hot_mirror(map: &ObjMap, shape: u32) -> HotMirrorHint {
     Some(HotMirror {
         shape,
-        fid: FID_MIRROR_NONE,
+        fid: object_mirror_fid(map),
         vals: map.vals.as_ptr() as u64,
     })
+}
+
+/// An object's fid-mirror word: [`FID_MIRROR_CTOR`] for a built-in
+/// constructor's map, else [`FID_MIRROR_NONE`].
+#[cfg(feature = "jit")]
+#[inline(always)]
+fn object_mirror_fid(map: &ObjMap) -> u32 {
+    if map.is_ctor {
+        FID_MIRROR_CTOR
+    } else {
+        FID_MIRROR_NONE
+    }
 }
 
 #[cfg(not(feature = "jit"))]
@@ -7217,8 +7337,8 @@ pub struct Heap {
     /// `GEN_OLD` by [`Heap::remset_reset`] at the end of each minor.
     remset: Vec<u32>,
     /// Stage-3 PERSISTENT trace roots: receivers a JIT cache can store into
-    /// with NO helper call (a filled SetProp data way; a baked method-inline
-    /// trivial-setter arm). Those stores can never run a barrier, so their
+    /// with NO barrier (a baked method-inline trivial-setter arm; a SetProp
+    /// way's hit runs the barrier itself). Those stores never see one, so their
     /// targets' edges are re-scanned at EVERY minor instead — sound because
     /// the set of such receivers is exactly what the fill sites registered.
     /// Deduped by `GEN_SCAN`; an entry self-expires when its slot is recycled
@@ -7330,6 +7450,13 @@ pub struct Heap {
     /// `ZIPP_NURSERY_YOUNG_BUDGET` or `ZIPP_NO_NURSERY_ADAPT=1`) — the
     /// survival-adaptive controller then never moves it.
     budget_pinned: bool,
+    /// The young survival (per mille) of the epoch before the controller's
+    /// last doubling, which the next epoch's survival judges; 0 when no
+    /// doubling awaits judgement (see `adapt_young_budget`).
+    grew_from_survival: u32,
+    /// Minors left before the controller may double again, after a doubling
+    /// that did not pay.
+    grow_hold: u32,
     /// W10 value-grain remembered set (B123): the YOUNG values stored into
     /// OLD-clean holders this epoch, recorded by `write_barrier_val` and
     /// marked DIRECTLY as minor roots — replacing the holder-grain full
@@ -7662,6 +7789,27 @@ fn parse_nursery_max_minors(raw: &str) -> Option<u32> {
 /// (async-promise-chain's chain-build phases: −3.3% at 64k in B121's trial).
 const NURSERY_BUDGET_MAX: usize = 1 << 17;
 
+/// Minors the survival-adaptive controller waits, after a doubling that did
+/// not cut survival, before it may double again (see
+/// `Heap::adapt_young_budget`): a phase change gets another try.
+const NURSERY_GROW_HOLD: u32 = 64;
+
+/// `ZIPP_NO_NURSERY_MARGINAL=1`: the young budget doubles on high survival
+/// whether or not the doubling pays (`Heap::adapt_young_budget`), for A/B.
+fn nursery_marginal_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_NURSERY_MARGINAL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Under `ZIPP_GC_STRESS=1` a collection runs at EVERY safe point; capping the
 /// streak at 3 makes stress alternate minor,minor,minor,major so BOTH sweep
 /// paths — and their interleavings over the same slots — are densely
@@ -7867,6 +8015,8 @@ impl Heap {
             nursery_max_minors,
             young_budget,
             budget_pinned,
+            grew_from_survival: 0,
+            grow_hold: 0,
             pretenure: 0,
             pretenure_on,
             nonyoung_cache: Vec::new(),
@@ -7919,6 +8069,15 @@ impl Heap {
     #[inline]
     pub(crate) fn upvals_mirror_of(&self, idx: u32) -> u64 {
         self.upvals_mirror[idx as usize]
+    }
+
+    /// Slot `idx`'s hot mirror record, for the interpreter's mirror-guarded
+    /// own-data read (`Vm::ic_get_prop_own_hit`), which relies on exactly
+    /// the discipline the field documents for the emitted shape-way probes.
+    #[cfg(feature = "jit")]
+    #[inline(always)]
+    pub(crate) fn hot_mirror_of(&self, idx: u32) -> HotMirror {
+        self.hot_mirror[idx as usize]
     }
 
     /// Pin slot `idx`'s mirrors permanently unmatchable. For the receivers
@@ -8185,6 +8344,23 @@ impl Heap {
             // SAFETY: this function's contract.
             return unsafe { self.alloc_finalized_thin(plan, vals, shape, true) };
         }
+        self.alloc_finalized(plan, vals, shape)
+    }
+
+    /// [`Heap::alloc_finalized`] for a plan that lives as long as the
+    /// process (an engine-made object such as an iterator result): borrowed
+    /// like a literal site's, with no unsafe contract left to the caller.
+    #[inline]
+    pub(crate) fn alloc_finalized_static(
+        &mut self,
+        plan: &'static crate::bytecode::StaticKeyPlan,
+        vals: &[Value],
+        shape: u32,
+    ) -> u32 {
+        // SAFETY: a `'static` plan outlives this heap.
+        #[cfg(not(feature = "safe-sandbox"))]
+        return unsafe { self.alloc_finalized_borrowed(plan, vals, shape) };
+        #[cfg(feature = "safe-sandbox")]
         self.alloc_finalized(plan, vals, shape)
     }
 
@@ -8614,7 +8790,7 @@ impl Heap {
         let hot = match &self.objs[idx as usize] {
             HeapObj::Object(m) => HotMirror {
                 shape: m.shape(),
-                fid: FID_MIRROR_NONE,
+                fid: object_mirror_fid(m),
                 vals: m.vals.as_ptr() as u64,
             },
             HeapObj::Func(f) => HotMirror {
@@ -9014,7 +9190,15 @@ impl Heap {
         // Reuse a reclaimed slot when one is available (its version is bumped so a
         // stale inline-cache entry for the old occupant misses).
         if let Some(idx) = self.free.pop() {
-            self.objs[idx as usize] = obj;
+            // Over the tombstone, as the thin paths install theirs: the
+            // assignment's drop glue was a call and a read of the dead
+            // occupant's tag on every general allocation into a reused slot.
+            #[cfg(not(feature = "safe-sandbox"))]
+            self.reuse_slot_write(idx, obj);
+            #[cfg(feature = "safe-sandbox")]
+            {
+                self.objs[idx as usize] = obj;
+            }
             debug_assert_eq!(self.resident_payload_charged[idx as usize].get(), 0);
             // B197: skip the (always-zero) charge-cell write with accounting
             // off — one less line on the slot-reuse alloc path.
@@ -9328,9 +9512,25 @@ impl Heap {
         let cap = if stress {
             NURSERY_STRESS_MINORS
         } else {
-            self.nursery_max_minors
+            self.backstop_minors()
         };
         self.nursery && !self.major_due && self.minors_since_major < cap
+    }
+
+    /// The backstop streak: at least `nursery_max_minors`, and for a large
+    /// heap as many minors as allocate twice what the last major found live.
+    /// A major traces the whole old heap, so a fixed streak made it the cost
+    /// of a big program's collections: Babel's standalone bundle ran eleven,
+    /// each tracing two million objects to reclaim one percent of them. Floats
+    /// stay bounded by `major_at`, which still forces a major on growth. An
+    /// explicit `ZIPP_NURSERY_MAX_MINORS` keeps its exact streak.
+    #[inline]
+    fn backstop_minors(&self) -> u32 {
+        if self.nursery_max_minors != NURSERY_MAX_MINORS_DEFAULT {
+            return self.nursery_max_minors;
+        }
+        let amortized = (self.live_at_major / self.young_budget.max(1)).saturating_mul(2);
+        (amortized.min(NURSERY_MAX_MINORS_LIMIT as usize) as u32).max(NURSERY_MAX_MINORS_DEFAULT)
     }
 
     /// The slots allocated since the last collection (the minor sweep set).
@@ -9496,13 +9696,12 @@ impl Heap {
         self.remset.push(holder);
     }
 
-    /// Register `holder` as a PERSISTENT minor-trace root: a JIT cache was
-    /// just filled (or a plan baked) that can store into it CALL-FREE, so no
-    /// barrier will ever see those stores. Every minor re-scans its edges
-    /// instead. Sticky until the slot is recycled (`alloc` clears the bit and
-    /// the minor prune drops the entry); bounded by the number of distinct
-    /// receivers ever filled into a Set-capable way, which the 8-way IC and
-    /// the ≤8-arm method-inline plans keep small in practice.
+    /// Register `holder` as a PERSISTENT minor-trace root: a plan was just
+    /// baked that can store into it CALL-FREE, so no barrier will ever see
+    /// those stores. Every minor re-scans its edges instead. Sticky until the
+    /// slot is recycled (`alloc` clears the bit and the minor prune drops the
+    /// entry); bounded by the ≤8-arm method-inline plans. Not for IC ways: a
+    /// receiver per fill, kept for the receiver's life, grew without bound.
     #[inline]
     #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
     pub fn register_scan_root(&mut self, holder: u32) {
@@ -9563,14 +9762,54 @@ impl Heap {
     /// `ZIPP_NO_NURSERY_ADAPT=1`), on an empty log (an all-pretenured
     /// epoch), and under GC stress (the caller guards — epochs of ~1 alloc
     /// make the ratio noise).
+    ///
+    /// A doubling must pay: the epoch after one has to cut survival by a
+    /// fifth, else the budget halves back and does not double again for
+    /// [`NURSERY_GROW_HOLD`] minors. Survivors that outlive any affordable
+    /// nursery (a 50,000-entry LRU cache, a tree that keeps every node) are
+    /// only made dearer by a larger one: each minor of a 128k nursery cost a
+    /// cache run five milliseconds against a quarter of one at 16k, while
+    /// survival fell only from 74% to 55%, and the run spent 2.4 times as
+    /// long collecting. Where the larger nursery lets objects die first
+    /// (54% -> 15% survival on `survival.js`) every doubling pays and the
+    /// budget still climbs. `ZIPP_NO_NURSERY_MARGINAL=1` restores the plain
+    /// controller.
     pub fn adapt_young_budget(&mut self, survivors: usize, log_len: usize) {
         if self.budget_pinned || log_len == 0 {
             return;
         }
+        if !nursery_marginal_enabled() {
+            if survivors * 4 > log_len {
+                self.young_budget = (self.young_budget * 2).min(NURSERY_BUDGET_MAX);
+            } else if survivors * 20 < log_len {
+                self.young_budget = (self.young_budget / 2).max(NURSERY_YOUNG_BUDGET);
+            }
+            return;
+        }
+        let survival = (survivors * 1000 / log_len) as u32;
         if survivors * 4 > log_len {
-            self.young_budget = (self.young_budget * 2).min(NURSERY_BUDGET_MAX);
-        } else if survivors * 20 < log_len {
-            self.young_budget = (self.young_budget / 2).max(NURSERY_YOUNG_BUDGET);
+            if self.grew_from_survival != 0 && survival * 5 > self.grew_from_survival * 4 {
+                self.young_budget = (self.young_budget / 2).max(NURSERY_YOUNG_BUDGET);
+                self.grew_from_survival = 0;
+                self.grow_hold = NURSERY_GROW_HOLD;
+                return;
+            }
+            if self.grow_hold > 0 {
+                self.grow_hold -= 1;
+                self.grew_from_survival = 0;
+                return;
+            }
+            if self.young_budget < NURSERY_BUDGET_MAX {
+                self.grew_from_survival = survival.max(1);
+                self.young_budget = (self.young_budget * 2).min(NURSERY_BUDGET_MAX);
+            } else {
+                self.grew_from_survival = 0;
+            }
+        } else {
+            self.grew_from_survival = 0;
+            if survivors * 20 < log_len {
+                self.young_budget = (self.young_budget / 2).max(NURSERY_YOUNG_BUDGET);
+            }
         }
     }
 
@@ -10547,6 +10786,25 @@ impl Heap {
         }
     }
 
+    /// [`Heap::array_store_in_place`] for a PRESENT element only (in range and
+    /// not a hole), in every build: the overwrite `set_index`'s first path
+    /// makes, which neither moves the storage nor changes what is present, so
+    /// no array snapshot needs to be invalidated. `false`, with nothing
+    /// written, for anything else.
+    #[inline]
+    pub(crate) fn array_overwrite_present(&mut self, idx: u32, i: usize, v: Value) -> bool {
+        match &mut self.objs[idx as usize] {
+            HeapObj::Array(items) => match items.get_mut(i) {
+                Some(slot) if !slot.is_hole() => {
+                    *slot = v;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Visit every compiled RegExp program held directly by a live heap slot.
     /// Both the authoritative Unicode program and its optional ASCII byte-opt
     /// twin participate. Callers deduplicate the shared `Arc` identities.
@@ -11074,6 +11332,24 @@ impl Heap {
             // `UpvalGet` and the emitted cell writes address.
             self.cell_vals_mirror[idx as usize] = v.bits();
         }
+    }
+
+    /// [`Heap::cell_set`] for a slot known to hold a cell: one a closure's
+    /// upvalue list names (an `UpvalSet`), which only ever holds cells the
+    /// closure keeps alive. Skips the occupant check, a read of the cell's
+    /// heap slot on every captured-variable write.
+    #[inline]
+    pub(crate) fn upval_cell_set(&mut self, idx: u32, v: Value) {
+        debug_assert!(matches!(self.get(idx), HeapObj::Cell));
+        self.write_barrier_val(idx, v);
+        if self.oracle
+            && v.is_heap()
+            && !self.oracle_young(idx)
+            && self.oracle_young(v.heap_index())
+        {
+            gcoracle::hit(gcoracle::CELL_SET);
+        }
+        self.cell_vals_mirror[idx as usize] = v.bits();
     }
 
     /// Cell-payload write for a caller that has ALREADY performed the nursery
@@ -13106,6 +13382,22 @@ mod tests {
             !h.minor_due(true),
             "GC stress must retain its fixed three-minor cadence"
         );
+    }
+
+    #[test]
+    fn default_backstop_streak_scales_with_the_heap_a_major_found() {
+        let mut h = Heap::new();
+        h.set_nursery(true);
+        h.nursery_max_minors = NURSERY_MAX_MINORS_DEFAULT;
+        h.young_budget = 16_384;
+        h.live_at_major = 100_000;
+        assert_eq!(h.backstop_minors(), NURSERY_MAX_MINORS_DEFAULT, "a small heap keeps the default");
+        h.live_at_major = 2_000_000;
+        assert_eq!(h.backstop_minors(), 244, "twice the live heap, in young budgets");
+        h.live_at_major = usize::MAX / 2;
+        assert_eq!(h.backstop_minors(), NURSERY_MAX_MINORS_LIMIT);
+        h.nursery_max_minors = 2;
+        assert_eq!(h.backstop_minors(), 2, "an explicit streak is kept exactly");
     }
 
     #[test]

@@ -57,45 +57,9 @@ impl Compiler {
             && !self.eval_outer_scope.iter().any(|n| n == name)
     }
 
-    /// The 1-based line and column of byte offset `pos` in the source; the
-    /// column counts UTF-16 code units. Line terminators are JS's: LF, CR,
-    /// CRLF, U+2028 and U+2029.
-    pub(crate) fn line_col(&mut self, pos: u32) -> (u32, u32) {
-        let source = &self.source;
-        let starts = self.line_starts.get_or_insert_with(|| {
-            let mut starts = vec![0u32];
-            let mut chars = source.char_indices().peekable();
-            while let Some((i, c)) = chars.next() {
-                let next = match c {
-                    '\r' if chars.peek().map(|&(_, n)| n) == Some('\n') => continue,
-                    '\n' | '\r' | '\u{2028}' | '\u{2029}' => i + c.len_utf8(),
-                    _ => continue,
-                };
-                starts.push(next as u32);
-            }
-            starts
-        });
-        let line = starts.partition_point(|&s| s <= pos).max(1);
-        let start = starts[line - 1] as usize;
-        let col = source
-            .get(start..(pos as usize).min(source.len()))
-            .map_or(0, |s| s.encode_utf16().count());
-        (line as u32, col as u32 + 1)
-    }
-
-    /// Give `proto` a position at its first instruction — where the function
-    /// starts in the source — unless a statement already has one there, so a
-    /// frame in it (an arrow with an expression body, say) still reports one.
-    pub(crate) fn default_position(&mut self, proto: &mut FuncProto, start: u32) {
-        if proto.positions.first().is_some_and(|p| p.ip == 0) {
-            return;
-        }
-        let (line, col) = self.line_col(start);
-        proto.positions.insert(0, crate::bytecode::SourcePos { ip: 0, line, col });
-    }
-
     pub(crate) fn new(source: String) -> Compiler {
         Compiler {
+            capture_memo: crate::capture::Session::new(),
             functions: Vec::new(),
             static_key_plan_sites: 0,
             static_key_plan_retained_bytes: 0,
@@ -106,7 +70,7 @@ impl Compiler {
             hoisted_globals: Vec::new(),
             hoisted_set: rustc_hash::FxHashSet::default(),
             source,
-            line_starts: None,
+            source_index: std::cell::OnceCell::new(),
             eval_mode: false,
             script_completion: false,
             eval_inherit_super: None,
@@ -185,6 +149,13 @@ impl Compiler {
             .get(start as usize..end as usize)
             .map(|s| s.to_string())
             .unwrap_or_default()
+    }
+
+    /// The `(line, column)` of source byte offset `off` (see `positions`).
+    pub(crate) fn line_col(&self, off: u32) -> (u32, u32) {
+        self.source_index
+            .get_or_init(|| super::positions::SourceIndex::new(&self.source))
+            .line_col(off)
     }
 
     /// Look up an already-reserved global without changing the deterministic
@@ -480,8 +451,25 @@ impl Compiler {
             capture::value_captures(params, params_ast, body, false, &captured)
         };
         captured.retain(|n| !value_captured.contains(n));
+        // Of the rest, bindings only directly returned closures capture stay
+        // plain until the `return` that makes one (`capture::late_box_names`).
+        let late_boxed = if is_script
+            || is_generator
+            || is_async
+            || body_refs_eval
+            || capture::stmts_refs_all(body).contains("arguments")
+            || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa))
+        {
+            HashSet::new()
+        } else {
+            capture::late_box_names(params_ast, body, &captured)
+        };
+        for n in &late_boxed {
+            captured.remove(n);
+        }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.value_captured = value_captured;
+        fc.late_boxed = late_boxed;
         if body_refs_eval {
             fc.box_all_locals = true;
         }
@@ -1156,6 +1144,7 @@ impl Compiler {
         fc.cx.dyn_global_zone = saved_dyn_zone;
         fc.typeof_alias_finish();
         fc.check_regs()?;
+        let call_sites = fc.take_call_sites();
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
             code: fc.code,
@@ -1195,9 +1184,9 @@ impl Compiler {
             makes_value_captures: fc.makes_value_captures.get(),
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by the caller from the function node's span
-            positions: std::mem::take(&mut fc.positions),
             script: None,
             fused: Default::default(),
+            call_sites,
         })
     }
 
@@ -1514,6 +1503,7 @@ impl Compiler {
         fc.cx.dyn_global_zone = saved_dyn_zone_cls;
         fc.typeof_alias_finish();
         fc.check_regs()?;
+        let call_sites = fc.take_call_sites();
         Ok(FuncProto {
             name: name.to_string(),
             code: fc.code,
@@ -1549,9 +1539,9 @@ impl Compiler {
             makes_value_captures: fc.makes_value_captures.get(),
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // class methods: caller may override from span
-            positions: std::mem::take(&mut fc.positions),
             script: None,
             fused: Default::default(),
+            call_sites,
         })
     }
 
@@ -1813,6 +1803,7 @@ impl Compiler {
         let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         fc.typeof_alias_finish();
         fc.check_regs()?;
+        let call_sites = fc.take_call_sites();
         Ok(FuncProto {
             name: "<arrow>".to_string(),
             code: fc.code,
@@ -1847,9 +1838,9 @@ impl Compiler {
             makes_value_captures: fc.makes_value_captures.get(),
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by compile_arrow from the arrow's span
-            positions: std::mem::take(&mut fc.positions),
             script: None,
             fused: Default::default(),
+            call_sites,
         })
     }
 }

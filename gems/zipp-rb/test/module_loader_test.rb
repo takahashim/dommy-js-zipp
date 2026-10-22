@@ -16,6 +16,7 @@ class ModuleLoaderTest < Minitest::Test
       export function greet(name) { return exclaim("hi " + name); }
     JS
     "https://example.test/app/util.js" => "export const exclaim = (s) => s + '!';",
+    "https://example.test/app/fail.js" => "export function trace() { return new Error('t').stack; }",
     "https://cdn.test/pkg@1/index.js" => "export const VERSION = 'v1';"
   }.freeze
 
@@ -48,6 +49,13 @@ class ModuleLoaderTest < Minitest::Test
 
   def test_import_meta_url_is_the_module_name
     assert_equal "https://example.test/app/main.js", @vm.import("https://example.test/app/main.js")["url"]
+  end
+
+  # A module's stack frames name it as import.meta.url does: by the name the
+  # loader gave it, not its internal path.
+  def test_a_module_frame_names_the_module
+    stack = @vm.eval_async('return (await import("https://example.test/app/fail.js")).trace();')
+    assert_includes stack, "at trace (https://example.test/app/fail.js:1:"
   end
 
   def test_a_module_is_loaded_once_per_canonical_name

@@ -13,7 +13,7 @@ use crate::bytecode::*;
 use crate::value::Value;
 
 /// Bumped when this file's layout changes.
-pub(crate) const FORMAT: u32 = 1;
+pub(crate) const FORMAT: u32 = 2;
 
 pub(crate) struct Writer {
     pub(crate) out: Vec<u8>,
@@ -350,10 +350,10 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         makes_value_captures,
         eval_sites,
         source,
-        positions,
         script,
         // The interpreter's superinstruction copy is rebuilt at run time.
         fused: _,
+        call_sites,
     } = f;
     w.str(name);
     w.len(code.len());
@@ -429,11 +429,11 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         w.strs(lexical);
     }
     sources.encode(w, source);
-    w.len(positions.len());
-    for p in positions {
-        w.u32(p.ip);
-        w.u32(p.line);
-        w.u32(p.col);
+    w.len(call_sites.len());
+    for s in call_sites.iter() {
+        for v in [s.start, s.end, s.line, s.col] {
+            w.u32(v);
+        }
     }
     match script {
         None => w.u8(0),
@@ -511,9 +511,15 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         eval_sites.push((bindings, collisions, r.strs()?));
     }
     let source = sources.decode(r)?;
-    let mut positions = Vec::new();
-    for _ in 0..r.len()? {
-        positions.push(crate::bytecode::SourcePos { ip: r.u32()?, line: r.u32()?, col: r.u32()? });
+    let n = r.len()?;
+    let mut call_sites = Vec::with_capacity(n);
+    for _ in 0..n {
+        call_sites.push(CallSite {
+            start: r.u32()?,
+            end: r.u32()?,
+            line: r.u32()?,
+            col: r.u32()?,
+        });
     }
     let script = match r.u8()? {
         0 => None,
@@ -545,9 +551,9 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         makes_value_captures,
         eval_sites,
         source,
-        positions,
         script,
         fused: Default::default(),
+        call_sites: call_sites.into_boxed_slice(),
     })
 }
 

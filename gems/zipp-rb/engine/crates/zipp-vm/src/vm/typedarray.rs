@@ -30,6 +30,13 @@ pub const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 27;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
 
+/// The `N` bytes of `data` at `off`, or `None` past its end: one bounds check
+/// and a fixed-width load, for the typed-array element reads.
+#[inline(always)]
+fn ta_bytes<const N: usize>(data: &[u8], off: usize) -> Option<[u8; N]> {
+    data.get(off..off.checked_add(N)?)?.try_into().ok()
+}
+
 /// Immutable TypedArray internal slots copied by the interpreter's exact
 /// receiver match. Private fields make the match the only authority that can
 /// feed the direct numeric-index leaves without re-reading the receiver.
@@ -68,6 +75,40 @@ impl TaInterpNumericView {
 /// The `TA_KINDS` index of each numeric DataView getter, by its position in
 /// `DV_PROTO_METHODS`: the kinds `dataview_get_kind` pairs with them.
 const DV_GET_KINDS: [u8; 8] = [0, 1, 3, 4, 5, 6, 7, 8];
+
+/// The %DataView.prototype% entry of the accessor `name` (the slot
+/// `dataview_get_kind`, `dataview_set_kind` and `dataview_big_kind` give),
+/// picked by the name's length and two of its bytes and then confirmed by
+/// one inline compare. The three `match`es compared the name with up to
+/// twenty literals by `memcmp`, on every `dv.getUint32` read: 11 ns of it.
+#[inline]
+fn dataview_proto_slot(name: &str) -> Option<usize> {
+    let b = name.as_bytes();
+    let (cand, slot) = match (b.len(), *b.first()?, *b.get(3)?) {
+        (7, b'g', b'I') => ("getInt8", 0),
+        (8, b'g', b'U') => ("getUint8", 1),
+        (8, b'g', b'I') if b[6] == b'1' => ("getInt16", 2),
+        (8, b'g', b'I') => ("getInt32", 4),
+        (9, b'g', b'U') if b[7] == b'1' => ("getUint16", 3),
+        (9, b'g', b'U') => ("getUint32", 5),
+        (10, b'g', b'F') if b[8] == b'3' => ("getFloat32", 6),
+        (10, b'g', b'F') => ("getFloat64", 7),
+        (11, b'g', b'B') => ("getBigInt64", 8),
+        (12, b'g', b'B') => ("getBigUint64", 9),
+        (7, b's', b'I') => ("setInt8", 10),
+        (8, b's', b'U') => ("setUint8", 11),
+        (8, b's', b'I') if b[6] == b'1' => ("setInt16", 12),
+        (8, b's', b'I') => ("setInt32", 14),
+        (9, b's', b'U') if b[7] == b'1' => ("setUint16", 13),
+        (9, b's', b'U') => ("setUint32", 15),
+        (10, b's', b'F') if b[8] == b'3' => ("setFloat32", 16),
+        (10, b's', b'F') => ("setFloat64", 17),
+        (11, b's', b'B') => ("setBigInt64", 18),
+        (12, b's', b'B') => ("setBigUint64", 19),
+        _ => return None,
+    };
+    crate::heap::key_eq(name, cand).then_some(slot)
+}
 
 /// Runtime kind id for the allocation-free, non-BigInt DataView getters.
 /// Keeping this as a direct match avoids a linear scan of all 22 get/set names
@@ -815,9 +856,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn dataview_proto_read(&self, view_idx: u32, name: &str) -> Option<u64> {
         // The setters and the BigInt accessors sit at their own boot entries;
         // the proof is the same.
-        let (method, _) = dataview_get_kind(name)
-            .or_else(|| dataview_set_kind(name))
-            .or_else(|| dataview_big_kind(name).map(|(slot, _)| (slot, 0)))?;
+        let method = dataview_proto_slot(name)?;
         let HeapObj::DataView {
             pristine_version, ..
         } = self.heap.get(view_idx)
@@ -923,40 +962,61 @@ impl<'p> Vm<'p> {
             ));
         }
         let abs = byte_offset + pos;
-        let bytes = &data[abs..abs + size];
-        let little = self.truthy(little_endian);
+        // `truthy` stayed an out-of-line call here; the flag is a primitive
+        // (`le === 1`, an absent one) in every read that runs hot.
+        let little = match little_endian.truthy_primitive() {
+            Some(t) => t,
+            None => self.truthy(little_endian),
+        };
+        // Fixed-width reads (the bounds were proved above, so `ta_bytes`
+        // cannot decline), and integer kinds as integer Values, as the typed
+        // array reads make them.
+        macro_rules! rd {
+            ($n:expr) => {
+                ta_bytes::<$n>(data, abs).expect("DataView read inside the bounds just checked")
+            };
+        }
         let result = match kind {
-            0 => Value::num(bytes[0] as i8 as f64),
-            1 => Value::num(bytes[0] as f64),
-            3 => Value::num(if little {
-                i16::from_le_bytes([bytes[0], bytes[1]]) as f64
+            0 => Value::int(rd!(1)[0] as i8 as i32),
+            1 => Value::int(rd!(1)[0] as i32),
+            3 => Value::int(if little {
+                i16::from_le_bytes(rd!(2))
             } else {
-                i16::from_be_bytes([bytes[0], bytes[1]]) as f64
-            }),
-            4 => Value::num(if little {
-                u16::from_le_bytes([bytes[0], bytes[1]]) as f64
+                i16::from_be_bytes(rd!(2))
+            } as i32),
+            4 => Value::int(if little {
+                u16::from_le_bytes(rd!(2))
             } else {
-                u16::from_be_bytes([bytes[0], bytes[1]]) as f64
-            }),
-            5 => Value::num(if little {
-                i32::from_le_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+                u16::from_be_bytes(rd!(2))
+            } as i32),
+            5 => Value::int(if little {
+                i32::from_le_bytes(rd!(4))
             } else {
-                i32::from_be_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+                i32::from_be_bytes(rd!(4))
             }),
-            6 => Value::num(if little {
-                u32::from_le_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
-            } else {
-                u32::from_be_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
-            }),
+            // `Value::num`'s answer without its trip through a double: an
+            // Int under 2^31, the double above. On every `getUint32`.
+            6 => {
+                let u = if little {
+                    u32::from_le_bytes(rd!(4))
+                } else {
+                    u32::from_be_bytes(rd!(4))
+                };
+                if u <= i32::MAX as u32 {
+                    Value::int(u as i32)
+                } else {
+                    Value::num(u as f64)
+                }
+            }
             7 => Value::num(if little {
-                f32::from_le_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+                f32::from_le_bytes(rd!(4))
             } else {
-                f32::from_be_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
-            }),
+                f32::from_be_bytes(rd!(4))
+            } as f64),
             8 => Value::num(if little {
-                f64::from_le_bytes(bytes.try_into().expect("eight-byte DataView read"))
+                f64::from_le_bytes(rd!(8))
             } else {
-                f64::from_be_bytes(bytes.try_into().expect("eight-byte DataView read"))
+                f64::from_be_bytes(rd!(8))
             }),
             _ => unreachable!("dataview_get_kind returned a non-numeric getter"),
         };
@@ -992,7 +1052,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let size = native::TA_KINDS[kind as usize].1;
-        if self.ta_tracking.contains(&ta_idx) {
+        if !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx) {
             if byte_offset > buf_len {
                 return None;
             }
@@ -1424,8 +1484,12 @@ impl<'p> Vm<'p> {
 
     /// Allocation-free numeric-index load using internal slots already copied
     /// by the dispatch receiver match. Backing-buffer identity, detachment and
-    /// resizable-view bounds remain live and fail closed here.
-    #[inline]
+    /// resizable-view bounds remain live and fail closed here. Inlined into
+    /// the main loop's `GetIndex` arm: out of line, the call (its 32-byte view
+    /// passed through memory, the prologue and epilogue) was half its cost,
+    /// an eighth of a typed-array read loop. The lite loop calls it out of
+    /// line ([`Vm::ta_interp_numeric_get_view_call`]).
+    #[inline(always)]
     pub(crate) fn ta_interp_numeric_get_view(
         &self,
         view: TaInterpNumericView,
@@ -1462,41 +1526,57 @@ impl<'p> Vm<'p> {
             return Some(Value::UNDEFINED);
         }
         let off = byte_offset + i * size;
-        let bytes = &data[off..off + size];
+        // Each kind reads its fixed width (a bounds check and one load) and
+        // an integer kind is an integer Value outright: through `f64` it paid
+        // a conversion and `Value::num`'s narrowing back for the same bits.
+        // The view lies in the buffer, so a read past it cannot happen; it
+        // would decline to the general path.
         Some(match kind {
-            0 => Value::num(bytes[0] as i8 as f64),
-            1 | 2 => Value::num(bytes[0] as f64),
-            3 => Value::num(i16::from_le_bytes([bytes[0], bytes[1]]) as f64),
-            4 => Value::num(u16::from_le_bytes([bytes[0], bytes[1]]) as f64),
-            5 => Value::num(
-                i32::from_le_bytes(bytes.try_into().expect("four-byte TypedArray read")) as f64,
-            ),
-            6 => Value::num(
-                u32::from_le_bytes(bytes.try_into().expect("four-byte TypedArray read")) as f64,
-            ),
-            7 => Value::num(
-                f32::from_le_bytes(bytes.try_into().expect("four-byte TypedArray read")) as f64,
-            ),
-            8 => Value::num(f64::from_le_bytes(
-                bytes.try_into().expect("eight-byte TypedArray read"),
-            )),
-            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(
-                u16::from_le_bytes([bytes[0], bytes[1]]),
-            )),
+            0 => Value::int(ta_bytes::<1>(data, off)?[0] as i8 as i32),
+            1 | 2 => Value::int(ta_bytes::<1>(data, off)?[0] as i32),
+            3 => Value::int(i16::from_le_bytes(ta_bytes(data, off)?) as i32),
+            4 => Value::int(u16::from_le_bytes(ta_bytes(data, off)?) as i32),
+            5 => Value::int(i32::from_le_bytes(ta_bytes(data, off)?)),
+            6 => Value::num(u32::from_le_bytes(ta_bytes(data, off)?) as f64),
+            7 => Value::num(f32::from_le_bytes(ta_bytes(data, off)?) as f64),
+            8 => Value::num(f64::from_le_bytes(ta_bytes(data, off)?)),
+            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes(ta_bytes(
+                data, off,
+            )?))),
             _ => return None,
         })
+    }
+
+    /// [`Vm::ta_interp_numeric_get_view`] as a call, for the lite loop: its
+    /// body inlined there cost that loop's calls up to a quarter, through
+    /// what it did to the loop's register allocation.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    pub(crate) fn ta_interp_numeric_get_view_call(
+        &self,
+        view: TaInterpNumericView,
+        i: usize,
+    ) -> Option<Value> {
+        self.ta_interp_numeric_get_view(view, i)
     }
 
     /// Primitive-number twin of [`Vm::ta_element_set`] using dispatch-validated
     /// internal slots. The caller has also excluded immutable buffers. Numeric
     /// conversion cannot execute JS, so encoding before the live bounds check
     /// preserves TypedArraySetElement's coerce-before-valid-index order.
-    #[inline]
+    ///
+    /// Takes the Number as its `Value` so an integer stores without the round
+    /// trip through `f64` and `to_uint_modular` (`ta_encode_int`), and writes
+    /// the element at its fixed width, where the slice copy of a runtime width
+    /// was a `memcpy` call per element. Out of line: the dispatch loop's
+    /// `SetIndex` arm calls it, and inlined there it slowed every interpreted
+    /// call by a few percent.
+    #[inline(never)]
     pub(crate) fn ta_interp_numeric_set_view(
         &mut self,
         view: TaInterpNumericView,
         i: usize,
-        number: f64,
+        number: Value,
     ) -> bool {
         let TaInterpNumericView {
             ta_idx,
@@ -1506,7 +1586,11 @@ impl<'p> Vm<'p> {
             stored_len,
         } = view;
         let size = native::TA_KINDS[kind as usize].1;
-        let bytes = ta_encode(kind, number);
+        let bytes = if number.is_int() {
+            ta_encode_int(kind, number.as_int())
+        } else {
+            ta_encode(kind, number.as_f64())
+        };
         let tracking = !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx);
         let data = match self.heap.get_mut(buffer) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => data,
@@ -1536,7 +1620,12 @@ impl<'p> Vm<'p> {
             return true;
         }
         let off = byte_offset + i * size;
-        data[off..off + size].copy_from_slice(&bytes[..size]);
+        match size {
+            1 => data[off] = bytes[0],
+            2 => data[off..off + 2].copy_from_slice(&bytes[..2]),
+            4 => data[off..off + 4].copy_from_slice(&bytes[..4]),
+            _ => data[off..off + 8].copy_from_slice(&bytes),
+        }
         true
     }
 
@@ -1612,6 +1701,21 @@ impl<'p> Vm<'p> {
             self.to_number_strict(v)?;
         }
         Ok(())
+    }
+
+    /// Whether the TypedArray `ta_idx` views an immutable ArrayBuffer. Its
+    /// numeric-key [[Set]] then returns false before any coercion, and its
+    /// elements are non-writable, non-configurable data properties (the
+    /// Immutable ArrayBuffer proposal's 10.4.5.1, .3 and .5); TypedArraySetElement
+    /// asserts it is not.
+    pub(crate) fn ta_view_immutable(&self, ta_idx: u32) -> bool {
+        if self.immutable_buffers.is_empty() {
+            return false;
+        }
+        match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { buffer, .. } => self.immutable_buffers.contains(buffer),
+            _ => false,
+        }
     }
 
     pub(crate) fn ta_element_set(&mut self, ta_idx: u32, i: usize, v: Value) -> Result<(), Thrown> {
@@ -2674,4 +2778,32 @@ fn sab_atomic_op(
     // keeps internal exhaustive call paths type-correct without exposing raw
     // shared-memory operations to untrusted code.
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dataview_proto_slot_matches_the_name_tables() {
+        let names = [
+            "getInt8", "getUint8", "getInt16", "getUint16", "getInt32", "getUint32", "getFloat32", "getFloat64",
+            "getBigInt64", "getBigUint64", "setInt8", "setUint8", "setInt16", "setUint16", "setInt32", "setUint32",
+            "setFloat32", "setFloat64", "setBigInt64", "setBigUint64",
+        ];
+        for n in names {
+            let want = dataview_get_kind(n)
+                .or_else(|| dataview_set_kind(n))
+                .or_else(|| dataview_big_kind(n).map(|(slot, _)| (slot, 0)))
+                .map(|(slot, _)| slot);
+            assert!(want.is_some(), "{n} is a table name");
+            assert_eq!(dataview_proto_slot(n), want, "{n}");
+        }
+        for n in [
+            "", "g", "get", "getInt9", "getUint8x", "getInt64", "getUint33", "getFloat16", "getFloat99", "getBigInt65",
+            "setBigUint6x", "gotUint32", "buffer", "byteLength", "getUint3", "GetUint32", "setInt7",
+        ] {
+            assert_eq!(dataview_proto_slot(n), None, "{n:?}");
+        }
+    }
 }
