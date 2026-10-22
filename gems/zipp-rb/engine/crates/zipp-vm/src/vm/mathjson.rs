@@ -7,6 +7,11 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Source bytes from which `JSON.parse` allocates its tree old (W9 static
+/// pretenure): a document this large is kept; a smaller one is usually a
+/// message parsed, read and dropped.
+const JSON_PRETENURE_MIN_BYTES: usize = 16 * 1024;
+
 /// `ZIPP_NO_JSON_LEAF_FAST=1` restores the old JSON.stringify leaf emission:
 /// the `into_owned` copy per string leaf, the fresh `String` per number
 /// (`fmt_f64`), and the cloned-key + `pos()` re-lookup object walk. Kept so
@@ -1026,6 +1031,29 @@ impl<'p> Vm<'p> {
             _ => {}
         }
         self.with_argv(base, arg_base, argc, |vm, args| vm.eval_math_args(op, args))
+    }
+
+    /// [`Self::eval_math`]'s result as the Value it stores: `Math.imul` of two
+    /// Ints is their Int product, without the trip through a double that
+    /// `Value::num` then narrows back; anything else is `eval_math`'s number.
+    /// Out of line, for the lite loop's `MathOp` arm, which stores it as it is
+    /// (the narrowing inline there was a sixth of a `Math.imul`-heavy loop).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    pub(crate) fn eval_math_value(
+        &mut self,
+        op: crate::bytecode::MathFn,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Value, Thrown> {
+        if matches!(op, crate::bytecode::MathFn::Imul) && argc >= 2 {
+            let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
+            if a.is_int() && b.is_int() {
+                return Ok(Value::int(a.as_int().wrapping_mul(b.as_int())));
+            }
+        }
+        Ok(Value::num(self.eval_math(op, base, arg_base, argc)?))
     }
 
     /// `Math.<op>` reduced to a single f64 result (used by the `MathSpread`
@@ -2201,9 +2229,20 @@ impl<'p> Vm<'p> {
         // `internalize_json`, is deliberately OUTSIDE it), so no GC-visible
         // young value can be created and missed here. Manual begin/end pair —
         // the error path must unwind the depth too.
-        self.heap.pretenure_begin();
+        //
+        // Only a large document, though: a small one parsed per message is
+        // a temporary, and born old it waited for a major (json-small-many
+        // swept 410K objects at majors).
+        let pretenure = src.len() >= JSON_PRETENURE_MIN_BYTES;
+        if pretenure {
+            self.heap.pretenure_begin();
+        }
+        // A parsed document's keys are data (`shape::data_keys`).
+        let _data = crate::shape::data_keys();
         let r = self.json_parse_scoped(src);
-        self.heap.pretenure_end();
+        if pretenure {
+            self.heap.pretenure_end();
+        }
         r
     }
 
@@ -2556,9 +2595,15 @@ impl<'p> Vm<'p> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
         // W9 static pretenure — same scope as `json_parse`; the reviver runs
         // later, outside this call, so its results stay young.
-        self.heap.pretenure_begin();
+        let pretenure = src.len() >= JSON_PRETENURE_MIN_BYTES;
+        if pretenure {
+            self.heap.pretenure_begin();
+        }
+        let _data = crate::shape::data_keys();
         let r = self.json_parse_with_src_scoped(src);
-        self.heap.pretenure_end();
+        if pretenure {
+            self.heap.pretenure_end();
+        }
         r
     }
 

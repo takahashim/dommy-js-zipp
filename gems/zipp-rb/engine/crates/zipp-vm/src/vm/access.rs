@@ -1711,6 +1711,7 @@ impl<'p> Vm<'p> {
             | HeapObj::WeakMap { .. }
             | HeapObj::WeakSet(_)
             | HeapObj::WeakRef(_)
+            | HeapObj::TextCodec(_)
             | HeapObj::FinalizationRegistry { .. }
             | HeapObj::Date(_)
             | HeapObj::Promise { .. }
@@ -2032,6 +2033,10 @@ impl<'p> Vm<'p> {
             // (non-integer, "-0", out of range, detached view) still runs the
             // value coercion then drops the write — it is NEVER a named prop.
             if self.is_canonical_numeric_index(key) {
+                // A view of an immutable buffer: false, before coercion.
+                if self.ta_view_immutable(idx) {
+                    return self.reject_write(key, strict);
+                }
                 match self.ta_valid_index(idx, key) {
                     Some(n) => self.ta_element_set(idx, n, val)?,
                     None => self.ta_coerce_for_set(idx, val)?,
@@ -2067,6 +2072,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::WeakMap { .. }
                 | HeapObj::WeakSet(_)
                 | HeapObj::WeakRef(_)
+                | HeapObj::TextCodec(_)
                 | HeapObj::FinalizationRegistry { .. }
                 | HeapObj::Date(_)
                 | HeapObj::Promise { .. }

@@ -167,9 +167,10 @@ impl<'p> Vm<'p> {
         // 5. Re-index function-id, global-slot, and class-id operands, leak each
         //    FuncProto (stable address — raw pointers live into it), append.
         let mut new_funcs: Vec<&'p FuncProto> = Vec::with_capacity(eval_prog.functions.len());
-        // The script the functions came from, for their Error stacks: the
-        // module being installed, else what the host named this evaluation.
-        let script = self.installing_module.clone().or_else(|| self.script_name.clone());
+        // The script the functions came from, for their Error stacks: what the
+        // host named this evaluation (`ScriptState::name_scripts`). A module's
+        // frames name the module instead (`stack_script_name`).
+        let script = self.script_name.clone();
         for mut f in eval_prog.functions {
             for ins in f.code.iter_mut() {
                 match ins {
@@ -312,6 +313,12 @@ impl<'p> Vm<'p> {
                     }
                     _ => {}
                 }
+            }
+            // `eval` / `new Function` code (not a module's): when it and its
+            // loops compile (`Jit::note_runtime_code`).
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            if !module {
+                self.jit.note_runtime_code(self.funcs.len() as u32, &r.code);
             }
             self.install_func(r);
         }
@@ -824,18 +831,6 @@ impl<'p> Vm<'p> {
             None,
         )?;
         Ok(completion)
-    }
-
-    /// Run `code` as a classic script in the live realm — what a browser does
-    /// with a `<script>`: script GlobalDeclarationInstantiation, so its
-    /// top-level `var`s and functions become global-object properties and its
-    /// `let`/`const`/`class` global lexicals visible to later scripts, even
-    /// when the script is strict (an indirect eval would keep both to
-    /// itself). Returns the completion value.
-    pub(crate) fn host_run_script(&mut self, code: &str) -> Result<Value, Thrown> {
-        self.require_external_code_enabled()?;
-        let prog = compile_host_script(code).map_err(Thrown)?;
-        self.host_run_compiled(prog)
     }
 
     /// Run a classic script [`compile_host_script`] compiled, possibly for

@@ -1585,7 +1585,7 @@ impl<'p> Vm<'p> {
             Err(t) => Err(self.take_host_throw(t)),
         };
         if drain_microtasks {
-            self.drain_microtasks();
+            self.microtask_checkpoint(false);
         } else {
             // This host entry is still a complete ECMAScript job even though
             // its queued jobs are intentionally left pending. The completion
@@ -1685,8 +1685,8 @@ impl<'p> Vm<'p> {
     /// [`JsError`]. Mirrors [`Self::host_eval_rich`] otherwise.
     pub(crate) fn host_eval_structured(&mut self, src: &str) -> Result<HostValue, JsError> {
         // A host's evaluation is a classic script, not an eval: a strict one's
-        // declarations still reach the global (see `host_run_script`).
-        let res = self.host_run_script(src);
+        // declarations still reach the global (see `eval_script`).
+        let res = self.eval_script(src);
         let mut budget = HostValueBudget::default();
         self.marshal_after_drain_structured(res, &mut budget, true)
     }
@@ -1732,7 +1732,9 @@ impl<'p> Vm<'p> {
                     };
                     let stack = match own_stack {
                         Some(s) => Some(self.display(s)),
-                        None if self.error_data.contains(&idx) => self.error_stack_string(idx).ok(),
+                        None if self.error_data.contains(&idx) => {
+                            self.error_stack_value(idx).ok().map(|v| self.display(v))
+                        }
                         None => None,
                     }
                     .filter(|s| !s.is_empty());
@@ -1767,7 +1769,7 @@ impl<'p> Vm<'p> {
     /// globals (rather than calling a function) uses this to let promise
     /// continuations observe the write.
     pub(crate) fn host_pump(&mut self) {
-        self.drain_microtasks();
+        self.microtask_checkpoint(false);
     }
 
     /// Evaluate `src` as indirect eval in the global scope and marshal the
@@ -2590,7 +2592,7 @@ impl<'p> HostCtx for Vm<'p> {
     /// stay queued for the outermost entry (see [`HostCtx::eval_script`]).
     fn eval_script(&mut self, src: &str) -> Result<HostValue, String> {
         let mut budget = HostValueBudget::default();
-        let res = self.host_run_script(src);
+        let res = self.eval_script(src);
         self.marshal_after_drain(res, &mut budget, false)
             .map_err(HostCallError::into_message)
     }

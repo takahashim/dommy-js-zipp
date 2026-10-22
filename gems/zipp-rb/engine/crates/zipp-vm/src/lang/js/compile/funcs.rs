@@ -126,7 +126,6 @@ impl<'a> FnCompiler<'a> {
             enclosing,
         )?;
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
-        self.cx.default_position(&mut proto, f.span.start);
         let id = self.cx.functions.len() as u32;
         let has_upvalues = !proto.upvalues.is_empty();
         // Resolve the name once. A script-level function hoists to a GLOBAL var
@@ -333,14 +332,18 @@ impl<'a> FnCompiler<'a> {
             Cell(Reg, Reg),   // (cell, temp)
             Global(u32, Reg), // (slot, temp)
         }
-        // A class declaration pre-declared block-local (e.g. inside a switch/block,
-        // where it is lexically scoped) binds to that existing innermost local
-        // rather than leaking to a global. `resolve_existing` scans innermost-first,
-        // so it returns the current block's binding (shadowing any outer/global one).
-        let dest = match self.resolve_existing(&n) {
+        // A class declaration is lexically scoped to its block, as `let` is: it
+        // binds to a binding the CURRENT scope already holds (pre-declared at
+        // block entry for a closure or a switch, or at a function body's entry)
+        // and otherwise declares a new one there. An outer binding of the same
+        // name is shadowed, never written: `const C = 1; { class C {} }` leaves
+        // `C === 1`. Only a script's own top level binds to a global slot, so a
+        // class in a script-level block does not leak either.
+        let here = self.scopes.last().and_then(|s| s.slot_of(&n)).map(|s| self.slot_binding(s));
+        let dest = match here {
             Some(Binding::LocalCell(r)) => Dest::Cell(r, self.temp()),
             Some(Binding::Local(r)) => Dest::Reg(r),
-            _ if self.is_script && !self.cx.eval_locals => {
+            _ if self.is_script && !self.cx.eval_locals && self.scopes.len() == 1 => {
                 let slot = self.cx.global_slot(&n) as u32;
                 Dest::Global(slot, self.temp())
             }
@@ -658,7 +661,20 @@ impl<'a> FnCompiler<'a> {
                         self.cx.heritage_classes.push((n.clone(), class_id));
                     }
                     let v = match finit {
-                        Some(e) => self.expr(e)?,
+                        // A static initializer is a method body of its own,
+                        // though compiled inline: `new.target` is allowed and
+                        // undefined there, and `arguments` is not (both through
+                        // `in_field_init`, as for an instance field). At script
+                        // level `new.target` was a SyntaxError, and inside a
+                        // function it read that function's.
+                        Some(e) => {
+                            let saved = (self.cx.new_target_ok, self.cx.in_field_init);
+                            self.cx.new_target_ok = true;
+                            self.cx.in_field_init = true;
+                            let r = self.expr(e);
+                            (self.cx.new_target_ok, self.cx.in_field_init) = saved;
+                            r?
+                        }
                         None => {
                             let t = self.temp();
                             self.emit(Instr::LoadUndefined { dst: t });
@@ -1508,7 +1524,6 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = self.cx.src_slice(func.span.start, func.span.end);
-            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             method_defs.push((mname.clone(), fid));
@@ -1537,7 +1552,6 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = self.cx.src_slice(func.span.start, func.span.end);
-            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             getter_defs.push((gname.clone(), fid));
@@ -1566,7 +1580,6 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = self.cx.src_slice(func.span.start, func.span.end);
-            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             setter_defs.push((sname.clone(), fid));
@@ -1591,7 +1604,6 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = method_source(self.cx.src_slice(func.span.start, func.span.end), true);
-            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_defs.push((sname.clone(), fid));
@@ -1620,7 +1632,6 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = method_source(self.cx.src_slice(func.span.start, func.span.end), true);
-            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_getter_defs.push((gname.clone(), fid));
@@ -1648,7 +1659,6 @@ impl<'a> FnCompiler<'a> {
                 None,
             )?;
             proto.source = method_source(self.cx.src_slice(func.span.start, func.span.end), true);
-            self.cx.default_position(&mut proto, func.span.start);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_setter_defs.push((sname.clone(), fid));
@@ -1736,7 +1746,6 @@ impl<'a> FnCompiler<'a> {
             )?;
             if let Some(cf) = ctor_fn {
                 proto.source = self.cx.src_slice(cf.span.start, cf.span.end);
-                self.cx.default_position(&mut proto, cf.span.start);
             }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -2008,7 +2017,6 @@ impl<'a> FnCompiler<'a> {
             enclosing,
         )?;
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
-        self.cx.default_position(&mut proto, f.span.start);
         let has_upvalues = !proto.upvalues.is_empty();
         let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);
@@ -2045,7 +2053,6 @@ impl<'a> FnCompiler<'a> {
         )?;
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
-        self.cx.default_position(&mut proto, a.span.start);
         let has_upvalues = !proto.upvalues.is_empty();
         let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);

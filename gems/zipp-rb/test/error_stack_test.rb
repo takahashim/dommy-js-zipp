@@ -2,7 +2,8 @@
 
 require "test_helper"
 
-# Error.prototype.stack: the frames an Error was created in, V8's format.
+# Error.prototype.stack: the frames an Error was created in, V8's format, with
+# V8's columns (the call's or `new`'s position, not the statement's).
 class ErrorStackTest < Minitest::Test
   def setup
     @vm = ZippRb::VM.new(timeout_msec: 5_000)
@@ -25,23 +26,25 @@ class ErrorStackTest < Minitest::Test
     stack = @vm.eval("try { outer(); } catch (e) { e.stack }", filename: "https://example.test/page")
     assert_equal <<~STACK.chomp, stack
       TypeError: deep
-          at inner (https://example.test/lib.js:1:20)
-          at outer (https://example.test/lib.js:3:3)
+          at inner (https://example.test/lib.js:1:26)
+          at outer (https://example.test/lib.js:3:10)
           at https://example.test/page:1:7
     STACK
   end
 
+  # The top frame of an error the engine raises itself has no position in
+  # the engine (V8 reports `cb (lib.js:6:52)`); the frames below it do.
   def test_an_engine_error_through_a_native_call_has_the_frames_too
     stack = @vm.eval("try { viaNative(); } catch (e) { e.stack }")
     lines = stack.lines.map(&:strip)
     assert_match(/\ATypeError: Cannot read properties of undefined/, lines[0])
-    assert_equal ["at cb (https://example.test/lib.js:6:35)", "at viaNative (https://example.test/lib.js:6:3)",
+    assert_equal ["at cb (https://example.test/lib.js)", "at viaNative (https://example.test/lib.js:6:14)",
                   "at <anonymous>:1:7"], lines[1..]
   end
 
   def test_a_js_error_raised_into_ruby_carries_the_frames_as_its_backtrace
     error = assert_raises(ZippRb::TypeError) { @vm.eval("outer()") }
-    assert_equal ["at inner (https://example.test/lib.js:1:20)", "at outer (https://example.test/lib.js:3:3)",
+    assert_equal ["at inner (https://example.test/lib.js:1:26)", "at outer (https://example.test/lib.js:3:10)",
                   "at <anonymous>:1:1"], error.backtrace
   end
 
@@ -60,7 +63,7 @@ class ErrorStackTest < Minitest::Test
 
   def test_a_subclass_and_an_arrow_report_positions
     @vm.load("class MyError extends Error {}\nglobalThis.make = () => new MyError('m');", filename: "c.js")
-    assert_equal "Error: m\n    at c.js:2:19\n    at <anonymous>:1:1", @vm.eval("make().stack")
+    assert_equal "Error: m\n    at c.js:2:25\n    at <anonymous>:1:1", @vm.eval("make().stack")
   end
 
   def test_the_name_lasts_only_for_its_evaluation

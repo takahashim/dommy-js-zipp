@@ -25,7 +25,11 @@ module Dommy
         # dotted path (`__rbHost.defineGlobal`) and calls it with its owner as
         # `this` (ZippRb::VM#call takes a global name only); `__dommyZippParses`
         # is the syntax check behind Runtime#evaluate. The engine's own
-        # `performance` goes, so the window's is the one the page finds.
+        # `performance`, `TextEncoder` and `TextDecoder` go, so the window's are
+        # the ones the page finds: the bridge defines a window member on the
+        # global only where the name is free, and Dommy's TextDecoder knows
+        # every WHATWG encoding (Shift_JIS, EUC-JP, ...) where the engine's has
+        # UTF-8 and UTF-16 only.
         # `__rbEvalP` (Runtime#evaluate's result slot) is the global's from the
         # start, so setting it never asks a window below the global (see
         # Runtime's unified_global) whether the host has the name.
@@ -36,6 +40,8 @@ module Dommy
             return owner[parts[parts.length - 1]].apply(owner, args);
           };
           delete globalThis.performance; // real-clock; the window's runs on Dommy's scheduler
+          delete globalThis.TextEncoder; // the window's pair covers every encoding
+          delete globalThis.TextDecoder;
           Object.defineProperty(globalThis, "__rbEvalP", { value: undefined, writable: true, enumerable: false, configurable: true });
           globalThis.__dommyZippParses = function (source) {
             try {

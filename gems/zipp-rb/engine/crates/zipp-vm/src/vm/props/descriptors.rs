@@ -408,7 +408,10 @@ impl<'p> Vm<'p> {
             HeapObj::TypedArray { .. } => {
                 if let Some(i) = self.ta_valid_index(idx, key) {
                     let v = self.ta_element_get(idx, i);
-                    return self.make_data_descriptor(v, true, true, true);
+                    // An immutable buffer's elements are neither writable nor
+                    // configurable.
+                    let mutable = !self.ta_view_immutable(idx);
+                    return self.make_data_descriptor(v, mutable, true, mutable);
                 }
                 self.arr_props
                     .get(&idx)
@@ -1037,6 +1040,8 @@ impl<'p> Vm<'p> {
             HeapObj::WeakMap { .. } => self.weakmap_proto,
             HeapObj::WeakSet(_) => self.weakset_proto,
             HeapObj::WeakRef(_) => self.weakref_proto,
+            HeapObj::TextCodec(c) if c.decoder => self.text_decoder_proto,
+            HeapObj::TextCodec(_) => self.text_encoder_proto,
             HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
             HeapObj::Iterator { proto, .. } => *proto,
             HeapObj::IterHelper { .. } => self.iterator_helper_proto,

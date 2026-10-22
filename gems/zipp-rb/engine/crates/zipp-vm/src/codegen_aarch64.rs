@@ -729,9 +729,9 @@ mod tests {
             makes_value_captures: false,
             eval_sites: Vec::new(),
             source: String::new(),
-            positions: Vec::new(),
             script: None,
             fused: Default::default(),
+            call_sites: Default::default(),
         }
     }
 

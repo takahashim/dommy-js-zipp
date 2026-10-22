@@ -480,15 +480,22 @@ impl<'p> Vm<'p> {
         // routes it through the plain call, the step lives here as well.
         // (IsRegExp — a Get of `@@match` — precedes the `constructor` Get, as
         // the spec orders them; `test262/built-ins/RegExp/S15.10.3.1_A1_T*`.)
+        // The build reuses that one IsRegExp answer: newTarget is RegExp
+        // itself, whose `prototype` is non-writable, so constructing would only
+        // repeat the `@@match` Get (kangax compat-table "Proxy, internal 'get'
+        // calls: RegExp constructor").
         if ci == self.regexp_ctor && self.regexp_ctor != 0 {
             let pattern = args.first().copied().unwrap_or(Value::UNDEFINED);
             let flags = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-            if self.is_regexp(pattern)? && flags == Value::UNDEFINED {
+            let pattern_is_regexp = self.is_regexp(pattern)?;
+            if pattern_is_regexp && flags == Value::UNDEFINED {
                 let c = self.get_prop(pattern, "constructor")?;
                 if self.same_value(c, callee) {
                     return Ok(pattern);
                 }
             }
+            let pre = self.regexp_pattern_snapshot_after(pattern, pattern_is_regexp);
+            return self.build_regexp_snapshot(pattern, flags, pre);
         }
         let proto = match self.heap.get(callee.heap_index()) {
             HeapObj::Object(m) => m
@@ -1174,12 +1181,15 @@ impl<'p> Vm<'p> {
     /// itself — holds the matching native as a data property. A method call
     /// or a `for-of` step that runs the generator directly is only right
     /// then; a replaced `next` is called (Node calls it; this did not).
+    /// `@@iterator` is the same question one level further up: inherited
+    /// from %Iterator.prototype%, whose intrinsic returns its receiver.
     pub(crate) fn gen_method_pristine(&self, idx: u32, name: &str) -> bool {
-        use crate::vm::native::{GEN_NEXT, GEN_RETURN, GEN_THROW};
+        use crate::vm::native::{GEN_NEXT, GEN_RETURN, GEN_THROW, ITER_SELF};
         let id = match name {
             "next" => GEN_NEXT,
             "return" => GEN_RETURN,
             "throw" => GEN_THROW,
+            "@@iterator" => ITER_SELF,
             _ => return false,
         };
         if !self.arr_props.is_empty()
@@ -1331,7 +1341,18 @@ impl<'p> Vm<'p> {
     /// delegation needs a genuine iterator so it can call `.next`/`.throw`/`.return`
     /// on it (an Array Iterator has `.next` but no `.throw`/`.return`, exactly as the
     /// spec requires).
+    ///
+    /// A generator whose `@@iterator` is still %Iterator.prototype%'s is its
+    /// own iterator: `yield* inner()` read that method through the generic
+    /// property path and called the native, a twentieth of a recursive
+    /// `yield*` walk.
     pub(crate) fn get_iterator_direct(&mut self, v: Value) -> Result<Value, Thrown> {
+        if v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. })
+            && self.gen_method_pristine(v.heap_index(), "@@iterator")
+        {
+            return Ok(v);
+        }
         let m = self.get_prop(v, "@@iterator")?;
         if !self.is_callable(m) {
             return Err(Thrown(format!(
@@ -1411,11 +1432,13 @@ impl<'p> Vm<'p> {
                         self.display(v)
                     )));
                 }
-                // Iterator objects the engine drives directly.
-                HeapObj::Generator { .. }
-                | HeapObj::AsyncGenerator(_)
-                | HeapObj::Iterator { .. }
-                | HeapObj::IterHelper { .. } => return Ok(v),
+                // Iterator objects the engine drives directly; a generator
+                // only while its `@@iterator` is the intrinsic (a patched
+                // one is called, below).
+                HeapObj::Generator { .. } if self.gen_method_pristine(idx, "@@iterator") => return Ok(v),
+                HeapObj::AsyncGenerator(_) | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => {
+                    return Ok(v)
+                }
                 // Everything else that is an object — a plain object, a Proxy, but
                 // also a Date / RegExp / Error / function / boxed primitive — goes
                 // through the real protocol. Restricting this to Object|Proxy left
@@ -1542,7 +1565,10 @@ impl<'p> Vm<'p> {
             Method(Value),
         }
         let drain = match self.heap.get(v.heap_index()) {
-            HeapObj::Generator { .. } => DestructureIter::Existing,
+            // A generator with a patched `@@iterator` calls it (below).
+            HeapObj::Generator { .. } if self.gen_method_pristine(v.heap_index(), "@@iterator") => {
+                DestructureIter::Existing
+            }
             // An ITERATOR OBJECT is iterable through the protocol and nothing
             // else — `%ArrayIteratorPrototype%[Symbol.iterator]` returns `this`.
             // Without this arm it fell to the positional fast path below, which
@@ -1677,8 +1703,21 @@ impl<'p> Vm<'p> {
         let mut iter_done = false;
         while out.len() < lim {
             let res = if is_gen {
-                self.generator_method(iter.heap_index(), "next", &[])?
-                    .unwrap_or(Value::UNDEFINED)
+                // The step as a value, without the result object (see
+                // `drain_iterator_steps`).
+                match self.generator_next_step(iter.heap_index())? {
+                    Some(crate::vm::async_runtime::GenStep::Yield(v)) => {
+                        out.push(v);
+                        self.instrument_drain_heap_check(out.len())?;
+                        continue;
+                    }
+                    Some(crate::vm::async_runtime::GenStep::Done(_)) => {
+                        iter_done = true;
+                        break;
+                    }
+                    Some(crate::vm::async_runtime::GenStep::Raw(r)) => r,
+                    None => Value::UNDEFINED,
+                }
             } else {
                 let next = self.get_prop(iter, "next")?;
                 if !self.is_callable(next) {
@@ -2033,9 +2072,29 @@ impl<'p> Vm<'p> {
                     }
                     res
                 }
-                None => self
-                    .generator_method(iter.heap_index(), "next", &[])?
-                    .unwrap_or(Value::UNDEFINED),
+                // A generator with the intrinsic `next` (the caller's
+                // proof): its step as a value, without the result object
+                // `next` would make and the two reads of it. Spreading a
+                // generator made and read one per element.
+                None => match self.generator_next_step(iter.heap_index())? {
+                    Some(crate::vm::async_runtime::GenStep::Yield(value)) => {
+                        if let HeapObj::Array(items) = self.heap.get_mut(acc) {
+                            items.push(value);
+                        }
+                        self.heap.write_barrier_val(acc, value);
+                        n += 1;
+                        if n > crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
+                            return Err(Thrown::from_static(
+                                "RangeError: iterator produced more values than the engine's limit",
+                            ));
+                        }
+                        self.instrument_drain_heap_check(n)?;
+                        continue;
+                    }
+                    Some(crate::vm::async_runtime::GenStep::Done(_)) => return Ok(()),
+                    Some(crate::vm::async_runtime::GenStep::Raw(r)) => r,
+                    None => Value::UNDEFINED,
+                },
             };
             self.host_result_roots[scratch] = res;
             let done = self.get_prop(res, "done")?;

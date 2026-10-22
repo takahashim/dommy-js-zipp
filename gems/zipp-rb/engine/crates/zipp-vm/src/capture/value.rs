@@ -235,8 +235,8 @@ impl<'a> Walk<'a> {
         match s {
             Stmt::Block(b) => self.stmts(b),
             Stmt::Empty | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Debugger => {}
-            Stmt::Expr(e, _) | Stmt::Throw(e, _) => self.expr(e),
-            Stmt::Return(e, _) => {
+            Stmt::Expr(e) | Stmt::Throw(e) => self.expr(e),
+            Stmt::Return(e) => {
                 if let Some(e) = e {
                     self.expr(e);
                 }
@@ -565,7 +565,7 @@ impl<'a> Walk<'a> {
                 self.expr(&c.callee);
                 self.args(&c.args);
             }
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, .. } => {
                 self.expr(callee);
                 self.args(args);
             }

@@ -103,6 +103,13 @@ impl<'p> Vm<'p> {
                 self.set(base, dst, v);
                 ip += 1;
             }
+            // A `switch` over string literals: here rather than in
+            // `dispatch_body`, where an arm moved rows that never run one by
+            // 4-7% (ephemeral, throw-catch); the call is a sliver of the
+            // compares it replaces.
+            Instr::FuseStrSwitch { ldst, a, dst, n } => {
+                ip = self.str_switch(running, func_id, base, ip, ldst, a, dst, n);
+            }
             Instr::LoadSpill { dst, vec, idx } => {
                 let holder = self.get(base, vec).heap_index();
                 let v = match self.heap.get(holder) {
@@ -751,6 +758,7 @@ impl<'p> Vm<'p> {
                     dec: None,
                     proto_dirty: false,
                     reproto_instances: false,
+                    no_has_instance_shape: std::cell::Cell::new(crate::shape::DICT),
                 }))));
                 self.brand_owner.insert(private_brand, v.heap_index());
                 // Remember it so `super` in a derived class can reach it.
@@ -997,6 +1005,7 @@ impl<'p> Vm<'p> {
                 args,
             } => {
                 let parent = self.get(base, ctor);
+                self.sync_top_ip(ip);
                 if !self.is_constructor(parent) {
                     return Err(Thrown(
                         "TypeError: superclass is not a constructor".into(),
@@ -1272,14 +1281,13 @@ impl<'p> Vm<'p> {
             } => {
                 let p = self.get(base, pattern);
                 let f = self.get(base, flags);
+                // IsRegExp(pattern) (ctor step 1) reads `@@match` once, for
+                // both the shortcut below and the build.
+                let pattern_is_regexp = self.is_regexp(p)?;
                 // `RegExp(re)` (NOT `new`) with no flags returns `re`
                 // unchanged when re's `constructor` is RegExp (ctor step 2.b).
                 let mut short = None;
-                if !is_construct
-                    && f.is_undefined()
-                    && self.regexp_ctor != 0
-                    && self.is_regexp(p)?
-                {
+                if !is_construct && f.is_undefined() && self.regexp_ctor != 0 && pattern_is_regexp {
                     let c = self.get_prop(p, "constructor")?;
                     if self.same_value(c, Value::heap(self.regexp_ctor)) {
                         short = Some(p);
@@ -1287,7 +1295,10 @@ impl<'p> Vm<'p> {
                 }
                 let v = match short {
                     Some(v) => v,
-                    None => self.build_regexp(p, f)?,
+                    None => {
+                        let pre = self.regexp_pattern_snapshot_after(p, pattern_is_regexp);
+                        self.build_regexp_snapshot(p, f, pre)?
+                    }
                 };
                 self.set(base, dst, v);
                 ip += 1;
@@ -1710,13 +1721,18 @@ impl<'p> Vm<'p> {
                             None => {
                                 // Lazily created, host-defined: ordinary
                                 // extensible null-proto object (GC-rooted
-                                // via module_metas).
-                                let m = self
-                                    .heap
-                                    .alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                                // via module_metas), whose `url` is the
+                                // module file's (HostGetImportMetaProperties,
+                                // as Node, Deno and browsers give it). No
+                                // collection runs between the two allocations.
+                                let mut meta = ObjMap::new();
+                                if let Some(url) = self.module_url(k) {
+                                    let url = self.alloc_str(url);
+                                    meta.set("url", url);
+                                }
+                                let m = self.heap.alloc(HeapObj::Object(Box::new(meta)));
                                 self.proto_of.insert(m, Value::NULL);
                                 self.module_metas.insert(k, m);
-                                self.fill_module_meta_url(m, k);
                                 m
                             }
                         },
@@ -1761,6 +1777,8 @@ impl<'p> Vm<'p> {
                 // already captured call reference.
                 let live = self.get(base, callee);
                 let call_this = self.get(base, this_v);
+                // The eval code's frames sit above this one at this call.
+                self.sync_top_ip(ip);
                 // Direct semantics depend on the captured VALUE's
                 // identity, not on where the named reference resolved.
                 // A miss ordinary-calls the exact captured value with
@@ -2352,6 +2370,15 @@ impl<'p> Vm<'p> {
                 // runs it directly; a plain yield comes back as its value,
                 // which the YieldDelegate then yields as a value too.
                 if mode_code == 0 {
+                    // Run the step as a frame of this loop; its yield or
+                    // return completes this instruction.
+                    if iter_v.is_heap()
+                        && matches!(self.heap.get(iter_v.heap_index()), HeapObj::Generator { .. })
+                        && self.gen_method_pristine(iter_v.heap_index(), "next")
+                        && self.gen_enter_inline(iter_v.heap_index(), ip, value_dst, done_dst, sent_v, true)
+                    {
+                        return Ok(ColdFlow::Frame);
+                    }
                     if let Some(step) = self.generator_delegate_step(iter_v, sent_v)? {
                         let (val, done_b, raw) = match step {
                             crate::vm::async_runtime::GenStep::Yield(y) => (y, false, false),
@@ -3572,6 +3599,13 @@ impl<'p> Vm<'p> {
                 // gen_resume (it detects the resume op is a YieldDelegate), so
                 // here we only suspend.
                 let v = self.get(base, val);
+                // A step `gen_enter_inline` runs in this loop: park, and
+                // continue the consumer.
+                if self.frames[frame_idx].gen != u32::MAX {
+                    let raw = std::mem::replace(&mut self.pending_yield_raw, false);
+                    self.gen_yield_delegate_inline(v, ip, raw)?;
+                    return Ok(ColdFlow::Frame);
+                }
                 let f = self.frames.pop().unwrap();
                 self.pending_yield_eval_scope = f.eval_scope;
                 self.pending_yield_handlers = f.handlers;
@@ -3643,6 +3677,7 @@ impl<'p> Vm<'p> {
                 let cv = self.get(base, callee);
                 let args_v = self.get(base, args);
                 let arg_vec = self.array_snapshot(args_v.heap_index());
+                self.sync_top_ip(ip);
                 let result = self.construct(cv, &arg_vec)?;
                 self.set(base, dst, result);
                 ip += 1;
@@ -4048,6 +4083,10 @@ impl<'p> Vm<'p> {
     #[cold]
     #[inline(never)]
     pub(crate) fn jit_compile_on_entry(&mut self, func_id: u32, base: usize) {
+        // Long `eval` / `new Function` code compiles after more calls.
+        if self.jit.runtime_fn_wait(func_id) {
+            return;
+        }
         // W9: a live register-homed region already serves this
         // function's hot loop; a Tier C body would shadow it with
         // mem-homed loop code forever (its back-edge is a bare

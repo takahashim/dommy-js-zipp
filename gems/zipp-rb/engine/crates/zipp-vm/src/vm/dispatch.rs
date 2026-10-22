@@ -91,6 +91,16 @@ pub(crate) mod interp_stats {
 /// `ZIPP_NO_LEAN_CALL=1`: every call-cache hit pushes its frame through
 /// `setup_call` and every return pops through `pop_frame_with`, out of line
 /// (the same-binary comparator for `setup_call_lean` / `pop_frame_fast`).
+/// [`Vm::lean_call_desc`]'s flags: a plain call takes the lean push.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) const LEAN_DESC_OK: u32 = 1 << 24;
+/// ... and the callee is sloppy, so its `this` is the global object.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) const LEAN_DESC_SLOPPY: u32 = 1 << 25;
+/// Set in every descriptor, so 0 means none.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) const LEAN_DESC_KNOWN: u32 = 1 << 26;
+
 #[inline(always)]
 fn lean_calls_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
@@ -161,6 +171,9 @@ impl<'p> Vm<'p> {
             }
             let f = self.frames.pop().unwrap();
             self.regs.truncate(f.base);
+            if f.gen != u32::MAX {
+                self.gen_complete(f.gen);
+            }
         }
         // Created in the CALLER's context: the refused callee never ran.
         let v = self.alloc_error_from_message(MSG);
@@ -285,6 +298,11 @@ impl<'p> Vm<'p> {
             }
             let f = self.frames.pop().unwrap();
             self.regs.truncate(f.base);
+            // A generator's step run in its consumer's loop
+            // (`gen_enter_inline`): the throw completes the generator.
+            if f.gen != u32::MAX {
+                self.gen_complete(f.gen);
+            }
         }
         false
     }
@@ -381,12 +399,19 @@ impl<'p> Vm<'p> {
             // Values are in regs/frames/globals/side-tables (the GC root set).
             self.maybe_gc();
             // Snapshot the current frame's coordinates. `ip` is advanced as a
-            // local and written back only on frame transitions / loops.
+            // local and written back only on frame transitions / loops. (They
+            // stay immutable here: switching frames inside the inner loop by
+            // reassigning them was tried and made every call 4-10% slower, as
+            // the loop then carried them all.)
             let frame_idx = self.frames.len() - 1;
             let func_id = self.frames[frame_idx].func;
             let base = self.frames[frame_idx].base;
             let mut ip = self.frames[frame_idx].ip;
             let cur_closure = self.frames[frame_idx].closure;
+            // This activation's upvalue list (`closure_upvalue_cached`),
+            // taken on its first upvalue access.
+            #[cfg(not(feature = "safe-sandbox"))]
+            let mut upv: (*const u32, usize) = (std::ptr::null(), 0);
             // `func()` returns a reference with the immutable PROGRAM lifetime,
             // so the hardened interpreter can cache the current function's
             // bytecode once per frame transition without extending a borrow of
@@ -568,8 +593,13 @@ impl<'p> Vm<'p> {
                 // only synced at frame transitions and is stale in here.
                 // (The general profile's hook is one decrement of `step_hot`
                 // and one test, with or without a recorder: see `step_hot`.)
+                // The lite-hooked copy runs only for a VM that had no
+                // recorder when it began (`lite_entry_ok`), and one is only
+                // ever installed between runs (`set_instrumentation`), so
+                // `step_hot` holds `i64::MAX` there and the hook never fires:
+                // it was a read-modify-write of the VM per instruction.
                 #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
-                {
+                if !LITE {
                     self.step_hot -= 1;
                     if self.step_hot < 0 {
                         if let Err(msg) = self.instrument_step_hot_out(base, ip, instr) {
@@ -587,10 +617,6 @@ impl<'p> Vm<'p> {
                         return Err(Thrown(msg.to_string()));
                     }
                 }
-                // The pc of the innermost interpreted frame, for an Error's
-                // stack (see `Vm::capture_error_frames`): `ip` is a local and
-                // `frames[..].ip` is stale here. One store per instruction.
-                self.interp_pc = ((frame_idx as u64) << 32) | ip as u64;
                 match *instr {
                     Instr::LoadConst { dst, idx } => {
                         // String constants are sentinels. Short, immutable-safe
@@ -1788,6 +1814,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(m));
                         ip = if m == when { target as usize } else { ip + 2 };
                     }
+                    Instr::FuseNotJump { dst, a, when, target } => {
+                        let m = !self.truthy(self.get(base, a));
+                        self.set(base, dst, Value::bool(m));
+                        ip = if m == when { target as usize } else { ip + 2 };
+                    }
 
                     Instr::Lt { dst, a, b } => {
                         let r = self.cmp_lt(base, a, b, true)?;
@@ -1946,12 +1977,7 @@ impl<'p> Vm<'p> {
                             }
                             break;
                         }
-                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
-                        for i in 0..argc {
-                            args.push(self.get(base, arg_base + i));
-                        }
-                        let result = self.construct(cv, &args)?;
-                        self.set(base, dst, result);
+                        self.new_construct(base, ip, dst, cv, arg_base, argc)?;
                         ip += 1;
                     }
                     Instr::FieldInit {
@@ -2024,30 +2050,7 @@ impl<'p> Vm<'p> {
                         arg_base,
                         argc,
                     } => {
-                        // IsConstructor is checked AFTER the argument registers
-                        // were evaluated (the fetch happened before them).
-                        let parent = self.get(base, ctor);
-                        if !self.is_constructor(parent) {
-                            return Err(Thrown(
-                                "TypeError: superclass is not a constructor".into(),
-                            ));
-                        }
-                        let this = self.get(base, 0);
-                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
-                        for i in 0..argc {
-                            args.push(self.get(base, arg_base + i));
-                        }
-                        // `super(...)` keeps the derived activation's new.target.
-                        let nt = self
-                            .frames
-                            .last()
-                            .map(|f| f.new_target)
-                            .unwrap_or(Value::UNDEFINED);
-                        // super() PRODUCES `this`; completion enforces the once-only
-                        // rule, rebinds reg 0 (return-override), lifts the this-TDZ
-                        // and runs this class's deferred field initializers.
-                        let produced = self.run_class_ctor(parent, this, &args, nt)?;
-                        self.super_ctor_complete(base, this, produced, home_class_id)?;
+                        self.super_ctor_call(base, ip, ctor, home_class_id, arg_base, argc)?;
                         ip += 1;
                     }
                     Instr::SuperBase { dst, home_class_id } => {
@@ -2899,8 +2902,8 @@ impl<'p> Vm<'p> {
                                 // SetProp{obj:0} — `mov [vals_ptr+slot*8]`),
                                 // so no barrier ever sees it. Register every
                                 // storing arm's receiver as a persistent
-                                // minor-trace root instead (same rule as the
-                                // SetProp IC data-way fill).
+                                // minor-trace root instead (at most eight arms
+                                // per site, baked into the code).
                                 if self.heap.nursery_on() {
                                     for plan in method_plan.values() {
                                         for shape in &plan.shapes {
@@ -3226,6 +3229,9 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::UpvalGet { dst, idx } => {
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
+                        #[cfg(feature = "safe-sandbox")]
                         let cell = self.closure_upvalue(cur_closure, idx);
                         let v = self.heap.cell_get(cell);
                         if v.is_uninitialized() {
@@ -3238,6 +3244,9 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::UpvalSet { idx, src } => {
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
+                        #[cfg(feature = "safe-sandbox")]
                         let cell = self.closure_upvalue(cur_closure, idx);
                         // Assignment to a captured `const` (PutValue on an
                         // immutable binding) throws in sloppy code too, so this
@@ -3270,7 +3279,7 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         let v = self.get(base, src);
-                        self.heap.cell_set(cell, v);
+                        self.heap.upval_cell_set(cell, v);
                         ip += 1;
                     }
                     Instr::NewArray {
@@ -3479,10 +3488,11 @@ impl<'p> Vm<'p> {
                                         || !self.immutable_buffers.contains(buffer))
                                 {
                                     if let Some(i) = array_index(k) {
-                                        // Preserve the SetIndex GC/oracle
-                                        // chokepoint before the live-buffer
-                                        // leaf. The token copy itself is pure
-                                        // and cannot change store ordering.
+                                        // No store barrier: `v` is a number,
+                                        // which neither generation's barrier
+                                        // nor the oracle records (both want a
+                                        // heap value), and the call was 3% of
+                                        // a typed-array store loop.
                                         let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
                                             ta_idx,
                                             *buffer,
@@ -3490,12 +3500,7 @@ impl<'p> Vm<'p> {
                                             *byte_offset,
                                             *length,
                                         );
-                                        self.store_barrier_v(
-                                            crate::heap::gcoracle::SET_INDEX,
-                                            o,
-                                            v,
-                                        );
-                                        if self.ta_interp_numeric_set_view(view, i, v.as_f64()) {
+                                        if self.ta_interp_numeric_set_view(view, i, v) {
                                             ip += 1;
                                             continue;
                                         }
@@ -3553,7 +3558,26 @@ impl<'p> Vm<'p> {
                     }
                     Instr::GetProp { dst, obj, name } => {
                         let o = self.get(base, obj);
+                        // The cache's way-0 own-data hit, inline and first: the
+                        // steps below answer only names and receivers that hit
+                        // never serves (a private name fills no way, and a
+                        // string, array or typed array has no shape), and they
+                        // read the key's text first. Anything else is the full
+                        // `ic_get_prop` call further down.
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
                         let key = strs[name as usize].as_str();
+                        // Its inherited-data hit, likewise.
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
                         // PrivateFieldGet brand check: reading a private member
                         // (`obj.#x`) from an object whose class did not declare it
                         // is a TypeError (has_property_str walks instance own fields
@@ -3676,29 +3700,14 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                             // A class value's static data property
-                            // (`Entity.count`, `new.target.kind`), or a
-                            // function's own one (`counter.calls`).
-                            if let Some(v) = self
-                                .class_static_data_read(o, &key)
-                                .or_else(|| self.fn_own_data_read(o, &key))
-                            {
+                            // (`Entity.count`, `new.target.kind`), a
+                            // function's own one (`counter.calls`), or a
+                            // prototype intrinsic (`dv.getUint32`).
+                            if let Some(v) = self.shapeless_read(o, &key) {
                                 self.set(base, dst, v);
                                 ip += 1;
                                 continue;
                             }
-                            if let Some(bits) = self.proto_intrinsic_read(o, &key) {
-                                self.set(base, dst, Value::from_bits(bits));
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // The cache's way-0 own-data hit, inline; anything
-                        // else is the full `ic_get_prop` call below.
-                        #[cfg(not(feature = "safe-sandbox"))]
-                        if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
-                            self.set(base, dst, v);
-                            ip += 1;
-                            continue;
                         }
                         // ── interpreter property IC ── own/chain data reads
                         // resolve through the per-site cache; a cached class /
@@ -3720,19 +3729,10 @@ impl<'p> Vm<'p> {
                             }
                             GetAct::None => {}
                         }
-                        // B289: a prototype-intrinsic read on an Array or
-                        // String receiver — `arr.push`, `s.charCodeAt`, the
-                        // captured half of the strict member-call lowering.
-                        // The property IC is shape-keyed and these receivers
-                        // have no shape, so every such read took the generic
-                        // walk (~70ns over an own-property hit). The B191
-                        // baseline proof answers it in a few loads.
+                        // (A shapeless receiver's prototype intrinsic was
+                        // asked before the cache, `shapeless_read`; an object
+                        // has none to answer.)
                         if o.is_heap() {
-                            if let Some(bits) = self.proto_intrinsic_read(o, &key) {
-                                self.set(base, dst, Value::from_bits(bits));
-                                ip += 1;
-                                continue;
-                            }
                             // `Object.hasOwn`, `Array.isArray`: a constructor's
                             // own data property, which the IC declines.
                             if let Some(v) = self.ctor_own_data_read(o, &key) {
@@ -3769,6 +3769,14 @@ impl<'p> Vm<'p> {
                     } => {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
+                        // The cache's way-0 own-data hit, inline and first (a
+                        // private name fills no way: `ic_set_prop`); anything
+                        // else is the full `ic_set_prop` call below.
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if self.ic_set_prop_own_hit(func_id, ip, o, v) {
+                            ip += 1;
+                            continue;
+                        }
                         let key = strs[name as usize].as_str();
                         // Private stores route to the side table / accessors
                         // (field-init emission, compound/update writes). One
@@ -3863,17 +3871,15 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        // The cache's way-0 own-data hit, inline; anything
-                        // else is the full `ic_set_prop` call below.
-                        #[cfg(not(feature = "safe-sandbox"))]
-                        if self.ic_set_prop_own_hit(func_id, ip, o, v) {
-                            ip += 1;
-                            continue;
-                        }
                         // A class value's own writable static data property
                         // (`Entity.count++`), or a function's, which the
-                        // cache declines.
-                        if self.class_static_data_write(o, &key, v) || self.fn_own_data_write(o, &key, v) {
+                        // cache declines. Neither is ever an ordinary
+                        // object's, whose adds (`this.x = x` in a
+                        // constructor) paid both lanes' key tests first.
+                        if o.is_heap()
+                            && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_))
+                            && (self.class_static_data_write(o, &key, v) || self.fn_own_data_write(o, &key, v))
+                        {
                             ip += 1;
                             continue;
                         }
@@ -4414,6 +4420,16 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
+                            // A loose for-of step through a bound array-iterator
+                            // `next` reuses its result object (`bound_step_call`).
+                            if argc == 0 {
+                                if let Some(r) = self.bound_step_call(func_id, ip, base, dst, callee_v) {
+                                    let r = r?;
+                                    self.set(base, dst, r);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                             // A bound or native function: run via call_value (fixes
                             // `this`/prepends bound args, or dispatches the builtin).
                             // A CombinatorResolver (a Promise.all/race/â€¦ resolve/reject
@@ -4547,6 +4563,30 @@ impl<'p> Vm<'p> {
                         // `func()` returns `&'p`, so the interned name key outlives
                         // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str = &strs[name as usize];
+                        // A method of an ordinary object or class instance: the
+                        // method cache first. None of the receiver-kind leaves
+                        // below can serve such a receiver (they want a string,
+                        // a DataView, a generator, an array, a Map or a
+                        // function), and each paid a key compare or a heap read
+                        // before the cache on every `o.m()`.
+                        let object_recv = recv.is_heap()
+                            && !is_private_key(key)
+                            && matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_));
+                        if object_recv {
+                            if let Some((fid, closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
+                                self.setup_call_lean_this(
+                                    fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, callee,
+                                )?;
+                                break;
+                            }
+                            // An own native method (`Reflect.get(t, k)`).
+                            if let Some(id) = self.ic_call_native(func_id, ip, recv, key) {
+                                let r = self.with_argv(base, arg_base, argc, |vm, argv| vm.call_native(id, recv, argv))?;
+                                self.set(base, dst, r);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // `charCodeAt` dominates the parser/tokenizer-shaped
                         // interpreter workload. Its exact flat-string + Int
                         // leaf bypasses the method IC, argument stack buffer,
@@ -4667,6 +4707,18 @@ impl<'p> Vm<'p> {
                                 self.get(base, arg_base)
                             };
                             super::builtins::builtin_stats_count(self, recv, "next");
+                            // Run the step as a frame of this loop; its yield or
+                            // return completes this call with its result object.
+                            if self.gen_enter_inline(
+                                recv.heap_index(),
+                                ip,
+                                dst,
+                                super::async_runtime::GEN_STEP_OBJECT,
+                                sent,
+                                false,
+                            ) {
+                                break;
+                            }
                             if let Some(result) = self.generator_method(recv.heap_index(), "next", &[sent])? {
                                 self.set(base, dst, result);
                                 ip += 1;
@@ -4748,7 +4800,7 @@ impl<'p> Vm<'p> {
                         // per-site cache (validated; see vm/ic.rs), skipping
                         // the builtin probe, the class/proto chain walk, and
                         // resolve_callable — straight to the frame push.
-                        if private_callee.is_none() {
+                        if private_callee.is_none() && !object_recv {
                             if let Some((fid, closure, callee)) =
                                 self.ic_call_method(func_id, ip, recv, key)
                             {
@@ -5120,6 +5172,12 @@ impl<'p> Vm<'p> {
                         // run_loop's stop frame) at a yield, so popping returns to
                         // the resumer. `pending_yield` carries the value + this ip.
                         let v = self.get(base, val);
+                        // A step `gen_enter_inline` runs in this loop: park, and
+                        // continue the consumer.
+                        if self.frames[frame_idx].gen != u32::MAX {
+                            self.gen_yield_inline(v, ip);
+                            break;
+                        }
                         // Capture this frame's `try` handlers so a SYNC generator can
                         // park them and `gen.throw(e)`/`gen.return(v)` resume into the
                         // body's try/catch/finally. (drive_async_gen ignores this.)
@@ -5332,6 +5390,11 @@ impl<'p> Vm<'p> {
                                 self.gen_method_pristine(it.heap_index(), "next")
                             }
                         {
+                            // Run the step as a frame of this loop; its yield or
+                            // return completes this instruction.
+                            if self.gen_enter_inline(it.heap_index(), ip, value_dst, done_dst, Value::UNDEFINED, false) {
+                                break;
+                            }
                             let res = match self.generator_next_step(it.heap_index())? {
                                 Some(super::async_runtime::GenStep::Yield(v)) => {
                                     self.set(base, value_dst, v);
@@ -5555,6 +5618,63 @@ impl<'p> Vm<'p> {
                     },
                 }
             }
+        }
+    }
+
+    /// `FuseStrSwitch` at `ip`: the `n` string-literal cases from `ip` in one
+    /// lookup of the discriminant's text, leaving `ldst` and `dst` as the
+    /// cases would (the matched or else the last case's literal, and whether
+    /// one matched). Only a string can be `===` a string literal, so any
+    /// other value matches none. Answers the next ip.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    pub(crate) fn str_switch(
+        &mut self,
+        running: &'p crate::bytecode::FuncProto,
+        func_id: u32,
+        base: usize,
+        ip: usize,
+        ldst: u16,
+        a: u16,
+        dst: u16,
+        n: u16,
+    ) -> usize {
+        let v = self.get(base, a);
+        let table = running.fused.str_switch(running, ip).and_then(|sw| {
+            let found = if v.is_heap() {
+                let idx = v.heap_index();
+                self.heap.flatten(idx);
+                match self.heap.get(idx) {
+                    HeapObj::Str(s) => sw.find(s.as_bytes()),
+                    _ => Ok(None),
+                }
+            } else {
+                Ok(None)
+            };
+            found.ok().map(|k| (sw, k))
+        });
+        let Some((sw, found)) = table else {
+            // No table: the first case alone, as `FuseConstEqJump` runs it.
+            let (Instr::LoadConst { idx, .. }, Instr::JumpIfTrue { target, .. }) =
+                (running.code[ip], running.code[ip + 2])
+            else {
+                unreachable!("FuseStrSwitch stands for a string case");
+            };
+            let c = self.resolve_const_slot(func_id, idx);
+            self.set(base, ldst, c);
+            let r = self.strict_eq(base, a, ldst);
+            self.set(base, dst, Value::bool(r));
+            return if r { target as usize } else { ip + 3 };
+        };
+        let case = found.unwrap_or(n as usize - 1);
+        let (idx, target) = sw.cases[case];
+        let c = self.resolve_const_slot(func_id, idx);
+        self.set(base, ldst, c);
+        self.set(base, dst, Value::bool(found.is_some()));
+        if found.is_some() {
+            target as usize
+        } else {
+            sw.after as usize
         }
     }
 
@@ -6315,9 +6435,29 @@ impl<'p> Vm<'p> {
         }
         let mut finished = self.frames.pop().expect("frame underflow");
         // A flat `new`: an object result replaces the instance, anything else
-        // returns it ([[Construct]] step 10-12 for an ordinary function).
-        if finished.construct_this && !self.is_object_value(ret) {
-            ret = self.regs[finished.base];
+        // returns it ([[Construct]] step 10-12 for an ordinary function). The
+        // instance's size is what the constructor's next one reserves.
+        if finished.construct_this {
+            // Or a generator's step run in its consumer's loop
+            // (`gen_enter_inline`), whose return completes the step.
+            if finished.gen != u32::MAX {
+                self.gen_return_inline(
+                    finished.base,
+                    finished.gen,
+                    finished.ret_dst,
+                    finished.argc,
+                    finished.super_done,
+                    ret,
+                );
+                return false;
+            }
+            let instance = self.regs[finished.base];
+            if instance.is_heap() {
+                self.learn_ctor_field_hint(finished.func, instance);
+            }
+            if !self.is_object_value(ret) {
+                ret = instance;
+            }
         }
         // Its handler buffer's storage, for another frame's first push.
         if finished.handlers.capacity() != 0 {
@@ -6935,6 +7075,31 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// [`Self::closure_upvalue`] through `cache`, the running activation's
+    /// upvalue list as (address, length), filled on its first upvalue access
+    /// and reset by the dispatch loops at every frame change. A closure's list
+    /// is fixed when `MakeClosure` makes it and its buffer stays where it is
+    /// as the heap grows, and the running frame roots the closure, so the
+    /// address holds for the whole activation. The access was a heap fetch
+    /// and the list's header on every `UpvalGet` / `UpvalSet`: three
+    /// dependent loads more than the cell itself.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    pub(crate) fn closure_upvalue_cached(&self, cache: &mut (*const u32, usize), closure: u32, idx: u16) -> u32 {
+        if cache.0.is_null() {
+            match self.heap.get(closure) {
+                HeapObj::Closure { upvalues, .. } => *cache = (upvalues.as_ptr(), upvalues.len()),
+                _ => panic!("UpvalGet/Set in a frame without a closure"),
+            }
+        }
+        let i = idx as usize;
+        assert!(i < cache.1, "upvalue index out of range");
+        // SAFETY: `cache` was taken from this activation's closure, whose
+        // list never changes and outlives the activation (see above), and
+        // `i` is in its bounds.
+        unsafe { *cache.0.add(i) }
+    }
+
     /// The running activation's [[NewTarget]]. An ARROW frame has none of its own,
     /// so it falls back to the one its closure captured lexically at MakeArrow —
     /// without this, `new.target` reads `undefined` for every arrow.
@@ -7206,6 +7371,62 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `New` at `ip` for a constructor the arm does not push a frame for:
+    /// `construct` with the argument registers, the result into `dst`. Out
+    /// of `dispatch_body`, as is its record of this frame's position for the
+    /// stack of an Error the construction creates (`sync_top_ip`): six lines
+    /// of it inside the loop moved a throw-and-catch row by a fifth.
+    #[inline(never)]
+    fn new_construct(
+        &mut self,
+        base: usize,
+        ip: usize,
+        dst: u16,
+        cv: Value,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<(), Thrown> {
+        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        self.sync_top_ip(ip);
+        let result = self.construct(cv, &args)?;
+        self.set(base, dst, result);
+        Ok(())
+    }
+
+    /// `SuperCtor` at `ip` (`super(...)`), out of `dispatch_body` as
+    /// [`Self::new_construct`] is.
+    #[inline(never)]
+    fn super_ctor_call(
+        &mut self,
+        base: usize,
+        ip: usize,
+        ctor: u16,
+        home_class_id: u32,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<(), Thrown> {
+        // IsConstructor is checked AFTER the argument registers were
+        // evaluated (the fetch happened before them).
+        let parent = self.get(base, ctor);
+        self.sync_top_ip(ip);
+        if !self.is_constructor(parent) {
+            return Err(Thrown("TypeError: superclass is not a constructor".into()));
+        }
+        let this = self.get(base, 0);
+        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        // `super(...)` keeps the derived activation's new.target.
+        let nt = self
+            .frames
+            .last()
+            .map(|f| f.new_target)
+            .unwrap_or(Value::UNDEFINED);
+        // super() PRODUCES `this`; completion enforces the once-only rule,
+        // rebinds reg 0 (return-override), lifts the this-TDZ and runs this
+        // class's deferred field initializers.
+        let produced = self.run_class_ctor(parent, this, &args, nt)?;
+        self.super_ctor_complete(base, this, produced, home_class_id)
+    }
+
     /// Push a new frame for `func_id`, binding `this_val` to register 0 and the
     /// `argc` arguments (staged at `caller_base + arg_base ..`) into registers
     /// `1..`. Records the caller's resume ip and result register.
@@ -7335,6 +7556,7 @@ impl<'p> Vm<'p> {
             argc,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -7369,13 +7591,47 @@ impl<'p> Vm<'p> {
         caller_ip_next: usize,
         callee_val: Value,
     ) -> Result<(), Thrown> {
+        self.setup_call_lean_this(
+            func_id,
+            closure,
+            this_val,
+            false,
+            caller_base,
+            arg_base,
+            argc,
+            dst,
+            caller_ip_next,
+            callee_val,
+        )
+    }
+
+    /// [`Self::setup_call_lean`] for a caller that knows whether `this_val`
+    /// is an object (`this_is_object`): a method the method cache resolved
+    /// for an ordinary object or class instance. Such a `this` needs no
+    /// boxing, so a sloppy callee takes the lean entry too; it fell to the
+    /// whole of `setup_call` on every object-literal method call.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn setup_call_lean_this(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this_val: Value,
+        this_is_object: bool,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
         let proto = self.func(func_id as usize);
         let callee_regs = (proto.reg_count as usize).max(1);
         let new_base = self.regs.len();
         let lean = proto.rest_reg.is_none()
             && proto.arguments_reg.is_none()
             && !proto.lexical_this
-            && (proto.is_strict || this_val.is_nullish())
+            && (proto.is_strict || this_is_object || this_val.is_nullish())
             && self.frames.len() < MAX_FRAMES
             && self.regs_fit_now(new_base + callee_regs)
             && lean_calls_enabled();
@@ -7394,7 +7650,7 @@ impl<'p> Vm<'p> {
                 callee_val,
             );
         }
-        let this_val = if !proto.is_strict && self.global_this != 0 {
+        let this_val = if !proto.is_strict && !this_is_object && self.global_this != 0 {
             Value::heap(self.callee_this_global(callee_val))
         } else {
             this_val
@@ -7417,6 +7673,7 @@ impl<'p> Vm<'p> {
             argc,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -7427,6 +7684,108 @@ impl<'p> Vm<'p> {
             callee: callee_val,
         });
         Ok(())
+    }
+
+    /// [`Self::setup_call_lean`] for a plain call (`this` undefined) whose
+    /// callee's frame facts the caller already holds, packed by
+    /// [`Self::lean_call_desc`]: the push reads nothing of the callee's
+    /// `FuncProto`. The lite loop's callee cache keeps the descriptor beside
+    /// the resolution, so a cached call skipped the dependent load of the
+    /// prototype and its flags, a quarter of the gap to QuickJS's call.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn setup_call_lean_desc(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        desc: u32,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
+        let callee_regs = (desc & 0xFFFF) as usize;
+        let params = ((desc >> 16) & 0xFF) as usize;
+        let new_base = self.regs.len();
+        let lean = desc & LEAN_DESC_OK != 0
+            && self.frames.len() < MAX_FRAMES
+            && self.regs_fit_now(new_base + callee_regs)
+            && lean_calls_enabled();
+        #[cfg(feature = "python")]
+        let lean = lean && !super::prof_py::on();
+        if !lean {
+            return self.setup_call_lean(
+                func_id,
+                closure,
+                Value::UNDEFINED,
+                caller_base,
+                arg_base,
+                argc,
+                dst,
+                caller_ip_next,
+                callee_val,
+            );
+        }
+        let this_val = if desc & LEAN_DESC_SLOPPY != 0 && self.global_this != 0 {
+            Value::heap(self.callee_this_global(callee_val))
+        } else {
+            Value::UNDEFINED
+        };
+        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
+        self.regs[new_base] = this_val;
+        let n = (argc as usize).min(params);
+        for i in 0..n {
+            let v = self.regs[caller_base + arg_base as usize + i];
+            self.regs[new_base + 1 + i] = v;
+        }
+        let last = self.frames.len() - 1;
+        self.frames[last].ip = caller_ip_next;
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: (caller_base + arg_base as usize) as u32,
+            argc,
+            is_eval: false,
+            construct_this: false,
+            gen: u32::MAX,
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: dst,
+            closure,
+            handlers: Vec::new(),
+            new_target,
+            callee: callee_val,
+        });
+        Ok(())
+    }
+
+    /// The frame facts [`Self::setup_call_lean_desc`] needs of `func_id`,
+    /// packed: its register count (bits 0-15), its parameter count (16-23),
+    /// [`LEAN_DESC_OK`] when a plain call to it takes the lean push (no rest
+    /// parameter, no `arguments` object, not an arrow), [`LEAN_DESC_SLOPPY`]
+    /// when its `this` is then the global object. 0 when the counts do not
+    /// fit, which sends every call to `setup_call_lean`.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) fn lean_call_desc(&self, func_id: u32) -> u32 {
+        let p = self.func(func_id as usize);
+        let regs = (p.reg_count as usize).max(1);
+        if regs > 0xFFFF || p.param_count as usize > 0xFF {
+            return 0;
+        }
+        let mut d = regs as u32 | ((p.param_count as u32) << 16);
+        if p.rest_reg.is_none() && p.arguments_reg.is_none() && !p.lexical_this {
+            d |= LEAN_DESC_OK;
+        }
+        if !p.is_strict {
+            d |= LEAN_DESC_SLOPPY;
+        }
+        d | LEAN_DESC_KNOWN
     }
 
     /// Whether a register window ending at `needed` fits the register file

@@ -17,12 +17,15 @@ end
 
 # The engine's own Rust unit tests: with the feature set the extension builds
 # (safe-sandbox: no JIT, no `unsafe`), then with upstream's default (JIT),
-# which the local changes must keep compiling and passing. `no_core_float_parse_in_engine_sources` reads
-# crates/zipp-wasm, which is not vendored (see engine/UPSTREAM), so it is
-# skipped rather than patched.
+# which the local changes must keep compiling and passing. Tests that read
+# upstream files which are not vendored (see engine/UPSTREAM) are skipped
+# rather than patched: `no_core_float_parse_in_engine_sources` reads
+# crates/zipp-wasm, and the x86_64 JIT's `bounded_walks_match_unbounded`
+# needs the JS sources in bench/.
 desc "Run the Zipp engine's Rust unit tests"
 task "engine:test" do
-  skip = "-- --skip num_parse::tests::no_core_float_parse_in_engine_sources"
+  skip = "-- --skip num_parse::tests::no_core_float_parse_in_engine_sources " \
+         "--skip codegen::emit_misc::int32_trunc_tests::bounded_walks_match_unbounded"
   sh "cargo test --manifest-path engine/Cargo.toml -p zipp-vm --lib --no-default-features --features instrument,safe-sandbox #{skip}"
   sh "cargo test --manifest-path engine/Cargo.toml -p zipp-vm --lib --features instrument #{skip}"
 end

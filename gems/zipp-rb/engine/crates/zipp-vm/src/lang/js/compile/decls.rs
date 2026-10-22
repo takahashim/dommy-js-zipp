@@ -106,11 +106,21 @@ impl<'a> FnCompiler<'a> {
     /// constants, pinned receivers), and sharing registers between the
     /// statements of a loop body would cost it those.
     pub(crate) fn stmt(&mut self, s: &ast::Stmt) -> R<()> {
-        self.note_stmt_pos(s);
         self.typeof_alias_stmt_enter(s);
         let save = (self.next_reg, self.bool_regs, self.recv_regs);
         let shape = self.scope_shape();
+        let late = self.box_late_for_return(s);
         let r = self.stmt_inner(s);
+        // The cells exist only on the path through this `return`; any later
+        // statement is reached some other way, where the bindings are plain.
+        // Removing cells without a scope pop would let `snapshot` reuse a
+        // list with these cells in it, so its cache goes too.
+        if !late.is_empty() {
+            for reg in late {
+                self.cell_regs.remove(&reg);
+            }
+            self.snapshot_cache.borrow_mut().take();
+        }
         self.typeof_alias_stmt_exit();
         if r.is_ok() && self.loop_ctx.is_empty() && self.scope_shape() == shape {
             if save.0 >= STMT_RECLAIM_FLOOR && self.next_reg > save.0 {
@@ -129,23 +139,35 @@ impl<'a> FnCompiler<'a> {
         r
     }
 
-    /// Record where `s` starts against the next instruction, for an Error's
-    /// stack (`FuncProto::positions`). Only statements that carry a position
-    /// do; one that emits nothing is overwritten by the next.
-    fn note_stmt_pos(&mut self, s: &ast::Stmt) {
-        use ast::Stmt as S;
-        let pos = match s {
-            S::Expr(_, pos) | S::Return(_, pos) | S::Throw(_, pos) => *pos,
-            S::VarDecl(d) => d.pos,
-            _ => return,
+    /// `return function () {…}` / `return () => …` capturing late-boxed
+    /// bindings (`late_boxed`): box each into a cell now, just before the
+    /// closure is made, and count it a cell while the statement compiles, so
+    /// the closure captures it. Nothing in this function reads or writes the
+    /// bindings after this point. Returns the registers to un-mark afterwards.
+    fn box_late_for_return(&mut self, s: &ast::Stmt) -> Vec<Reg> {
+        let ast::Stmt::Return(Some(arg)) = s else {
+            return Vec::new();
         };
-        let (line, col) = self.cx.line_col(pos);
-        let ip = self.code.len() as u32;
-        let at = crate::bytecode::SourcePos { ip, line, col };
-        match self.positions.last_mut() {
-            Some(last) if last.ip == ip => *last = at,
-            _ => self.positions.push(at),
+        if self.late_boxed.is_empty() || !matches!(arg, ast::Expr::Function(_) | ast::Expr::Arrow(_)) {
+            return Vec::new();
         }
+        let free = crate::capture::closure_free_names(arg);
+        let mut names: Vec<String> = self.late_boxed.iter().filter(|n| free.contains(*n)).cloned().collect();
+        names.sort();
+        let mut boxed = Vec::with_capacity(names.len());
+        for n in &names {
+            // A parameter or `var`: a register in the function scope (the
+            // analysis rules out shadowing, and `spills` keeps it a register).
+            match self.resolve_existing(n) {
+                Some(Binding::Local(r)) => boxed.push(r),
+                _ => debug_assert!(false, "late-boxed `{n}` is not a register"),
+            }
+        }
+        for &r in &boxed {
+            self.emit(Instr::MakeCell { reg: r });
+            self.cell_regs.insert(r);
+        }
+        boxed
     }
 
     /// The depth of the scope stack and the sizes of the two scopes a
@@ -164,7 +186,7 @@ impl<'a> FnCompiler<'a> {
     fn stmt_inner(&mut self, s: &ast::Stmt) -> R<()> {
         use ast::Stmt as S;
         match s {
-            S::Expr(e, _) => {
+            S::Expr(e) => {
                 // Discarded — UNLESS this is an eval program, where the value
                 // becomes the completion and `i++` must still yield the old one.
                 let r = if self.completion_reg.is_none() {
@@ -394,7 +416,7 @@ impl<'a> FnCompiler<'a> {
                 }
             }
             S::Switch { disc, cases } => self.switch_stmt(disc, cases)?,
-            S::Return(argument, _) => {
+            S::Return(argument) => {
                 // Proper tail call: strict `return <expr with a call in tail
                 // position>` in an UNPROTECTED context (no try handlers, no
                 // enclosing loop with an iterator to close, no using scope,
@@ -494,7 +516,7 @@ impl<'a> FnCompiler<'a> {
                 }
             }
             S::FnDecl(f) => self.func_decl(f)?,
-            S::Throw(argument, _) => {
+            S::Throw(argument) => {
                 let v = self.expr(argument)?;
                 self.emit(Instr::Throw { src: v });
             }

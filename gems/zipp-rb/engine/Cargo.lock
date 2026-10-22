@@ -262,9 +262,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "unicode-ident"
-version = "1.0.26"
+version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "unicode-normalization"
@@ -283,7 +283,7 @@ checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
 name = "zipp-numparse"
-version = "0.0.27"
+version = "0.0.28"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-pyparse"
-version = "0.0.27"
+version = "0.0.28"
 dependencies = [
  "bumpalo",
  "rustc-hash",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-vm"
-version = "0.0.27"
+version = "0.0.28"
 dependencies = [
  "dynasm",
  "dynasmrt",

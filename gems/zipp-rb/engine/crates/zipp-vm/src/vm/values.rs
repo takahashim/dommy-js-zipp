@@ -26,14 +26,15 @@ pub(crate) enum PlainGet {
     Absent,
 }
 
-/// `Vm::private_memo`'s size, a power of two.
-pub(crate) const PRIVATE_MEMO_SLOTS: usize = 256;
+/// `Vm::private_memo`'s size, a power of two. Keyed by callee, a class's
+/// every method and field initializer holds entries of its own.
+pub(crate) const PRIVATE_MEMO_SLOTS: usize = 1024;
 
 /// One answer of `Vm::resolve_private_in`: at the access site `site` (see
-/// `private_site`), code whose chain's innermost brand is `head` resolves
-/// its private name to `(brand, kind, owner)`, and the name's id in
-/// `private_name_ids` is `id`. A site never has every bit set, so `EMPTY`
-/// matches nothing.
+/// `private_site`), code running as the callee `head` names (its heap index
+/// and slot version, `Vm::private_memo_key`) resolves its private name to
+/// `(brand, kind, owner)`, and the name's id in `private_name_ids` is `id`.
+/// A site never has every bit set, so `EMPTY` matches nothing.
 #[derive(Clone, Copy)]
 pub(crate) struct PrivateMemo {
     head: u64,
@@ -62,12 +63,15 @@ pub(crate) fn private_site(func_id: u32, name: u32) -> u64 {
     (u64::from(func_id) << 32) | u64::from(name)
 }
 
+/// The memo slot of a key: its callee's index (with the version folded in)
+/// and the site's function and name, each by its own odd multiplier, read
+/// from the high bits.
 #[inline]
 fn private_memo_index(head: u64, site: u64) -> usize {
-    let h = (head as u32).wrapping_mul(0x9E37_79B1)
+    let h = ((head as u32) ^ (head >> 32) as u32).wrapping_mul(0x9E37_79B1)
         ^ ((site >> 32) as u32).wrapping_mul(0x85EB_CA77)
         ^ (site as u32).wrapping_mul(0xC2B2_AE3D);
-    (h >> 24) as usize & (PRIVATE_MEMO_SLOTS - 1)
+    (h >> 22) as usize & (PRIVATE_MEMO_SLOTS - 1)
 }
 
 /// Everything the RegExp constructor reads out of `pattern` BEFORE RegExpAlloc.
@@ -560,6 +564,8 @@ impl<'p> Vm<'p> {
                             HeapObj::WeakMap { .. } => self.weakmap_proto,
                             HeapObj::WeakSet(_) => self.weakset_proto,
                             HeapObj::WeakRef(_) => self.weakref_proto,
+                            HeapObj::TextCodec(c) if c.decoder => self.text_decoder_proto,
+                            HeapObj::TextCodec(_) => self.text_encoder_proto,
                             HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
                             HeapObj::Generator { .. } => self.gen_proto,
                             HeapObj::AsyncGenerator(_) => self.asyncgen_proto,
@@ -999,26 +1005,30 @@ impl<'p> Vm<'p> {
     ///
     /// The search compares `key` with the private names of each class on the
     /// accessing chain, on every `this.#x`, and its answer depends only on
-    /// the chain and the name. The chain's innermost brand names the chain:
-    /// each class evaluation mints a fresh brand from a counter that never
-    /// repeats, and every function of its body carries the same chain. A
-    /// brand's declared names are fixed when its class is made, and kept
-    /// while a live chain holds the brand, as the running one does. What can
-    /// change is `brand_owner`: the declaring class can die while one of its
-    /// methods lives on, which makes the search answer `None`; the collector
-    /// clears the memo whenever it drops an entry there.
+    /// the chain and the name. The chain is the running callee's, fixed when
+    /// the callee is made (`method_brand`), so the memo is keyed by the callee
+    /// itself (`private_memo_key`): its heap index and slot version, which a
+    /// reuse of the slot bumps. That spared the chain's own lookup on every
+    /// hit (a side-table walk and the chain's buffer), a fifteenth of class
+    /// construction with private fields. A brand's declared names are fixed
+    /// when its class is made, and kept while a live chain holds the brand,
+    /// as the running one does. What can change is `brand_owner`: the
+    /// declaring class can die while one of its methods lives on, which makes
+    /// the search answer `None`; the collector clears the memo whenever it
+    /// drops an entry there.
     pub(crate) fn resolve_private_site(
         &mut self,
         ctx: Value,
         site: u64,
         key: &str,
     ) -> Option<(u64, u8, u32, u32)> {
-        let head = *self.private_brands_of(ctx)?.first()?;
+        let head = self.private_memo_key(ctx)?;
         let slot = private_memo_index(head, site);
         let e = self.private_memo[slot];
         if e.head == head && e.site == site {
             return Some((e.brand, e.kind, e.owner, e.id));
         }
+        self.private_brands_of(ctx)?.first()?;
         let (brand, kind, owner) = self.resolve_private_in(ctx, key)?;
         let id = self.private_name_id(key);
         self.private_memo[slot] = PrivateMemo {
@@ -1035,11 +1045,23 @@ impl<'p> Vm<'p> {
     /// What `resolve_private_site` remembers for `site` under `ctx`'s chain,
     /// if anything; never resolves. For a caller that can then skip spelling
     /// the name, which only a miss needs.
-    #[inline]
+    #[inline(never)]
     pub(crate) fn private_memo_hit(&self, ctx: Value, site: u64) -> Option<(u64, u8, u32, u32)> {
-        let head = *self.private_brands_of(ctx)?.first()?;
+        let head = self.private_memo_key(ctx)?;
         let e = self.private_memo[private_memo_index(head, site)];
         (e.head == head && e.site == site).then_some((e.brand, e.kind, e.owner, e.id))
+    }
+
+    /// `private_memo`'s key for code running as the callee `ctx`: its heap
+    /// index and the slot's version, which a reuse of the slot bumps, so a
+    /// live callee, and the brand chain it was made with, owns its entries.
+    #[inline]
+    fn private_memo_key(&self, ctx: Value) -> Option<u64> {
+        if !ctx.is_heap() {
+            return None;
+        }
+        let i = ctx.heap_index();
+        Some((u64::from(i) << 32) | u64::from(self.heap.version_of(i)))
     }
 
     /// Forget every remembered private resolution (see
@@ -1888,13 +1910,16 @@ impl<'p> Vm<'p> {
         // The exact-capacity path benefits Lite. Full profiles retain their
         // previous allocation path after repeated error-throughput regressions.
         #[cfg(not(feature = "wasm-lite"))]
-        return self.make_error(kind, Some(message));
+        let e = self.make_error(kind, Some(message));
         #[cfg(feature = "wasm-lite")]
-        {
+        let e = {
             let mut map = ObjMap::with_capacity(1);
             map.define("message", message, ERROR_MESSAGE_ATTR);
             self.alloc_error_map(kind, map)
-        }
+        };
+        // The engine's own throw: the running frame's instruction is unknown.
+        self.forget_top_position(e.heap_index());
+        e
     }
 
     pub(crate) fn make_error(&mut self, kind: u8, msg: Option<Value>) -> Value {
@@ -1922,8 +1947,7 @@ impl<'p> Vm<'p> {
         if p != 0 {
             self.proto_of.insert(obj, Value::heap(p));
         }
-        self.error_data.insert(obj); // [[ErrorData]] internal slot
-        self.capture_error_frames(obj);
+        self.mark_error_data(obj); // [[ErrorData]] internal slot
         Value::heap(obj)
     }
 
@@ -2377,6 +2401,25 @@ impl<'p> Vm<'p> {
         self.build_regexp_snapshot(p, f, pre)
     }
 
+    /// RegExpCreate(P, F) (22.2.3.1): RegExpAlloc + RegExpInitialize, which
+    /// coerces the pattern with ToString and nothing else. There is no
+    /// IsRegExp, so no `@@match` read, and a RegExp pattern is its ToString
+    /// (`"/a/g"`), not its source. String.prototype.match, search and matchAll
+    /// build theirs this way, after their own one `@@match`/`@@matchAll` Get.
+    pub(crate) fn regexp_create(&mut self, p: Value, f: Value) -> Result<Value, Thrown> {
+        let exact_bytes = if p.is_heap() && self.heap.is_str_like(p.heap_index()) {
+            self.heap.str_exact_if_not_wellformed(p.heap_index())
+        } else {
+            None
+        };
+        let pre = RegExpPre {
+            pattern_is_regexp: false,
+            real_regexp: None,
+            exact_bytes,
+        };
+        self.build_regexp_snapshot(p, f, pre)
+    }
+
     /// Admit one newly-compiled immutable RegExp program before it is wrapped
     /// in an `Arc` or retained by a heap object/cache entry.
     pub(crate) fn preflight_regex_program(&mut self, regex: &regress::Regex) -> Result<(), Thrown> {
@@ -2408,6 +2451,13 @@ impl<'p> Vm<'p> {
         // the pattern, so it runs before the slot snapshot. (Non-objects return
         // false with no Get.)
         let pattern_is_regexp = self.is_regexp(p)?;
+        Ok(self.regexp_pattern_snapshot_after(p, pattern_is_regexp))
+    }
+
+    /// `regexp_pattern_snapshot` for a caller that has already run
+    /// IsRegExp(pattern): `RegExp(p)` called as a function needs the answer
+    /// for its `constructor` shortcut too, and reads `@@match` once for both.
+    pub(crate) fn regexp_pattern_snapshot_after(&self, p: Value, pattern_is_regexp: bool) -> RegExpPre {
         // A real RegExp exotic contributes its [[OriginalSource]] (+ flags when
         // none are given) via its slots, regardless of a falsy @@match override.
         let real_regexp = match p.is_heap().then(|| self.heap.get(p.heap_index())) {
@@ -2432,11 +2482,11 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
-        Ok(RegExpPre {
+        RegExpPre {
             pattern_is_regexp,
             real_regexp,
             exact_bytes,
-        })
+        }
     }
 
     /// RegExpInitialize against an already-taken pattern snapshot.

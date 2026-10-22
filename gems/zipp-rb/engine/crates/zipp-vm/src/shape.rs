@@ -88,7 +88,17 @@ pub const EMPTY: u32 = 1;
 /// wants 54,390 shapes for 18,604 objects. It can never benefit from a
 /// shape-keyed guard, and before this cap it paid ~9% for the privilege of
 /// finding that out on every append.
-const SHAPE_MAX: usize = 4096;
+///
+/// It was 4,096, which an application reaches long before its data does:
+/// the TypeScript, Babel, Prettier and three.js bundles each filled the
+/// table while still loading, and every layout after that — most of their
+/// objects — went `DICT`, with no shape-keyed cache way and no shared key
+/// list. A node costs about 80 bytes plus its key.
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) const SHAPE_MAX: usize = 1 << 16;
+/// The safe profile keeps the old bound: the table is outside its heap meter.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const SHAPE_MAX: usize = 4096;
 
 /// Longest key (in bytes) an edge may carry. The table is thread-local, lives
 /// longer than any `Vm`, and is outside the heap meter, so a node count alone
@@ -99,6 +109,9 @@ const SHAPE_KEY_MAX: usize = 256;
 
 /// Total key bytes the table may retain — the byte-denominated twin of
 /// [`SHAPE_MAX`]. Once spent, new edges are refused exactly like a full table.
+#[cfg(not(feature = "safe-sandbox"))]
+const SHAPE_KEY_BYTES_MAX: usize = 4 << 20;
+#[cfg(feature = "safe-sandbox")]
 const SHAPE_KEY_BYTES_MAX: usize = 512 << 10;
 
 /// Fan-out at which a node stops being scanned linearly and gains a hash index.
@@ -247,6 +260,70 @@ fn disabled() -> bool {
     }
 }
 
+/// The cap for a shape minted inside a [`data_keys`] scope: the table size
+/// past which a computed key or a parsed JSON key no longer mints one.
+const DATA_SHAPE_MAX: usize = 4096;
+
+thread_local! {
+    /// Open [`data_keys`] scopes on this thread.
+    static DATA_KEYS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A scope in which the keys appended are data: a computed member store's
+/// (`o[k] = v`) and `JSON.parse`'s. Inside it a new shape is minted only
+/// while the table holds fewer than [`DATA_SHAPE_MAX`]; existing transitions
+/// are still followed. Code's own layouts (`o.x = v`, literals, class
+/// fields) keep the whole table: a bundled application needs tens of
+/// thousands of them, while keys built from data (`json-large`'s
+/// `obj[word + "_" + j]`, its parse back) are effectively unique, and
+/// minting a shape for each made that benchmark 7% slower for nothing a
+/// cache could use.
+pub(crate) struct DataKeys(());
+
+/// `ZIPP_NO_DATA_KEYS=1`: a data key mints shapes like any other (A/B).
+fn data_keys_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_DATA_KEYS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+pub(crate) fn data_keys() -> DataKeys {
+    DATA_KEYS.with(|c| c.set(c.get() + 1));
+    DataKeys(())
+}
+
+impl Drop for DataKeys {
+    fn drop(&mut self) {
+        DATA_KEYS.with(|c| c.set(c.get() - 1));
+    }
+}
+
+/// [`SHAPE_MAX`], or a lower `ZIPP_SHAPE_MAX` (an A/B switch).
+#[inline]
+fn shape_max() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static MAX: AtomicUsize = AtomicUsize::new(0);
+    match MAX.load(Ordering::Relaxed) {
+        0 => {
+            let m = std::env::var("ZIPP_SHAPE_MAX")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map_or(SHAPE_MAX, |v| v.clamp(2, SHAPE_MAX));
+            MAX.store(m, Ordering::Relaxed);
+            m
+        }
+        m => m,
+    }
+}
+
 /// Pack a property's descriptor flags into the byte that participates in shape
 /// identity. The accessor's setter VALUE is deliberately absent: it is
 /// per-object data, so two objects can share a shape while holding different
@@ -307,7 +384,12 @@ pub fn add(from: u32, key: &str, bits: u8) -> u32 {
                 }
             }
         }
-        if t.nodes.len() >= SHAPE_MAX || t.key_bytes + key.len() > SHAPE_KEY_BYTES_MAX {
+        let cap = if DATA_KEYS.with(|c| c.get()) > 0 && data_keys_enabled() {
+            DATA_SHAPE_MAX.min(shape_max())
+        } else {
+            shape_max()
+        };
+        if t.nodes.len() >= cap || t.key_bytes + key.len() > SHAPE_KEY_BYTES_MAX {
             return DICT;
         }
         t.key_bytes += key.len();
@@ -402,9 +484,9 @@ pub fn describe(shape: u32) -> Vec<(Box<str>, u8)> {
 }
 
 /// Own property names of `shape`, in insertion order: diagnostics, debug
-/// assertions, and the shared key lists the JIT's add ways give the objects
-/// they append to (`Vm::shape_key_plan`), built once per shape.
-#[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
+/// assertions, and the shared key lists the JIT's add ways and the
+/// interpreter's cached adds give the objects they append to
+/// (`helpers_misc::shape_key_plan`), built once per shape.
 pub fn keys_of(shape: u32) -> Vec<String> {
     if shape == DICT {
         return Vec::new();
