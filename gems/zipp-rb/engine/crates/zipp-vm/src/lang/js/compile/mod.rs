@@ -123,12 +123,46 @@ type UpvalList = Rc<RefCell<Vec<(String, UpvalSource)>>>;
 struct EnclosingFn {
     /// name → register holding that binding's CELL in the parent frame. Only
     /// captured bindings appear here (non-captured locals can't be upvalues).
-    cell_locals: Vec<(String, Reg)>,
+    /// Shared: every function compiled under the ancestor while its bindings
+    /// stay the same holds the same snapshot (`FnCompiler::snapshot`).
+    cell_locals: std::rc::Rc<CellLocals>,
     /// The ancestor's own upvalue list (shared handle).
     upvalues: UpvalList,
 }
 
+/// One function's cell-backed bindings as a nested function sees them, in
+/// `list` weakest binding first (the order `FnCompiler::snapshot` documents)
+/// and in `index` by name, each name's strongest (last) entry. Copying and
+/// scanning the list for every nested function made a module of thousands of
+/// captured declarations and functions compile in quadratic time: the
+/// TypeScript compiler's bundle spent 62% of its run compiling.
+pub(crate) struct CellLocals {
+    list: Vec<(String, Reg)>,
+    index: rustc_hash::FxHashMap<String, Reg>,
+}
+
+impl CellLocals {
+    fn new(list: Vec<(String, Reg)>) -> CellLocals {
+        let mut index = rustc_hash::FxHashMap::default();
+        index.reserve(list.len());
+        for (n, r) in &list {
+            index.insert(n.clone(), *r);
+        }
+        CellLocals { list, index }
+    }
+
+    /// The register of the strongest binding of `name` (a backward scan's
+    /// first match).
+    fn get(&self, name: &str) -> Option<Reg> {
+        self.index.get(name).copied()
+    }
+}
+
 struct Compiler {
+    /// Scopes `capture`'s per-compile memo of nested functions' free names;
+    /// the AST it points into outlives the compiler.
+    #[allow(dead_code)]
+    capture_memo: crate::capture::Session,
     functions: Vec<FuncProto>,
     /// Program-wide source caps for compiler-prepared object-literal keys.
     /// These count retained plan sites/bytes, not runtime objects.
@@ -161,6 +195,9 @@ struct Compiler {
     /// The full program source, kept so each function can record its exact
     /// source slice (by span) for `Function.prototype.toString`.
     source: String,
+    /// `source`'s lines, for the positions of call sites (`FuncProto::
+    /// call_sites`); built when the first function with one is finished.
+    source_index: std::cell::OnceCell<positions::SourceIndex>,
     /// True when compiling an `eval` code string: the top-level script returns
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
@@ -346,8 +383,8 @@ fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
     // at the child's creation point — the binding `resolve` would pick in the
     // parent. Taking the first match handed a closure inside `{ let a; }` the
     // OUTER `a`'s cell.
-    if let Some((_, reg)) = parent.cell_locals.iter().rfind(|(n, _)| n == name) {
-        return Some(UpvalSource::ParentLocal(*reg));
+    if let Some(reg) = parent.cell_locals.get(name) {
+        return Some(UpvalSource::ParentLocal(reg));
     }
     // Parent already captured it as an upvalue.
     if let Some(i) = parent.upvalues.borrow().iter().position(|(n, _)| n == name) {
@@ -426,6 +463,7 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         eval_sites: Vec::new(),
         source: String::new(),
         fused: Default::default(),
+        call_sites: Box::default(),
     }
 }
 
@@ -451,6 +489,9 @@ fn fn_directives(f: &ast::Function) -> &[ast::Directive] {
 struct FnCompiler<'a> {
     cx: &'a mut Compiler,
     code: Vec<Instr>,
+    /// The calls and `new`s compiled so far: (first instruction, end,
+    /// source offset). Finished into `FuncProto::call_sites`.
+    call_sites: Vec<(u32, u32, u32)>,
     constants: Vec<Value>,
     string_constants: Vec<String>,
     static_key_plans: Vec<crate::bytecode::StaticKeyPlan>,
@@ -472,6 +513,10 @@ struct FnCompiler<'a> {
     spill_new_at: Option<usize>,
     /// Spill slots of `const` bindings: an assignment to one is a TypeError.
     const_spills: HashSet<u32>,
+    /// `pop_scope`s so far, and the last `snapshot`'s list with the key it
+    /// was built at (see `snapshot`).
+    scope_pops: u64,
+    snapshot_cache: std::cell::RefCell<Option<((u64, usize, usize, usize), std::rc::Rc<CellLocals>)>>,
     /// Parallel to `scopes` (same length, same indices): the lexically-declared
     /// names of each BLOCK-like scope, recorded at block ENTRY.
     ///
@@ -621,6 +666,10 @@ struct FnCompiler<'a> {
     /// This function's own bindings that some nested function captures; these
     /// are boxed into heap cells at declaration so the closure shares the slot.
     captured: HashSet<String>,
+    /// Captured bindings left out of `captured` because only directly
+    /// returned closures capture them (`capture::late_box_names`): plain
+    /// registers, boxed by the `return` that makes such a closure.
+    late_boxed: HashSet<String>,
     /// Registers currently holding a CELL (a boxed captured binding), so reads/
     /// writes of them go through CellGet/CellSet.
     cell_regs: HashSet<Reg>,
@@ -889,7 +938,8 @@ mod entry;
 mod exprs;
 mod funcs;
 mod helpers;
-mod remap;
+mod positions;
+pub(crate) mod remap;
 mod scopes;
 mod string_accum;
 mod typeof_alias;

@@ -132,14 +132,13 @@ impl<'p> Vm<'p> {
             })
         };
         crate::parse::stmt::parse_standalone_params(&params).map_err(as_syntax_error)?;
-        // …and the BODY on its own as a FunctionBody (step 18), under this
-        // constructor's [Yield]/[Await] parameters. A body that closes the
-        // wrapper early (`}); evil(); (function(){`) is a SyntaxError HERE, so
-        // nothing of it is ever compiled or run: assembling it would have made
-        // a three-statement Script that executes `evil()` during construction
-        // and returns a function of the body's choosing.
-        crate::parse::stmt::parse_standalone_body(&body, matches!(kind, 1 | 3), matches!(kind, 2 | 3))
-            .map_err(as_syntax_error)?;
+        // The BODY is not parsed on its own (step 18): `do_eval` requires the
+        // assembled source to be exactly the one bare function expression, so
+        // a body that closes the wrapper early (`}); evil(); (function(){`)
+        // is a SyntaxError there, before anything compiles or runs, and a
+        // body that does not is that function's body token for token, after
+        // the same newline and under the same [Yield]/[Await] parameters. The
+        // second parse of every body was 40% of a `new Function` loop's parse.
         // The newline before `)` defends against a `//` comment in the last
         // parameter; the wrapper parens make the body a function EXPRESSION whose
         // value (the function) becomes the eval completion value.
@@ -432,7 +431,7 @@ impl<'p> Vm<'p> {
             self.proto_of
                 .insert(idx, Value::heap(self.suppressederror_proto));
         }
-        self.error_data.insert(idx); // [[ErrorData]] internal slot
+        self.mark_error_data(idx); // [[ErrorData]] internal slot
         Ok(Value::heap(idx))
     }
 
@@ -867,8 +866,7 @@ impl<'p> Vm<'p> {
         // The whole map (and its vals Vec) was replaced: invalidate any JIT
         // inline cache that captured the old vals pointer.
         self.heap.bump_version(idx);
-        self.module_namespaces.insert(idx, slot_map);
-        self.heap.pin_mirror_dict(idx);
+        self.register_module_namespace(idx, slot_map);
     }
 
     pub(crate) fn disposable_op(

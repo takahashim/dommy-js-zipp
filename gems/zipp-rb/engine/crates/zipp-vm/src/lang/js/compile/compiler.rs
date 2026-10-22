@@ -59,6 +59,7 @@ impl Compiler {
 
     pub(crate) fn new(source: String) -> Compiler {
         Compiler {
+            capture_memo: crate::capture::Session::new(),
             functions: Vec::new(),
             static_key_plan_sites: 0,
             static_key_plan_retained_bytes: 0,
@@ -69,6 +70,7 @@ impl Compiler {
             hoisted_globals: Vec::new(),
             hoisted_set: rustc_hash::FxHashSet::default(),
             source,
+            source_index: std::cell::OnceCell::new(),
             eval_mode: false,
             script_completion: false,
             eval_inherit_super: None,
@@ -147,6 +149,13 @@ impl Compiler {
             .get(start as usize..end as usize)
             .map(|s| s.to_string())
             .unwrap_or_default()
+    }
+
+    /// The `(line, column)` of source byte offset `off` (see `positions`).
+    pub(crate) fn line_col(&self, off: u32) -> (u32, u32) {
+        self.source_index
+            .get_or_init(|| super::positions::SourceIndex::new(&self.source))
+            .line_col(off)
     }
 
     /// Look up an already-reserved global without changing the deterministic
@@ -434,7 +443,24 @@ impl Compiler {
             }
             captured.extend(all);
         }
+        // Bindings only directly returned closures capture stay plain until
+        // the `return` that makes one (`capture::late_box_names`).
+        let late_boxed = if is_script
+            || is_generator
+            || is_async
+            || body_refs_eval
+            || capture::stmts_refs_all(body).contains("arguments")
+            || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa))
+        {
+            HashSet::new()
+        } else {
+            capture::late_box_names(params_ast, body, &captured)
+        };
+        for n in &late_boxed {
+            captured.remove(n);
+        }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.late_boxed = late_boxed;
         if body_refs_eval {
             fc.box_all_locals = true;
         }
@@ -1109,6 +1135,7 @@ impl Compiler {
         fc.cx.dyn_global_zone = saved_dyn_zone;
         fc.typeof_alias_finish();
         fc.check_regs()?;
+        let call_sites = fc.take_call_sites();
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
             code: fc.code,
@@ -1148,6 +1175,7 @@ impl Compiler {
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by the caller from the function node's span
             fused: Default::default(),
+            call_sites,
         })
     }
 
@@ -1464,6 +1492,7 @@ impl Compiler {
         fc.cx.dyn_global_zone = saved_dyn_zone_cls;
         fc.typeof_alias_finish();
         fc.check_regs()?;
+        let call_sites = fc.take_call_sites();
         Ok(FuncProto {
             name: name.to_string(),
             code: fc.code,
@@ -1499,6 +1528,7 @@ impl Compiler {
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // class methods: caller may override from span
             fused: Default::default(),
+            call_sites,
         })
     }
 
@@ -1753,6 +1783,7 @@ impl Compiler {
         let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         fc.typeof_alias_finish();
         fc.check_regs()?;
+        let call_sites = fc.take_call_sites();
         Ok(FuncProto {
             name: "<arrow>".to_string(),
             code: fc.code,
@@ -1787,6 +1818,7 @@ impl Compiler {
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by compile_arrow from the arrow's span
             fused: Default::default(),
+            call_sites,
         })
     }
 }

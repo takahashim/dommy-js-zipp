@@ -37,6 +37,34 @@ fn bytecode_stored_slots(_: &Program) -> rustc_hash::FxHashSet<u32> {
     rustc_hash::FxHashSet::default()
 }
 
+/// A JavaScript program with at least this many functions runs interpreted.
+///
+/// Every bundled application measured ran slower with the JIT on than off:
+/// TypeScript's compiler 1.33x, Prettier 1.36x, Babel 1.12x, a three.js and
+/// lodash bundle 1.24x, Vue's server renderer 1.06x, React's 1.04x. Raising
+/// the compile thresholds narrows that but never closes it (at a million
+/// calls and back-edges, with next to nothing compiled, still 1.04-1.12x):
+/// a JIT-enabled VM keeps feedback paths and bytecode the interpreter-only
+/// one drops. The benchmark rows and test programs that the JIT does speed
+/// up have at most a few dozen functions; React's renderer has 311, Preact's
+/// (unaffected either way) 92. `ZIPP_JIT_LARGE=1` keeps the JIT on for a
+/// large program; `ZIPP_NOJIT` still turns it off for any.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+const JIT_LARGE_PROGRAM_FUNCS: usize = 256;
+
+/// Whether a VM over `program` starts with its JIT on (see
+/// [`JIT_LARGE_PROGRAM_FUNCS`]). A Python program keeps it: its runtime
+/// stays interpreted already and its own bodies are what compiles.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn jit_wanted(program: &Program) -> bool {
+    if std::env::var_os("ZIPP_NOJIT").is_some() {
+        return false;
+    }
+    program.python_natives
+        || program.functions.len() < JIT_LARGE_PROGRAM_FUNCS
+        || std::env::var_os("ZIPP_JIT_LARGE").is_some()
+}
+
 #[inline]
 fn module_func_range_contains(ranges: &[(u32, u32, u32)], func_id: u32) -> bool {
     ranges
@@ -179,6 +207,8 @@ impl<'p> Vm<'p> {
         eval_arena: &'p crate::vm::eval_arena::EvalArena,
     ) -> Vm<'p> {
         let mut heap = Heap::new();
+        let report_unhandled = std::env::var("ZIPP_REPORT_UNHANDLED").is_ok_and(|v| v == "1");
+        let fatal_rejections = crate::unhandled_rejections_fatal() && !report_unhandled;
         // Pre-load string constants of every function into the heap so
         // `LoadConst` of a string resolves to a stable heap index. We rewrite
         // string-constant slots to carry their heap index as an Int payload
@@ -259,6 +289,9 @@ impl<'p> Vm<'p> {
                 crate::vm::indexing_date::KEYED_SLOT_MEMO_SLOTS
             ]
             .into_boxed_slice(),
+            own_slot_cache: (0..crate::vm::ic::OWN_SLOT_CACHE_SLOTS)
+                .map(|_| std::cell::Cell::new(crate::vm::ic::OwnSlot::EMPTY))
+                .collect(),
             json_default_tj: None,
             site_ics: Vec::new(),
             #[cfg(feature = "python")]
@@ -266,6 +299,7 @@ impl<'p> Vm<'p> {
             dynamic_ic_bytes: 0,
             const_string_cache: rustc_hash::FxHashMap::default(),
             const_string_dense: Vec::new(),
+            const_string_texts: rustc_hash::FxHashMap::default(),
             key_str_cache: rustc_hash::FxHashMap::default(),
             enum_key_cache: Vec::new(),
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),
@@ -319,20 +353,28 @@ impl<'p> Vm<'p> {
             unhandled_rejections: Vec::new(),
             rejecting_thrown_job: false,
             uncaught_timer_errors: Vec::new(),
-            report_unhandled: std::env::var("ZIPP_REPORT_UNHANDLED").is_ok_and(|v| v == "1"),
+            report_unhandled,
+            track_rejections: fatal_rejections,
+            pending_rejections: Vec::new(),
+            notified_rejections: Vec::new(),
+            rejection_sink: None,
+            rejection_hook: None,
+            fatal_rejections,
+            uncaught_in_promise: false,
             coll_proof_cache: [(u32::MAX, 0, 0, 0); crate::vm::COLL_PROOF_SLOTS],
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_shape_slot: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_shape_slot_sites: rustc_hash::FxHashSet::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_add_ways: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_stores: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_framefree: Vec::new(),
-            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            shape_key_plans: Vec::new(),
+            shape_key_plans: Default::default(),
             for_in_barren: rustc_hash::FxHashMap::default(),
             for_in_silent: rustc_hash::FxHashMap::default(),
             regexp_string_iters: rustc_hash::FxHashMap::default(),
@@ -515,6 +557,9 @@ impl<'p> Vm<'p> {
             immutable_buffers: std::collections::HashSet::new(),
             pinned_buffers: std::collections::HashSet::new(),
             error_data: crate::slot_table::SlotSet::default(),
+            error_stacks: Default::default(),
+            script_name: None,
+            jit_new_site: (super::super::error_stack::NO_JIT_SITE, 0),
             fn_name_cells: crate::slot_table::SlotSet::default(),
             const_cells: crate::slot_table::SlotSet::default(),
             const_cells_nonempty: 0,
@@ -529,6 +574,7 @@ impl<'p> Vm<'p> {
             eval_prelude_mode: false,
             arguments_objs: crate::slot_table::SlotTable::default(),
             gen_args_obj: std::collections::HashMap::new(),
+            gen_inline_ok: Vec::new(),
             module_base_dir: None,
             module_root: None,
             module_max_bytes: None,
@@ -541,7 +587,8 @@ impl<'p> Vm<'p> {
             closure_home: ClosureHomeTable::default(),
             closure_new_target: crate::slot_table::SlotTable::default(),
             finalize_shapes: rustc_hash::FxHashMap::default(),
-            iter_result_plan: None,
+            iter_result_shape: None,
+            step_tokens: vec![(u32::MAX, 0, 0); crate::vm::STEP_TOKEN_SLOTS].into_boxed_slice(),
             from_async_fn: None,
             async_dispose_fn: None,
             sync_dispose_shim_fn: None,
@@ -647,7 +694,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "aarch64"))]
             jit: crate::codegen::Jit::new(),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            jit_enabled: std::env::var_os("ZIPP_NOJIT").is_none(),
+            jit_enabled: jit_wanted(program),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_recurse_depth: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

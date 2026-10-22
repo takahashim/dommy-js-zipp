@@ -34,12 +34,16 @@ impl<'p> Vm<'p> {
         // An explicit `fn.prototype = value` wins. A non-object value means there is
         // no usable prototype OBJECT (OrdinaryCreateFromConstructor then falls back to
         // the intrinsic default), so report None.
-        if let Some(&v) = self.fn_proto_override.get(&idx) {
-            return if v.is_heap() && self.is_object_value(v) {
-                Some(v)
-            } else {
-                None
-            };
+        // Empty in nearly every program: skip its SipHash (`instanceof`
+        // asks this at every class level it walks).
+        if !self.fn_proto_override.is_empty() {
+            if let Some(&v) = self.fn_proto_override.get(&idx) {
+                return if v.is_heap() && self.is_object_value(v) {
+                    Some(v)
+                } else {
+                    None
+                };
+            }
         }
         if let Some(&p) = self.prototypes.get(&idx) {
             return Some(Value::heap(p));
@@ -845,11 +849,13 @@ impl<'p> Vm<'p> {
             &[("register", FR_REGISTER), ("unregister", FR_UNREGISTER)],
             None,
         );
-        // %ArrayIteratorPrototype% (next + @@iterator). Array entries/keys/values
-        // iterators delegate here.
+        // %ArrayIteratorPrototype% (next). Array entries/keys/values iterators
+        // delegate here. Like the Map, Set, String and RegExp String iterator
+        // prototypes, it has no own @@iterator: that is %Iterator.prototype%'s
+        // (27.1.2.1), which `getOwnPropertySymbols`/`hasOwnProperty` observe.
         let array_iter_proto = build(
             self,
-            &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+            &[("next", ITER_NEXT)],
             None,
         );
         self.array_iter_proto = array_iter_proto;
@@ -863,18 +869,18 @@ impl<'p> Vm<'p> {
         // different identity so getPrototypeOf discriminates them).
         self.map_iter_proto = build(
             self,
-            &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+            &[("next", ITER_NEXT)],
             None,
         );
         self.set_iter_proto = build(
             self,
-            &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+            &[("next", ITER_NEXT)],
             None,
         );
         // %StringIteratorPrototype% + String.prototype[@@iterator] (code points).
         self.string_iter_proto = build(
             self,
-            &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+            &[("next", ITER_NEXT)],
             None,
         );
         {
@@ -1464,7 +1470,7 @@ impl<'p> Vm<'p> {
             // carries the "RegExp String Iterator" toStringTag.
             let rsi_proto = build(
                 self,
-                &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+                &[("next", ITER_NEXT)],
                 None,
             );
             let iter_root = self.iterator_proto_root;
@@ -3187,7 +3193,7 @@ impl<'p> Vm<'p> {
             };
             let mut ctors: Vec<u32> =
                 vec![self.ta_base_ctor, self.regexp_ctor, self.arraybuffer_ctor];
-            for n in ["Array", "Map", "Set", "Promise"] {
+            for n in ["Array", "Map", "Set", "Promise", "SharedArrayBuffer"] {
                 if let Some(v) = self.global_by_name(n) {
                     if v.is_heap() {
                         ctors.push(v.heap_index());

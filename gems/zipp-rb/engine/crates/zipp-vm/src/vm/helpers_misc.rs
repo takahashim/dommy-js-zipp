@@ -1243,6 +1243,20 @@ pub(crate) extern "win64" fn jit_new_ic(
     })
 }
 
+/// Win64 helper for `throw v` (`Throw`) in a Tier C body: `v` becomes the
+/// pending exception, as the interpreter's arm makes it, and the body then
+/// bails at the `Throw`, so every entry unwinds from there exactly as it does
+/// after a call that threw. A throw is not a deopt signal.
+///
+/// # Safety
+/// `vm` is the running VM.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_throw(vm: *mut core::ffi::c_void, v: u64) {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.pending_throw = Some(Value::from_bits(v));
+    vm.osr_deopt_exempt = true;
+}
+
 /// Win64 helpers for array destructuring, array spread and a spread call in a
 /// compiled region: `IterToArray` (`packed_args` = `src | count << 16`),
 /// `ArrayAppend` (`arr | val << 16 | spread << 32`; the array's own bits come
@@ -2129,6 +2143,8 @@ pub(crate) extern "win64" fn jit_set_index(
             }
             if let Some(k) = new_key {
                 if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
+                    // A computed key that appends is data (`shape::data_keys`).
+                    let _data = crate::shape::data_keys();
                     m.push_data(k, Value::from_bits(val_bits));
                     vm.heap.bump_version(oidx); // a key add reallocs `vals`
                     return 0;
@@ -2232,47 +2248,34 @@ pub(crate) extern "win64" fn jit_set_index(
 /// returns the element's Value bits (undefined for OOB / detached / shrunk
 /// views, exactly like the interpreter), or `None` for a BigInt kind (whose
 /// result would allocate — the caller deopts).
+///
+/// The interpreter's read (`ta_interp_numeric_get_view`): one look at the
+/// view and its buffer, a fixed-width load, an integer kind an integer Value.
+/// This helper's own copy re-read the view for its length, probed the
+/// length-tracking set unguarded and copied the element through `memcpy`;
+/// with its caller it was 45% of dataview-binary with the JIT on.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn ta_fast_get_bits(vm: &Vm, ta_idx: u32, i: usize) -> Option<u64> {
-    let (buffer, kind, byte_offset) = match vm.heap.get(ta_idx) {
-        HeapObj::TypedArray {
-            buffer,
-            kind,
-            byte_offset,
-            ..
-        } => (*buffer, *kind, *byte_offset),
-        _ => return None,
+    let HeapObj::TypedArray {
+        buffer,
+        kind,
+        byte_offset,
+        length,
+    } = vm.heap.get(ta_idx)
+    else {
+        return None;
     };
-    if kind >= 9 {
+    if native::TA_KINDS[*kind as usize].2 {
         return None; // BigInt64/BigUint64 → interpreter (allocates)
     }
-    if i >= vm.ta_effective_len(ta_idx).unwrap_or(0) {
-        return Some(Value::UNDEFINED.bits());
-    }
-    let size = native::TA_KINDS[kind as usize].1;
-    let data = match vm.heap.get(buffer) {
-        HeapObj::ArrayBuffer { data, detached } if !*detached => data,
-        _ => return Some(Value::UNDEFINED.bits()),
-    };
-    let off = byte_offset + i * size;
-    if off + size > data.len() {
-        return Some(Value::UNDEFINED.bits());
-    }
-    let mut b = [0u8; 8];
-    b[..size].copy_from_slice(&data[off..off + size]);
-    Some(
-        match kind {
-            0 => Value::num(b[0] as i8 as f64),
-            1 | 2 => Value::num(b[0] as f64),
-            3 => Value::num(i16::from_le_bytes([b[0], b[1]]) as f64),
-            4 => Value::num(u16::from_le_bytes([b[0], b[1]]) as f64),
-            5 => Value::num(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-            6 => Value::num(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-            7 => Value::num(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-            _ => Value::num(f64::from_le_bytes(b)),
-        }
-        .bits(),
-    )
+    let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
+        ta_idx,
+        *buffer,
+        *kind,
+        *byte_offset,
+        *length,
+    );
+    vm.ta_interp_numeric_get_view(view, i).map(Value::bits)
 }
 
 /// Mirror of `ta_element_set` for a NUMBER value on a non-BigInt element kind
@@ -2291,7 +2294,9 @@ fn ta_fast_set(vm: &mut Vm, ta_idx: u32, i: usize, val: Value) -> u64 {
         } => (*buffer, *kind, *byte_offset),
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
-    if kind >= 9 || !val.is_number() {
+    // A view of an immutable buffer: the interpreter's [[Set]] returns false
+    // (and throws in strict code).
+    if kind >= 9 || !val.is_number() || vm.ta_view_immutable(ta_idx) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let f = if val.is_int() {
@@ -2630,9 +2635,11 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             // A length-tracking GSAB can grow concurrently without any VM call
             // that would refresh this region-entry snapshot. Decline that pin;
             // the per-access helper below reads its live length instead.
-            if !vm.dv_tracking.is_empty()
+            // An immutable buffer: the native lane's setters would write it.
+            if (!vm.dv_tracking.is_empty()
                 && vm.dv_tracking.contains(&idx)
-                && vm.shared_buffers.contains(&buffer)
+                && vm.shared_buffers.contains(&buffer))
+                || (!vm.immutable_buffers.is_empty() && vm.immutable_buffers.contains(&buffer))
             {
                 return None;
             }
@@ -2665,7 +2672,8 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             } => (*buffer, *kind, *byte_offset),
             _ => return None,
         };
-        if k as u32 != kind || k >= 9 {
+        // An immutable buffer: a pinned element store would write it.
+        if k as u32 != kind || k >= 9 || vm.ta_view_immutable(idx) {
             return None;
         }
         let len = vm.ta_effective_len(idx)?;
@@ -4521,9 +4529,21 @@ fn jit_direct_miss_gate(vm: &mut Vm, site_idx: u32) -> crate::codegen::DirectMis
     if !vm.jit.direct_miss_gate_ready(site_idx) {
         return crate::codegen::DirectMissGate::Probe;
     }
-    let memo_sites: rustc_hash::FxHashSet<u32> =
-        vm.jit_shape_slot.keys().map(|&(site, _)| site).collect();
-    vm.jit.direct_miss_gate(site_idx, &memo_sites)
+    // The set is kept with the memo. Building it here per call was meant to
+    // be a one-shot cost, but a site the gate keeps declining asks on every
+    // miss: with the TypeScript bundle's memo near its cap that rebuild was
+    // 70% of the run.
+    vm.jit.direct_miss_gate(site_idx, &vm.jit_shape_slot_sites)
+}
+
+/// Record a `(site, shape) -> slot` memo entry and its site.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_shape_slot_put(vm: &mut Vm, site_idx: u32, shape: u32, slot: u32) {
+    if vm.jit_shape_slot.len() < JIT_SHAPE_SLOT_MAX {
+        vm.jit_shape_slot.insert((site_idx, shape), slot);
+        vm.jit_shape_slot_sites.insert(site_idx);
+    }
 }
 
 /// Read-only twin of `get_member_slow`'s Array / String tail for a NAMED
@@ -5223,11 +5243,8 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // the receiver's own layout and is already guarded by hop versions.
     if let HeapObj::Object(map) = vm.heap.get(idx) {
         let sh = map.shape();
-        if sh != crate::shape::DICT
-            && map.attr_get(slot as usize).is_some_and(|a| !a.accessor)
-            && vm.jit_shape_slot.len() < JIT_SHAPE_SLOT_MAX
-        {
-            vm.jit_shape_slot.insert((site_idx, sh), slot);
+        if sh != crate::shape::DICT && map.attr_get(slot as usize).is_some_and(|a| !a.accessor) {
+            jit_shape_slot_put(vm, site_idx, sh, slot);
         }
     }
     val.bits()
@@ -5426,18 +5443,55 @@ pub(crate) struct AddWay {
 
 /// Longest key list a shape gets a shared plan for, and the most key bytes it
 /// may hold: plans live outside the heap, one per shape reached by an add way
-/// (shapes are capped at 4,096), so a long or wide one stays on owned keys.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-const SHAPE_PLAN_MAX_KEYS: u32 = 16;
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-const SHAPE_PLAN_MAX_BYTES: usize = 512;
+/// (shapes are capped at `shape::SHAPE_MAX`), so a long or wide one stays on
+/// owned keys. At 16 keys a constructor writing 17 fields (Babel's NodePath)
+/// copied all 16 keys into a list of its own at the 17th, for every object.
+const SHAPE_PLAN_MAX_KEYS: u32 = 32;
+const SHAPE_PLAN_MAX_BYTES: usize = 1024;
+/// The key bytes every shape plan holds together, for the process: past it a
+/// shape stays on owned keys, so a hostile program minting wide shapes cannot
+/// make the plans its memory sink.
+const SHAPE_PLAN_TOTAL_BYTES: usize = 32 << 20;
+static SHAPE_PLAN_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// `shape`'s key list as a shared plan, built the first time an add way
-/// reaches the shape; `None` for a dictionary shape or a list past the caps.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+/// What a shape plan counts against [`SHAPE_PLAN_TOTAL_BYTES`]: its key
+/// bytes and each key's `String` record.
+fn shape_plan_charge(keys: &[String]) -> usize {
+    keys.iter().map(String::len).sum::<usize>() + keys.len() * std::mem::size_of::<String>()
+}
+
+/// `Vm::shape_key_plans`: by shape id, the shared key list of each shape that
+/// has one. A VM going away returns its plans' charge to the process budget.
+#[derive(Default)]
+pub(crate) struct ShapePlans(Vec<Option<crate::bytecode::StaticKeyPlan>>);
+
+impl std::ops::Deref for ShapePlans {
+    type Target = Vec<Option<crate::bytecode::StaticKeyPlan>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ShapePlans {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ShapePlans {
+    fn drop(&mut self) {
+        let held: usize = self.0.iter().flatten().map(|p| shape_plan_charge(p.keys())).sum();
+        SHAPE_PLAN_BYTES.fetch_sub(held, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `shape`'s key list as a shared plan, built the first time an add way (or
+/// the interpreter's cached add) reaches the shape; `None` for a dictionary
+/// shape or a list past the caps.
 pub(crate) fn shape_key_plan(vm: &mut Vm, shape: u32) -> Option<crate::bytecode::StaticKeyPlan> {
     let s = shape as usize;
-    if shape == crate::shape::DICT || s >= 1 << 14 {
+    if shape == crate::shape::DICT || s >= crate::shape::SHAPE_MAX {
         return None;
     }
     if let Some(Some(p)) = vm.shape_key_plans.get(s) {
@@ -5450,8 +5504,13 @@ pub(crate) fn shape_key_plan(vm: &mut Vm, shape: u32) -> Option<crate::bytecode:
     if keys.iter().map(String::len).sum::<usize>() > SHAPE_PLAN_MAX_BYTES {
         return None;
     }
+    let charge = shape_plan_charge(&keys);
     let plan = crate::bytecode::StaticKeyPlan::new(keys);
     if !plan.runtime_valid() || plan.has_element_key() {
+        return None;
+    }
+    if SHAPE_PLAN_BYTES.fetch_add(charge, std::sync::atomic::Ordering::Relaxed) + charge > SHAPE_PLAN_TOTAL_BYTES {
+        SHAPE_PLAN_BYTES.fetch_sub(charge, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
     if vm.shape_key_plans.len() <= s {
@@ -5574,8 +5633,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // table directly is an out-of-bounds panic the moment such a function gets hot
     // and takes a `SetProp` miss. The get side was fixed; this one was missed.
     // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 1, the JIT miss
-    // route. IC-HIT stores make no call — that is what `register_scan_root`
-    // at the fill below is for.
+    // route. IC-HIT stores run the barrier in the emitted probe instead.
     vm.store_barrier(
         crate::heap::gcoracle::JIT_SET_PROP,
         idx,
@@ -5663,7 +5721,6 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                     vm.jit.ic_rot_bump(site_idx);
                 } else {
                     vm.jit.set_ic(site_idx, e);
-                    vm.heap.register_scan_root(idx);
                 }
             }
         }
@@ -5854,15 +5911,10 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             if vm.jit.ic_thrashing(site_idx) && crate::codegen::ic_refill_gate_enabled() {
                 vm.jit.ic_rot_bump(site_idx);
             } else {
+                // Nursery: this way's hits run the value-grain barrier
+                // themselves (`emit_ic_probe`'s store arm), so the receiver
+                // needs no persistent minor-trace root.
                 vm.jit.set_ic(site_idx, e);
-                // Nursery: this way's HITS store into `idx` with NO call (the probe's
-                // `mov [vals+slot*8], val`), so no barrier can ever see them.
-                // Register the receiver as a persistent minor-trace root instead —
-                // its edges are re-scanned at every minor for as long as the slot
-                // lives (the way itself dies with the slot's version on free/reuse).
-                // It covers call-free stores through a FILLED way and nothing else,
-                // so a suppressed fill must not register one.
-                vm.heap.register_scan_root(idx);
             }
         }
     }
@@ -5875,9 +5927,8 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             && map
                 .attr_get(slot as usize)
                 .is_some_and(|a| !a.accessor && a.writable)
-            && vm.jit_shape_slot.len() < JIT_SHAPE_SLOT_MAX
         {
-            vm.jit_shape_slot.insert((site_idx, sh), slot);
+            jit_shape_slot_put(vm, site_idx, sh, slot);
         }
     }
     0
@@ -6920,6 +6971,7 @@ pub(crate) extern "win64" fn jit_cross3_finish(
         argc: argc as u16,
         is_eval: false,
         construct_this: false,
+        gen: u32::MAX,
         func: fid,
         base: new_base,
         ip: bail as usize,
@@ -7844,6 +7896,15 @@ impl<'p> Vm<'p> {
             },
         };
         self.native_on_intrinsic_receiver(intrinsic_receiver, native_id, callee, this_v)
+    }
+
+    /// `static_builtin_is_intrinsic("Math", ..)` for a caller that cannot
+    /// inline it (the lite loop): the `Math` slot read directly, where the
+    /// out-of-line generic one matched the namespace's name on every call.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    pub(crate) fn math_method_is_intrinsic(&self, native_id: u16, callee: Value, this_v: Value) -> bool {
+        self.native_on_intrinsic_receiver(self.builtin_ns_slots[0], native_id, callee, this_v)
     }
 
     /// The tail of [`Vm::static_builtin_is_intrinsic`] once the namespace's

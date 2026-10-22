@@ -32,6 +32,22 @@ fn collect_static_key_plan_name(plan_names: &mut Vec<u32>, name: u32) {
     }
 }
 
+/// Whether the code being compiled can only ever be interpreted: a build
+/// without the JIT. Such code can drop the copies the JIT's pattern matchers
+/// expect (`expr_discarded`).
+///
+/// Not a process run with `ZIPP_NOJIT`: the bytecode a JIT build compiles
+/// must not depend on whether its JIT runs, or a metered VM stops at another
+/// step and heap figure with the JIT off than on (str_append_index's
+/// `reserved_first_builder_tiny_heap_boundary_matches_all_modes`, in CI's
+/// workspace lane, where `instrument` and the JIT meet). Dropping the copies
+/// under `ZIPP_NOJIT` had bought 4% of the interpreter's real and hostile
+/// suites; an interpreter-only rewrite belongs in `FusedCode`, which keeps
+/// the bytecode's length and positions.
+pub(crate) fn interp_only_bytecode() -> bool {
+    cfg!(not(feature = "jit"))
+}
+
 // NOTE: parenthesization. `ast` has no ParenthesizedExpression, so every peel is
 // gone from this file (`expr_into`, `typeof (f)`, `delete (x)`). That is a
 // deliberate behaviour change in one direction only: a parenthesized operand now
@@ -283,30 +299,32 @@ impl<'a> FnCompiler<'a> {
     /// the byte-identical `while (i < n) { …; ++i; }` — 3.9x, for the choice of
     /// `i++` over `++i` in a position where the two cannot be told apart.
     ///
-    /// The other, in builds without the JIT: an update or an assignment of a
-    /// plain register local computes in the local's own register, and what it
-    /// then hands back is a copy of that register into the result. Nobody
-    /// reads a discarded result, so the local is named as the result and the
-    /// copy is never emitted. `s += i` and `i++` as statements were two dead
-    /// `Move`s in a six-instruction loop: a third of what the interpreter
-    /// dispatched. The JIT's planners and stream recognisers match the
-    /// compiler's exact output, copies included, so builds with it keep it.
+    /// The other, for code only the interpreter will run: an update or an
+    /// assignment of a plain register local computes in the local's own
+    /// register, and what it then hands back is a copy of that register into
+    /// the result. Nobody reads a discarded result, so the local is named as
+    /// the result and the copy is never emitted. `s += i` and `i++` as
+    /// statements were two dead `Move`s in a six-instruction loop: a third of
+    /// what the interpreter dispatched. The JIT's planners and stream
+    /// recognisers match the compiler's exact output, copies included, so code
+    /// a JIT may compile keeps it ([`interp_only_bytecode`]).
     pub(crate) fn expr_discarded(&mut self, e: &ast::Expr) -> R<Reg> {
-        #[cfg(not(feature = "jit"))]
-        match e {
-            ast::Expr::Update { op, target, .. } => {
-                if let Some(r) = self.discarded_in_place_reg(target) {
-                    return self.update(*op, true, target, r);
+        if interp_only_bytecode() {
+            match e {
+                ast::Expr::Update { op, target, .. } => {
+                    if let Some(r) = self.discarded_in_place_reg(target) {
+                        return self.update(*op, true, target, r);
+                    }
                 }
-            }
-            ast::Expr::Assign {
-                op, target, value, ..
-            } if !op.is_logical() => {
-                if let Some(r) = self.discarded_in_place_reg(target) {
-                    return self.assign(*op, target, value, r);
+                ast::Expr::Assign {
+                    op, target, value, ..
+                } if !op.is_logical() => {
+                    if let Some(r) = self.discarded_in_place_reg(target) {
+                        return self.assign(*op, target, value, r);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
         if let ast::Expr::Update {
             op,
@@ -328,7 +346,6 @@ impl<'a> FnCompiler<'a> {
     ///
     /// Reads the scopes only. `resolve` threads upvalues and mints globals,
     /// and `with_obj_regs` emits code; neither may run for a question.
-    #[cfg(not(feature = "jit"))]
     fn discarded_in_place_reg(&self, target: &ast::Target) -> Option<Reg> {
         let ast::Target::Ident { name, .. } = target else {
             return None;
@@ -693,56 +710,11 @@ impl<'a> FnCompiler<'a> {
             E::Yield { arg, delegate } => self.yield_expr(arg.as_deref(), *delegate, dst),
             E::Await(a) => self.await_expr(a, dst),
             E::Call(c) => self.call(c, dst),
-            E::New { callee, args } => {
-                // Only Array keeps a dedicated user-visible constructor opcode.
-                // Every other named builtin uses the generic construct path: it
-                // already implements exact constructor identity, proxies,
-                // newTarget/prototype selection and the complete argument list.
-                let has_spread = args.iter().any(|a| matches!(a, ast::Arg::Spread(_)));
-                if !has_spread
-                    && matches!(&**callee, ast::Expr::Ident(id) if &**id == "Array" && self.builtin_unshadowed(id))
-                {
-                    let save = self.next_reg;
-                    let callee_reg = self.capture_plain_callee(callee)?;
-                    let (arg_base, argc) = self.eval_args_contiguous(args)?;
-                    self.emit(Instr::ArrayCtor {
-                        dst,
-                        callee: Some(callee_reg),
-                        arg_base,
-                        argc,
-                        is_construct: true,
-                    });
-                    self.set_next_reg(save.max(dst.saturating_add(1)));
-                    return Ok(dst);
-                }
-                // General `new C(args)`: evaluate the constructor value, then the
-                // args (contiguous), and let the VM build the instance. When the
-                // arguments contain a spread (`new C(...xs)`), build a flat args
-                // array and construct via NewSpread instead. The constructor is
-                // SNAPSHOTTED into a temp before the args run: an argument's
-                // side effect reassigning the callee variable must not change
-                // which value is constructed (EvaluateNew takes GetValue first).
-                let save = self.next_reg;
-                let callee_reg = self.capture_plain_callee(callee)?;
-                if has_spread {
-                    let args_arr = self.build_spread_args(args)?;
-                    self.emit(Instr::NewSpread {
-                        dst,
-                        callee: callee_reg,
-                        args: args_arr,
-                    });
-                    self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + arg scratch
-                    return Ok(dst);
-                }
-                let (arg_base, argc) = self.eval_args_contiguous(args)?;
-                self.emit(Instr::New {
-                    dst,
-                    callee: callee_reg,
-                    arg_base,
-                    argc,
-                });
-                self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + args
-                Ok(dst)
+            E::New { callee, args, pos } => {
+                let start = self.code.len();
+                let r = self.new_expr(callee, args, dst);
+                self.note_call_site(start, *pos);
+                r
             }
             E::Function(f) => {
                 let (id, has_up) =
@@ -797,6 +769,14 @@ impl<'a> FnCompiler<'a> {
                 if !self.cx.new_target_ok {
                     return Err("SyntaxError: new.target expression is not allowed here".into());
                 }
+                // In a field initializer (and an arrow inside one) it is undefined:
+                // the initializer is called, never constructed. A class with no
+                // explicit constructor compiles its initializers into the one
+                // it synthesizes, whose frame does carry the `new` target.
+                if self.cx.in_field_init {
+                    self.emit(Instr::LoadUndefined { dst });
+                    return Ok(dst);
+                }
                 // The current activation's new.target (undefined unless entered via
                 // new/Reflect.construct/super). Arrows inherit it lexically from their
                 // enclosing function via the frame they run in.
@@ -849,6 +829,60 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// `new C(args)`, an arm of `expr` apart so that its call site is
+    /// recorded around it.
+    fn new_expr(&mut self, callee: &ast::Expr, args: &[ast::Arg], dst: Reg) -> R<Reg> {
+        // Only Array keeps a dedicated user-visible constructor opcode.
+        // Every other named builtin uses the generic construct path: it
+        // already implements exact constructor identity, proxies,
+        // newTarget/prototype selection and the complete argument list.
+        let has_spread = args.iter().any(|a| matches!(a, ast::Arg::Spread(_)));
+        if !has_spread
+            && matches!(callee, ast::Expr::Ident(id) if &**id == "Array" && self.builtin_unshadowed(id))
+        {
+            let save = self.next_reg;
+            let callee_reg = self.capture_plain_callee(callee)?;
+            let (arg_base, argc) = self.eval_args_contiguous(args)?;
+            self.emit(Instr::ArrayCtor {
+                dst,
+                callee: Some(callee_reg),
+                arg_base,
+                argc,
+                is_construct: true,
+            });
+            self.set_next_reg(save.max(dst.saturating_add(1)));
+            return Ok(dst);
+        }
+        // General `new C(args)`: evaluate the constructor value, then the
+        // args (contiguous), and let the VM build the instance. When the
+        // arguments contain a spread (`new C(...xs)`), build a flat args
+        // array and construct via NewSpread instead. The constructor is
+        // SNAPSHOTTED into a temp before the args run: an argument's
+        // side effect reassigning the callee variable must not change
+        // which value is constructed (EvaluateNew takes GetValue first).
+        let save = self.next_reg;
+        let callee_reg = self.capture_plain_callee(callee)?;
+        if has_spread {
+            let args_arr = self.build_spread_args(args)?;
+            self.emit(Instr::NewSpread {
+                dst,
+                callee: callee_reg,
+                args: args_arr,
+            });
+            self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + arg scratch
+            return Ok(dst);
+        }
+        let (arg_base, argc) = self.eval_args_contiguous(args)?;
+        self.emit(Instr::New {
+            dst,
+            callee: callee_reg,
+            arg_base,
+            argc,
+        });
+        self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + args
+        Ok(dst)
+    }
+
     /// `obj.x` / `obj[k]` / `obj.#x` — one node in `ast`, three lowerings.
     pub(crate) fn member(&mut self, m: &ast::Member, dst: Reg) -> R<Reg> {
         match &m.prop {
@@ -882,7 +916,23 @@ impl<'a> FnCompiler<'a> {
             }
             return Ok(dst);
         }
-        let obj = self.recv_expr(&m.object)?;
+        // `(x = v).p` with `x` a plain local: assign in place and read the
+        // property from the local itself. Nothing runs between the store and
+        // the read, so that is the assignment's value, and the general path's
+        // copy into a temporary is a Move per evaluation (per step of a loose
+        // for-of loop, `!(_step = _iterator()).done`).
+        let in_place = match &m.object {
+            ast::Expr::Assign {
+                op: ast::AssignOp::Assign,
+                target,
+                ..
+            } => self.discarded_in_place_reg(target),
+            _ => None,
+        };
+        let obj = match (&m.object, in_place) {
+            (ast::Expr::Assign { op, target, value, .. }, Some(r)) => self.assign(*op, target, value, r)?,
+            _ => self.recv_expr(&m.object)?,
+        };
         if m.optional {
             self.emit_optional_check(obj);
         }
@@ -3403,28 +3453,30 @@ mod static_key_plan_tests {
     }
 
     #[test]
-    fn compiler_site_cap_falls_back_at_257_without_rejecting_source() {
-        let source = (0..=crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES)
+    fn compiler_byte_cap_falls_back_past_the_cap_without_rejecting_source() {
+        // The byte ceiling binds before the site ceiling (see the constants):
+        // one more site than it admits must keep the legacy bytecode.
+        let charge = crate::bytecode::static_key_plan_retained_charge(&["k".to_string()]).unwrap();
+        let admitted = crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES / charge;
+        assert!(admitted < crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES);
+        let source = (0..=admitted)
             .map(|i| format!("var x{i}={{k:{i}}};"))
             .collect::<String>();
         let program = compile(&source);
         let main = &program.functions[0];
-        assert_eq!(
-            main.static_key_plans.len(),
-            crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES
-        );
+        assert_eq!(main.static_key_plans.len(), admitted);
         assert_eq!(
             main.code
                 .iter()
                 .filter(|instr| matches!(instr, Instr::NewPlannedObject { .. }))
                 .count(),
-            crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES
+            admitted
         );
         assert!(
             main.code
                 .iter()
                 .any(|instr| matches!(instr, Instr::NewObject { hint: 1, .. })),
-            "site 257 must retain exact legacy capacity bytecode"
+            "the site past the cap must retain exact legacy capacity bytecode"
         );
     }
 

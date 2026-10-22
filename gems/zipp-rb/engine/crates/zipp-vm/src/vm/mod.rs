@@ -432,7 +432,16 @@ struct Frame {
     /// hands the caller that instance unless the body returned an object, as
     /// [[Construct]] does, and a tail call may not reuse the frame.
     construct_this: bool,
+    /// The generator (heap index) this frame resumes inside its consumer's
+    /// loop (`Vm::gen_enter_inline`), or u32::MAX. Such a frame also has
+    /// `construct_this` set, so its return takes `pop_frame_with`, and a
+    /// tail call does not reuse it.
+    gen: u32,
 }
+
+// `gen` fits the padding the other fields leave: every call pushes a Frame.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Frame>() == 88, "Frame grew");
 
 /// [[ParameterMap]] bookkeeping for a MAPPED arguments object (sloppy callee
 /// with a simple parameter list). While the creating frame is live, a still-
@@ -526,6 +535,9 @@ pub(crate) enum Resume {
     /// iterator's `return`. Only meaningful for an async generator at a delegate point.
     Return(Value),
 }
+
+/// `Vm::step_tokens`' size, a power of two.
+pub(crate) const STEP_TOKEN_SLOTS: usize = 64;
 
 /// B214 latch: `ZIPP_NO_MICROTASK_ROOT=1` restores the pre-B214 whole-task
 /// GC suspension (the pricing comparator; it re-opens the TLA starvation).
@@ -1616,6 +1628,9 @@ pub struct Vm<'p> {
     /// `o`'s own properties: a direct-mapped table of (receiver, key, slot)
     /// that predicts the slot, which every use verifies (`keyed_memo_slot`).
     pub(crate) keyed_slot_memo: Box<[indexing_date::KeyedSlotMemo]>,
+    /// Where a shaped object holds a named key, or that it does not
+    /// (`Vm::own_pos`): a direct-mapped table keyed by (shape, key bytes).
+    pub(crate) own_slot_cache: Box<[std::cell::Cell<ic::OwnSlot>]>,
     /// JSON.stringify fast-path cache: `(obj_proto version, arr_proto version,
     /// either default prototype has a callable `toJSON`)`. Keyed on the two proto
     /// shape versions so any mutation that adds/removes `toJSON` on the default
@@ -1641,11 +1656,15 @@ pub struct Vm<'p> {
     /// are explicit GC roots because the map is VM-internal. See
     /// `const_cache.rs` for the mutation exclusion and resource bounds.
     const_string_cache: rustc_hash::FxHashMap<u64, Value>,
-    /// The same entries by function and slot (`const_cache::CONST_DENSE_FUNCS`
-    /// functions at most), `UNDEFINED` where none: a loaded literal is two
-    /// indexed reads instead of a hash probe, which was 14% of an interpreted
-    /// `switch (typeof x)` loop. The map stays the owner (and the GC root).
+    /// The same entries by function and slot (every source-bounded function,
+    /// `const_cache::CONST_DENSE_FUNCS` runtime ones), `UNDEFINED` where none:
+    /// a loaded literal is two indexed reads instead of a hash probe, which
+    /// was 14% of an interpreted `switch (typeof x)` loop. The map stays the
+    /// owner (and the GC root).
     const_string_dense: Vec<Vec<Value>>,
+    /// The cached representation of each literal text, so every slot holding
+    /// that text shares one string; a subset of `const_string_cache`'s values.
+    const_string_texts: rustc_hash::FxHashMap<&'p str, Value>,
     /// The heap string enumeration hands out for a property key, by the key's
     /// stored text (`Vm::alloc_key_str`). `for (k in o)`, `Object.keys` and
     /// their kin made a fresh string for every key of every object on every
@@ -1890,6 +1909,36 @@ pub struct Vm<'p> {
     /// them, as it has no HostReportErrors hook).
     uncaught_timer_errors: Vec<String>,
     report_unhandled: bool,
+    /// HostPromiseRejectionTracker for a host that asked to hear of
+    /// unhandled rejections (#77): the `zipp` command, which ends the program
+    /// on one as Node does (`fatal_rejections`), or an embedder's
+    /// `set_unhandled_rejection_sink` / `set_promise_rejection_hook`. Off,
+    /// nothing is recorded.
+    pub(crate) track_rejections: bool,
+    /// Promises rejected while no handler was attached, since the last
+    /// microtask checkpoint, in rejection order (HTML's about-to-be-notified
+    /// rejected promises list). GC ROOTS until `rejection_checkpoint` looks
+    /// at them; the ones that gained a handler meanwhile are dropped there.
+    pending_rejections: Vec<u32>,
+    /// Promises reported unhandled to `rejection_hook`, kept for its
+    /// "rejectionhandled" call should one gain a handler later (HTML's
+    /// outstanding rejected promises weak set). WEAK: a promise nothing
+    /// reaches can never gain a handler, so the collector drops it.
+    pub(crate) notified_rejections: Vec<u32>,
+    /// The embedder's `set_unhandled_rejection_sink`: called with the reason's
+    /// message for each rejection still unhandled at a checkpoint.
+    pub(crate) rejection_sink: Option<Box<dyn FnMut(&str)>>,
+    /// The embedder's `set_promise_rejection_hook` function, called as
+    /// `hook("unhandledrejection" | "rejectionhandled", promise, reason)`.
+    /// A GC root.
+    pub(crate) rejection_hook: Option<Value>,
+    /// End the event loop on the first rejection still unhandled at a
+    /// checkpoint, which becomes the program's error (Node's default
+    /// `--unhandled-rejections=throw`). Set for the `zipp` command; never
+    /// with the Test262 report, which scores such rejections itself.
+    fatal_rejections: bool,
+    /// `uncaught_timer_throw` holds such a rejection's reason, not a throw.
+    uncaught_in_promise: bool,
     /// The `.raw` array of a tagged-template strings object, keyed by the cooked
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).
@@ -1915,6 +1964,10 @@ pub struct Vm<'p> {
     /// dropped freely.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_shape_slot: rustc_hash::FxHashMap<(u32, u32), u32>,
+    /// The sites `jit_shape_slot` holds an entry for, kept with it (neither
+    /// ever drops one): the direct-miss gate's proof set.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_shape_slot_sites: rustc_hash::FxHashSet<u32>,
     /// The last property append each JIT `SetProp` site proved, by IC site
     /// index (`helpers_misc::AddWay`): a constructor's `this.x = v` adds a
     /// key to a new object every time, which no identity or shape way can
@@ -1933,10 +1986,10 @@ pub struct Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     ctor_framefree: Vec<u8>,
     /// Each shape's key list as a shared plan, by shape id, for the objects
-    /// the JIT's add ways append to (`helpers_misc::shape_key_plan`): built
-    /// once a way reaches the shape, `None` where the list is too long.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    shape_key_plans: Vec<Option<crate::bytecode::StaticKeyPlan>>,
+    /// the JIT's add ways and the interpreter's cached adds append to
+    /// (`helpers_misc::shape_key_plan`): built once an add reaches the
+    /// shape, `None` where the list is too long.
+    shape_key_plans: helpers_misc::ShapePlans,
     /// Prototype objects known to contribute NOTHING to a `for-in`: no own key
     /// is enumerable, and none can shadow a farther level because the walk ends
     /// there. Keyed by heap index, valued by the heap version the answer was
@@ -2556,6 +2609,18 @@ pub struct Vm<'p> {
     /// removed once for every error collected, so it is a bit a slot: as a
     /// hashed set of slots those two were 7% of a throw-and-catch loop.
     error_data: crate::slot_table::SlotSet,
+    /// The stack each error object was created on, for Error.prototype.stack`r
+    /// (error_stack): its frames until the first read, then that read's text.
+    /// Pruned on GC sweep with error_data.
+    error_stacks: crate::slot_table::SlotTable<error_stack::ErrorStack>,
+    /// The name the main program's frames give their script in a stack, as
+    /// the host supplies it (the zipp command, a file's path); None is
+    /// <anonymous>.
+    pub(crate) script_name: Option<std::sync::Arc<str>>,
+    /// The compiled caller of the construction running now, as the JIT's
+    /// `new` helper hands it over (`func << 32 | ip`), and the frame count
+    /// then; `error_stack::NO_JIT_SITE` otherwise. Read by `mark_error_data`.
+    pub(crate) jit_new_site: (u64, usize),
     /// Set by the module loader just before executing a MODULE BODY: the
     /// next alloc_async (the body's own activation) marks its result promise
     /// in module_body_results. Consumed (mem::take) at alloc_async entry.
@@ -2648,6 +2713,9 @@ pub struct Vm<'p> {
     /// to the freshly spliced frame (`relink_mapped_args`), so the live aliasing
     /// survives suspension. Pruned on GC sweep alongside `arguments_objs`.
     gen_args_obj: std::collections::HashMap<u32, u32>,
+    /// Per generator function: whether a `for-of` step may resume it in the
+    /// consumer's loop (`Vm::gen_enter_inline`). 0 undecided, 1 yes, 2 no.
+    gen_inline_ok: Vec<u8>,
     /// Directory the running script was loaded from, used to resolve a dynamic
     /// `import(specifier)` against the filesystem (relative + bare specifiers).
     /// `None` when running from a string (eval/embedding) — then `import()` has no
@@ -2684,7 +2752,9 @@ pub struct Vm<'p> {
     ///
     /// Fx-hashed, both levels: every property cache check asks whether its
     /// receiver is a namespace (`ic_obj_ok`) once any module is loaded, and
-    /// SipHash there was a fifth of a module program's run.
+    /// SipHash there was a fifth of a module program's run. (A `SlotTable`
+    /// here was tried: it made every program 4-6% slower, modules or not,
+    /// by moving the `Vm`'s hot fields; this struct's layout is load-bearing.)
     module_namespaces: rustc_hash::FxHashMap<u32, ExportSlots>,
     /// Modules CURRENTLY being linked (cycle detection): resolved path → its OWN
     /// export name→live-slot map (re-exports not yet resolved). Present only during
@@ -2887,10 +2957,15 @@ pub struct Vm<'p> {
     /// (fid, plan) keys are append-only over the program + eval tables, so an
     /// entry can never alias a different plan.
     finalize_shapes: rustc_hash::FxHashMap<(u32, u16), u32>,
-    /// The key plan of an iterator result object (`["value", "done"]`) and
-    /// the shape two data appends of those keys reach, made at the first
-    /// result (`Vm::iter_result`).
-    iter_result_plan: Option<(crate::bytecode::StaticKeyPlan, u32)>,
+    /// The shape two data appends of `value` and `done` reach, the layout of
+    /// an iterator result object, made at the first result (`Vm::iter_result`).
+    iter_result_shape: Option<u32>,
+    /// The result object each step register last got from the bound-next
+    /// fast path (`Vm::bound_step_call`), direct-mapped by the register's
+    /// absolute index: (absolute register, heap index, heap version), with
+    /// `u32::MAX` for a register no step has written. `STEP_TOKEN_SLOTS` of
+    /// them.
+    step_tokens: Box<[(u32, u32, u32)]>,
     /// The lazily-compiled `Array.fromAsync` JS polyfill (an async function value).
     /// Compiled on first call via `do_eval`, then cached + GC-rooted. `None` until
     /// the first `Array.fromAsync(...)` invocation.
@@ -3409,6 +3484,7 @@ mod counted_loop;
 mod dtf_locale;
 mod dtf_pattern;
 mod enum_stream;
+mod error_stack;
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 mod lite;
 mod text_codec;

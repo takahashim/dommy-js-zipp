@@ -166,6 +166,36 @@ impl<'p> Vm<'p> {
         Some(s)
     }
 
+    /// `arr[sym]` for the ordinary Array `oidx` and the Symbol `kidx`, when
+    /// the array holds no own properties beyond its elements, its
+    /// [[Prototype]] is this realm's %Array.prototype%, and that object has
+    /// a data property under the symbol: that property's value. The general
+    /// path copied the symbol's key string (`key_of`) and walked the member
+    /// lookup to reach the same slot. Anything else is `None`, and the
+    /// general path answers.
+    fn array_symbol_proto_get(&self, oidx: u32, kidx: u32) -> Option<Value> {
+        let HeapObj::Symbol { prop_key, .. } = self.heap.get(kidx) else {
+            return None;
+        };
+        if !matches!(self.heap.get(oidx), HeapObj::Array(_))
+            || self.arr_props.contains_key(&oidx)
+            || self.arguments_objs.contains_key(&oidx)
+            || self.proto_of.contains_key(&oidx)
+            || self.arr_proto == 0
+        {
+            return None;
+        }
+        let HeapObj::Object(pm) = self.heap.get(self.arr_proto) else {
+            return None;
+        };
+        let i = pm.pos(prop_key)?;
+        if pm.attr_at(i).accessor {
+            return None;
+        }
+        let v = pm.val_at(i);
+        (!v.is_uninitialized()).then_some(v)
+    }
+
     /// Record that `oidx` has the key `kidx` at `slot` (see `keyed_memo_slot`).
     #[inline]
     pub(crate) fn keyed_memo_put(&mut self, oidx: u32, kidx: u32, slot: usize) {
@@ -485,6 +515,14 @@ impl<'p> Vm<'p> {
             }
             let k = self.key_of(key);
             return self.get_prop(obj, &k);
+        }
+        // FAST PATH: a Symbol-keyed read of an ordinary Array's inherited
+        // member (`arr[Symbol.iterator]`, which every loose-mode for...of and
+        // spread helper makes once per loop).
+        if key.is_heap() {
+            if let Some(v) = self.array_symbol_proto_get(obj.heap_index(), key.heap_index()) {
+                return Ok(v);
+            }
         }
         // FAST PATH: a plain-object computed read whose flat string key hits an
         // own DATA property answers straight from the ObjMap, with the key's
@@ -922,13 +960,11 @@ impl<'p> Vm<'p> {
         if let Some(i) = array_index(key) {
             if (self.arr_props.is_empty() || !self.arr_props.contains_key(&idx))
                 && (self.arguments_objs.is_empty() || !self.arguments_objs.contains_key(&idx))
+                // An overwrite moves no storage and changes nothing present,
+                // so it skips `get_mut`'s array-snapshot invalidation.
+                && self.heap.array_overwrite_present(idx, i, val)
             {
-                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                    if i < items.len() && !items[i].is_hole() {
-                        items[i] = val;
-                        return Ok(());
-                    }
-                }
+                return Ok(());
             }
         }
         // A rope key is flattened in place first, as `get_index` does: the
@@ -936,6 +972,8 @@ impl<'p> Vm<'p> {
         if key.is_heap() && matches!(self.heap.get(idx), HeapObj::Object(_)) {
             self.heap.flatten(key.heap_index());
         }
+        // A computed key that appends is data (`shape::data_keys`).
+        let _data = key.is_heap().then(crate::shape::data_keys);
         // FAST PATH: a plain-object computed write whose flat string key hits an
         // own WRITABLE DATA property stores straight into the ObjMap slot — the
         // twin of get_index's fast read (no key String materialization, no shape
@@ -1020,10 +1058,19 @@ impl<'p> Vm<'p> {
         // A TypedArray: a canonical numeric index writes the element (coerced +
         // out-of-bounds is a silent no-op); other keys go to set_prop.
         if matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
+            // A view of an immutable buffer: [[Set]] of any numeric key
+            // returns false, before coercing the value.
+            let immutable = self.ta_view_immutable(idx);
             if let Some(i) = array_index(key) {
+                if immutable {
+                    return self.reject_write(&i.to_string(), strict).map(|_| ());
+                }
                 return self.ta_element_set(idx, i, val);
             }
             let k = self.key_of(key);
+            if immutable && self.is_canonical_numeric_index(&k) {
+                return self.reject_write(&k, strict).map(|_| ());
+            }
             // A valid integer index given as a STRING ("0") still writes the element.
             if let Some(i) = self.ta_valid_index(idx, &k) {
                 return self.ta_element_set(idx, i, val);
@@ -1331,6 +1378,8 @@ impl<'p> Vm<'p> {
         strict: bool,
         func_id: u32,
     ) -> Result<(), Thrown> {
+        // A computed key that appends is data (`shape::data_keys`).
+        let _data = crate::shape::data_keys();
         if key.is_int() && obj.is_heap() {
             let mut scratch = std::mem::take(&mut self.idx_key_scratch);
             self.build_concat_key(&mut scratch, name, key.as_int(), func_id);

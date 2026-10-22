@@ -5,6 +5,29 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Whether class `cc` has no own `@@hasInstance` (a static method, field or
+/// accessor), remembered by the shape of its `statics`
+/// (`ClassData::no_has_instance_shape`): every `instanceof` against a class
+/// asked each level of its chain, a key scan of the statics apiece.
+#[inline]
+fn class_lacks_has_instance(cc: &crate::heap::ClassData) -> bool {
+    let shape = cc.statics.shape();
+    let no_accessors = cc.static_getters.is_empty() && cc.static_setters.is_empty();
+    if no_accessors && cc.statics.shape_guardable() && cc.no_has_instance_shape.get() == shape {
+        return true;
+    }
+    if cc.statics.pos("@@hasInstance").is_some()
+        || cc.static_getters.iter().any(|(k, _)| k == "@@hasInstance")
+        || cc.static_setters.iter().any(|(k, _)| k == "@@hasInstance")
+    {
+        return false;
+    }
+    if no_accessors && cc.statics.shape_guardable() {
+        cc.no_has_instance_shape.set(shape);
+    }
+    true
+}
+
 impl<'p> Vm<'p> {
     /// Build the callable for a class constructor: a plain `Func`, or a `Closure`
     /// over the cells the ctor captured (at class-definition time) when it closes
@@ -81,7 +104,25 @@ impl<'p> Vm<'p> {
         // the checked OrdinaryHasInstance path below is the only
         // fallback.
         if c.is_heap() {
-            let hi = self.get_prop(c, "@@hasInstance")?;
+            // A class's own static data method (`static [Symbol.hasInstance]`)
+            // is what the Get returns: read it there, not through the generic
+            // property path's class arm.
+            let own = match self.heap.get(c.heap_index()) {
+                HeapObj::Class(cc)
+                    if !cc.static_getters.iter().any(|(k, _)| k == "@@hasInstance")
+                        && !cc.static_setters.iter().any(|(k, _)| k == "@@hasInstance") =>
+                {
+                    cc.statics
+                        .pos("@@hasInstance")
+                        .filter(|&i| !cc.statics.attr_at(i).accessor)
+                        .map(|i| cc.statics.val_at(i))
+                }
+                _ => None,
+            };
+            let hi = match own {
+                Some(h) => h,
+                None => self.get_prop(c, "@@hasInstance")?,
+            };
             // The built-in Function.prototype[@@hasInstance] is
             // OrdinaryHasInstance.  Invoke that algorithm directly
             // (rather than skipping the method by native-function
@@ -168,11 +209,7 @@ impl<'p> Vm<'p> {
                     break;
                 }
                 HeapObj::Class(cc) => {
-                    if cc.statics.pos("@@hasInstance").is_some()
-                        || cc.static_getters.iter().any(|(k, _)| k == "@@hasInstance")
-                        || cc.static_setters.iter().any(|(k, _)| k == "@@hasInstance")
-                        || self.proto_of.get(&cur).is_some()
-                    {
+                    if !class_lacks_has_instance(cc) || self.proto_of.get(&cur).is_some() {
                         return None;
                     }
                     match cc.parent {
@@ -211,6 +248,9 @@ impl<'p> Vm<'p> {
                 return None;
             }
         }
+        if let Some(b) = self.instanceof_class_walk(ci, v) {
+            return Some(b);
+        }
         let p = self.prototype_of(c)?;
         if !self.is_object_value(p) {
             return None;
@@ -220,10 +260,15 @@ impl<'p> Vm<'p> {
         }
         let mut cur = v;
         for _ in 0..10_000 {
-            if self.proxy_parts(cur.heap_index()).is_some() {
-                return None;
-            }
-            cur = self.object_get_prototype_of(cur);
+            cur = match self.instanceof_proto_step(cur) {
+                Some(next) => next,
+                None => {
+                    if self.proxy_parts(cur.heap_index()).is_some() {
+                        return None;
+                    }
+                    self.object_get_prototype_of(cur)
+                }
+            };
             if !cur.is_heap() {
                 return Some(false);
             }
@@ -232,6 +277,72 @@ impl<'p> Vm<'p> {
             }
         }
         None
+    }
+
+    /// `v instanceof C` for a class `C` (heap `ci`) and a class instance `v`
+    /// with no [[Prototype]] of its own, by its class chain: `v`'s chain is
+    /// its class's prototype, then each parent class's, as long as no level's
+    /// prototype object was re-prototyped or otherwise retired
+    /// (`proto_dirty`, sticky). Distinct classes have distinct prototypes, so
+    /// `C.prototype` is on the chain exactly when `C` is one of the classes.
+    /// `None` for anything else, including a level whose parent is not a
+    /// class. The prototype walk paid a side-table lookup per hop.
+    #[inline]
+    fn instanceof_class_walk(&self, ci: u32, v: Value) -> Option<bool> {
+        if !v.is_heap() || !matches!(self.heap.get(ci), HeapObj::Class(_)) {
+            return None;
+        }
+        let vi = v.heap_index();
+        let mut cur = match self.heap.get(vi) {
+            HeapObj::Object(m) if !m.is_ctor && !m.class_proto => m.class?,
+            _ => return None,
+        };
+        if self.proto_of.contains_key(&vi) {
+            return None;
+        }
+        for _ in 0..64 {
+            if cur == ci {
+                return Some(true);
+            }
+            let HeapObj::Class(c) = self.heap.get(cur) else {
+                return None;
+            };
+            if c.proto_dirty {
+                return None;
+            }
+            match c.parent {
+                // A base class's prototype inherits from %Object.prototype%
+                // (or null), which no class's prototype is.
+                None => return Some(false),
+                Some(p) => cur = p,
+            }
+        }
+        None
+    }
+
+    /// `object_get_prototype_of(cur)` for the objects an `instanceof` walk
+    /// meets most, an ordinary object or class instance (`None`: ask it).
+    /// The general one tested for a Proxy, a class value, a dozen built-in
+    /// kinds and a callable before reaching an instance's class: a tenth of
+    /// a loop of `o instanceof C`.
+    #[inline]
+    fn instanceof_proto_step(&mut self, cur: Value) -> Option<Value> {
+        let idx = cur.heap_index();
+        let class = match self.heap.get(idx) {
+            HeapObj::Object(m) if !m.is_ctor => m.class,
+            _ => return None,
+        };
+        if let Some(&p) = self.proto_of.get(&idx) {
+            return Some(p);
+        }
+        if idx == self.obj_proto {
+            return Some(Value::NULL);
+        }
+        match class {
+            Some(cidx) => self.prototype_of(Value::heap(cidx)),
+            None if self.obj_proto != 0 => Some(Value::heap(self.obj_proto)),
+            None => None,
+        }
     }
 
     pub(crate) fn ordinary_has_instance(&mut self, mut c: Value, v: Value) -> Result<bool, Thrown> {
@@ -644,7 +755,7 @@ impl<'p> Vm<'p> {
                             map.define("error", error, attr);
                             map.define("suppressed", suppressed, attr);
                         }
-                        self.error_data.insert(obj.heap_index());
+                        self.mark_constructed_error_data(obj.heap_index(), new_target);
                         return Ok(obj);
                     }
                     if let Some(k) = self
@@ -653,7 +764,7 @@ impl<'p> Vm<'p> {
                         .position(|&c| c == cval.heap_index())
                     {
                         // `class X extends Error` instance: it has the [[ErrorData]] slot.
-                        self.error_data.insert(obj.heap_index());
+                        self.mark_constructed_error_data(obj.heap_index(), new_target);
                         let msg = if k == 7 {
                             args.get(1).copied()
                         } else {

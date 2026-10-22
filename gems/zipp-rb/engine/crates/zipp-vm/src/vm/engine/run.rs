@@ -263,6 +263,7 @@ impl<'p> Vm<'p> {
             argc: 0,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: 0,
             base,
             ip: 0,
@@ -295,18 +296,32 @@ impl<'p> Vm<'p> {
         }
         // The main script's throw is the program's error; a timer throw
         // after it is dropped rather than kept rooted for the VM's life.
-        self.uncaught_timer_throw = None;
+        self.drop_uncaught_timer_throw();
         main
     }
 
     /// The first exception a timer callback let escape (see
     /// `uncaught_timer_throw`), rethrown as the program's completion: the
     /// value goes back into `pending_throw` so a host sees the real error.
+    /// Or, under `fatal_rejections`, the reason of the rejection that ended
+    /// the loop, as `Uncaught (in promise) <reason>`.
     pub(crate) fn take_uncaught_timer_throw(&mut self) -> Option<Thrown> {
         let v = self.uncaught_timer_throw.take()?;
-        let msg = self.throw_message(v);
+        let msg = if std::mem::take(&mut self.uncaught_in_promise) {
+            format!("Uncaught (in promise) {}", self.rejection_message(v))
+        } else {
+            self.throw_message(v)
+        };
         self.pending_throw = Some(v);
         Some(Thrown(msg))
+    }
+
+    /// Forget `uncaught_timer_throw` without reporting it (the program's
+    /// own error came first, or an agent's task ended), so it is not kept
+    /// rooted for the VM's life.
+    pub(crate) fn drop_uncaught_timer_throw(&mut self) {
+        self.uncaught_timer_throw = None;
+        self.uncaught_in_promise = false;
     }
 
     /// Run a MODULE as the program entry. The top-level body (func 0) is an async
@@ -339,6 +354,9 @@ impl<'p> Vm<'p> {
         // microtask drain below; if its body promise then REJECTED, that
         // rejection IS the program's error (the entry module failed).
         let body = self.pending_module_body.take();
+        if let Some(bp) = body {
+            self.mark_promise_handled(bp);
+        }
         self.run_event_loop();
         if let Some(bp) = body {
             if bp.is_heap() {
@@ -361,7 +379,7 @@ impl<'p> Vm<'p> {
                 return Err(t);
             }
         }
-        self.uncaught_timer_throw = None;
+        self.drop_uncaught_timer_throw();
         r.map(|_| Value::UNDEFINED)
     }
 
@@ -453,6 +471,8 @@ impl<'p> Vm<'p> {
         // Module top-level `this` is undefined. alloc_async builds + drives the
         // activation to its first await; drain_microtasks runs it to completion.
         let p = self.alloc_async(0, NO_CLOSURE, Value::UNDEFINED, &[]);
+        // Its rejection is the program's error below, never an unhandled one.
+        self.mark_promise_handled(p);
         self.run_event_loop();
         if p.is_heap() {
             if let HeapObj::Promise {
@@ -468,7 +488,7 @@ impl<'p> Vm<'p> {
                 // Render the rejection like an uncaught throw ("Name: message")
                 // rather than display() (which gives "[object Object]" for an Error).
                 let msg = self.throw_message(reason);
-                self.uncaught_timer_throw = None;
+                self.drop_uncaught_timer_throw();
                 return Err(Thrown(msg));
             }
         }
@@ -589,6 +609,78 @@ impl<'p> Vm<'p> {
         self.call_value_exotic(callee, this, args)
     }
 
+    /// A loose for-of loop's step, `_step = _iterator()` with `_iterator`
+    /// `it.next.bind(it)` over an array iterator, at a `Call` writing a step
+    /// register (`FusedCode::step_site`): `call_value_exotic`'s bound-next
+    /// fast path, whose result object rewrites the one the previous step
+    /// left in that register instead of allocating another. `None` when any
+    /// of that does not hold; the caller then makes the ordinary call.
+    #[inline(never)]
+    pub(crate) fn bound_step_call(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        dst: crate::bytecode::Reg,
+        callee: Value,
+    ) -> Option<Result<Value, Thrown>> {
+        if !callee.is_heap() || !self.realm_global_objs.is_empty() || !self.regexp_string_iters.is_empty() {
+            return None;
+        }
+        let (target, this) = match self.heap.get(callee.heap_index()) {
+            HeapObj::Bound { target, this, args } if args.is_empty() => (*target, *this),
+            _ => return None,
+        };
+        if !target.is_heap()
+            || !this.is_heap()
+            || !matches!(self.heap.get(target.heap_index()), HeapObj::Native(id) if *id == crate::vm::native::ITER_NEXT)
+        {
+            return None;
+        }
+        let f = self.func(func_id as usize);
+        if !f.fused.step_site(f, ip) {
+            return None;
+        }
+        let (v, done) = match self.array_iter_step(this.heap_index())? {
+            Ok(step) => step,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok(self.step_result(base + dst as usize, v, done)))
+    }
+
+    /// The step's `{ value, done }`: the object the fast path last made for
+    /// this register (`step_tokens`), rewritten in place, when it is still
+    /// there (same version); else a new one, remembered for the next step.
+    ///
+    /// A step register is the only holder of its results, and the register
+    /// lives at that absolute index in exactly one frame at a time (live
+    /// frames' windows are disjoint; a tail call replaces its caller's). So
+    /// the remembered object is either this register's current value or what
+    /// a frame that has since returned left there, unreachable either way:
+    /// the first step of a loop in a fresh frame reuses it too.
+    fn step_result(&mut self, reg: usize, v: Value, done: bool) -> Value {
+        let slot = reg & (crate::vm::STEP_TOKEN_SLOTS - 1);
+        let (treg, idx, ver) = self.step_tokens[slot];
+        if treg as usize == reg && self.heap.version_of(idx) == ver {
+            if let Some(shape) = self.iter_result_shape {
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    if m.shape() == shape {
+                        m.set_val_at(0, v);
+                        m.set_val_at(1, Value::bool(done));
+                        self.heap.write_barrier_val(idx, v);
+                        return Value::heap(idx);
+                    }
+                }
+            }
+        }
+        let r = self.iter_result(v, done);
+        if r.is_heap() {
+            let idx = r.heap_index();
+            self.step_tokens[slot] = (reg as u32, idx, self.heap.version_of(idx));
+        }
+        r
+    }
+
     /// The rare-receiver tail of [`call_value`]: the pre-flattening cascade,
     /// arm for arm in its original order (some arms are order-dependent —
     /// `realm_fns` must be probed before the plain `Native` arm because its
@@ -623,6 +715,17 @@ impl<'p> Vm<'p> {
         // A callable Proxy: `apply` trap (or call the target).
         if callee.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(callee.heap_index()) {
+                // Only a Proxy whose target is callable has [[Call]] (10.5.12):
+                // `new Proxy({}, { apply() {} })()` is a TypeError, and the trap
+                // never runs. (`typeof`, `.call` and Reflect.apply already ask
+                // `is_callable`; a direct call came straight here.)
+                if !self.is_callable(callee) {
+                    // Worded as the forwarded call to the target used to fail.
+                    return Err(Thrown(format!(
+                        "TypeError: {} is not a function",
+                        self.display(target)
+                    )));
+                }
                 if revoked {
                     return Err(Thrown(
                         "TypeError: Cannot perform 'apply' on a revoked proxy".into(),
@@ -730,7 +833,48 @@ impl<'p> Vm<'p> {
         // cap (32) made calling a 300-deep chain a RangeError where Node
         // calls it.
         if callee.is_heap() {
-            if matches!(self.heap.get(callee.heap_index()), HeapObj::Bound { .. }) {
+            if let HeapObj::Bound {
+                target,
+                this: th,
+                args: bargs,
+            } = self.heap.get(callee.heap_index())
+            {
+                // One level with nothing bound — `it.next.bind(it)`, which a
+                // loose-mode `for…of` makes per loop and calls per step — calls
+                // its target with the caller's arguments as they are.
+                let (t, th) = (*target, *th);
+                if bargs.is_empty() && t.is_heap() {
+                    match self.heap.get(t.heap_index()) {
+                        HeapObj::Bound { .. } => {}
+                        // A builtin target (an iterator's `next`) is the
+                        // `Native` arm below, without the second trip
+                        // through `call_value` to reach it. A realm copy
+                        // takes that trip: it switches realm context.
+                        HeapObj::Native(id) if self.realm_global_objs.is_empty() => {
+                            let id = *id;
+                            return self.with_native_recursion_guard(|vm| {
+                                // An array's iterator, the usual target: the
+                                // `ITER_NEXT` arm's own array step and result,
+                                // without `call_native`'s frame. That arm asks
+                                // the RegExp String Iterator table first, so
+                                // this only runs while the table is empty.
+                                if id == crate::vm::native::ITER_NEXT
+                                    && th.is_heap()
+                                    && vm.regexp_string_iters.is_empty()
+                                {
+                                    if let Some(step) = vm.array_iter_step(th.heap_index()) {
+                                        let (v, done) = step?;
+                                        return Ok(vm.iter_result(v, done));
+                                    }
+                                }
+                                vm.call_native(id, th, args)
+                            });
+                        }
+                        _ => return self.with_native_recursion_guard(|vm| vm.call_value(t, th, args)),
+                    }
+                } else if bargs.is_empty() {
+                    return self.with_native_recursion_guard(|vm| vm.call_value(t, th, args));
+                }
                 let (t, th, all) = self.unwrap_bound_call(callee, args);
                 return self.with_native_recursion_guard(|vm| vm.call_value(t, th, &all));
             }
@@ -1101,6 +1245,7 @@ impl<'p> Vm<'p> {
             argc: 0,
             is_eval,
             construct_this: false,
+            gen: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -1445,6 +1590,7 @@ impl<'p> Vm<'p> {
             argc: 0,
             is_eval,
             construct_this: false,
+            gen: u32::MAX,
             func: func_id,
             base,
             ip,

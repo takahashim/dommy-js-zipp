@@ -291,6 +291,11 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
             && self.is_canonical_numeric_index(&key)
         {
+            // A view of an immutable buffer: false, before the receiver test
+            // and any coercion.
+            if self.ta_view_immutable(a0.heap_index()) {
+                return Ok(false);
+            }
             if self.same_value(a0, receiver) {
                 match self.ta_valid_index(a0.heap_index(), &key) {
                     Some(i) => self.ta_element_set(a0.heap_index(), i, value)?,
@@ -427,6 +432,9 @@ impl<'p> Vm<'p> {
         if let Some(c) = ta_chain_node {
             // parent.[[Set]](P, V, Receiver) reached the TypedArray: same
             // TA [[Set]] step 1 as above, with the ORIGINAL receiver.
+            if self.ta_view_immutable(c) {
+                return Ok(false);
+            }
             if self.same_value(Value::heap(c), receiver) {
                 match self.ta_valid_index(c, &key) {
                     Some(i) => self.ta_element_set(c, i, value)?,
@@ -661,6 +669,11 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(ridx), HeapObj::TypedArray { .. })
             && self.is_canonical_numeric_index(&key)
         {
+            // An immutable view's element is a non-writable data property:
+            // OrdinarySetWithOwnDescriptor returns false.
+            if self.ta_view_immutable(ridx) {
+                return Ok(false);
+            }
             return match self.ta_valid_index(ridx, &key) {
                 Some(i) => {
                     self.ta_element_set(ridx, i, value)?;
@@ -1490,6 +1503,13 @@ impl<'p> Vm<'p> {
     /// Main-realm calls pay only the same single Option check.
     pub(crate) fn alloc_object_current_realm(&mut self, map: ObjMap) -> Value {
         let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
+        self.adopt_current_realm_object(idx)
+    }
+
+    /// The realm half of [`Vm::alloc_object_current_realm`], for an ordinary
+    /// object `idx` the caller has just allocated by another route.
+    #[inline]
+    pub(crate) fn adopt_current_realm_object(&mut self, idx: u32) -> Value {
         if let Some(r) = self.native_callee_realm {
             let home = self.native_home(self.obj_proto);
             if home != self.obj_proto {
@@ -1721,13 +1741,23 @@ impl<'p> Vm<'p> {
 
     /// `this` for OrdinaryCallBindThis's global substitution: the CALLEE realm's
     /// global object (a createRealm child function binds the CHILD's global).
+    /// Inline: every sloppy-mode call binds it, and out of line the call was
+    /// 3% of a plain sloppy call for one emptiness test.
+    #[inline]
     pub(crate) fn callee_this_global(&self, callee: Value) -> u32 {
         if !self.realm_global_objs.is_empty() {
-            let r = self.get_function_realm(callee);
-            if r != 0 {
-                if let Some(g) = self.realm_global_obj(r) {
-                    return g;
-                }
+            return self.callee_this_global_realm(callee);
+        }
+        self.global_this
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn callee_this_global_realm(&self, callee: Value) -> u32 {
+        let r = self.get_function_realm(callee);
+        if r != 0 {
+            if let Some(g) = self.realm_global_obj(r) {
+                return g;
             }
         }
         self.global_this
@@ -3133,6 +3163,21 @@ impl<'p> Vm<'p> {
                 // reads below, so a Proxy target's getPrototypeOf trap fires first
                 // — and its result is then held un-rooted across those (re-entrant)
                 // reads, so GC has to stay suspended until it lands in `proto_of`.
+                if self.bind_lazy_name_length_ok(this) {
+                    // A plain target: no step below can run guest code, and
+                    // the name and length are derived when read.
+                    let bound_proto = self.object_get_prototype_of(this);
+                    let bound: Vec<Value> = args.get(1..).map_or_else(Vec::new, <[Value]>::to_vec);
+                    let idx = self.heap.alloc(HeapObj::Bound {
+                        target: this,
+                        this: a0,
+                        args: bound,
+                    });
+                    if self.object_get_prototype_of(Value::heap(idx)) != bound_proto {
+                        self.proto_of.insert(idx, bound_proto);
+                    }
+                    return Ok(Value::heap(idx));
+                }
                 let _gc = self.gc_lock_guard();
                 let bound_proto = self.object_get_prototype_of(this);
                 // Steps 4-6: HasOwnProperty(Target, "length") → Get(Target,
@@ -5168,26 +5213,32 @@ impl<'p> Vm<'p> {
                 // Spec order: ToObject(this) [step 1], THEN IsCallable(getter) [step 2],
                 // THEN ToPropertyKey(P) [step 4]. A null/undefined receiver therefore
                 // throws before the getter is type-checked or the key is coerced.
+                // A primitive receiver is boxed (`__defineGetter__.call(1, …)`
+                // defines on a Number wrapper, as `__proto__`'s getter boxes),
+                // and the wrapper is rooted across the key's ToPrimitive.
                 self.require_object_coercible(this)?;
+                let o = self.to_object(this)?;
                 if !self.is_callable(a1) {
                     return Err(Thrown::from_static(
                         "TypeError: Object.prototype.__define[GS]etter__: expecting a function",
                     ));
                 }
-                let key = self.to_property_key(a0)?;
-                let mut d = ObjMap::new();
-                d.set(
-                    if id == OBJPROTO_DEFINE_GETTER {
-                        "get"
-                    } else {
-                        "set"
-                    },
-                    a1,
-                );
-                d.set("enumerable", Value::bool(true));
-                d.set("configurable", Value::bool(true));
-                let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(d))));
-                self.object_define_property(this, &key, desc)?;
+                self.with_host_roots(&[o], |vm| {
+                    let key = vm.to_property_key(a0)?;
+                    let mut d = ObjMap::new();
+                    d.set(
+                        if id == OBJPROTO_DEFINE_GETTER {
+                            "get"
+                        } else {
+                            "set"
+                        },
+                        a1,
+                    );
+                    d.set("enumerable", Value::bool(true));
+                    d.set("configurable", Value::bool(true));
+                    let desc = Value::heap(vm.heap.alloc(HeapObj::Object(Box::new(d))));
+                    vm.object_define_property(o, &key, desc)
+                })?;
                 Value::UNDEFINED
             }
             OBJPROTO_LOOKUP_GETTER | OBJPROTO_LOOKUP_SETTER => {
@@ -5241,7 +5292,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if this.is_heap() && self.error_data.contains(&this.heap_index()) {
-                    self.alloc_str(String::new())
+                    self.error_stack_value(this.heap_index())?
                 } else {
                     Value::UNDEFINED
                 }
